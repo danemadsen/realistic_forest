@@ -13,6 +13,7 @@ mod noise;
 mod player;
 mod render;
 mod ui;
+mod water;
 
 use crate::automation::AutomationSettings;
 use crate::constants::*;

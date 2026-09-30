@@ -99,6 +99,9 @@ struct StageUniforms {
     erosion_visibility_center: vec2<f32>,  // uErosionVisibilityCenter
     erosion_visibility_full_radius: f32,   // uErosionVisibilityFullRadius
     erosion_visibility_zero_radius: f32,   // uErosionVisibilityZeroRadius
+    waterline_push_land: f32,              // uWaterlinePushLand (vertex stage)
+    waterline_push_sea: f32,               // uWaterlinePushSea (vertex stage)
+    waterline_push_scale: f32,             // uWaterlinePushScale (vertex stage)
 };
 @group(2) @binding(0) var<uniform> stage: StageUniforms;
 

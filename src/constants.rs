@@ -19,10 +19,35 @@ pub const LAND_PROFILE_PEAK: f32 = 280.0;
 
 // Waterline clearance: a decaying stretch of the land signal just above sea
 // level. It lifts the near-sea plains out of the water plane's z-fighting
-// band and relaxes to zero before the foothills.
+// band and relaxes to zero before the foothills. It acts on the *macro*
+// landform, before the fine detail octaves are added.
 pub const WATERLINE_CLEARANCE: f32 = 5.0;
 pub const WATERLINE_CLEARANCE_SCALE: f32 = 7.0;
 pub const WATERLINE_CLEARANCE_DECAY: f32 = 15.0;
+
+// Final waterline push: metres of separation forced between the finished
+// surface and sea level. waterline_clearance above cannot hold the coastline
+// on its own, because fine_height is added *after* the profile and swings the
+// result by roughly +-2 m at 8.6 m and 31 m wavelengths. That swing is what
+// turns the coastal plain into a fractal speckle of puddles and islets: the
+// terrain crosses the water surface thousands of times per kilometre, and
+// every crossing is a depth-buffer tie.
+//
+// The push adds `WATERLINE_PUSH_LAND * tanh(h / WATERLINE_PUSH_SCALE)` above
+// the waterline and `WATERLINE_PUSH_SEA * tanh(h / WATERLINE_PUSH_SCALE)`
+// below it. It is sign-preserving and exactly zero at sea level, so the
+// coastline's position does not move; it only steepens the approach to it,
+// multiplying the local gradient by 1 + PUSH/SCALE. Land that would have sat
+// at 0.1 m — inside the band where wave troughs and the depth buffer both
+// disagree about who is in front — lands at roughly 0.4 m instead, and land
+// at 0.5 m lands near 2 m, clear of any wave crest.
+//
+// The sea side is deliberately much weaker than the land side: pushing the bed
+// down as hard would erase the shallow shelf that the water's shoaling, foam
+// and transmission all read, so the bed keeps its shelf and only firms up.
+pub const WATERLINE_PUSH_LAND: f32 = 6.0;
+pub const WATERLINE_PUSH_SEA: f32 = 2.0;
+pub const WATERLINE_PUSH_SCALE: f32 = 2.0;
 
 // The ocean reference is met by the deepest continental signal, and the
 // curve holds the depth constant beyond it — a flat abyssal plain.

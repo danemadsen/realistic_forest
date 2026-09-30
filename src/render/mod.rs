@@ -6,6 +6,7 @@ pub mod erosion_node;
 pub mod gpu_textures;
 pub mod post_nodes;
 pub mod terrain_node;
+pub mod water_node;
 
 use crate::constants::*;
 use crate::erosion::{ErosionBridge, ErosionCache};
@@ -104,9 +105,12 @@ pub struct TerrainStageUniforms {
     pub erosion_visibility_center: [f32; 2],  // 248 uErosionVisibilityCenter
     pub erosion_visibility_full_radius: f32,  // 256 uErosionVisibilityFullRadius
     pub erosion_visibility_zero_radius: f32,  // 260 uErosionVisibilityZeroRadius
-    _end_pad: [f32; 2],                       // 264 (align(16) tail)
+    pub waterline_push_land: f32,             // 264 uWaterlinePushLand
+    pub waterline_push_sea: f32,              // 268 uWaterlinePushSea
+    pub waterline_push_scale: f32,            // 272 uWaterlinePushScale
+    _end_pad: [f32; 3],                       // 276 (align(16) tail)
 }
-const _: () = assert!(std::mem::size_of::<TerrainStageUniforms>() == 272);
+const _: () = assert!(std::mem::size_of::<TerrainStageUniforms>() == 288);
 
 impl TerrainStageUniforms {
     /// Per-level uniforms from `DrawClipmap` + the shared block from
@@ -171,23 +175,13 @@ impl TerrainStageUniforms {
             erosion_visibility_center: visibility_center,
             erosion_visibility_full_radius: EROSION_VISIBILITY_FULL_RADIUS,
             erosion_visibility_zero_radius: EROSION_VISIBILITY_ZERO_RADIUS,
-            _end_pad: [0.0; 2],
+            waterline_push_land: WATERLINE_PUSH_LAND,
+            waterline_push_sea: WATERLINE_PUSH_SEA,
+            waterline_push_scale: WATERLINE_PUSH_SCALE,
+            _end_pad: [0.0; 3],
         }
     }
 }
-
-/// basic-gbuffer stage uniforms (matModel, inverse(matView*matModel), uColor,
-/// uRoughness) — the ocean plane's material block.
-#[repr(C, align(16))]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct BasicStageUniforms {
-    pub mat_model: [f32; 16],           // 0   matModel
-    pub inverse_model_view: [f32; 16],  // 64  inverse(matView*matModel), CPU-supplied
-    pub color: [f32; 4],                // 128 uColor
-    pub roughness: f32,                 // 144 uRoughness
-    _end_pad: [f32; 3],                 // 148
-}
-const _: () = assert!(std::mem::size_of::<BasicStageUniforms>() == 160);
 
 /// ssao stage uniforms. uProjection moved into the shared GlobalUniforms
 /// buffer, which the WGSL reads as globals.projection.
@@ -317,7 +311,6 @@ pub fn globals_layout(device: &RenderDevice) -> BindGroupLayout {
 pub struct ForestShaderHandles {
     pub terrain_vs: Handle<Shader>,
     pub terrain_fs: Handle<Shader>,
-    pub basic: Handle<Shader>,
     pub erosion_init: Handle<Shader>,
     pub erosion_flux: Handle<Shader>,
     pub erosion_water: Handle<Shader>,
@@ -326,6 +319,9 @@ pub struct ForestShaderHandles {
     pub ssao_blur: Handle<Shader>,
     pub composite: Handle<Shader>,
     pub fxaa: Handle<Shader>,
+    pub water_surface: Handle<Shader>,
+    pub water_underwater: Handle<Shader>,
+    pub water_blit: Handle<Shader>,
 }
 
 pub struct ForestRenderPlugin {
@@ -355,7 +351,6 @@ impl Plugin for ForestRenderPlugin {
             ForestShaderHandles {
                 terrain_vs: asset_server.load::<Shader>("shaders/terrain-vs.wgsl"),
                 terrain_fs: asset_server.load::<Shader>("shaders/terrain-fs.wgsl"),
-                basic: asset_server.load::<Shader>("shaders/basic-gbuffer.wgsl"),
                 erosion_init: asset_server.load::<Shader>("shaders/erosion-init.wgsl"),
                 erosion_flux: asset_server.load::<Shader>("shaders/erosion-flux.wgsl"),
                 erosion_water: asset_server.load::<Shader>("shaders/erosion-water.wgsl"),
@@ -364,11 +359,17 @@ impl Plugin for ForestRenderPlugin {
                 ssao_blur: asset_server.load::<Shader>("shaders/ssao-blur.wgsl"),
                 composite: asset_server.load::<Shader>("shaders/composite.wgsl"),
                 fxaa: asset_server.load::<Shader>("shaders/fxaa.wgsl"),
+                water_surface: asset_server.load::<Shader>("shaders/water-surface.wgsl"),
+                water_underwater: asset_server.load::<Shader>("shaders/water-underwater.wgsl"),
+                water_blit: asset_server.load::<Shader>("shaders/water-blit.wgsl"),
             }
         };
         // The main world's terrain layer images (and the erosion blend mask)
         // are lifted into the render world, since it cannot read them directly.
         gpu_textures::register_main_texture_systems(app);
+        // Main-world registration has to happen before the render sub-app is
+        // borrowed below.
+        water_node::register_water_main_world(app);
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -384,6 +385,9 @@ impl Plugin for ForestRenderPlugin {
         render_app.init_resource::<erosion_node::ErosionSimState>();
         render_app.init_resource::<terrain_node::TerrainNodeState>();
         render_app.init_resource::<post_nodes::SsaoNodeState>();
+        // The vendored ocean. It owns its own extractor, prepare systems and
+        // main-world resource so `src/water` stays removable in one piece.
+        water_node::register_water_systems(render_app);
 
         gpu_textures::register_gpu_texture_systems(render_app);
         erosion_node::register_erosion_systems(render_app);
@@ -428,6 +432,14 @@ fn build_forest_graph(render_app: &mut bevy::app::SubApp) -> RenderGraph {
         ViewNodeRunner::new(post_nodes::ForestCompositeNode, render_app.world_mut()),
     );
     graph.add_node(
+        water_node::NodeWater::SurfacePass,
+        ViewNodeRunner::new(water_node::ForestWaterSurfaceNode, render_app.world_mut()),
+    );
+    graph.add_node(
+        water_node::NodeWater::UnderwaterPass,
+        ViewNodeRunner::new(water_node::ForestUnderwaterNode, render_app.world_mut()),
+    );
+    graph.add_node(
         post_nodes::NodeSsao::FxaaPass,
         ViewNodeRunner::new(post_nodes::ForestFxaaNode, render_app.world_mut()),
     );
@@ -441,7 +453,9 @@ fn build_forest_graph(render_app: &mut bevy::app::SubApp) -> RenderGraph {
     graph.add_node_edge(terrain_node::NodeTerrain::TerrainPass, post_nodes::NodeSsao::SsaoPass);
     graph.add_node_edge(post_nodes::NodeSsao::SsaoPass, post_nodes::NodeSsao::BlurPass);
     graph.add_node_edge(post_nodes::NodeSsao::BlurPass, post_nodes::NodeSsao::CompositePass);
-    graph.add_node_edge(post_nodes::NodeSsao::CompositePass, post_nodes::NodeSsao::FxaaPass);
+    graph.add_node_edge(post_nodes::NodeSsao::CompositePass, water_node::NodeWater::SurfacePass);
+    graph.add_node_edge(water_node::NodeWater::SurfacePass, water_node::NodeWater::UnderwaterPass);
+    graph.add_node_edge(water_node::NodeWater::UnderwaterPass, post_nodes::NodeSsao::FxaaPass);
     graph.add_node_edge(post_nodes::NodeSsao::FxaaPass, NodeEgui::EguiPass);
     graph.add_node_edge(NodeEgui::EguiPass, NodeForestUpscale);
     graph

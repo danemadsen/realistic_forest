@@ -19,25 +19,35 @@ pub fn view_matrix(eye: Vec3, target: Vec3, up: Vec3) -> [f32; 16] {
 }
 
 /// Perspective projection matching raylib's `MatrixPerspective(fov_y, aspect,
-/// near, far)` as fed by `BeginMode3D`, with the standard GL -> wgpu clip
-/// conversion (GL NDC z spans [-1, 1]; wgpu's spans [0, 1], so z is halved and
-/// shifted so the near plane maps to depth 0 and the far plane to 1). Column-
-/// major, eye looks down -Z.
+/// near, far)` as fed by `BeginMode3D`, but with **reverse-Z** depth: the near
+/// plane maps to depth 1 and the far plane to 0, which is what wgpu's [0, 1]
+/// depth range wants when the buffer is `Depth32Float`.
+///
+/// DIVERGENCE FROM THE C++: raylib uses a GL-style forward projection, and the
+/// port reproduced it exactly. That projection is the reason the coastal plains
+/// tore apart. Forward [0, 1] depth spends its precision near the eye: with
+/// `NEAR_PLANE` 0.1 and `FAR_PLANE` 5800, the resolvable step is already ~2.4 m
+/// at 2 km and ~20 m at 5.8 km, so terrain within a few metres of the ocean
+/// surface z-fights across its entire visible extent. Float depth is
+/// distributed uniformly in *reciprocal* z, so reversing the mapping puts the
+/// dense end of the float range at the far plane instead, giving a relative
+/// resolution of about 1e-7 of the view distance — sub-millimetre at 2 km.
+///
+/// Column-major, eye looks down -Z. The -1 that turns w_clip into -z sits in
+/// column 2 (index 11 = M[3][2]); M[3][3] stays 0. Putting -1 at index 15
+/// makes w_clip a constant -1, which drives every vertex outside the clip
+/// volume.
 pub fn perspective(fov_y_degrees: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
     let fov = fov_y_degrees.to_radians();
     let w = 1.0 / (0.5 * fov).tan();
-    // GL terms: ndc_z = (A*z + B)/w, A = (far + near)/(near - far), B = 2*far*near/(near - far).
-    let a = (far + near) / (near - far);
-    let b = 2.0 * far * near / (near - far);
-    // D3D-style conversion: ndc' = 0.5*ndc + 0.5 -> row 2 becomes (0.5A - 0.5, 0.5B).
-    // Column-major: the -1 that turns w_clip into -z sits in column 2
-    // (index 11 = M[3][2]) and M[3][3] stays 0. Putting -1 at index 15 makes
-    // w_clip a constant -1, which drives every vertex outside the clip volume.
+    // Reverse-Z terms: z_clip = (near/(far - near))*z_eye + far*near/(far - near)
+    // against w_clip = -z_eye, so z_ndc(-near) = 1 and z_ndc(-far) = 0.
+    let span = far - near;
     [
         w / aspect, 0.0, 0.0, 0.0,
         0.0, w, 0.0, 0.0,
-        0.0, 0.0, 0.5 * a - 0.5, -1.0,
-        0.0, 0.0, 0.5 * b, 0.0,
+        0.0, 0.0, near / span, -1.0,
+        0.0, 0.0, far * near / span, 0.0,
     ]
 }
 
@@ -93,15 +103,6 @@ pub const IDENTITY: [f32; 16] = [
     0.0, 0.0, 1.0, 0.0,
     0.0, 0.0, 0.0, 1.0,
 ];
-
-/// Translation matrix, matching raylib's `MatrixTranslate`.
-pub fn translation(x: f32, y: f32, z: f32) -> [f32; 16] {
-    let mut out = IDENTITY;
-    out[12] = x;
-    out[13] = y;
-    out[14] = z;
-    out
-}
 
 /// Multiply two column-major 4x4 matrices (a * b).
 pub fn mul_m4(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {

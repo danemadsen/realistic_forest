@@ -42,6 +42,7 @@ use crate::matrices;
 use crate::noise::NoiseField;
 use crate::player::{Player, PlayerCamera, UiWantsInput};
 use crate::render::gpu_textures::GpuWorldTexturesOption;
+use crate::water::{WaterOptics, WaterSettings};
 use bevy::image::BevyDefault;
 use bevy::math::Vec3;
 use bevy::prelude::*;
@@ -81,6 +82,7 @@ pub fn draw_diagnostics_ui(
     mut contexts: EguiContexts,
     mut settings: ResMut<AppSettings>,
     mut erosion_settings: ResMut<ErosionSettings>,
+    mut water_settings: ResMut<WaterSettings>,
     cache: Res<ErosionCache>,
     noise: Res<NoiseField>,
     players: Query<&Player>,
@@ -99,6 +101,7 @@ pub fn draw_diagnostics_ui(
             ctx,
             &mut settings,
             &mut erosion_settings,
+            &mut water_settings,
             &cache,
             player,
             &mut rerun,
@@ -147,6 +150,7 @@ fn draw_diagnostics_window(
     ctx: &mut egui::Context,
     settings: &mut AppSettings,
     erosion_settings: &mut ErosionSettings,
+    water_settings: &mut WaterSettings,
     cache: &ErosionCache,
     player: &Player,
     rerun: &mut RerunErosion,
@@ -257,6 +261,45 @@ fn draw_diagnostics_window(
                     .text("Dirt/gravel variant scale")
                     .fixed_decimals(3),
             );
+
+            separator_text(ui, "Water");
+            ui.checkbox(&mut water_settings.enabled, "Water surface");
+            // The wave block is only rebuilt when one of these actually
+            // changes, so graying them out while the surface is off keeps the
+            // spectrum from being regenerated for a pass that will not run.
+            ui.add_enabled_ui(water_settings.enabled, |ui| {
+                ui.add(
+                    egui::Slider::new(&mut water_settings.sea_state_amplitude, 0.0..=1.5)
+                        .text("Sea state")
+                        .fixed_decimals(2),
+                );
+                ui.add(
+                    egui::Slider::new(&mut water_settings.wind_direction_degrees, 0.0..=360.0)
+                        .text("Wind direction")
+                        .fixed_decimals(0)
+                        .suffix("°"),
+                );
+                // A combo box rather than aqua's cycle-on-click button: the
+                // presets are compared by value, so the selection survives
+                // edits to the fields they do not carry.
+                let selected = WaterOptics::PRESETS
+                    .iter()
+                    .position(|(_, preset)| *preset == water_settings.optics)
+                    .unwrap_or(0);
+                let mut index = selected;
+                egui::ComboBox::from_label("Optics")
+                    .selected_text(WaterOptics::PRESETS[selected].0)
+                    .show_ui(ui, |ui| {
+                        for (slot, (name, _)) in WaterOptics::PRESETS.iter().enumerate() {
+                            ui.selectable_value(&mut index, slot, *name);
+                        }
+                    });
+                if index != selected {
+                    water_settings.optics = WaterOptics::PRESETS[index].1;
+                }
+                ui.checkbox(&mut water_settings.underwater_effects, "Underwater effects");
+                ui.checkbox(&mut water_settings.flat_surface, "Flat surface (debug)");
+            });
 
             separator_text(ui, "Hydraulic erosion");
             ui.add(egui::Slider::new(&mut erosion_settings.iterations, 20..=400).text("Iterations"));

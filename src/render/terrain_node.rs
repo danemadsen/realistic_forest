@@ -10,7 +10,7 @@
 use crate::constants::*;
 use crate::render::gpu_textures::{GpuWorldTextures, GpuWorldTexturesOption};
 use crate::render::{
-    BasicStageUniforms, ExtractedForestView, ForestGlobals, ForestShaderHandles,
+    ExtractedForestView, ForestGlobals, ForestShaderHandles,
     TerrainStageUniforms,
 };
 use bevy::asset::Handle;
@@ -29,22 +29,11 @@ use std::sync::Mutex;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// `DrawWorldGeometry`: `MatrixTranslate(oceanOrigin.x, kSeaLevel + 0.12,
-/// oceanOrigin.y)`. The plane floats just above the waterline so the near-shore
-/// terrain (lifted by the waterline clearance) stays clear of it instead of
-/// fighting for the same depth.
-const OCEAN_SURFACE_OFFSET: f32 = 0.12;
-const OCEAN_SURFACE_HEIGHT: f32 = SEA_LEVEL + OCEAN_SURFACE_OFFSET;
-/// `GenMeshPlane(16000.0f, 16000.0f, 1, 1)`.
-const OCEAN_PLANE_SIZE: f32 = 16000.0;
-/// `DrawWorldGeometry`: `oceanOrigin = floor(position / 256) * 256`, so the
-/// patch follows the player in 256 m steps.
-const OCEAN_ORIGIN_SNAP: f32 = 256.0;
-/// Deep water is an extremely dark blue-green in linear space; the perceived
-/// brightness comes from the sun glint the GGX lobe gives the smooth surface,
-/// not from diffuse colour.
-const OCEAN_COLOR: [f32; 4] = [0.012, 0.062, 0.088, 1.0];
-const OCEAN_ROUGHNESS: f32 = 0.18;
+// The ocean placeholder plane that used to live here (a 16 km `DrawWorldGeometry`
+// quad tracking the player in 256 m steps, tinted OCEAN_COLOR and drawn through
+// `basic-gbuffer`) is gone. The ocean is now the vendored bevy-aqua surface in
+// `src/render/water_node.rs`, which shades itself and is drawn after the
+// composite rather than into this G-buffer.
 
 /// The G-buffer clear: `rlClearColor(112, 173, 214, 0)` then
 /// `rlClearScreenBuffers()`.
@@ -68,31 +57,6 @@ const TERRAIN_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttri
     shader_location: 0,
 }];
 const TERRAIN_VERTEX_STRIDE: u64 = 12;
-
-/// basic-gbuffer's raylib-style attributes, shader locations 0-3.
-const BASIC_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] = [
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x3,
-        offset: 0,
-        shader_location: 0,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x2,
-        offset: 12,
-        shader_location: 1,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x3,
-        offset: 20,
-        shader_location: 2,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x4,
-        offset: 32,
-        shader_location: 3,
-    },
-];
-const BASIC_VERTEX_STRIDE: u64 = 48;
 
 // ---------------------------------------------------------------------------
 // Public view/state types
@@ -173,22 +137,12 @@ struct TerrainResources {
     globals: BindGroup,
     /// group(1): the world textures.
     terrain_textures: BindGroup,
-    /// group(1) for the ocean pipeline, whose layout has a deliberately empty
-    /// slot there: `basic-gbuffer` samples no textures, but wgpu still
-    /// validates that every group in the pipeline layout is bound at draw
-    /// time, so the ocean draw binds this instead of inheriting the terrain
-    /// textures group.
-    empty_textures: BindGroup,
     terrain_pipeline: CachedRenderPipelineId,
-    ocean_pipeline: CachedRenderPipelineId,
     center_mesh: GpuMesh,
     ring_mesh: GpuMesh,
-    ocean_mesh: GpuMesh,
     /// One stage block per clipmap level, matching `DrawClipmap`'s per-level
     /// uniforms.
     levels: [StageUniform; CLIP_LEVELS],
-    /// The ocean patch's `BasicStageUniforms` block.
-    ocean: StageUniform,
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +187,10 @@ impl Node for ForestTerrainNode {
         let Some(view) = world.get_resource::<ExtractedForestView>() else {
             return Ok(());
         };
-        let Some(globals) = world.get_resource::<ForestGlobals>() else {
+        // The globals resource is not read here — the terrain's group-0 bind
+        // group already wraps its buffer — but the pass must not run before it
+        // exists, so the lookup stays as an ordering guard.
+        let Some(_globals) = world.get_resource::<ForestGlobals>() else {
             return Ok(());
         };
         let Some(queue) = world.get_resource::<RenderQueue>() else {
@@ -258,30 +215,6 @@ impl Node for ForestTerrainNode {
                 visibility_center,
             );
             queue.write_buffer(&stage.buffer, 0, bytemuck::bytes_of(&uniforms));
-        }
-
-        if view.draw_ocean {
-            let ocean_origin = [
-                (view.player_position[0] / OCEAN_ORIGIN_SNAP).floor() * OCEAN_ORIGIN_SNAP,
-                (view.player_position[2] / OCEAN_ORIGIN_SNAP).floor() * OCEAN_ORIGIN_SNAP,
-            ];
-            // MatrixTranslate(oceanOrigin.x, kSeaLevel + 0.12, oceanOrigin.y).
-            let mat_model =
-                crate::matrices::translation(ocean_origin[0], OCEAN_SURFACE_HEIGHT, ocean_origin[1]);
-            // basic-gbuffer builds its normal matrix from
-            // inverse(matView*matModel); the view half is the frame's shared
-            // globals.view, written by prepare_forest_globals from the same
-            // camera state DrawWorldGeometry used.
-            let model_view = crate::matrices::mul_m4(&globals.globals.view, &mat_model);
-            let uniforms = BasicStageUniforms {
-                mat_model,
-                inverse_model_view: crate::matrices::invert_affine(&model_view),
-                color: OCEAN_COLOR,
-                roughness: OCEAN_ROUGHNESS,
-                // Trailing padding; the WGSL struct ends at roughness.
-                _end_pad: [0.0; 3],
-            };
-            queue.write_buffer(&resources.ocean.buffer, 0, bytemuck::bytes_of(&uniforms));
         }
 
         // One pass, three colour targets + depth, cleared exactly like the
@@ -323,7 +256,9 @@ impl Node for ForestTerrainNode {
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &gbuffer.depth_view,
                 depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
+                    // Reverse-Z: the far plane is 0, so the clear value is the
+                    // far distance rather than the near one.
+                    load: wgpu::LoadOp::Clear(0.0),
                     store: wgpu::StoreOp::Store,
                 }),
                 stencil_ops: None,
@@ -341,8 +276,7 @@ impl Node for ForestTerrainNode {
             1.0,
         );
 
-        // Terrain first, then the ocean, both sharing this pass's depth
-        // buffer. The C++ walks the levels in order and draws
+        // The C++ walks the levels in order and draws
         // `level == 0 ? center : ring` for each of them.
         if let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.terrain_pipeline) {
             pass.set_render_pipeline(pipeline);
@@ -358,24 +292,6 @@ impl Node for ForestTerrainNode {
                 pass.set_vertex_buffer(0, mesh.vertices.slice(..));
                 pass.set_index_buffer(mesh.indices.slice(..), 0, wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
-        }
-
-        if view.draw_ocean {
-            if let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.ocean_pipeline) {
-                pass.set_render_pipeline(pipeline);
-                pass.set_bind_group(0, &resources.globals, &[]);
-                // Group 1 is unused by basic-gbuffer; its layout slot exists
-                // only so the stage block stays at index 2.
-                pass.set_bind_group(1, &resources.empty_textures, &[]);
-                pass.set_bind_group(2, &resources.ocean.bind_group, &[]);
-                pass.set_vertex_buffer(0, resources.ocean_mesh.vertices.slice(..));
-                pass.set_index_buffer(
-                    resources.ocean_mesh.indices.slice(..),
-                    0,
-                    wgpu::IndexFormat::Uint32,
-                );
-                pass.draw_indexed(0..resources.ocean_mesh.index_count, 0, 0..1);
             }
         }
 
@@ -411,20 +327,6 @@ fn upload_mesh<V: bytemuck::Pod, I: bytemuck::Pod>(
         index_count,
     }
 }
-
-/// raylib's default 3D vertex layout, interleaved: position (3 f32),
-/// texcoord (2 f32), normal (3 f32), colour (4 f32). raylib keeps these in
-/// four separate VBOs; the port interleaves them into one buffer, which feeds
-/// the vertex stage identical per-vertex values.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct BasicVertex {
-    position: [f32; 3],
-    texcoord: [f32; 2],
-    normal: [f32; 3],
-    color: [f32; 4],
-}
-const _: () = assert!(std::mem::size_of::<BasicVertex>() == BASIC_VERTEX_STRIDE as usize);
 
 /// `CreateClipGrid`: the clipmap grid in planar grid coordinates.
 ///
@@ -479,51 +381,6 @@ fn build_clip_mesh(device: &RenderDevice, ring: bool) -> GpuMesh {
         "forest_clip_center"
     };
     upload_mesh(device, label, &vertices, &indices)
-}
-
-/// `GenMeshPlane(16000.0f, 16000.0f, 1, 1)` from rmodels.c.
-///
-/// raylib bumps both resolutions to at least 2 first, so the plane is 4
-/// vertices on the `(+-8000, 0, +-8000)` corners. The mesh ordering follows
-/// raylib's loops exactly:
-///   `vertices[x + z*resX] = ((x/(resX-1) - 0.5)*width, 0, (z/(resZ-1) - 0.5)*length)`
-///   `texcoords[u + v*resX] = (u/(resX-1), v/(resZ-1))`, so index 0 is (0,0)
-///   and index 3 is (1,1)
-///   the single face `i = 0` emits `{i+resX, i+1, i}` then
-///   `{i+resX, i+resX+1, i+1}` -> indices `{2, 1, 0, 2, 3, 1}`
-///
-/// GenMeshPlane leaves `mesh.colors` NULL, so raylib's DrawMesh supplies the
-/// default vertex attribute (1, 1, 1, 1) — the white colour stored here.
-fn build_ocean_mesh(device: &RenderDevice) -> GpuMesh {
-    let half = OCEAN_PLANE_SIZE * 0.5;
-    let vertices = [
-        BasicVertex {
-            position: [-half, 0.0, -half],
-            texcoord: [0.0, 0.0],
-            normal: [0.0, 1.0, 0.0],
-            color: [1.0; 4],
-        },
-        BasicVertex {
-            position: [half, 0.0, -half],
-            texcoord: [1.0, 0.0],
-            normal: [0.0, 1.0, 0.0],
-            color: [1.0; 4],
-        },
-        BasicVertex {
-            position: [-half, 0.0, half],
-            texcoord: [0.0, 1.0],
-            normal: [0.0, 1.0, 0.0],
-            color: [1.0; 4],
-        },
-        BasicVertex {
-            position: [half, 0.0, half],
-            texcoord: [1.0, 1.0],
-            normal: [0.0, 1.0, 0.0],
-            color: [1.0; 4],
-        },
-    ];
-    let indices: [u32; 6] = [2, 1, 0, 2, 3, 1];
-    upload_mesh(device, "forest_ocean_mesh", &vertices, &indices)
 }
 
 // ---------------------------------------------------------------------------
@@ -884,11 +741,12 @@ fn queue_gbuffer_pipeline(
             // texture, not a renderbuffer.
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: true,
-            // PORT NOTE: rlgl initialises the context with
-            // glDepthFunc(GL_LEQUAL) and nothing in this path changes it, so
-            // an exact tie goes to the later draw — the ocean plane wins
-            // against terrain that lands on precisely the same depth.
-            depth_compare: wgpu::CompareFunction::LessEqual,
+            // DIVERGENCE FROM THE C++: rlgl runs glDepthFunc(GL_LEQUAL) against
+            // a forward projection. The projection is reverse-Z now (see
+            // crate::matrices::perspective), so the comparison flips with it:
+            // GreaterEqual keeps the same "an exact tie goes to the later draw,
+            // so the water surface wins against terrain at identical depth".
+            depth_compare: wgpu::CompareFunction::GreaterEqual,
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -928,7 +786,7 @@ fn queue_gbuffer_pipeline(
 /// Builds the meshes, pipelines, uniform slots and bind groups once the shared
 /// globals buffer (group 0) and the world textures (group 1) exist.
 ///
-/// The globals guard is a hard requirement because the ocean's bind group
+/// The globals guard is a hard requirement because the terrain's bind group
 /// wraps that very buffer; the texture guard duplicates the explicit ordering
 /// against `gpu_textures::prepare_gpu_textures` that `register_terrain_systems`
 /// declares, so this system still retries safely if that ordering ever
@@ -974,19 +832,9 @@ fn prepare_terrain(
         "forest_terrain_stage_layout",
         std::mem::size_of::<TerrainStageUniforms>() as u64,
     );
-    let ocean_stage_layout = stage_uniform_layout(
-        device,
-        "forest_ocean_stage_layout",
-        std::mem::size_of::<BasicStageUniforms>() as u64,
-    );
-    // basic-gbuffer samples no textures, but its pipeline layout still needs a
-    // group-1 slot so the stage block stays at index 2.
-    let empty_layout = device.create_bind_group_layout("forest_no_textures_layout", &[]);
-    let empty_textures =
-        device.create_bind_group("forest_no_textures_bind_group", &empty_layout, &[]);
 
-    // Terrain: terrain-vs + terrain-fs over a plain vec3 position. Ocean:
-    // basic-gbuffer over raylib's four attributes. Same three colour targets.
+    // terrain-vs + terrain-fs over a plain vec3 position, into the same three
+    // colour targets the other G-buffer passes use.
     let terrain_pipeline = queue_gbuffer_pipeline(
         &pipeline_cache,
         "forest_terrain_pipeline",
@@ -1003,18 +851,6 @@ fn prepare_terrain(
             terrain_stage_layout.clone(),
         ],
     );
-    let ocean_pipeline = queue_gbuffer_pipeline(
-        &pipeline_cache,
-        "forest_ocean_pipeline",
-        shaders.basic.clone(),
-        shaders.basic.clone(),
-        vec![VertexBufferLayout {
-            array_stride: BASIC_VERTEX_STRIDE,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: BASIC_VERTEX_ATTRIBUTES.to_vec(),
-        }],
-        vec![globals_layout, empty_layout, ocean_stage_layout.clone()],
-    );
 
     let levels: [StageUniform; CLIP_LEVELS] = std::array::from_fn(|_| {
         StageUniform::new(
@@ -1024,24 +860,14 @@ fn prepare_terrain(
             std::mem::size_of::<TerrainStageUniforms>() as u64,
         )
     });
-    let ocean = StageUniform::new(
-        device,
-        &ocean_stage_layout,
-        "forest_ocean_stage_uniform",
-        std::mem::size_of::<BasicStageUniforms>() as u64,
-    );
 
     *resources = Some(TerrainResources {
         globals: globals_bind_group,
         terrain_textures,
-        empty_textures,
         terrain_pipeline,
-        ocean_pipeline,
         center_mesh: build_clip_mesh(device, false),
         ring_mesh: build_clip_mesh(device, true),
-        ocean_mesh: build_ocean_mesh(device),
         levels,
-        ocean,
     });
 
     // `samplers` and the standalone layouts are deliberately not stored: a

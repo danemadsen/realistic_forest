@@ -135,6 +135,32 @@ pub fn shape_elevation(macro_height: f32) -> f32 {
     OCEAN_PROFILE_DEPTH * ((OCEAN_PROFILE_CURVE * t).exp() - 1.0) / (OCEAN_PROFILE_CURVE.exp() - 1.0)
 }
 
+/// Push a finished height away from the waterline, preserving its sign.
+///
+/// `shape_elevation` shapes only the macro landform, and `base_height` adds
+/// the fine detail octaves afterwards, so the terrain can land anywhere within
+/// about +-2 m of sea level across the whole coastal plain. Terrain in that
+/// band is indistinguishable from the water surface as far as the depth buffer
+/// is concerned — and, once the sea has waves, as far as the eye is concerned
+/// too, because every wave trough exposes it again.
+///
+/// This is the dead-zone removal that makes the coastline decisive. It is a
+/// monotone, sign-preserving function that is exactly zero at sea level, so
+/// the shoreline stays exactly where the landform put it; it only steepens the
+/// gradient approaching it. `WATERLINE_PUSH_LAND` above and
+/// `WATERLINE_PUSH_SEA` below are separate so the bed keeps its shelf.
+///
+/// Mirrored exactly by `pushFromWaterline` in terrain-vs.wgsl.
+pub fn push_from_waterline(height: f32) -> f32 {
+    let scale = WATERLINE_PUSH_SCALE.max(1e-4);
+    let push = if height >= 0.0 {
+        WATERLINE_PUSH_LAND
+    } else {
+        WATERLINE_PUSH_SEA
+    };
+    height + push * (height / scale).tanh()
+}
+
 /// The portable CPU base height, matching `baseHeight` in terrain.wgsl so
 /// walking collision and spawn placement agree with the rendered surface.
 pub fn base_height(noise: &NoiseField, x: f32, z: f32) -> f32 {
@@ -177,7 +203,10 @@ pub fn base_height(noise: &NoiseField, x: f32, z: f32) -> f32 {
         + shape_elevation((macro_height - SEA_LEVEL) * LANDFORM_VERTICAL_SCALE)
         + fine_height * LANDFORM_VERTICAL_SCALE;
     let safe_height = SEA_LEVEL + 14.0 + plains * 1.8 + detail * 0.35;
-    lerp(safe_height, height, smoothstep(22.0, 90.0, distance_from_spawn))
+    // The push goes on last, after the spawn blend, so the stabilised patch and
+    // the open landscape are shaped by the same function and no artificial
+    // ring appears at the blend's edge.
+    push_from_waterline(lerp(safe_height, height, smoothstep(22.0, 90.0, distance_from_spawn)))
 }
 
 /// The 480x480 base height map one erosion tile simulates, sampled at cell

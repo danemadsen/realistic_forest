@@ -74,6 +74,9 @@ struct StageUniforms {
     erosion_visibility_center: vec2<f32>,  // uErosionVisibilityCenter
     erosion_visibility_full_radius: f32,   // uErosionVisibilityFullRadius
     erosion_visibility_zero_radius: f32,   // uErosionVisibilityZeroRadius
+    waterline_push_land: f32,              // uWaterlinePushLand
+    waterline_push_sea: f32,               // uWaterlinePushSea
+    waterline_push_scale: f32,             // uWaterlinePushScale
 };
 @group(2) @binding(0) var<uniform> stage: StageUniforms;
 
@@ -151,6 +154,27 @@ fn shapeElevation(macroIn: f32) -> f32
          / (exp(stage.ocean_profile_curve) - 1.0);
 }
 
+// Push a finished height away from the waterline, preserving its sign.
+// Mirrored exactly by `push_from_waterline` in src/noise.rs, which is what the
+// player's walking collision samples — the two must stay identical or the
+// player floats over or sinks into the rendered ground.
+//
+// shapeElevation shapes only the macro landform, and the fine detail octaves
+// are added after it, so the surface can land anywhere within about +-2 m of
+// sea level across the whole coastal plain. Terrain in that band is
+// indistinguishable from the water surface to the depth buffer, and once the
+// sea has waves it is indistinguishable to the eye as well, because every
+// trough exposes it again. This is the dead-zone removal that makes the
+// coastline decisive: monotone, exactly zero at sea level so the shoreline
+// does not move, and steepening the approach to it by 1 + push/scale.
+fn pushFromWaterline(height: f32) -> f32
+{
+    let scale = max(stage.waterline_push_scale, 0.0001);
+    let push = select(stage.waterline_push_sea, stage.waterline_push_land,
+                      height >= 0.0);
+    return height + push*tanh(height/scale);
+}
+
 fn baseHeight(p: vec2<f32>) -> f32
 {
     // Compress only the macro domain. The final detail octaves still use
@@ -203,7 +227,10 @@ fn baseHeight(p: vec2<f32>) -> f32
     let distanceFromSpawn = length(p);
     let safeHeight = stage.sea_level + 14.0 + plains*1.8 + detail*0.35;
     let spawnBlend = smoothHermite(22.0, 90.0, distanceFromSpawn);
-    return mix(safeHeight, height, spawnBlend);
+    // The push goes on last, after the spawn blend, so the stabilised patch and
+    // the open landscape are shaped by the same function and no artificial
+    // ring appears at the blend's edge.
+    return pushFromWaterline(mix(safeHeight, height, spawnBlend));
 }
 
 fn lookupErosionTile(tileCoordinate: vec2<f32>, record: ptr<function, vec4<f32>>) -> bool
