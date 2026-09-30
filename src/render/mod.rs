@@ -1,0 +1,563 @@
+//! The forest render graph: erosion simulation -> terrain G-buffer -> SSAO
+//! -> blur -> composite -> FXAA -> egui -> upscale. Ports the C++ main loop
+//! render order 1:1 on wgpu.
+
+pub mod erosion_node;
+pub mod gpu_textures;
+pub mod post_nodes;
+pub mod terrain_node;
+
+use crate::constants::*;
+use crate::erosion::{ErosionBridge, ErosionCache};
+use crate::noise::NoiseField;
+use crate::player::{Player, PlayerCamera};
+use crate::WorldOptions;
+use bevy::asset::Handle;
+use bevy::prelude::*;
+use bevy::render::render_graph::{RenderGraph, RenderSubGraph, ViewNodeRunner};
+use bevy::render::render_resource::{BindGroupEntry, BindGroupLayout};
+use bevy::render::renderer::{RenderDevice, RenderQueue};
+use bevy::render::{ExtractSchedule, MainWorld, RenderApp};
+use bevy::shader::Shader;
+use bevy::window::PrimaryWindow;
+
+/// The camera render sub-graph label; cameras point at it via
+/// `CameraRenderGraph::new(ForestSubGraph)`.
+#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderSubGraph)]
+pub struct ForestSubGraph;
+
+/// Graph-local label for the final upscale/blit node. bevy's `UpscalingNode`
+/// deliberately carries no public name of its own.
+#[derive(Debug, Hash, PartialEq, Eq, Clone, bevy::render::render_graph::RenderLabel)]
+pub struct NodeForestUpscale;
+
+/// Camera-attached data extracted from the main world each frame.
+#[derive(Resource, Default)]
+pub struct ExtractedForestView {
+    pub player_position: [f32; 3],
+    pub player_yaw: f32,
+    pub player_pitch: f32,
+    pub physical_width: u32,
+    pub physical_height: u32,
+    pub settings: AppSettings,
+    pub draw_ocean: bool,
+    pub lookup_minimum: (i64, i64),
+    pub frame: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Uniform structures — byte layouts matching the WGSL stage uniforms. Every
+// struct ends with a `const _` assert pinning its size so WGSL edits cannot
+// silently drift.
+// ---------------------------------------------------------------------------
+
+/// The shared `GlobalUniforms` preamble (group 0, binding 0), 224 bytes.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GlobalUniformsGpu {
+    pub view: [f32; 16],
+    pub projection: [f32; 16],
+    pub camera_position: [f32; 4],
+    pub sun_direction: [f32; 4],
+    pub viewport: [f32; 4],
+    pub params: [f32; 4],
+    pub settings_a: [f32; 4],
+    pub settings_b: [f32; 4],
+}
+const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 224);
+
+/// terrain-vs + terrain-fs share one canonical StageUniforms layout
+/// (272 bytes); the WGSL files are reconciled to this exact field order.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TerrainStageUniforms {
+    pub mat_model: [f32; 16],                 // 0   matModel
+    pub inverse_model: [f32; 16],             // 64  inverse(matModel), CPU-supplied
+    pub clip_origin: [f32; 2],                // 128 uClipOrigin
+    pub spacing: f32,                         // 136 uSpacing
+    pub next_spacing: f32,                    // 140 uNextSpacing
+    pub morph_start: f32,                     // 144 uMorphStart
+    pub morph_end: f32,                       // 148 uMorphEnd
+    pub sea_level: f32,                       // 152 uSeaLevel
+    pub noise_period: f32,                    // 156 uNoisePeriod
+    pub landform_horizontal_scale: f32,       // 160 uLandformHorizontalScale
+    pub landform_vertical_scale: f32,         // 164 uLandformVerticalScale
+    pub land_profile_curve: f32,              // 168 uLandProfileCurve
+    pub land_profile_reference: f32,          // 172 uLandProfileReference
+    pub land_profile_peak: f32,               // 176 uLandProfilePeak
+    pub waterline_clearance: f32,             // 180 uWaterlineClearance
+    pub waterline_clearance_scale: f32,       // 184 uWaterlineClearanceScale
+    pub waterline_clearance_decay: f32,       // 188 uWaterlineClearanceDecay
+    pub ocean_profile_curve: f32,             // 192 uOceanProfileCurve
+    pub ocean_profile_reference: f32,         // 196 uOceanProfileReference
+    pub ocean_profile_depth: f32,             // 200 uOceanProfileDepth
+    pub erosion_tile_stride: f32,             // 204 uErosionTileStride
+    pub erosion_footprint_size: f32,          // 208 uErosionFootprintSize
+    pub erosion_output_resolution: f32,       // 212 uErosionOutputResolution
+    pub erosion_atlas_pitch: f32,             // 216 uErosionAtlasPitch
+    pub erosion_atlas_size: f32,              // 220 uErosionAtlasSize
+    pub erosion_atlas_gutter: f32,            // 224 uErosionAtlasGutter
+    _pad0: f32,                               // 228 (vec2 alignment)
+    pub erosion_lookup_min_tile: [f32; 2],    // 232 uErosionLookupMinTile
+    pub erosion_lookup_size: f32,             // 240 uErosionLookupSize
+    _pad1: f32,                               // 244 (vec2 alignment)
+    pub erosion_visibility_center: [f32; 2],  // 248 uErosionVisibilityCenter
+    pub erosion_visibility_full_radius: f32,  // 256 uErosionVisibilityFullRadius
+    pub erosion_visibility_zero_radius: f32,  // 260 uErosionVisibilityZeroRadius
+    _end_pad: [f32; 2],                       // 264 (align(16) tail)
+}
+const _: () = assert!(std::mem::size_of::<TerrainStageUniforms>() == 272);
+
+impl TerrainStageUniforms {
+    /// Per-level uniforms from `DrawClipmap` + the shared block from
+    /// `SetTerrainSharedUniforms`. One instance per clipmap level.
+    ///
+    /// uFlowDebug / uErosionDebug / uTexScale / uNormalStrength / uVariantScale
+    /// / uCameraPosition / uSunDirectionWorld / uSparkleStrength moved into the
+    /// shared GlobalUniforms buffer; the WGSL reads them from there.
+    pub fn build(
+        mat_model: [f32; 16],
+        level: u32,
+        player_position: [f32; 3],
+        lookup_minimum: (i64, i64),
+        visibility_center: [f32; 2],
+    ) -> Self {
+        let anchor_spacing = CLIP_ANCHOR_SPACING;
+        let clip_origin = [
+            (player_position[0] / anchor_spacing + 0.5).floor() * anchor_spacing,
+            (player_position[2] / anchor_spacing + 0.5).floor() * anchor_spacing,
+        ];
+        let spacing = (1u32 << level) as f32;
+        let has_coarser_level = level + 1 < CLIP_LEVELS as u32;
+        Self {
+            mat_model,
+            inverse_model: crate::matrices::invert_affine(&mat_model),
+            clip_origin,
+            spacing,
+            next_spacing: spacing * 2.0,
+            morph_start: if has_coarser_level {
+                CLIP_CELLS as f32 * 0.43 * spacing
+            } else {
+                1.0e20
+            },
+            morph_end: if has_coarser_level {
+                CLIP_CELLS as f32 * 0.49 * spacing
+            } else {
+                2.0e20
+            },
+            sea_level: SEA_LEVEL,
+            noise_period: NOISE_PERIOD,
+            landform_horizontal_scale: LANDFORM_HORIZONTAL_SCALE,
+            landform_vertical_scale: LANDFORM_VERTICAL_SCALE,
+            land_profile_curve: LAND_PROFILE_CURVE,
+            land_profile_reference: LAND_PROFILE_REFERENCE,
+            land_profile_peak: LAND_PROFILE_PEAK,
+            waterline_clearance: WATERLINE_CLEARANCE,
+            waterline_clearance_scale: WATERLINE_CLEARANCE_SCALE,
+            waterline_clearance_decay: WATERLINE_CLEARANCE_DECAY,
+            ocean_profile_curve: OCEAN_PROFILE_CURVE,
+            ocean_profile_reference: OCEAN_PROFILE_REFERENCE,
+            ocean_profile_depth: OCEAN_PROFILE_DEPTH,
+            erosion_tile_stride: EROSION_TILE_STRIDE,
+            erosion_footprint_size: EROSION_FOOTPRINT_SIZE,
+            erosion_output_resolution: EROSION_OUTPUT_RESOLUTION as f32,
+            erosion_atlas_pitch: EROSION_ATLAS_PITCH as f32,
+            erosion_atlas_size: EROSION_ATLAS_SIZE as f32,
+            erosion_atlas_gutter: EROSION_ATLAS_GUTTER as f32,
+            _pad0: 0.0,
+            erosion_lookup_min_tile: [lookup_minimum.0 as f32, lookup_minimum.1 as f32],
+            erosion_lookup_size: EROSION_LOOKUP_DIAMETER as f32,
+            _pad1: 0.0,
+            erosion_visibility_center: visibility_center,
+            erosion_visibility_full_radius: EROSION_VISIBILITY_FULL_RADIUS,
+            erosion_visibility_zero_radius: EROSION_VISIBILITY_ZERO_RADIUS,
+            _end_pad: [0.0; 2],
+        }
+    }
+}
+
+/// basic-gbuffer stage uniforms (matModel, inverse(matView*matModel), uColor,
+/// uRoughness) — the ocean plane's material block.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BasicStageUniforms {
+    pub mat_model: [f32; 16],           // 0   matModel
+    pub inverse_model_view: [f32; 16],  // 64  inverse(matView*matModel), CPU-supplied
+    pub color: [f32; 4],                // 128 uColor
+    pub roughness: f32,                 // 144 uRoughness
+    _end_pad: [f32; 3],                 // 148
+}
+const _: () = assert!(std::mem::size_of::<BasicStageUniforms>() == 160);
+
+/// ssao stage uniforms. uProjection moved into the shared GlobalUniforms
+/// buffer, which the WGSL reads as globals.projection.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct SsaoStageUniforms {
+    pub screen_size: [f32; 2],  // 0  uScreenSize (AO target resolution)
+    pub radius: f32,            // 8  uRadius
+    pub bias: f32,              // 12 uBias
+    pub power: f32,             // 16 uPower
+    _end_pad: [f32; 3],         // 20
+}
+const _: () = assert!(std::mem::size_of::<SsaoStageUniforms>() == 32);
+
+/// ssao-blur stage uniforms.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct BlurStageUniforms {
+    pub texel_size: [f32; 2],  // 0  uTexelSize
+    pub depth_sharpness: f32,  // 8  uDepthSharpness
+    pub normal_sharpness: f32, // 12 uNormalSharpness
+}
+const _: () = assert!(std::mem::size_of::<BlurStageUniforms>() == 16);
+
+/// composite stage uniforms. uAoTexStrength / uFogDensity / uSunIntensity /
+/// uExposure live in the shared GlobalUniforms buffer (settings_a.x/z,
+/// params.x/z); only the light direction and the AO strength are per-frame
+/// stage data.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CompositeStageUniforms {
+    pub light_direction_view: [f32; 4], // 0  uLightDirectionView (w unused)
+    pub ao_strength: f32,               // 16 uAoStrength
+    _end_pad: [f32; 3],                 // 20
+}
+const _: () = assert!(std::mem::size_of::<CompositeStageUniforms>() == 32);
+
+/// erosion-init stage uniforms.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ErosionInitStageUniforms {
+    pub mode: i32,           // 0  uMode
+    _pad0: f32,              // 4
+    pub world_min: [f32; 2], // 8  uWorldMin
+    pub cell_size: f32,      // 16 uCellSize
+    _end_pad: [f32; 3],      // 20
+}
+const _: () = assert!(std::mem::size_of::<ErosionInitStageUniforms>() == 32);
+
+/// erosion-flux stage uniforms.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ErosionFluxStageUniforms {
+    pub resolution: [f32; 2], // 0  uResolution
+    pub delta_time: f32,      // 8  uDeltaTime
+    pub cell_size: f32,       // 12 uCellSize
+    pub gravity: f32,         // 16 uGravity
+    _end_pad: [f32; 3],       // 20
+}
+const _: () = assert!(std::mem::size_of::<ErosionFluxStageUniforms>() == 32);
+
+/// erosion-water stage uniforms.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ErosionWaterStageUniforms {
+    pub resolution: [f32; 2],  // 0
+    pub delta_time: f32,       // 8
+    pub cell_size: f32,        // 12
+    pub rain: f32,             // 16
+    pub evaporation: f32,      // 20
+    pub sea_level: f32,        // 24
+    _end_pad: f32,             // 28 (uniform size rounds to 32)
+}
+const _: () = assert!(std::mem::size_of::<ErosionWaterStageUniforms>() == 32);
+
+/// erosion-terrain stage uniforms.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ErosionTerrainStageUniforms {
+    pub resolution: [f32; 2],       // 0
+    pub delta_time: f32,            // 8
+    pub cell_size: f32,             // 12
+    pub sea_level: f32,             // 16
+    pub erosion_rate: f32,          // 20
+    pub deposition_rate: f32,       // 24
+    pub sediment_capacity: f32,     // 28
+    pub minimum_slope: f32,         // 32
+    pub maximum_erosion: f32,       // 36
+    pub transport_rate: f32,        // 40
+    pub guard_band_pixels: f32,     // 44
+    pub brush_strength: f32,        // 48
+    _align: f32,                    // 52
+    pub world_min: [f32; 2],        // 56 uWorldMin
+}
+const _: () = assert!(std::mem::size_of::<ErosionTerrainStageUniforms>() == 64);
+
+pub fn normalize3([x, y, z]: [f32; 3]) -> [f32; 4] {
+    let length = (x * x + y * y + z * z).sqrt();
+    [x / length, y / length, z / length, 0.0]
+}
+
+/// The group(0) bind group layout every pass shares: one uniform buffer.
+pub fn globals_layout(device: &RenderDevice) -> BindGroupLayout {
+    device.create_bind_group_layout(
+        "forest_globals_layout",
+        &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(
+                    std::mem::size_of::<GlobalUniformsGpu>() as u64,
+                ),
+            },
+            count: None,
+        }],
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Plugin + graph assembly
+// ---------------------------------------------------------------------------
+
+/// Shader asset handles for every pipeline.
+#[derive(Clone, Resource)]
+pub struct ForestShaderHandles {
+    pub terrain_vs: Handle<Shader>,
+    pub terrain_fs: Handle<Shader>,
+    pub basic: Handle<Shader>,
+    pub erosion_init: Handle<Shader>,
+    pub erosion_flux: Handle<Shader>,
+    pub erosion_water: Handle<Shader>,
+    pub erosion_terrain: Handle<Shader>,
+    pub ssao: Handle<Shader>,
+    pub ssao_blur: Handle<Shader>,
+    pub composite: Handle<Shader>,
+    pub fxaa: Handle<Shader>,
+}
+
+pub struct ForestRenderPlugin {
+    noise_field: NoiseField,
+}
+
+impl ForestRenderPlugin {
+    /// Shared CPU data lifted into the render world once at plugin build.
+    pub fn new(noise_field: NoiseField) -> Self {
+        Self { noise_field }
+    }
+}
+
+impl Plugin for ForestRenderPlugin {
+    fn build(&self, app: &mut App) {
+        // Main-world values are read (and the main-world systems registered)
+        // BEFORE the render sub-app is borrowed, so `app` is free again by the
+        // time `get_sub_app_mut` takes its mutable borrow.
+        //
+        // Shared cross-world state: the erosion bridge carries one frame of
+        // simulation commands at a time from the main world.
+        let bridge = app.world().resource::<ErosionBridge>().clone();
+        // Shader assets live in the main world's Assets<Shader>; handles work
+        // in the render app because PipelineCache watches shader assets.
+        let handles = {
+            let asset_server = app.world().resource::<AssetServer>();
+            ForestShaderHandles {
+                terrain_vs: asset_server.load::<Shader>("shaders/terrain-vs.wgsl"),
+                terrain_fs: asset_server.load::<Shader>("shaders/terrain-fs.wgsl"),
+                basic: asset_server.load::<Shader>("shaders/basic-gbuffer.wgsl"),
+                erosion_init: asset_server.load::<Shader>("shaders/erosion-init.wgsl"),
+                erosion_flux: asset_server.load::<Shader>("shaders/erosion-flux.wgsl"),
+                erosion_water: asset_server.load::<Shader>("shaders/erosion-water.wgsl"),
+                erosion_terrain: asset_server.load::<Shader>("shaders/erosion-terrain.wgsl"),
+                ssao: asset_server.load::<Shader>("shaders/ssao.wgsl"),
+                ssao_blur: asset_server.load::<Shader>("shaders/ssao-blur.wgsl"),
+                composite: asset_server.load::<Shader>("shaders/composite.wgsl"),
+                fxaa: asset_server.load::<Shader>("shaders/fxaa.wgsl"),
+            }
+        };
+        // The main world's terrain layer images (and the erosion blend mask)
+        // are lifted into the render world, since it cannot read them directly.
+        gpu_textures::register_main_texture_systems(app);
+
+        let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
+            return;
+        };
+
+        render_app.insert_resource(bridge);
+        render_app.insert_resource(self.noise_field.clone());
+        render_app.insert_resource(handles);
+
+        render_app.init_resource::<ExtractedForestView>();
+        render_app.init_resource::<ForestGlobals>();
+        render_app.init_resource::<gpu_textures::GpuWorldTexturesOption>();
+        render_app.init_resource::<erosion_node::ErosionSimState>();
+        render_app.init_resource::<terrain_node::TerrainNodeState>();
+        render_app.init_resource::<post_nodes::SsaoNodeState>();
+
+        gpu_textures::register_gpu_texture_systems(render_app);
+        erosion_node::register_erosion_systems(render_app);
+        terrain_node::register_terrain_systems(render_app);
+        post_nodes::register_post_systems(render_app);
+
+        render_app.add_systems(ExtractSchedule, extract_forest_view);
+        render_app.add_systems(
+            bevy::render::Render,
+            (gpu_textures::prepare_gpu_textures, prepare_forest_globals)
+                .chain()
+                .in_set(bevy::render::RenderSystems::Prepare),
+        );
+
+        // Build the graph first: `ViewNodeRunner::new` needs the render world,
+        // and the `RenderGraph` resource borrow must not overlap it.
+        let graph = build_forest_graph(render_app);
+        render_app
+            .world_mut()
+            .resource_mut::<RenderGraph>()
+            .add_sub_graph(ForestSubGraph, graph);
+    }
+}
+
+/// Builds the ForestSubGraph render graph on the render app's sub-app.
+fn build_forest_graph(render_app: &mut bevy::app::SubApp) -> RenderGraph {
+    use bevy::core_pipeline::upscaling::UpscalingNode;
+    use bevy_egui::render::{RunEguiSubgraphOnEguiViewNode, graph::NodeEgui};
+
+    let mut graph = RenderGraph::default();
+    // bevy_egui attaches its subgraph to the built-in Core2d/Core3d graphs
+    // only; this camera renders through ForestSubGraph, so the same subgraph
+    // has to be attached here for `RunEguiSubgraphOnEguiViewNode` to find it.
+    let egui_graph = bevy_egui::render::get_egui_graph(render_app);
+    graph.add_sub_graph(bevy_egui::render::graph::SubGraphEgui, egui_graph);
+    graph.add_node(erosion_node::NodeErosion::ErosionSim, erosion_node::ForestErosionNode);
+    graph.add_node(terrain_node::NodeTerrain::TerrainPass, terrain_node::ForestTerrainNode);
+    graph.add_node(post_nodes::NodeSsao::SsaoPass, post_nodes::ForestSsaoNode);
+    graph.add_node(post_nodes::NodeSsao::BlurPass, post_nodes::ForestBlurNode);
+    graph.add_node(
+        post_nodes::NodeSsao::CompositePass,
+        ViewNodeRunner::new(post_nodes::ForestCompositeNode, render_app.world_mut()),
+    );
+    graph.add_node(
+        post_nodes::NodeSsao::FxaaPass,
+        ViewNodeRunner::new(post_nodes::ForestFxaaNode, render_app.world_mut()),
+    );
+    graph.add_node(NodeEgui::EguiPass, RunEguiSubgraphOnEguiViewNode);
+    graph.add_node(
+        NodeForestUpscale,
+        ViewNodeRunner::new(UpscalingNode::default(), render_app.world_mut()),
+    );
+
+    graph.add_node_edge(erosion_node::NodeErosion::ErosionSim, terrain_node::NodeTerrain::TerrainPass);
+    graph.add_node_edge(terrain_node::NodeTerrain::TerrainPass, post_nodes::NodeSsao::SsaoPass);
+    graph.add_node_edge(post_nodes::NodeSsao::SsaoPass, post_nodes::NodeSsao::BlurPass);
+    graph.add_node_edge(post_nodes::NodeSsao::BlurPass, post_nodes::NodeSsao::CompositePass);
+    graph.add_node_edge(post_nodes::NodeSsao::CompositePass, post_nodes::NodeSsao::FxaaPass);
+    graph.add_node_edge(post_nodes::NodeSsao::FxaaPass, NodeEgui::EguiPass);
+    graph.add_node_edge(NodeEgui::EguiPass, NodeForestUpscale);
+    graph
+}
+
+// ---------------------------------------------------------------------------
+// Extraction + globals buffer
+// ---------------------------------------------------------------------------
+
+/// Camera state + settings + erosion lookup frame copied main -> render.
+fn extract_forest_view(
+    mut main_world: ResMut<MainWorld>,
+    mut view: ResMut<ExtractedForestView>,
+) {
+    // `ResMut<MainWorld>` derefs twice -- to `MainWorld`, then to `World` --
+    // so one `&mut` reaches the main world's storage directly.
+    let world: &mut World = &mut main_world;
+    let mut player_query = world.query::<&Player>();
+    let Ok(player) = player_query.single_mut(world) else {
+        return;
+    };
+    view.player_position = [player.position.x, player.position.y, player.position.z];
+    view.player_yaw = player.yaw;
+    view.player_pitch = player.pitch;
+
+    if let Ok((window,)) = world.query_filtered::<(&Window,), With<PrimaryWindow>>().single(world) {
+        view.physical_width = window.physical_width();
+        view.physical_height = window.physical_height();
+    }
+
+    view.settings = *world.resource::<AppSettings>();
+    view.draw_ocean = world.resource::<WorldOptions>().draw_ocean;
+    let cache = world.resource::<ErosionCache>();
+    view.lookup_minimum = (cache.lookup_minimum.x, cache.lookup_minimum.z);
+    view.frame += 1;
+}
+
+/// The globals uniform buffer shared at group(0) binding(0) by every pass.
+#[derive(Resource)]
+pub struct ForestGlobals {
+    pub globals: GlobalUniformsGpu,
+    pub buffer: Option<wgpu::Buffer>,
+}
+
+impl Default for ForestGlobals {
+    fn default() -> Self {
+        Self { globals: GlobalUniformsGpu::default(), buffer: None }
+    }
+}
+
+pub fn prepare_forest_globals(
+    mut globals: ResMut<ForestGlobals>,
+    view: Res<ExtractedForestView>,
+    device: Res<RenderDevice>,
+    queue: Res<RenderQueue>,
+) {
+    let width = view.physical_width.max(1) as f32;
+    let height = view.physical_height.max(1) as f32;
+    let aspect = width / height;
+    // GL-style projection with the GL->wgpu z conversion baked in so raster
+    // depth matches the C++ (standard depth, near -> 0, far -> 1).
+    let projection = crate::matrices::perspective(68.0, aspect, NEAR_PLANE, FAR_PLANE);
+    let player = Player {
+        position: bevy::math::Vec3::from(view.player_position),
+        yaw: view.player_yaw,
+        pitch: view.player_pitch,
+        ..Player::default()
+    };
+    let camera = PlayerCamera::from_player(&player);
+    let view_matrix = crate::matrices::view_matrix(camera.position, camera.target, camera.up);
+    let sun = normalize3(SUN_DIRECTION_WORLD);
+    globals.globals = GlobalUniformsGpu {
+        view: view_matrix,
+        projection,
+        camera_position: [view.player_position[0], view.player_position[1], view.player_position[2], 0.0],
+        sun_direction: sun,
+        viewport: [width, height, 1.0 / width, 1.0 / height],
+        params: [
+            view.settings.fog_density,
+            FAR_PLANE,
+            view.settings.exposure,
+            view.settings.ssao_enabled as u32 as f32,
+        ],
+        settings_a: [
+            view.settings.sun_intensity,
+            view.settings.texture_scale,
+            view.settings.ao_tex_strength,
+            view.settings.variant_scale,
+        ],
+        settings_b: [
+            view.settings.normal_strength,
+            view.settings.sparkle_strength,
+            view.settings.flow_debug as u32 as f32,
+            view.settings.erosion_debug as u32 as f32,
+        ],
+    };
+    if globals.buffer.is_none() {
+        // Created straight off the wgpu device so the field can stay a raw
+        // `wgpu::Buffer`, the type `globals_bind_group_entries` and the
+        // terrain node's layout code take.
+        globals.buffer = Some(device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forest_global_uniforms"),
+            size: std::mem::size_of::<GlobalUniformsGpu>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+    }
+    if let Some(buffer) = &globals.buffer {
+        queue.write_buffer(buffer, 0, bytemuck::bytes_of(&globals.globals));
+    }
+}
+
+/// Group-0 bind group entries for the shared globals buffer.
+pub fn globals_bind_group_entries(buffer: &wgpu::Buffer) -> [BindGroupEntry<'_>; 1] {
+    [BindGroupEntry {
+        binding: 0,
+        resource: buffer.as_entire_binding(),
+    }]
+}

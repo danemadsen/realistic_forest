@@ -1,0 +1,249 @@
+# Forest
+
+Forest is a Rust 2024 prototype for an infinite procedural landscape. It renders
+mountains, plains, beaches, ocean, and biome colours with an indexed geometry
+clipmap. Procedural terrain can be evaluated at any world coordinate, and
+overlapping GPU hydraulic-erosion tiles are generated and cached around the
+player as the world streams. Walking and flight are not clamped to a simulation
+domain: there is no world border.
+
+It is a port of the C++17/raylib/OpenGL project at `~/forest`, keeping the same
+math, constants and structure. The renderer is now wgpu through Bevy, the source
+noise comes from quick-noise, and the diagnostics panel is egui. Each shader in
+`assets/shaders` carries a `PORT NOTES` header naming the GLSL file it came from
+and recording every deliberate deviation.
+
+## Build and run
+
+Requirements:
+
+- A recent stable Rust toolchain (developed against 1.98.1; the crate uses the
+  2024 edition)
+- A Vulkan, Metal or D3D12 capable GPU
+
+From a fresh checkout:
+
+```sh
+cargo run --release
+```
+
+A debug build also works and is much faster to compile; the shaders are compiled
+by naga at runtime either way.
+
+## Controls
+
+| Input | Action |
+| --- | --- |
+| Mouse | Look |
+| W/A/S/D | Move |
+| Space | Jump, or rise while flying |
+| Left Shift | Descend while flying |
+| Left Control | Movement boost |
+| V | Toggle flight |
+| F1 | Toggle the diagnostics panel and release the cursor |
+| Escape | Release the cursor |
+| Left click | Capture the cursor again |
+
+Movement is unbounded in both walking and flight modes.
+
+## Command line
+
+| Flag | Effect |
+| --- | --- |
+| `--camera x,y,z,yawDeg,pitchDeg` | Pin the camera pose and fly, for reproducible shots |
+| `--shot path.png` | Render, save a screenshot, then exit |
+| `--wait n` | Frames to render before the screenshot |
+| `--size W,H` | Window size in points (comma-separated, as the C++'s `sscanf`) |
+| `--probe` | Print terrain and erosion statistics, then exit |
+| `--probe-extent`, `--probe-step` | Probe sampling window |
+| `--measure-overlap` | Compare erosion tiles across a shared lattice edge |
+| `--overlap-tile x,z` | Select the tile pair to compare |
+| `--lattice` | Draw the erosion lattice overlay |
+| `--no-fog`, `--no-water` | Disable those stages |
+
+## Terrain and clipmap
+
+quick-noise creates a deterministic, tileable 1024×1024 R32 source field.
+Both CPU collision/erosion setup and the terrain vertex shader sample that same
+field with matching bilinear rules at any world coordinate. Domain warping,
+independent continental and plain fields, and two blended ridge scales keep the
+large landforms irregular. `LANDFORM_HORIZONTAL_SCALE` stretches their macro
+coordinate domain 2.5×, producing broader ranges, plains, coastlines, and
+islands while retaining the original fine surface frequencies. The macro
+landform is then shaped through a bounded-exponential altitude profile around
+sea level: land compresses toward the waterline into broad plains and rises
+through an accelerating gradient into steeper, taller alpine crowns, while
+the seabed keeps a gentle littoral shelf and then descends progressively
+into a deep basin. Fine surface octaves bypass the profile so plains keep
+their rolling detail. `LANDFORM_VERTICAL_SCALE` independently scales the
+macro input and fine relief 1.5×. A decaying clearance stretch lifts the
+lowest land a few metres clear of the sea plane so wide near-shore plains do
+not z-fight with it, and the deepest basins flatten onto an abyssal plain.
+Only a small area immediately around spawn
+is gently stabilised.
+
+The terrain uses one indexed 224×224-quad centre mesh and one reusable ring
+mesh. Seven levels use vertex spacing from 1 to 64 metres, reaching 7168 metres
+from the clipmap anchor. All levels share a stable 64-metre world lattice. The
+outer part of each level morphs onto the next coarser global lattice, including
+its normal sampling interval, which prevents cracks and greatly reduces LOD
+shimmer. A 5800-metre far plane bounds the finite render horizon while
+generation itself remains unbounded.
+
+Terrain uses triplanar PBR textures with a muted, earthy palette. Grass004
+covers stable ground; erosion and fresh deposition can replace it with
+Ground103 soil and subtle Ground106 variation, without a minimum grass share.
+Deposited fines favour flats, while scouring also exposes soil on banks.
+Rock032 appears on the upper mountain faces — steep or high ground — where
+ground cover cannot hold, with a slope-dependent ceiling so high-but-gentle
+benches keep meadow pockets while steep faces reach full stone, and a hard
+contour at the grass contact so the two never blend into an olive half-mix.
+Gravel fills the energetic, scoured drainage that cuts through those faces,
+so a gully reads as loose debris between intact rock walls. Ground093C sand
+follows the coast and slower depositional channels. Snow006 settles like
+sediment rather than following altitude alone: it holds deeper and reaches
+lower inside dry sheltered hollows, drains down inactive gullies as fingers
+below the regional line, sheds steep walls to bare rock, melts earlier from
+sun-facing slopes, eroded ridges and scoured faces, and its melt margin
+picks up a grey-brown sediment stain where active drainage works the
+thinning pack. These are material-placement rules derived from the erosion
+results, not a climate or snowmelt simulation.
+
+World-anchored, warped fields vary patch size and density across broad regions;
+fine breakup filters away with distance. Grass shifts subtly between green and
+olive. Each material supplies matching colour, normal, roughness and optional
+ambient-occlusion maps. Texture cells use deterministic quarter turns and
+narrow edge blends; grass, soil, gravel and sand also use independent sample
+offsets to avoid repeating the same tufts and stones. All PBR channels share
+the mapping, including normal orientation. Damp ground darkens and becomes
+smoother, while snow retains its wind relief and glints. A camera-centred
+sea-level plane creates ocean and shorelines. The **Dirt/gravel variant scale**
+control affects scan variation within soil and gravel.
+
+## Fidelity of the noise substitution
+
+The C++ samples FastNoiseLite's OpenSimplex2S; the port samples quick-noise's
+Simplex with identical parameters (seed 1337, 5 octaves, frequency 0.0085,
+lacunarity 2.02, gain 0.5) and the identical `*0.5 + 0.5` remap. These are
+different algorithms, so they produce different fields — statistically
+equivalent realizations, not the same realization. Measured over the full
+1024×1024 field:
+
+| | FastNoiseLite | quick-noise |
+| --- | --- | --- |
+| mean | +0.00262 | +0.00098 |
+| sd | 0.25045 | 0.25672 |
+| range | [-0.7889, 0.7622] | [-0.7158, 0.7023] |
+
+Coarse-grained sd agrees within 2 percent for windows from 8 to 256 metres, and
+the pointwise correlation between the two fields is +0.014.
+
+That difference propagates through the domain warp, so the port renders a
+*different landscape*, not a different formula. The evidence: feeding the C++'s
+own height function the quick-noise field reproduces the port's 4225-point probe
+grid to 0.01 metres (r = 1.000000), while feeding it the FastNoiseLite field
+reproduces the C++'s grid to the same 0.01 metres. And the C++'s generator
+disagrees with itself this much from one seed to the next — across 40
+FastNoiseLite seeds at identical parameters the height field's sd spans
+39–88 metres and its cross-seed correlation spans -0.37 to +1.0, a range that
+contains the port's terrain (sd 45 metres, the 15th percentile). Run
+`cargo run --bin noise-compare` to dump the field for such a comparison.
+
+## Hydraulic erosion and flow output
+
+Independent 1024×1024-metre erosion passes are centred on a globally aligned
+512-metre lattice, so neighbouring footprints overlap by exactly 50 percent.
+Every steady-state world point is therefore a gradient blend of four genuinely
+independent hydraulic simulations. Each pass uses 4-metre cells plus a
+448-metre scratch halo; only the central 1024 metres are retained. Water and
+sediment evolve throughout that halo, putting the closed simulation edge well
+outside the visible footprint. Each pass starts from the same world-aligned
+base terrain and geology, so its result does not depend on which neighbours
+finished first. There are no hard overlap thresholds or frozen internal
+boundaries; only the distant outer guard band fades erosion back to base.
+
+Each tile runs as three fragment-shader passes with float ping-pong targets,
+which avoids compute shaders and keeps every pass a plain render target:
+
+1. Conservative pipe flux steered by a rotationally symmetric 3×3 gradient.
+2. Rain, evaporation, water transport, continuous-angle velocity, and discharge.
+3. Inertial sediment advection, erosion, settling, and deposition.
+
+The flow and sediment passes adapt the useful physics from the hydraulic
+erosion shader in `~/nerthus` without depending on its WebGPU compute atomics.
+Runoff retains inertia and follows a bilinearly sampled downhill direction;
+excavation is capped by the actual forward drop and becomes progressively more
+resistant with channel depth. Uphill travel and slow or evaporating water settle
+their carried sediment. World-stable multi-scale geology bends and branches
+channels consistently through tile overlaps, while a bilateral cone footprint
+removes isolated cuts without smoothing away small tributaries. Ocean cells
+remain drains, and the small spawn footprint resists destructive excavation.
+
+One scratch simulation is advanced incrementally while completed passes are
+packed into surface and flow atlases. A lookup texture maps
+nearby lattice coordinates to cache slots and reveal weights. The shared
+blend-mask image is a square gradient profile remapped to a separable Hermite
+tent and stored as R32, so opposing pass weights form a smooth partition
+without 8-bit bands. The four fixed geometric weights are normalized together,
+while each pass fades in independently; a pass that is not ready contributes
+procedural base terrain rather than amplifying the others. The initial four-pass
+quartet is prewarmed at spawn. Beyond 1100 metres from the player, one shared C1
+radial visibility field fades height and flow and material evidence back to the
+procedural base terrain, reaching zero by 1600 metres — safely before the
+nearest exact-four support edge of the 9×9 pass cache. CPU collision and both
+terrain shaders use the same lattice, weights, centre, and radii.
+
+The retained RGBA flow atlas is available to the terrain shader and the
+diagnostics view with this per-texel contract:
+
+| Channel | Value |
+| --- | --- |
+| R | Water depth |
+| G | Signed world-X velocity |
+| B | Signed world-Z velocity |
+| A | Accumulated discharge |
+
+The RGBA surface atlas retains signed height displacement in R for the vertex
+shader and collision. G stores local concavity in
+metres; B stores positive log2 discharge concentration relative to a surrounding
+12-metre ring; A stores substrate hardness. These fields are derived at tile
+completion using the simulation halo, then share the same gutters, overlap
+weights, reveal and visibility as the terrain. Positive displacement is net
+deposition; suspended sediment is not treated as deposited soil. Concentrated
+discharge distinguishes drainage channels from general rainfall, and shallow
+water velocities are gated when estimating transport strength.
+
+The flow output
+remains available for later river geometry. Press F1 and enable **Flow visualization** to inspect it on the
+terrain, or expand **Flow output** to inspect the cached target. Erosion
+parameters can be edited from the same panel and applied with **Regenerate
+erosion cache**. The panel also reports maximum incision, deposited height,
+small-scale detail within actively eroded ground, and flow-axis bias for the
+most recently completed tile.
+
+## SSAO pipeline
+
+The renderer writes view position, view normal, and albedo to a three-target
+G-buffer. SSAO is evaluated at half resolution with a 24-sample rotated
+hemisphere kernel, followed by a depth/normal-aware bilateral blur and a final
+lighting/fog composite. Water opts out naturally through its smooth normal and
+geometry coverage. FXAA then smooths the composited frame, and the diagnostics
+panel draws on top. The G-buffer and AO targets are recreated for resize and
+HiDPI render-size changes.
+
+The composite and FXAA passes ping-pong between the view target's two main
+textures: composite reads the G-buffer and writes one, FXAA reads that one and
+writes the other, which the upscale node then presents. Both write into an
+sRGB-format target, where the C++ wrote into a plain framebuffer with no
+conversion, so the two passes split the encode between them: the composite
+writes its display-encoded value and lets the target encode it, FXAA's fetch of
+that same target decodes it straight back — which is what keeps FXAA filtering
+in the C++'s display-encoded domain, where its luma thresholds mean what the
+GLSL meant. FXAA is the last pass that authors pixels, so its store inverts the
+encode analytically and the target's encode cancels it: the byte written is the
+value the filter produced, matching the C++'s byte pixel for pixel wherever FXAA
+passes a pixel through untouched. The `PORT NOTES` in `assets/shaders/fxaa.wgsl`
+explains this in full.
+
+This is currently a desktop prototype with a fixed terrain seed and a bounded
+in-memory erosion cache over an unbounded procedural world.
