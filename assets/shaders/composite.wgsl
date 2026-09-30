@@ -12,10 +12,15 @@
 //   dropped (the source has none): fragTexCoord derives from
 //   @builtin(position) as position.xy * globals.viewport.zw. The G-buffer
 //   reads are a same-frame blit, so GL's bottom-left gl_FragCoord origin
-//   cancels out there; the analytic sky gradient is not, and takes a
-//   GL-oriented v = 1 - uv.y (see sky_uv in fs_main). The sky/terrain
-//   branch keys off texture DATA (packedPosition.a), not screen
-//   orientation.
+//   cancels out there. The sky/terrain branch keys off texture DATA
+//   (packedPosition.a), not screen orientation.
+// - DIVERGENCE FROM THE C++: the analytic sky gradient no longer takes a
+//   screen coordinate at all. The GLSL passed gl_FragCoord-derived screen
+//   rows, which ties the horizon band to the bottom of the frame instead of
+//   to the horizon; skyParameter/viewRayElevation below index it by the view
+//   ray's own elevation so the band lands on the horizon line at any pitch.
+//   Terrain ambient is the one consumer still on the old screen-row ramp
+//   (see ambient_ramp in fs_main) and is unchanged by design.
 // - texture1 was sampled twice in the GLSL (xyz for the normal, .a for
 //   roughness); one sample of the same texture at the same uv now feeds
 //   both reads — bit-identical values, one fewer fetch.
@@ -104,12 +109,63 @@ fn V_SmithGGX(n_dot_l: f32, n_dot_v: f32, alpha: f32) -> f32
     return 0.5/max(ggxL + ggxV, 1e-7);
 }
 
-fn skyColour(uv: vec2<f32>) -> vec3<f32>
+/// The gradient itself, as a function of its own parameter: 0 at the horizon,
+/// 1 at the zenith.
+///
+/// This takes a parameter rather than a direction on purpose. Three passes draw
+/// or sample this sky — this one, water-surface.wgsl and water-underwater.wgsl
+/// — and they only agree if they agree on how a direction becomes a parameter.
+/// Keeping the mix separate from the mapping leaves exactly one place where
+/// that conversion happens.
+fn skyColour(parameter: f32) -> vec3<f32>
 {
-    let elevation = smoothstep(0.0, 1.0, uv.y);
     let horizon = vec3<f32>(0.72, 0.82, 0.90);
     let zenith = vec3<f32>(0.22, 0.46, 0.74);
-    return mix(horizon, zenith, elevation);
+    return mix(horizon, zenith, parameter);
+}
+
+/// Sky gradient parameter for a ray whose sine of elevation is `direction_y`.
+///
+/// The 0.85 edge puts full zenith at asin(0.85) = 58 degrees above the horizon.
+/// That edge is not free to choose: water-surface.wgsl's reflection was
+/// authored against it, so the sky a water pixel mirrors and the sky this pass
+/// draws have to use the same one or the two disagree everywhere above the
+/// horizon. Below the horizon the clamp is what is wanted — a ray that ends on
+/// terrain is hazier than any sky, so it takes the horizon end.
+fn skyParameter(direction_y: f32) -> f32
+{
+    return smoothstep(0.0, 0.85, direction_y);
+}
+
+/// Sine of the elevation above the horizon of the view ray through `uv`.
+///
+/// No inverse matrix: for a symmetric perspective the view-space ray is
+/// `ndc / (projection[0][0], projection[1][1])` at unit depth, so only the
+/// projection's own scale terms are needed. uv.y counts down from the top of
+/// the frame while view space y counts up, so it flips.
+///
+/// The elevation is `dot(globals.view[1].xyz, view_direction)`. `globals.view`
+/// is world->view with the camera basis in its ROWS — row 0 right, row 1 up,
+/// row 2 backward — and WGSL stores it column-major, so `globals.view[1]` is
+/// not that up axis: it is column 1, the second component of each of the three
+/// axes. View->world is the transpose (the rotation is orthonormal), and the y
+/// of `transpose(view) * v` is exactly that dot product. Summing
+/// `v.x*view[0] + v.y*view[1] + v.z*view[2]` instead evaluates `view * v` —
+/// world->view applied to a view-space vector — which is what
+/// water-underwater.wgsl's rayDirection did. That is the wrong contraction
+/// rather than a fixed offset, so how wrong it is depends on where the camera
+/// points, and it is exactly right in two orientations that are easy to reach
+/// by accident: pitch 0, and yaw 180, where this matrix is symmetric and
+/// `view * v` coincides with its transpose. At the pose these sky captures use
+/// (yaw 90, pitch -25) the returned direction is 155 degrees from the true one
+/// and the horizon lands on row 225 instead of row 69.
+fn viewRayElevation(uv: vec2<f32>) -> f32
+{
+    let ndc = vec2<f32>(uv.x*2.0 - 1.0, 1.0 - uv.y*2.0);
+    let view_direction = normalize(vec3<f32>(ndc.x/max(globals.projection[0][0], 1e-6),
+                                             ndc.y/max(globals.projection[1][1], 1e-6),
+                                             -1.0));
+    return dot(globals.view[1].xyz, view_direction);
 }
 
 // Narkowicz's fitted ACES filmic curve. A tonemap replaces the raw gamma
@@ -136,22 +192,38 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
     let uv = position.xy * globals.viewport.zw;
     // The G-buffer reads below are a same-frame blit and share wgpu's
     // top-down origin with the passes that wrote them, so they use `uv`
-    // unchanged. The sky gradient is NOT a blit: the GLSL evaluated
-    // skyColour(gl_FragCoord.xy * uViewport.zw) with GL's bottom-up
-    // fragment origin, so v = 0 was the horizon and v = 1 the zenith.
-    // @builtin(position).y counts down from the top, so the gradient is
-    // fed the GL-oriented v to keep zenith up.
-    let sky_uv = vec2<f32>(uv.x, 1.0 - uv.y);
+    // unchanged.
+    //
+    // The sky gradient is indexed by the ELEVATION of the fragment's own view
+    // ray, not by its screen row. The GLSL this port came from evaluated
+    // skyColour(gl_FragCoord.xy * uViewport.zw), which makes the parameter a
+    // screen row — and a screen-row sky draws its pale horizon band at the
+    // bottom of the frame wherever the camera points, so a camera pitched down
+    // never shows the band at all. This shot sees 0 to 9 degrees of sky, which
+    // a row-indexed ramp renders as the last 7 per cent of the gradient: pure
+    // zenith (49,141,206) across the entire visible band, with the sky's own
+    // horizon colour unreachable. Elevation puts the pale band back on the
+    // horizon line — where the terrain silhouette is, and where the water's
+    // grazing reflection already was — so the sea can sit below its sky instead
+    // of above it.
+    let sky_lin = pow(skyColour(skyParameter(viewRayElevation(uv))), vec3<f32>(2.2));
+
+    // Terrain ambient is NOT the sky along this fragment's ray: it is the
+    // skylight arriving AT the surface, which has nothing to do with which
+    // pixel the surface landed on. It therefore does not follow the sky onto
+    // the elevation parameterisation, and keeps the screen-row ramp it had, so
+    // nothing about terrain lighting moves in this change. That ramp is a
+    // per-fragment vertical gradient — the same meadow is lit differently when
+    // the camera tilts — which is a real defect, but it is a scene relight
+    // rather than a sky fix, so it is left alone here deliberately.
+    let ambient_ramp = smoothstep(0.0, 1.0, 1.0 - uv.y);
+    let ambient_sky_lin = pow(skyColour(ambient_ramp), vec3<f32>(2.2));
 
     // Uniform mapping (see PORT NOTES): uFogDensity -> globals.params.x,
     // uExposure -> globals.params.z, uSunIntensity -> globals.settings_a.x,
     // uAoTexStrength -> globals.settings_a.z; stage.light_direction_view and
     // stage.ao_strength carry uLightDirectionView and uAoStrength.
     let packed_position = textureSample(texture0, texture0_sampler, uv);
-    let sky = skyColour(sky_uv);
-    // The sky constants are authored in display space; decode to linear once
-    // so ambient, fog and sky pixels all share one space.
-    let sky_lin = pow(sky, vec3<f32>(2.2));
 
     // HOISTED SAMPLES: the GLSL read these below the early sky return, where
     // WGSL forbids implicit-derivative sampling (non-uniform control flow).
@@ -272,8 +344,9 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
     // the warm-up, pushed the nearest field toward chartreuse. The snow
     // path is unchanged (same 0.45 blue mix as before).
     let ambient_strength = mix(0.12, 0.28, snow_mask);
-    let ambient_colour = mix(sky_lin*vec3<f32>(0.80, 1.00, 0.68),
-                             mix(sky_lin, sky_lin*vec3<f32>(0.70, 0.90, 1.42), 0.45),
+    let ambient_colour = mix(ambient_sky_lin*vec3<f32>(0.80, 1.00, 0.68),
+                             mix(ambient_sky_lin,
+                                 ambient_sky_lin*vec3<f32>(0.70, 0.90, 1.42), 0.45),
                              snow_mask);
     lit += albedo*ambient_colour*ambient_strength*ao_factor;
 
@@ -289,6 +362,11 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
                           *view_distance);
     // Aerial perspective fades terrain into the same linear sky the sky
     // pixels display, so distant land dissolves into the haze behind it.
+    // `sky_lin` is that sky for THIS fragment's view ray — the same ray, so
+    // the same elevation, so the same colour the sky pass would have painted
+    // had the terrain not been there. A fully fogged fragment lands on the sky
+    // byte-for-byte through the identical ACES path, and the horizon has no
+    // seam to band at.
     // Surviving sun glints are the exception: a mirror facet's specular
     // spike rides orders of magnitude above the diffuse field, and light
     // haze attenuates such a spike without dissolving it into sky — the

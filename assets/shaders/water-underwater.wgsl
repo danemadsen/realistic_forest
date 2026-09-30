@@ -56,11 +56,20 @@ fn smoothstepf(edge0: f32, edge1: f32, x: f32) -> f32
     return t*t*(3.0 - 2.0*t);
 }
 
-fn skyColour(uv: vec2<f32>) -> vec3<f32>
+/// The gradient itself, as a function of its own parameter: 0 at the horizon,
+/// 1 at the zenith. Byte-for-byte the copy composite.wgsl draws with.
+fn skyColour(parameter: f32) -> vec3<f32>
 {
     let horizon = vec3<f32>(0.72, 0.82, 0.90);
     let zenith = vec3<f32>(0.22, 0.46, 0.74);
-    return mix(horizon, zenith, smoothstepf(0.0, 1.0, uv.y));
+    return mix(horizon, zenith, parameter);
+}
+
+/// Sky gradient parameter for a ray whose sine of elevation is `direction_y`,
+/// matching composite.wgsl's and water-surface.wgsl's.
+fn skyParameter(direction_y: f32) -> f32
+{
+    return smoothstepf(0.0, 0.85, direction_y);
 }
 
 /// `skyColour` decoded into the linear space this pass lights in.
@@ -69,10 +78,22 @@ fn skyColour(uv: vec2<f32>) -> vec3<f32>
 /// `pow(sky, 2.2)` before use — and this shader decodes the incoming frame the
 /// same way, so the light pouring through Snell's window has to be decoded too
 /// or it lands about 2.5x too bright.
-fn skyLinear(uv: vec2<f32>) -> vec3<f32>
+fn skyLinear(parameter: f32) -> vec3<f32>
 {
-    return pow(max(skyColour(uv), vec3<f32>(0.0)), vec3<f32>(2.2));
+    return pow(max(skyColour(parameter), vec3<f32>(0.0)), vec3<f32>(2.2));
 }
+
+/// Elevation sine of the representative sky that pours through Snell's window.
+///
+/// The window is not a view direction: it is the whole sky dome refracted into
+/// a cone, so it wants ONE colour and stays a constant under the elevation
+/// parameterisation. `0.85 * 0.85` is the old screen-row value carried across —
+/// under a ramp of `smoothstep(0, 1, x)` a value `x` and the elevation sine
+/// `0.85x` land on the same gradient parameter — so the window light is
+/// unchanged. (The same literal 0.85 in water-surface.wgsl's `skyParameter` is
+/// a ramp EDGE; here it is a sample point. Unrelated meanings, kept apart by
+/// naming this one for what it is.)
+const WINDOW_SKY_ELEVATION: f32 = 0.85 * 0.85;
 
 fn henyeyGreenstein(cos_theta: f32, g: f32) -> f32
 {
@@ -105,15 +126,35 @@ fn vs_main(@builtin(vertex_index) vertex: u32) -> VsOutput
 /// projection's own scale terms rather than an inverse matrix: for a symmetric
 /// perspective, view space x/y are `ndc / (projection[0][0], projection[1][1])`
 /// at unit depth. uv.y is top-down and view space y is up, so it flips.
+///
+/// View -> world is the TRANSPOSE of `globals.view`, which is world -> view and
+/// whose rotation is orthonormal. A transpose is the dot product of the vector
+/// with each ROW, and WGSL stores the matrix column-major, so row `i` is
+/// `vec3(view[0][i], view[1][i], view[2][i])` — NOT `view[i].xyz`, which is
+/// column `i`. The three dot products below are that transpose.
+///
+/// This used to read `v.x*view[0] + v.y*view[1] + v.z*view[2]`, which is the
+/// other contraction — `view * v`, world -> view applied to a view-space
+/// vector. For an orthonormal basis the two differ only by which index is
+/// summed, so the error is a function of orientation rather than a constant,
+/// and it is exactly zero in two orientations reachable by accident: pitch 0,
+/// and yaw 180, where this matrix is symmetric and `view * v` coincides with
+/// its transpose. Everywhere else it is severe — at yaw 90 it returned
+/// (-1, 0, 0) for a true forward of (0.906, -0.423, 0), 155 degrees away, and
+/// at yaw 0 pitch -25 it put the horizon on row 381 of 450 where the truth is
+/// row 69. `to_view.y` drives the Snell window, so the window sat where the
+/// camera was not pointing: at yaw 0, 90 and 270 the contraction never reached
+/// the window's 0.5412 threshold at all, so the window was simply absent, and
+/// it appeared only at yaw 180 where the matrix is symmetric.
 fn rayDirection(uv: vec2<f32>) -> vec3<f32>
 {
     let ndc = vec2<f32>(uv.x*2.0 - 1.0, 1.0 - uv.y*2.0);
     let view_direction = normalize(vec3<f32>(ndc.x/max(globals.projection[0][0], 1e-6),
                                              ndc.y/max(globals.projection[1][1], 1e-6),
                                              -1.0));
-    return view_direction.x*globals.view[0].xyz
-         + view_direction.y*globals.view[1].xyz
-         + view_direction.z*globals.view[2].xyz;
+    return vec3<f32>(dot(globals.view[0].xyz, view_direction),
+                     dot(globals.view[1].xyz, view_direction),
+                     dot(globals.view[2].xyz, view_direction));
 }
 
 @fragment
@@ -165,7 +206,7 @@ fn fs_main(in: VsOutput) -> @location(0) vec4<f32>
     let critical_cosine = sqrt(max(1.0 - 1.0/(N_WATER*N_WATER), 0.0));
     let window = smoothstepf(critical_cosine - 0.12, critical_cosine + 0.03,
                              max(to_view.y, 0.0));
-    let window_light = skyLinear(vec2<f32>(0.5, 0.85))*globals.params.z;
+    let window_light = skyLinear(skyParameter(WINDOW_SKY_ELEVATION))*globals.params.z;
 
     let lit = scene_linear*transmittance + scattered + window_light*window*0.28;
     let medium_result = pow(max(lit, vec3<f32>(0.0)), vec3<f32>(1.0/2.2));

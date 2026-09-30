@@ -33,18 +33,21 @@
 // - The reflected sky is this renderer's own skyColour() gradient, and the
 //   fog/tonemap match composite.wgsl so water dissolves into the same haze as
 //   the terrain behind it. Aqua uses an environment cubemap and an HDR target.
-//   One convention has to be matched for that to be true rather than
-//   approximate, and `skyLinear` below handles it: the gradient's return value
-//   is display-encoded, which the composite decodes with `pow(sky, 2.2)`
-//   before lighting.
-//   The gradient's *parameter* is deliberately not matched. composite.wgsl
-//   evaluates `skyColour(uv.x, 1 - uv.y)`, so for the drawn sky the parameter
-//   is a screen row and the zenith sits at the top of the frame whatever the
-//   camera pitch. A reflection cannot use that: the reflected ray leaves the
-//   water pointing up and its screen projection clamps, which pinned every
-//   water pixel to the zenith end of the ramp. The reflection is indexed by
-//   the reflected ray's own elevation instead, so it varies the way a real
-//   reflection does.
+//   Two conventions have to be matched for that to be true rather than
+//   approximate. The first is the gradient's *value*: it is display-encoded,
+//   which the composite decodes with `pow(sky, 2.2)` before lighting, and
+//   `skyLinear` below applies the same decode.
+//   The second is its *parameter*, which used to be deliberately mismatched
+//   and now is not. composite.wgsl once indexed the gradient by screen row —
+//   `skyColour(uv.x, 1 - uv.y)` — which puts the zenith at the top of the
+//   frame whatever the camera pitch and makes the horizon band unreachable.
+//   Neither pass can use that: for the reflection the reflected ray leaves the
+//   water pointing up, its screen projection clamps, and every water pixel
+//   pinned to the zenith end of the ramp; for the drawn sky a camera pitched
+//   down never shows the pale band at all. Both now index by the ray's own
+//   elevation through `skyParameter`, the same function with the same 0.85
+//   edge, so a water pixel mirrors exactly the sky the composite would have
+//   painted in that direction.
 //
 // WGSL CONSTRAINT: `textureSample` uses implicit derivatives and is illegal in
 // non-uniform control flow, and this shader branches on sampled data (the
@@ -217,35 +220,48 @@ fn sampleSurface(world_xz: vec2<f32>, footprint: f32) -> SurfaceSample
 // Sky and tone, matching composite.wgsl so water and terrain share one haze
 // ---------------------------------------------------------------------------
 
-fn skyColour(uv: vec2<f32>) -> vec3<f32>
+/// The gradient itself, as a function of its own parameter: 0 at the horizon,
+/// 1 at the zenith. Byte-for-byte the copy composite.wgsl draws with.
+fn skyColour(parameter: f32) -> vec3<f32>
 {
     let horizon = vec3<f32>(0.72, 0.82, 0.90);
     let zenith = vec3<f32>(0.22, 0.46, 0.74);
-    return mix(horizon, zenith, smoothstepf(0.0, 1.0, uv.y));
+    return mix(horizon, zenith, parameter);
 }
 
-/// The gradient parameter of the sky pixel a world direction points at.
+/// Sky gradient parameter for a ray whose sine of elevation is `direction_y`,
+/// matching composite.wgsl's.
 ///
-/// The gradient is a screen-space one, so a direction can only be compared
-/// against the sky it mirrors by going through the same projection the sky
-/// pixels were rasterized with: into view space, out through the projection,
-/// and back to the top-down screen row composite.wgsl builds `sky_uv` from.
-/// Feeding `direction.y` in directly instead — the obvious reading — makes
-/// every grazing reflection the white horizon colour, because a reflection
-/// that is nearly horizontal has `direction.y ~ 0`, while the sky *drawn* at
-/// that row is the mid-blue of however far up the screen the horizon sits.
+/// The 0.85 edge is the one this shader's reflection has always been authored
+/// against; the sky now uses it as well, so the gradient a water pixel mirrors
+/// and the gradient the sky pass paints are the same function of elevation and
+/// agree at every angle, not only where both clamp to the horizon.
+fn skyParameter(direction_y: f32) -> f32
+{
+    return smoothstepf(0.0, 0.85, direction_y);
+}
 
 /// `skyColour` in the linear space the rest of this shader lights in.
 ///
 /// composite.wgsl authoring is display-referred: it decodes the gradient with
-/// `pow(sky, 2.2)` before mixing it into `sky_lin`. Multiplying by exposure and
-/// running ACES + the gamma encode at the end then reproduces the sky pixel
-/// exactly, so a fogged or fully reflective water fragment lands on the same
-/// value as the sky behind it instead of banding at the horizon.
-fn skyLinear(uv: vec2<f32>) -> vec3<f32>
+/// `pow(sky, 2.2)` before lighting. Multiplying by exposure and running ACES +
+/// the gamma encode at the end then reproduces the sky pixel exactly, so a
+/// fogged or fully reflective water fragment lands on the same value as the sky
+/// behind it instead of banding at the horizon.
+fn skyLinear(parameter: f32) -> vec3<f32>
 {
-    return pow(max(skyColour(uv), vec3<f32>(0.0)), vec3<f32>(2.2));
+    return pow(max(skyColour(parameter), vec3<f32>(0.0)), vec3<f32>(2.2));
 }
+
+/// Elevation sine of the representative sky that lights the foam.
+///
+/// Foam is neither a mirror nor a view direction: it is a diffuse surface lit
+/// by the sky over the water, so it wants ONE colour rather than a ray, and it
+/// stays a constant under the elevation parameterisation. `0.85 * 0.75` is the
+/// old screen-row value carried across — under a ramp of
+/// `smoothstep(0, 1, x)` a value `x` and the elevation sine `0.85x` land on the
+/// same gradient parameter — so the foam is lit exactly as it was before.
+const FOAM_SKY_ELEVATION: f32 = 0.85 * 0.75;
 
 fn acesFilm(x: vec3<f32>) -> vec3<f32>
 {
@@ -495,7 +511,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     // sky it is lit by — not the two-and-a-half times that `sun_colour*0.25`
     // produced, which clipped the shore break to flat white.
     let foam_colour = vec3<f32>(0.92, 0.95, 0.96)
-                    * (sun_colour*0.05 + skyLinear(vec2<f32>(0.5, 0.75))*0.75);
+                    * (sun_colour*0.05
+                       + skyLinear(skyParameter(FOAM_SKY_ELEVATION))*0.75);
     body = mix(body, foam_colour, foam);
 
     // --- Reflection ----------------------------------------------------------
@@ -516,7 +533,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     // sine of the reflected ray's elevation — lets grazing water converge on
     // the horizon colour and steep views reach up to the zenith, which is the
     // gradient real water shows.
-    let reflected = skyLinear(vec2<f32>(0.5, smoothstepf(0.0, 0.85, reflection_direction.y)))*0.85;
+    //
+    // `skyParameter` is applied exactly once, here. It used to be applied
+    // twice — once here and again inside `skyColour`, which then carried its
+    // own `smoothstep(0, 1, ·)`. That was invisible while the drawn sky was
+    // indexed by screen row, because the reflection was not matching it
+    // anyway; now that both are functions of elevation, a second application
+    // would mirror a sky that is not there — about 0.09 of gradient parameter
+    // too dark from 10 to 30 degrees of elevation, a few luma of tone step
+    // through the mid-field.
+    let reflected = skyLinear(skyParameter(reflection_direction.y))*0.85;
 
     // Sun specular: GGX over the wave roughness, which is what produces a
     // glitter path rather than one broad highlight.
@@ -539,9 +565,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
 
     // --- Aerial perspective, matching composite.wgsl -------------------------
     let fog = 1.0 - exp(-max(globals.params.x, 0.0)*view_distance);
-    // The analytic sky gradient is not a same-frame blit, so it carries the
-    // GL-oriented v = 1 - uv.y flip, exactly as composite.wgsl's sky_uv does.
-    let sky_fog_linear = skyLinear(vec2<f32>(uv.x, 1.0 - uv.y));
+    // The haze this water dissolves into is the sky along the same view ray,
+    // which is `-to_view`: `to_view` points from the surface back to the eye,
+    // so its negation is the eye's ray out to this fragment. Taking the
+    // elevation from the geometry rather than rebuilding it from `uv` gives
+    // exactly the direction composite.wgsl will use for the sky pixel at this
+    // position — the fragment lies on that ray — so water haze and terrain
+    // haze stay one colour where they meet instead of banding at the shoreline.
+    // (A `y` below zero is a ray that ends on the water rather than in the sky;
+    // `skyParameter` clamps it to the horizon end, the haze it is fading into.)
+    let sky_fog_linear = skyLinear(skyParameter(-to_view.y));
     lit = mix(lit, sky_fog_linear, clamp(fog, 0.0, 1.0));
 
     return vec4<f32>(pow(acesFilm(lit*globals.params.z), vec3<f32>(1.0/2.2)), 1.0);
