@@ -758,10 +758,10 @@ fn fs_main(input: FsInput) -> FsOutput
     // Both transitions share this field: grass has completely yielded to
     // dirt before any rock appears, including at erosion-cut boundaries.
     // This preserves a soil shoulder instead of blending grass into stone.
-    let exposedSoil = smoothHermite(0.055, 0.22, terrainExposure);
+    let exposedSoil = smoothHermite(0.085, 0.22, terrainExposure);
     let grassSoilBlend = 1.0 - (1.0 - backgroundSoil * soilFlatness)
                                * (1.0 - disturbedSoil) * (1.0 - exposedSoil);
-    let fRock = smoothHermite(0.24, 0.56, terrainExposure);
+    let fRock = smoothHermite(0.24, 0.52, terrainExposure);
     // Gravel is the eroded mountain: energetic drainage cuts through the
     // rock faces and leaves coarse debris along its gullies. Substrate
     // hardness keeps the coarsest material on the hardest beds.
