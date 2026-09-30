@@ -45,6 +45,9 @@
 //    uSparkleStrength, sun_direction = uSunDirectionWorld, camera_position =
 //    uCameraPosition, view = matView) or into StageUniforms (see its
 //    provenance comment and the STAGE UNIFORMS block at the file end).
+// 8. Material placement now uses world-anchored terrain exposure for an
+//    ordered grass -> soil -> rock transition. Snow combines regional climate
+//    variation with terrain retention instead of a fixed contour on rock.
 
 // Shared global uniforms — the spec preamble, verbatim.
 struct GlobalUniforms {
@@ -693,10 +696,8 @@ fn fs_main(input: FsInput) -> FsOutput
                                               + vec2<f32>(0.43, 0.67))).r;
     let grassHeight = height + (grassDrift - 0.5) * 7.0;
 
-    // Sand gives way to a shared grass/soil cover, then rock on steep or high
-    // mountain faces, gravel where erosion cuts them, and snow above the
-    // snowline. Soil is part of the grass cover rather than a separate band
-    // around moderate slopes.
+    // Sand gives way to grass, then soil as cover thins, then exposed rock.
+    // Eroded drainage and retained snow overlay that ground progression.
     // A wider band here survives grazing sightlines but reads as one
     // painted shore stripe at distance. The exponential altitude profile
     // halves the waterline gradient, so 0.6-5 m spans the same shore strip
@@ -739,46 +740,28 @@ fn fs_main(input: FsInput) -> FsOutput
     var disturbedSoil = 1.0 - (1.0 - depositedSoil) * (1.0 - scouredSoil)
                               * (1.0 - channelSoil);
     disturbedSoil += (soilEdge - 0.5) * 0.6 * disturbedSoil * (1.0 - disturbedSoil);
+    // Soil depth follows the landform, with no altitude gate for stone.
+    // Broad geology and smaller weathering patches persist outside the
+    // erosion cache. Incised, convex ground exposes resistant beds; hollows
+    // and deposited fines retain cover. Hardness only amplifies incision so
+    // the protected spawn's high hardness cannot paint a ring of rock.
+    let rockRegion = filteredGroundNoise(
+        rotateUV(groundDomain * 0.0031, 0.26) + vec2<f32>(-57.4, 18.9));
+    let resistantBed = clamp(surface.a / 0.56, 0.0, 1.0);
+    let terrainExposure = slope
+                        + (rockRegion - 0.5) * 0.22
+                        + (groundGrowth - 0.5) * 0.10
+                        + (soilLarge - 0.5) * 0.04
+                        + incision * mix(0.10, 0.24, resistantBed)
+                        + ridge * 0.10 - hollow * 0.08
+                        - deposition * soilRetention * (1.0 - transport) * 0.24;
+    // Both transitions share this field: grass has completely yielded to
+    // dirt before any rock appears, including at erosion-cut boundaries.
+    // This preserves a soil shoulder instead of blending grass into stone.
+    let exposedSoil = smoothHermite(0.055, 0.22, terrainExposure);
     let grassSoilBlend = 1.0 - (1.0 - backgroundSoil * soilFlatness)
-                               * (1.0 - disturbedSoil);
-    // A little regional variation keeps the rock transition from tracing
-    // the same contour on every hillside while preserving its slope bias.
-    // The onset eases 0.20 -> 0.17 (~33 degrees): the old onset left
-    // dissected lowland bluffs grass-topped and vision rounds measured
-    // whole mountain belts reading as grass with a painted cliff band.
-    let rockBreakup = groundGrowth - 0.5;
-    let rockSlope = smoothHermite(0.17, 0.62, slope + rockBreakup * 0.045);
-    // The altitude term rises through a slope-dependent ceiling: high but
-    // gentle ground keeps vegetation in its pockets, while steep faces
-    // reach full rock through the slope term regardless of height. The
-    // old (sea+70, sea+140) band with a flat 0.62 cap parked 85 m flanks
-    // at ~7% rock; the lower band and climbing cap hold stone across the
-    // 80-95 m belt while meadows survive the gentle benches between.
-    // Since the v9 re-anchor the belt floor also moves DOWN to meet the
-    // raised pack: onset sea+45 -> sea+38 and the gentle-slope cap
-    // 0.62 -> 0.70 push the rendered stone floor (composed fRock past
-    // the 0.30 remap knee) from ~sea+71 down to ~sea+60-70 on gentle
-    // ground, so the pack's lowest wander and the gully fingers land on
-    // stone, never grass. Snow-on-grass is fixed by band geometry alone —
-    // no removal or blending machinery.
-    let rockCap = mix(0.70, 0.85, smoothHermite(0.25, 0.45, slope));
-    let rockHeight = smoothHermite(stage.sea_level + 38.0, stage.sea_level + 100.0,
-                                   height + rockBreakup * 10.0) * rockCap;
-    // Exposed bedrock on the up mountain faces, where the slope sheds soil
-    // and the altitude outruns the ground cover. Settled fines bury it again
-    // in gentle depositional pockets.
-    var fRock = max(rockSlope, rockHeight);
-    fRock = fRock * (1.0 - deposition * soilFlatness * (1.0 - transport) * 0.55);
-    // Sharpen the rock boundary before the partition. Grass runs ~6x
-    // brighter than rock, so a mid-blend pixel reads as dark grass — the
-    // transition rendered as a wide olive smear where stone looked green
-    // instead of a hard contour between the two. Remapping fRock through
-    // a narrow S-curve keeps the 50% contour (and the coverage shape above)
-    // exactly where it was while collapsing the blend band ~3x to a hard
-    // interlock. This sits AFTER the depositional burial so soft soil
-    // pockets keep their gentle fade into the meadow; only the grass/rock
-    // contest itself hardens.
-    fRock = smoothHermite(0.30, 0.70, fRock);
+                               * (1.0 - disturbedSoil) * (1.0 - exposedSoil);
+    let fRock = smoothHermite(0.24, 0.56, terrainExposure);
     // Gravel is the eroded mountain: energetic drainage cuts through the
     // rock faces and leaves coarse debris along its gullies. Substrate
     // hardness keeps the coarsest material on the hardest beds.
@@ -790,20 +773,18 @@ fn fs_main(input: FsInput) -> FsOutput
     let sedimentSand = deposition * channel * (1.0 - transport) * soilFlatness;
     let fSand = max(1.0 - fGrass, sedimentSand);
 
-    // Low-frequency drift perturbs the snowline so it wanders and patches
-    // like real winter terrain instead of tracing one deterministic contour
-    // around every peak. Frequency calibration as for grassDrift above: the
-    // multipliers put the three octaves at ~75 m / ~14 m / ~5 m feature
-    // scales.
-    let snowDrift = textureSample(texture0, texture0_sampler, mirrorTile(worldXZ * 0.0012 + vec2<f32>(0.59, 0.13))).r;
-    let snowDriftFine = textureSample(texture0, texture0_sampler, mirrorTile(worldXZ * 0.0064 + vec2<f32>(0.77, 0.05))).r;
-    // A ~5 m third octave: at multi-kilometre ridge distances the broad
-    // wander collapses toward a pixel or two and the distant snowline read
-    // as a smooth airbrushed margin; this one keeps a couple of pixels of
-    // meander at the ranges where the others are sub-pixel.
-    let snowDriftMicro = textureSample(texture0, texture0_sampler,
-                                       mirrorTile(rotateUV(worldXZ * 0.018, 1.25)
-                                                  + vec2<f32>(0.31, 0.83))).r;
+    // Regional climate and local drifts use repeatable world-space fields
+    // on EVERY substrate, including rock. The broad ~600 m variation keeps
+    // entire slopes from sharing a snowline; ~77 / 20 / 7 m detail breaks
+    // up its edge and filters away only when smaller than a pixel.
+    let snowRegion = filteredGroundNoise(
+        rotateUV(groundDomain * 0.0017, 0.63) + vec2<f32>(91.7, -53.2));
+    let snowDrift = filteredGroundNoise(
+        rotateUV(groundDomain * 0.013, 1.19) + vec2<f32>(-23.8, 67.4));
+    let snowDriftFine = filteredGroundNoise(
+        rotateUV(groundDomain * 0.05, 0.41) + vec2<f32>(37.1, 12.6));
+    let snowDriftMicro = filteredGroundNoise(
+        rotateUV(groundDomain * 0.15, 1.87) + vec2<f32>(-61.3, -42.9));
     // Snow settles like sediment: closed hollows retain deeper beds lower
     // down, while eroded ridges and sun-facing slopes expose the substrate
     // earlier. Active watercourses (channel) flush what falls into them,
@@ -815,49 +796,16 @@ fn fs_main(input: FsInput) -> FsOutput
     let flushSnow = smoothHermite(0.08, 0.30, dischargeAmount);
     let dryHollow = hollow * (1.0 - channel * mix(0.45, 1.0, flushSnow));
     let sunExposure = max(dot(normalWorld, -normalize(globals.sun_direction.xyz)), 0.0);
-    // Stone reads the landform, not the noise. This block sits below the
-    // rock partition on purpose: on exposed stone the wander octaves are
-    // removed outright, so snow-on-rock coverage is decided entirely by
-    // the hydraulic fields — dry gully cores hold the pack, ridge noses
-    // shed it, incised gorges cut through — never by the drift. The
-    // drift's combined +/-25 m swing is 2.5x the 10 m snowline band, so
-    // even a damped residual (audited at 25% and 35%) still broke the
-    // contour into noise-aligned disconnected patches down the flanks.
-    // On stone the line's variation comes from the erosion terms below
-    // plus the slope/aspect/shed gates; on soil the full wander is kept
-    // for the round-9 meadow read.
-    let snowWander = 1.0 - fRock;
-    var snowHeight = height + ((snowDrift - 0.5) * 30.0
-                             + (snowDriftFine - 0.5) * 13.0
-                             + (snowDriftMicro - 0.5) * 8.0) * snowWander;
-    // Holds and sheds cross the 10 m snowline band systematically rather
-    // than inside the wander's ~10 m 1-sigma: hollow cores hold 12 m lower,
-    // crest noses shed 6 m bare between cap patches, and sun-facing slopes
-    // melt 6 m earlier than shaded ones. On stone the hollow hold is
-    // cubed like the gully finger below: a linear uplift reads as
-    // scattered dabs across every moderate swale, so only true gully
-    // cores hold below the line and the face's snow stays in coherent
-    // ribbons and caps.
-    let hollowHold = mix(dryHollow, dryHollow * dryHollow * dryHollow, fRock);
-    snowHeight += hollowHold * 12.0 - ridge * 6.0
-                - (sunExposure - 0.65) * 6.0 * flowDomain;
-    // The 10 m transition band plus the three wander octaves keeps distant
-    // snowlines crisp AND patchy: the wander amplitudes (~15 m at the broad
-    // ~75 m scale, ~6.5 m at the ~14 m scale, ~4 m at ~5 m) swing the
-    // contour in and out of the band faster than the band itself is wide,
-    // so the margin reads as interlocking snow and bare patches. A wide
-    // smooth band alone smeared over 11+ px on far ridges and read as a
-    // fog fade, not a snow edge; a narrow band without wander read as one
-    // painted contour. Round 6 still measured distant margins as
-    // continuous unbroken fringes (422/422 columns carrying snow) — the
-    // fine/micro amplitudes could not fully cross the band, so gaps never
-    // opened at grazing range — hence these larger swings. The v9
-    // re-anchor lifts the whole line a full 10 m (sea+90..100 ->
-    // sea+100..110, band width preserved so the wander/crispness
-    // interplay is translated, not reshaped): the pack's floor — hollow
-    // uplift and gully fingers included — clears the grass belt and
-    // meets the lowered stone instead.
-    let snowLine = smoothHermite(stage.sea_level + 100.0, stage.sea_level + 110.0, snowHeight);
+    // Height supplies a broad climate bias, not a shared material cutoff.
+    // Curvature and solar aspect shift local retention by comparable amounts
+    // to the drift fields. Aspect remains active beyond the erosion cache.
+    let snowHeight = height + (snowRegion - 0.5) * 100.0
+                            + (snowDrift - 0.5) * 42.0
+                            + (snowDriftFine - 0.5) * 16.0
+                            + (snowDriftMicro - 0.5) * 6.0
+                            + dryHollow * 28.0 - ridge * 18.0
+                            - (sunExposure - 0.65) * 22.0;
+    let snowLine = smoothHermite(stage.sea_level + 92.0, stage.sea_level + 126.0, snowHeight);
     let snowHold = smoothHermite(0.12, 0.72, normalWorld.y);
     var fSnow = snowLine * snowHold;
 
@@ -873,44 +821,12 @@ fn fs_main(input: FsInput) -> FsOutput
     let leeDrift = smoothHermite(0.20, 0.70, windAlignment) * snowLine;
     fSnow = clamp(fSnow * (1.0 - 0.70 * scour) + 0.12 * leeDrift, 0.0, 1.0);
 
-    // Distant-margin erosion. The wander octaves meander the snowline, but
-    // at 300-600 m grazing range even their swings project to a pixel or
-    // two of lateral shift, and vision rounds kept measuring the distant
-    // margin as one continuous unbroken fringe (round 6: 422/422 columns
-    // carrying snow; round 7: a smooth 1-11 px thickness ramp, no gaps).
-    // The margin therefore thins and opens gaps at range — but the shed
-    // field is EROSION, not a noise octave: gaps land where the landform
-    // actually sheds (convex noses, steep slabs, incised cuts) while
-    // hollow cores and benches keep their cover, so the patchiness reads
-    // as terrain, never as random unmoored patches. Close margins (under
-    // ~80 m) keep the drift-only edge, so the near snowline poses are
-    // untouched.
-    {
-        let marginBand = snowLine * (1.0 - snowLine) * 4.0;
-        let viewDistance = length(frag_position_view);
-        // Slope carries the shed to any range (the mesh normal never fades
-        // with the atlas); the convexity and channel terms thin out with
-        // flowDomain past ~1.1-1.6 km like every other erosion read. Round
-        // 8's artifact hunter measured the right crest sector at 0/650
-        // bare columns against the mid sector's 27.8% — the shed must
-        // reach full removal where the landform it describes is bare
-        // (steep noses), or the surviving fringe reads continuous.
-        let marginShed = clamp(0.9 * ridge + smoothHermite(0.12, 0.50, slope)
-                             + 0.5 * incision + 0.5 * channel, 0.0, 1.0);
-        fSnow = fSnow * (1.0 - 0.95 * marginBand * marginShed
-                              * smoothHermite(80.0, 350.0, viewDistance));
-        // Crest-band strip: the height-band weight above peaks at the
-        // transition's middle and fades to zero as snowLine saturates, so the
-        // upper fringe — where a distant crest's snowline actually sits —
-        // keeps its cover. A second erosion gated to the crest band (snowLine
-        // 0.55-0.96) and to the 350-650 m grazing range opens bare gaps in
-        // exactly that sector, sharing the shed field so the two erosions
-        // stay coherent.
-        let crestErode = smoothHermite(350.0, 650.0, viewDistance)
-                       * smoothHermite(0.55, 0.78, snowLine)
-                       * (1.0 - smoothHermite(0.82, 0.96, snowLine));
-        fSnow = fSnow * (1.0 - 0.85 * crestErode * marginShed);
-    }
+    // Thin pack opens over convex noses and active cuts at every viewing
+    // distance. Camera movement must not change where a surface holds snow.
+    let marginBand = snowLine * (1.0 - snowLine) * 4.0;
+    let marginShed = clamp(0.9 * ridge + smoothHermite(0.12, 0.50, slope)
+                         + 0.5 * incision + 0.5 * channel, 0.0, 1.0);
+    fSnow = fSnow * (1.0 - 0.70 * marginBand * marginShed);
 
     // Sediment pack vs active drainage: the dry hollows that thicken the
     // pack above also let it settle lower down, but the watercourses that
@@ -935,27 +851,11 @@ fn fs_main(input: FsInput) -> FsOutput
     snowCut = clamp(snowCut, 0.0, 1.0);
     fSnow = fSnow * (1.0 - snowCut * mix(0.92, 0.55, 1.0 - clamp(surface.a / 0.56, 0.0, 1.0)));
 
-    // Snow fingers: sheltered, sun-starved, inactive gully troughs hold a
-    // pack far below the regional line — the most characteristic
-    // real-mountain read, and one the snowLine ramp cannot express at all:
-    // a threshold saturates, so no weight on snowHeight reaches snow that
-    // is already zero. This is a coverage union instead of an altitude bias.
-    // dryHollow^3 concentrates coverage onto strong trough cores — the
-    // re-anchored (0.05, 1.2) hollow gate passes moderate swales too, and
-    // the squared form put paint-dab reads on bank-top undulation; cubing
-    // suppresses the moderate tail while keeping true gully cores. The
-    // shade gate is near-exclusive: full-sun gullies keep only 15% of the
-    // finger so sun-baked floors read bare next to shaded snowy ones, and
-    // the band floor (sea+84 since the v9 re-anchor, lift +8, tracking
-    // the raised snowline) keeps the union off lowland ground —
-    // the vision round measured amorphous feathered dabs on flat escarp
-    // bank tops at 50-58 m, below any gully that should hold a pack.
-    // Still-cutting beds carry only a thin skin, steep walls shed, and
-    // flowDomain fades fingers with the atlas past ~1.1-1.6 km like every
-    // other erosion read. The union keeps fSnow in [0,1] with no clamp
-    // kink and leaves the partition telescope exact.
+    // Inactive, shaded gully cores retain fingers below their local climate
+    // margin. The cubed hollow gate concentrates these in real troughs;
+    // the shared snowHeight field keeps their lower edge irregular too.
     let gullyShade = 1.0 - 0.85 * smoothHermite(0.30, 0.85, sunExposure);
-    let fingerBand = smoothHermite(stage.sea_level + 84.0, stage.sea_level + 104.0,
+    let fingerBand = smoothHermite(stage.sea_level + 70.0, stage.sea_level + 110.0,
                                    snowHeight + dryHollow * 8.0);
     let gullyFinger = 0.92 * flowDomain * (dryHollow * dryHollow * dryHollow) * gullyShade
                     * (1.0 - 0.45 * incision)
@@ -1605,29 +1505,10 @@ fn fs_main(input: FsInput) -> FsOutput
         let fringeLum = dot(albedo, vec3<f32>(0.299, 0.587, 0.114));
         albedo = mix(albedo, vec3<f32>(fringeLum) * vec3<f32>(1.04, 0.99, 0.92), fringe * 0.5);
 
-        // Sediment-laden meltout: where meltwater works beds at the thinning
-        // flank of the pack, drained silt rides onto the residual snow, so
-        // the snowline reads as a dirty grey-brown meltout zone over dark
-        // substrate instead of a clean white-to-green edge — the signature
-        // of a real snowline at any range. The first cut of this feature
-        // measured invisible (margin R-B +5, zero contribution at matched
-        // luma): erosion alone fires too sparsely to carry a band read. So
-        // the BASE is now the receding margin itself — every thin-flank
-        // snow pixel inside the sea+98..122 clearance band (lifted +10
-        // with the v9 snowline re-anchor so the stain tracks the margin)
-        // picks up a
-        // baseline dirt load (any real snowpack settling onto wet ground
-        // stains), the transition band adds its mid-coverage share, and
-        // active cutting (incision, transport) amplifies locally into
-        // dirty crust rims around cleared beds. Deep interior pack stays
-        // clean (clearance ramps to zero), gSnow-gated so bare pixels and
-        // thin residual films keep their own tint (distant film patches must
-        // stay brighter than the meadow under them, not read as damp smudge),
-        // and the warm cast — red falls two-thirds as far as blue, doubled
-        // after the first cut measured near hue-neutral at matched luma —
-        // reads as silt, not shadow.
-        let sedimentClearance = smoothHermite(stage.sea_level + 98.0,
-                                              stage.sea_level + 122.0, snowHeight);
+        // Silt stains the thinning pack around its local climate margin.
+        // Use coverage rather than another altitude band so the stain tracks
+        // drift, hollows and exposure. Deep pack and bare ground stay clean.
+        let sedimentClearance = smoothHermite(0.35, 0.95, snowLine);
         let meltBand = snowLine * (1.0 - snowLine) * 4.0;
         var sedimentLoad = flowDomain
                          * (0.85 * smoothHermite(0.55, 0.95, snowLine)

@@ -94,19 +94,26 @@ Terrain uses triplanar PBR textures with a muted, earthy palette. Grass004
 covers stable ground; erosion and fresh deposition can replace it with
 Ground103 soil and subtle Ground106 variation, without a minimum grass share.
 Deposited fines favour flats, while scouring also exposes soil on banks.
-Rock032 appears on the upper mountain faces — steep or high ground — where
-ground cover cannot hold, with a slope-dependent ceiling so high-but-gentle
-benches keep meadow pockets while steep faces reach full stone, and a hard
-contour at the grass contact so the two never blend into an olive half-mix.
+Grass gives way to soil before Rock032 appears: both transitions follow the
+same exposure field, with grass fully replaced by dirt before rock begins.
+Slope, incision, substrate hardness and convex ridges expose stone; sheltered
+hollows and deposited sediment retain cover. Broad, deterministic geology and
+smaller weathering patches vary those boundaries in world space, with no rock
+altitude cutoff, so high gentle benches can keep meadows and low cliffs can
+expose stone.
 Gravel fills the energetic, scoured drainage that cuts through those faces,
 so a gully reads as loose debris between intact rock walls. Ground093C sand
-follows the coast and slower depositional channels. Snow006 settles like
-sediment rather than following altitude alone: it holds deeper and reaches
+follows the coast and slower depositional channels. Snow006 combines a broad
+altitude climate bias with world-anchored regional variation and local drifts,
+including on exposed rock, so slopes do not share a fixed snow contour.
+It settles like sediment: it holds deeper and reaches
 lower inside dry sheltered hollows, drains down inactive gullies as fingers
 below the regional line, sheds steep walls to bare rock, melts earlier from
 sun-facing slopes, eroded ridges and scoured faces, and its melt margin
 picks up a grey-brown sediment stain where active drainage works the
-thinning pack. These are material-placement rules derived from the erosion
+thinning pack. Retention and shedding use terrain evidence at every viewing
+distance; only unresolved fine noise is filtered away. These are
+material-placement rules derived from the erosion
 results, not a climate or snowmelt simulation.
 
 World-anchored, warped fields vary patch size and density across broad regions;
