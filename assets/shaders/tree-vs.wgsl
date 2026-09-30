@@ -32,8 +32,8 @@
 // it.
 //
 // The instance's XZ is the only horizontal input. Everything else — scale,
-// yaw, the sink that seats the trunk on a slope, the ground height itself —
-// arrives per instance.
+// orientation, the sink that seats the trunk on a slope, the ground height
+// itself — arrives per instance.
 
 struct GlobalUniforms {
     view: mat4x4<f32>,            // matView: column-major world->view
@@ -59,24 +59,29 @@ struct GlobalUniforms {
 // Per-instance placement
 // ---------------------------------------------------------------------------
 
-// One scattered tree. 28 bytes, mirrored by `TreeInstance` in
+// One scattered tree. 40 bytes, mirrored by `TreeInstance` in
 // src/trees/mod.rs, which pins the size with a const assert.
 struct TreeInstance {
     @location(4) centre: vec2<f32>,     // world XZ
     @location(5) ground: f32,           // world Y of the ground under `centre`
     @location(6) scale: f32,            // uniform object-space scale
-    @location(7) rotation: f32,         // yaw, radians
+    @location(7) rotation: vec4<f32>,   // world orientation quaternion, xyzw
     @location(8) variation: f32,        // 0..1 stable per-tree random
     @location(9) sink: f32,             // metres the base is pushed below ground
 };
 
-// Yaw only. A tree grows upright whatever the ground under it does, so the
-// trunk is never tilted onto the surface normal — it is sunk into it instead.
-fn rotateY(p: vec3<f32>, angle: f32) -> vec3<f32>
+// Rotate `v` by the unit quaternion `q` (xyz = axis*sin(theta/2), w =
+// cos(theta/2)). The two-cross-product form, which is why the orientation
+// arrives as a quaternion: no trigonometry, and no Euler order to get wrong.
+//
+// The tilt is still never taken from the surface normal. A tree grows upright
+// whatever the ground under it does — the lean is the tree's own crookedness,
+// drawn at scatter time — and a trunk that stood perpendicular to a 30-degree
+// slope would read as a fallen log, not a fir.
+fn rotateByQuaternion(q: vec4<f32>, v: vec3<f32>) -> vec3<f32>
 {
-    let c = cos(angle);
-    let s = sin(angle);
-    return vec3<f32>(c*p.x + s*p.z, p.y, -s*p.x + c*p.z);
+    let t = 2.0 * cross(q.xyz, v);
+    return v + q.w*t + cross(q.xyz, t);
 }
 
 struct VsOutput {
@@ -100,10 +105,10 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>,
     // does not balance on the downhill edge of its own base.
     let foot = vec3<f32>(instance.centre.x, instance.ground - instance.sink, instance.centre.y);
 
-    let localPosition = rotateY(vertexPosition*instance.scale, instance.rotation);
+    let localPosition = rotateByQuaternion(instance.rotation, vertexPosition*instance.scale);
     let worldPosition = foot + localPosition;
-    let worldNormal = rotateY(vertexNormal, instance.rotation);
-    let worldTangent = rotateY(vertexTangent.xyz, instance.rotation);
+    let worldNormal = rotateByQuaternion(instance.rotation, vertexNormal);
+    let worldTangent = rotateByQuaternion(instance.rotation, vertexTangent.xyz);
 
     var output: VsOutput;
     output.position = globals.projection*globals.view*vec4<f32>(worldPosition, 1.0);

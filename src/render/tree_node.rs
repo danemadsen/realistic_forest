@@ -76,7 +76,7 @@ const TREE_INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_a
     4 => Float32x2, // centre (world XZ)
     5 => Float32,   // ground (world Y under the centre)
     6 => Float32,   // scale
-    7 => Float32,   // rotation (yaw)
+    7 => Float32x4, // rotation (unit quaternion, xyzw)
     8 => Float32,   // variation
     9 => Float32,   // sink
 ];
@@ -222,11 +222,20 @@ impl InstanceBuffer {
 struct TreeResources {
     /// group(0): the frame's shared globals.
     globals: BindGroup,
+    /// Draws both faces: for the `doubleSided` bark and branch-card materials.
     pipeline: CachedRenderPipelineId,
+    /// Culls back faces: for the single-sided LOD-3 billboard cards, whose
+    /// crossed planes each carry a card per axis direction so that exactly one
+    /// of the pair faces any given camera. Same shader, same layout, one
+    /// `cull_mode` apart — see `TreeMaterialRange::double_sided`.
+    pipeline_culled: CachedRenderPipelineId,
     meshes: Vec<GpuTreeMesh>,
     /// Material bind groups, flattened: group `g`'s materials start at
     /// `material_slot[g]` and run for `material_count[g]`.
     materials: Vec<BindGroup>,
+    /// One per entry of `materials`: true when that material is single-sided
+    /// and must be drawn with `pipeline_culled`.
+    culled: Vec<bool>,
     material_slot: [u32; TREE_GROUP_COUNT],
     material_count: [u32; TREE_GROUP_COUNT],
     /// One per group, indexed by `tree_group`.
@@ -298,6 +307,10 @@ impl Node for ForestTreeNode {
             // or two is correct, panicking is not.
             return Ok(());
         };
+        let Some(pipeline_culled) = pipeline_cache.get_render_pipeline(resources.pipeline_culled)
+        else {
+            return Ok(());
+        };
 
         // Load, never clear: the terrain pass has already written the G-buffer
         // and this pass is adding to it. Clearing any of these attachments
@@ -361,10 +374,14 @@ impl Node for ForestTreeNode {
             0.0,
             1.0,
         );
-        pass.set_render_pipeline(pipeline);
         pass.set_bind_group(0, &resources.globals, &[]);
 
         let mut draws = 0usize;
+        // Which of the two pipelines is bound, so the loop does not re-set it
+        // for a material that matches the previous draw's. `None` until the
+        // first draw, and the first draw is always a culled or an unculled
+        // group rather than neither.
+        let mut bound_culled: Option<bool> = None;
         for group in 0..TREE_GROUP_COUNT {
             let Some(instance) = resources.instances[group].as_ref() else {
                 continue;
@@ -378,10 +395,21 @@ impl Node for ForestTreeNode {
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_vertex_buffer(1, instance.buffer.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), 0, wgpu::IndexFormat::Uint32);
-            // One draw per primitive, each with its own material. A fir has two
-            // (bark, foliage cards) and a billboard has one.
+            // One draw per primitive, each with its own material — a fir has
+            // two (bark, foliage cards) and a billboard has one. The pipeline
+            // is re-set here rather than once outside the loop because
+            // sidedness is a property of the material, and this pack mixes it:
+            // every LOD-3 billboard is single-sided and everything nearer is
+            // not. Most groups hold a single material, so in practice this is
+            // one `set_render_pipeline` per group.
             for material in 0..material_count {
-                pass.set_bind_group(1, &resources.materials[first + material], &[]);
+                let slot = first + material;
+                let culled = resources.culled[slot];
+                if bound_culled != Some(culled) {
+                    pass.set_render_pipeline(if culled { pipeline_culled } else { pipeline });
+                    bound_culled = Some(culled);
+                }
+                pass.set_bind_group(1, &resources.materials[slot], &[]);
                 let (first_index, index_count) = mesh.ranges[material];
                 pass.draw_indexed(first_index..first_index + index_count, 0, 0..instance.count);
                 draws += 1;
@@ -596,85 +624,92 @@ fn prepare_trees(
 
     let layout = material_layout(device);
 
-    // The trees are doubleSided in the pack — `doubleSided` is true on all 36
-    // files, and the loader records it as `alphaMode`'s counterpart — so the
-    // pipeline draws both faces rather than culling the back one. Note that
-    // against the terrain, which culls: a fir's foliage is a set of flat cards
-    // and half of them face away from any given camera. The fragment stage
-    // flips the shading normal on the back faces so they are lit rather than
-    // black.
-    let pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
-        label: Some("forest_tree_pipeline".into()),
-        layout: vec![globals_layout.clone(), layout.clone()],
-        push_constant_ranges: vec![],
-        vertex: VertexState {
-            shader: shaders.tree_vs.clone(),
-            shader_defs: vec![],
-            entry_point: Some("vs_main".into()),
-            buffers: vec![
-                VertexBufferLayout {
-                    array_stride: std::mem::size_of::<GlbVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: TREE_VERTEX_ATTRIBUTES.to_vec(),
-                },
-                VertexBufferLayout {
-                    array_stride: std::mem::size_of::<TreeInstance>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: TREE_INSTANCE_ATTRIBUTES.to_vec(),
-                },
-            ],
-        },
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            // Matches the terrain pass, which is what GL's glFrontFace(GL_CCW)
-            // maps to (see the long note in terrain_node.rs). It matters much
-            // less here because nothing is culled, but the winding still
-            // decides `@builtin(front_facing)` and therefore which foliage
-            // normals get flipped.
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: None,
-            unclipped_depth: false,
-            polygon_mode: wgpu::PolygonMode::Fill,
-            conservative: false,
-        },
-        depth_stencil: Some(wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            // Depth writes on, like the terrain. The alpha cutout discards
-            // before the write, so the depth laid down is the tree's own
-            // surface, and the water pass's texel-exact depth reconstruction
-            // sees a crisp edge rather than a blend.
-            depth_write_enabled: true,
-            // Reverse-Z, same as every other G-buffer pass.
-            depth_compare: wgpu::CompareFunction::GreaterEqual,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(FragmentState {
-            shader: shaders.tree_fs.clone(),
-            shader_defs: vec![],
-            entry_point: Some("fs_main".into()),
-            targets: vec![
-                Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba32Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-                Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                }),
-            ],
-        }),
-        zero_initialize_workgroup_memory: false,
-    });
+    // Two pipelines out of one descriptor, because the pack mixes sidedness
+    // across LODs and the cull mode is the only thing that differs between
+    // them. `TreeMaterialRange::double_sided` has the long version; the short
+    // one is that a fir's branch cards are flat planes you are meant to see
+    // from behind, while a billboard's cross carries a card per axis direction
+    // so that only one of each pair ever faces the camera at all.
+    //
+    // The fragment stage still flips the shading normal on back faces. With
+    // both pipelines in place that only ever fires for the double-sided LODs,
+    // which is exactly where it is wanted.
+    let build_tree_pipeline = |label: &'static str, cull_mode: Option<wgpu::Face>| {
+        pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+            label: Some(label.into()),
+            layout: vec![globals_layout.clone(), layout.clone()],
+            push_constant_ranges: vec![],
+            vertex: VertexState {
+                shader: shaders.tree_vs.clone(),
+                shader_defs: vec![],
+                entry_point: Some("vs_main".into()),
+                buffers: vec![
+                    VertexBufferLayout {
+                        array_stride: std::mem::size_of::<GlbVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: TREE_VERTEX_ATTRIBUTES.to_vec(),
+                    },
+                    VertexBufferLayout {
+                        array_stride: std::mem::size_of::<TreeInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: TREE_INSTANCE_ATTRIBUTES.to_vec(),
+                    },
+                ],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                // Matches the terrain pass, which is what GL's glFrontFace(GL_CCW)
+                // maps to (see the long note in terrain_node.rs). The winding
+                // decides `@builtin(front_facing)` and therefore which foliage
+                // normals get flipped, and it is what `cull_mode` tests.
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode,
+                unclipped_depth: false,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                // Depth writes on, like the terrain. The alpha cutout discards
+                // before the write, so the depth laid down is the tree's own
+                // surface, and the water pass's texel-exact depth reconstruction
+                // sees a crisp edge rather than a blend.
+                depth_write_enabled: true,
+                // Reverse-Z, same as every other G-buffer pass.
+                depth_compare: wgpu::CompareFunction::GreaterEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(FragmentState {
+                shader: shaders.tree_fs.clone(),
+                shader_defs: vec![],
+                entry_point: Some("fs_main".into()),
+                targets: vec![
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
+            }),
+            zero_initialize_workgroup_memory: false,
+        })
+    };
+    let pipeline = build_tree_pipeline("forest_tree_pipeline", None);
+    let pipeline_culled =
+        build_tree_pipeline("forest_tree_pipeline_culled", Some(wgpu::Face::Back));
 
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("forest_tree_sampler"),
@@ -710,12 +745,14 @@ fn prepare_trees(
 
     let mut meshes = Vec::with_capacity(TREE_GROUP_COUNT);
     let mut materials = Vec::new();
+    let mut culled = Vec::new();
     let mut material_slot = [0u32; TREE_GROUP_COUNT];
     let mut material_count = [0u32; TREE_GROUP_COUNT];
     for (group, mesh) in assets.meshes.iter().enumerate() {
         material_slot[group] = materials.len() as u32;
         material_count[group] = mesh.ranges.len() as u32;
         for material in &mesh.ranges {
+            culled.push(!material.double_sided);
             materials.push(build_material_bind_group(
                 device,
                 &layout,
@@ -746,8 +783,10 @@ fn prepare_trees(
     *resources = Some(TreeResources {
         globals,
         pipeline,
+        pipeline_culled,
         meshes,
         materials,
+        culled,
         material_slot,
         material_count,
         instances: (0..TREE_GROUP_COUNT).map(|_| None).collect(),

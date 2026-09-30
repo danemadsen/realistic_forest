@@ -8,6 +8,8 @@
 //! `--raymarch-quality low|balanced|high` selects their sampling budget.
 //! `--no-clouds` disables clouds independently; `--cloud-coverage`,
 //! `--cloud-density`, `--cloud-base` and `--cloud-thickness` set cloud weather.
+//! `--no-vsync` asks for an uncapped swapchain; on this machine it did not move
+//! the frame time, see the flag's comment below for what the trace does show.
 
 use crate::constants::AppSettings;
 use crate::erosion::TileKey;
@@ -51,6 +53,8 @@ pub struct AutomationSettings {
     pub no_raymarch: bool,
     pub raymarch_quality: u32,
     pub no_clouds: bool,
+    pub no_trees: bool,
+    pub no_vsync: bool,
     pub cloud_coverage: f32,
     pub cloud_density: f32,
     pub cloud_base_height: f32,
@@ -83,6 +87,8 @@ impl Default for AutomationSettings {
             no_raymarch: false,
             raymarch_quality: 1,
             no_clouds: false,
+            no_trees: false,
+            no_vsync: false,
             cloud_coverage: render_settings.cloud_coverage,
             cloud_density: render_settings.cloud_density,
             cloud_base_height: render_settings.cloud_base_height,
@@ -109,6 +115,16 @@ fn parse_ints(argument: &str, expected: usize) -> Option<Vec<i64>> {
 
 /// Parses `N` floats separated by commas; accepts a trailing-`x`/`,` variant
 /// the C++ `sscanf` tolerated on malformed input only when all `N` parse.
+///
+/// There is deliberately no `--gpu-timing`. Per-node GPU spans need a timestamp
+/// written *inside* a render pass, and `TIMESTAMP_QUERY_INSIDE_PASSES` is
+/// unsupported on this Apple M3 — requesting it fails the device request
+/// outright. Encoder-level timestamps are advertised but useless here: wgpu-hal
+/// Metal defers any write made between passes into one stub blit encoder, so a
+/// pair written around a node lands in the same encoder and reports 0.00 for
+/// every node. Cost attribution is therefore ablation only — `--no-trees`,
+/// `--no-clouds`, `--no-water` — run interleaved and differenced, plus the
+/// frame-time trace `--shot` already prints.
 pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSettings {
     let arguments: Vec<String> = arguments.collect();
     let mut automation = AutomationSettings::default();
@@ -166,7 +182,26 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--pause-time" => automation.pause_time = true,
             "--advance-time" => advance_capture_time = true,
             "--no-raymarch" => automation.no_raymarch = true,
+            // Skips the tree scatter entirely, so the tree pass has nothing to
+            // draw. Its only purpose is to price the forest: the difference
+            // between a capture with and without it is what the trees actually
+            // cost, which no amount of reasoning about vertex counts settles.
+            "--no-trees" => automation.no_trees = true,
             "--no-clouds" => automation.no_clouds = true,
+            // Requests an uncapped swapchain, for measuring work instead of
+            // pacing. Measured on this machine (75 Hz panel): it does not move
+            // the frame time. A run that is not otherwise bound reports 13.3 ms
+            // with and without it, so the wait is not the swapchain's — it is
+            // still there with AutoNoVsync. What the frame-time trace does show
+            // is that the reading is max(work, ~13.3 ms): five different
+            // configurations (sky, ground, 480x270, 1600x900, cloud probe on
+            // and off) all reported exactly 13.3, while anything costing more
+            // reported its honest cost with no quantisation — 17.6 ms under
+            // vsync, not one refresh interval or a multiple of it. So every
+            // reading above 13.3 ms is real work; every reading of exactly
+            // 13.3 ms means only "cheaper than the wait" and cannot be ranked.
+            // The flag stays as the knob, not as the fix for that.
+            "--no-vsync" => automation.no_vsync = true,
             "--cloud-coverage" | "--cloud-density" | "--cloud-base" | "--cloud-thickness" => {
                 let bounds = match flag {
                     "--cloud-coverage" => 0.0..=1.0,

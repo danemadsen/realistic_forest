@@ -82,9 +82,10 @@ pub struct GlbMaterial {
     /// coverage that disagree, streaking the raymarched reflection.
     pub alpha_cutout: bool,
     pub alpha_cutoff: f32,
-    /// `doubleSided`, kept so a future one-sided species can opt into culling.
-    /// The tree pass draws everything with `cull_mode: None` regardless, which
-    /// is what the pack's cards need at every LOD.
+    /// `doubleSided`, carried through to the tree pass so it can pick a cull
+    /// mode per material. The pack needs both: its branch cards are flat planes
+    /// meant to be seen from behind, and its LOD-3 billboards are crossed cards
+    /// where one of each facing pair is always pointing away.
     pub double_sided: bool,
     /// `KHR_materials_specular`'s `specularFactor`, the scale on the
     /// dielectric Fresnel term (glTF's own default when the extension is

@@ -74,6 +74,38 @@ pub const TREE_SCATTER_RADIUS: f32 = 900.0;
 /// couple of pixels, which is what makes the drop invisible when it comes.
 pub const TREE_RETAIN_RADIUS: f32 = 1050.0;
 
+/// How far the coarse far tier reaches, in metres.
+///
+/// [`TREE_SCATTER_RADIUS`] alone leaves the horizon bare: it is 900 m of
+/// forest and then nothing, and the terrain the renderer draws runs out to
+/// 1,600 m, so everything between the two is a treeless band the width of the
+/// whole near forest. This is the radius that closes it — a little past
+/// `EROSION_VISIBILITY_ZERO_RADIUS` so the last trees stand where the erosion
+/// fade has already gone to zero.
+pub const TREE_FAR_RADIUS: f32 = 1800.0;
+
+/// Chunks holding far content are retained to here, for the same reason the
+/// near tier has its own slack: a player who turns around should see the
+/// forest they walked through, not the edge of a disc that follows them.
+pub const TREE_FAR_RETAIN_RADIUS: f32 = 2000.0;
+
+/// How many lattice cells the far tier skips per tree, per axis.
+///
+/// The near lattice's 2.8 m is a *sampling* rate — it is what lets the density
+/// roll draw a ragged tree line rather than a contour of the lattice — and a
+/// sample rate is only worth paying for where the samples resolve. At 900 m a
+/// tree is ten pixels tall and one tree per 2.8 m is a solid mass of them; the
+/// far tier is not trying to reproduce that, it is trying to put a treeline on
+/// the horizon.
+///
+/// Four puts far candidates on an 11.2 m lattice, which is a sixteenth of the
+/// candidates and a sixteenth of the `evaluate_site` calls behind them. The
+/// sites it keeps are not new points: they are the `(4i, 4j)` subset of the
+/// near lattice, so a far tree and the near tree that would have stood there
+/// are the same tree down to the hash — which is what lets a chunk be promoted
+/// from one tier to the other without the forest changing underneath it.
+pub const TREE_FAR_STRIDE: usize = 4;
+
 /// Side of one scatter chunk. Matches the erosion system's own 256 m streaming
 /// tile, so one chunk's readiness gate is one erosion tile's readiness gate.
 pub const TREE_CHUNK_SIZE: f32 = 256.0;
@@ -155,6 +187,32 @@ pub const TREE_SNOWLINE_HEIGHT: f32 = 92.0;
 /// have moved up.
 const TREE_DENSITY_MINIMUM: f32 = 0.18;
 const TREE_DENSITY_MAXIMUM: f32 = 1.00;
+
+/// Where [`tree_vigour`] stops meaning a sapling and starts meaning a medium
+/// fir, and then a large one.
+///
+/// These are the field's 20th and 50th percentiles, measured.
+///
+/// The first pair was 0.42/0.68, reasoned from the *shape* of the vigour field
+/// rather than from its distribution — and the distribution sits far below the
+/// middle of its nominal [0, 1] range, because `soilPatches` and `groundGrowth`
+/// are products of terrain masks that spend most of their time near zero. The
+/// 0.42 boundary therefore landed on the 77th percentile, and the stand came
+/// out 67.6% small, 13.9% medium, 18.4% large: two thirds of the forest was
+/// 1.5 m saplings, which is what made a scatter of 68,000 trees read as
+/// parkland. The scatter histograms the vigour of every site that clears the
+/// hard tests — `TREES: chunk ... vigour per 0.1 [...]` — and over 154,405
+/// sites in 37 chunks that distribution gives p20 = 0.14 and p50 = 0.26.
+///
+/// Splitting there yields 20% small, 30% medium, 50% large, which is the
+/// gradient the doc comment on `tree_size` describes: the large fir on the
+/// deep soil, the smaller classes on the thin ground at the edge of a clearing.
+/// It also roughly doubles the stand's canopy area, since canopy goes as
+/// height squared and the large class is six times the small one — at the
+/// measured 1 tree per 29 m² of the mid field that takes the large trees from
+/// 12.5 m apart to 7.6 m, against a 5.3 m crown.
+const TREE_SMALL_MAX_VIGOUR: f32 = 0.14;
+const TREE_MEDIUM_MAX_VIGOUR: f32 = 0.26;
 
 // ---------------------------------------------------------------------------
 // The portable half of the ground-cover field
@@ -365,11 +423,25 @@ pub struct TreeSite {
     /// small ones ring the clearings — which is what makes a stand read as a
     /// stand rather than as three species sprinkled independently.
     pub size: usize,
+    /// The field `size` was bucketed from, before the bucket boundaries. The
+    /// three size classes are 1.5 m, 4.4 m and 9.3 m tall, so which bucket a
+    /// site lands in moves the canopy far more than the acceptance roll does —
+    /// and the boundaries are constants chosen against a field whose real
+    /// distribution is not visible from their definition. Carrying the raw
+    /// value out lets the scatter histogram it and the boundaries be set from
+    /// measurement instead of from an assumption about the terrain.
+    pub vigour: f32,
 }
 
 /// The number of independent per-cell randoms [`cell_randoms`] returns. Named
 /// so the scatter cannot silently index past the end when it grows a field.
-pub const TREE_CELL_RANDOM_COUNT: usize = 5;
+///
+/// Eight: jitter X, jitter Z, the density roll, the variant, the scale, the
+/// lean's direction, the lean's magnitude, and the yaw. The variant, scale and
+/// orientation draws are deliberately *separate* indices — while the variant
+/// and the yaw shared one, every tree's yaw was a function of its mesh, and
+/// with three variants the crossed cards of a stand fell into three yaw bands.
+pub const TREE_CELL_RANDOM_COUNT: usize = 8;
 
 /// Stable per-cell randoms in [0, 1).
 ///
@@ -387,6 +459,77 @@ pub fn cell_randoms(cell: [f32; 2]) -> [f32; TREE_CELL_RANDOM_COUNT] {
     })
 }
 
+/// How far off vertical a tree may lean, in radians: 5% of a right angle, so
+/// 4.5 degrees at the very most.
+///
+/// A full turn's 5% — 18 degrees — was the first reading of "up to 5%" and it
+/// is far too much: at that cap a fir's trunk visibly departs from the ground
+/// at an angle, and a stand of them reads as storm-damaged rather than as a
+/// forest. Five percent of the *quadrant* keeps the lean inside the range where
+/// it reads as a crook in a tree that is still growing at the sky.
+///
+/// The cap is on the *total* tilt, not per axis, so even the crookedest fir in
+/// the forest is still unmistakably pointing at the sky — which is what lets
+/// the rest of the pipeline keep assuming a tree's trunk is vertical. See
+/// `TreeInstance::ground` in src/trees/mod.rs for where that assumption is
+/// load-bearing.
+pub const TREE_MAX_LEAN: f32 = std::f32::consts::FRAC_PI_2 * 0.05;
+
+/// A tree's orientation as a world-space quaternion, `[x, y, z, w]`.
+///
+/// Yaw is a full uniform turn about up: a fir has no front, and at three mesh
+/// variants a stand whose trees all face one way shows it.
+///
+/// The lean is a tilt of at most [`TREE_MAX_LEAN`] about a random *horizontal*
+/// axis, composed so the tilt happens before the yaw — the tree leans the same
+/// way relative to its own trunk whichever way it is then turned. The
+/// magnitude is the signed square of the random, which crowds the distribution
+/// towards zero: most trees come out near enough upright that the eye reads the
+/// stand as vertical, and a minority carry the cap. A uniform magnitude would
+/// put every tree at an average 9 degrees off vertical, which reads as a forest
+/// falling over rather than one with a few crooked trees in it.
+///
+/// A quaternion rather than the yaw angle this used to be, for two reasons. The
+/// vertex shader can then rotate with two cross products and no trigonometry,
+/// and it does that for every vertex of every instance — eight million vertices
+/// a frame in the filled forest, so six `sin`/`cos` calls per vertex is a real
+/// cost rather than a rounding error. And three Euler angles would fix the lean
+/// axes in world space, so a tree leaning north would lean *sideways* relative
+/// to its own trunk once the yaw turned it; the quaternion applies the tilt in
+/// the tree's frame.
+pub fn tree_rotation(yaw_random: f32, lean_direction_random: f32, lean_random: f32) -> [f32; 4] {
+    let signed = 2.0 * lean_random - 1.0;
+    let lean = TREE_MAX_LEAN * signed * signed.abs();
+
+    let (lean_sin, lean_cos) = lean.sin_cos();
+    let (direction_sin, direction_cos) =
+        (lean_direction_random * std::f32::consts::TAU).sin_cos();
+    let (yaw_sin, yaw_cos) = (yaw_random * std::f32::consts::TAU).sin_cos();
+
+    // Axis-angle about the horizontal direction (cos d, 0, sin d), then yaw
+    // about up. Composing as `yaw * lean` applies the lean first, in the
+    // tree's own frame.
+    quaternion_product(
+        [0.0, yaw_sin, 0.0, yaw_cos],
+        [
+            direction_cos * lean_sin,
+            0.0,
+            direction_sin * lean_sin,
+            lean_cos,
+        ],
+    )
+}
+
+/// Hamilton product: the rotation `after` applied in the frame `before` leaves.
+fn quaternion_product(after: [f32; 4], before: [f32; 4]) -> [f32; 4] {
+    [
+        after[3] * before[0] + after[0] * before[3] + after[1] * before[2] - after[2] * before[1],
+        after[3] * before[1] - after[0] * before[2] + after[1] * before[3] + after[2] * before[0],
+        after[3] * before[2] + after[0] * before[1] - after[1] * before[0] + after[2] * before[3],
+        after[3] * before[3] - after[0] * before[0] - after[1] * before[1] - after[2] * before[2],
+    ]
+}
+
 /// Decide whether one candidate point may carry a tree.
 ///
 /// `slope` and `neighbourhood_mean` come from the chunk's height grid rather
@@ -401,8 +544,21 @@ pub fn cell_randoms(cell: [f32; 2]) -> [f32; TREE_CELL_RANDOM_COUNT] {
 /// every candidate well inside `EROSION_VISIBILITY_FULL_RADIUS`, so
 /// `erosionVisibility` is exactly 1 and the judgement is a pure function of
 /// world position: same chunk, same trees, forever.
+/// `cache` is `None` for the far tier, which judges the *uneroded* landform
+/// instead. That is not a shortcut: erosion's whole contribution to the height
+/// is the incision and deposition the flow simulation deposits, and the tiles
+/// report it at around a metre (see the `incision` field of the `EROSION:
+/// independent pass` line). A metre of error under a tree 1,000 m away is
+/// 0.4 px of screen, and past `EROSION_VISIBILITY_ZERO_RADIUS` the renderer
+/// fades the erosion term out entirely, so beyond 1,600 m `base_height` is not
+/// an approximation of the drawn surface — it *is* the drawn surface. What the
+/// far tier gives up is the furrow test's access to erosion-carved channels;
+/// the test still runs, against the base landform's own hollows, which is the
+/// scale that survives to that distance anyway. What it gains is that a far
+/// chunk is ready the moment it is asked for, instead of waiting out the
+/// ninety seconds the erosion tiles at that range take to simulate.
 pub fn evaluate_site(
-    cache: &ErosionCache,
+    cache: Option<&ErosionCache>,
     noise: &NoiseField,
     x: f32,
     z: f32,
@@ -410,7 +566,10 @@ pub fn evaluate_site(
     slope: f32,
     neighbourhood_mean: f32,
 ) -> Result<TreeSite, SiteReject> {
-    let height = sample_eroded_height(cache, noise, x, z, visibility_center);
+    let height = match cache {
+        Some(cache) => sample_eroded_height(cache, noise, x, z, visibility_center),
+        None => crate::noise::base_height(noise, x, z),
+    };
 
     // Underwater, on the beach, and too close to the ocean are one test: the
     // height at which grass has taken over from shore sand.
@@ -447,6 +606,7 @@ pub fn evaluate_site(
         height,
         density: tree_density(&cover),
         size: tree_size(&cover),
+        vigour: tree_vigour(&cover),
     })
 }
 
@@ -478,14 +638,19 @@ pub enum SiteReject {
 /// large trees and leaves the medium and small ones on the thin ground at the
 /// edge of a clearing — the same gradient a real treeline shows.
 fn tree_size(cover: &GroundCover) -> usize {
-    let vigour = 0.6 * cover.soil_patches + 0.4 * cover.ground_growth;
-    if vigour < 0.42 {
+    let vigour = tree_vigour(cover);
+    if vigour < TREE_SMALL_MAX_VIGOUR {
         0
-    } else if vigour < 0.68 {
+    } else if vigour < TREE_MEDIUM_MAX_VIGOUR {
         1
     } else {
         2
     }
+}
+
+/// The bare field behind [`tree_size`], 0 to 1.
+fn tree_vigour(cover: &GroundCover) -> f32 {
+    0.6 * cover.soil_patches + 0.4 * cover.ground_growth
 }
 
 /// Turn the cover fields into an acceptance probability.
@@ -519,8 +684,15 @@ fn tree_density(cover: &GroundCover) -> f32 {
 /// Terrain height over one chunk's lattice, with a one-cell apron so slopes
 /// and neighbourhood means are defined on the chunk's own cells. `side` counts
 /// interior cells; the grid is `side + 2` square.
+///
+/// `step` is the lattice spacing the grid was rasterised at, in metres. It is a
+/// property of the grid rather than the constant [`TREE_LATTICE`] because the
+/// far tier rasterises the same chunk at [`TREE_FAR_STRIDE`] times the spacing:
+/// `slope` is a finite difference and `neighbourhood_mean` a window, and both
+/// have to divide by the spacing they were actually sampled at.
 pub struct HeightGrid {
     pub side: usize,
+    pub step: f32,
     pub heights: Vec<f32>,
 }
 
@@ -534,7 +706,7 @@ impl HeightGrid {
     /// derivatives; this reconstructs the same quantity from the ground
     /// itself, which is what a scatter can actually see.
     pub fn slope(&self, ix: usize, iz: usize) -> f32 {
-        let step = TREE_LATTICE;
+        let step = self.step;
         let dx = (self.at(ix + 1, iz) - self.at(ix - 1, iz)) / (2.0 * step);
         let dz = (self.at(ix, iz + 1) - self.at(ix, iz - 1)) / (2.0 * step);
         (dx * dx + dz * dz).sqrt()
@@ -544,7 +716,7 @@ impl HeightGrid {
     /// one. The radius is rounded to whole lattice cells, so the window is the
     /// same shape for every candidate.
     pub fn neighbourhood_mean(&self, ix: usize, iz: usize) -> f32 {
-        let reach = (TREE_FURROW_RADIUS / TREE_LATTICE).round() as usize;
+        let reach = (TREE_FURROW_RADIUS / self.step).round() as usize;
         let reach = reach.max(1).min(self.side);
         let mut total = 0.0f32;
         let mut count = 0.0f32;
@@ -561,13 +733,26 @@ impl HeightGrid {
 }
 
 /// Rasterise one chunk's terrain height on the scatter lattice.
+///
+/// `cache` is `None` for the far tier; see [`evaluate_site`]. `step` is the
+/// lattice spacing to sample at — [`TREE_LATTICE`] for the near tier, and
+/// [`TREE_FAR_STRIDE`] times that for the far one, whose sample points are
+/// therefore a subset of the near tier's and land on the same world positions.
+///
+/// The grid is rasterised at the tier's own spacing rather than at the near
+/// spacing with candidates skipped, and that is the difference between the far
+/// tier being cheap and being pointless: the grid is `side + 2` square and one
+/// height model call per cell, so a far chunk that rasterised 93 x 93 and then
+/// used every sixteenth cell would pay the full 8,649 samples to evaluate 529
+/// of them. At the coarse spacing it is 25 x 25.
 pub fn build_height_grid(
-    cache: &ErosionCache,
+    cache: Option<&ErosionCache>,
     noise: &NoiseField,
     chunk: [i32; 2],
+    step: f32,
     visibility_center: [f32; 2],
 ) -> HeightGrid {
-    let side = (TREE_CHUNK_SIZE / TREE_LATTICE).round() as usize;
+    let side = (TREE_CHUNK_SIZE / step).round() as usize;
     let origin = [
         chunk[0] as f32 * TREE_CHUNK_SIZE,
         chunk[1] as f32 * TREE_CHUNK_SIZE,
@@ -577,23 +762,49 @@ pub fn build_height_grid(
         for ix in 0..side + 2 {
             // The apron extends one cell past each edge, so cell 0's backward
             // difference reaches into the neighbouring chunk's ground.
-            let x = origin[0] + (ix as f32 - 1.0) * TREE_LATTICE;
-            let z = origin[1] + (iz as f32 - 1.0) * TREE_LATTICE;
-            heights.push(sample_eroded_height(cache, noise, x, z, visibility_center));
+            let x = origin[0] + (ix as f32 - 1.0) * step;
+            let z = origin[1] + (iz as f32 - 1.0) * step;
+            heights.push(match cache {
+                Some(cache) => sample_eroded_height(cache, noise, x, z, visibility_center),
+                None => crate::noise::base_height(noise, x, z),
+            });
         }
     }
     HeightGrid {
         side,
+        step,
         heights,
     }
 }
 
-/// Whether every erosion tile overlapping this chunk has finished simulating.
+/// Whether every erosion tile this chunk's height model actually reads has
+/// finished simulating.
 ///
 /// Scattering a chunk before its tiles are ready would judge candidates
 /// against the un-eroded `baseHeight`, and the furrow test — the whole reason
 /// the erosion fields are needed here — would find no furrows at all. The
 /// chunk is simply deferred until the ground it sits on exists.
+///
+/// The set asked about is exactly the set `sample_eroded_height` reads: the
+/// four candidate tiles of `erosion_candidate_minimum`, whose retained
+/// footprints are the ones the blend mask weights. `TREE_CHUNK_SIZE` is half
+/// `EROSION_TILE_STRIDE`, so a chunk spans two candidate tiles per axis and the
+/// union over its corners is a 2x2 block.
+///
+/// This used to inflate that block by `EROSION_FOOTPRINT_SIZE * 0.5` on every
+/// side — a tile of slack for the blend mask's support, giving a 4x4 block of
+/// 16 tiles where the height model reads 4. The mask does reach half a
+/// footprint past a pass centre, but its Hermite tent weight is *zero* at that
+/// boundary (`sample_erosion_blend_mask` returns 0 outside the support square
+/// and the tent vanishes at its edge), so the extra twelve tiles were read by
+/// nothing and gated everything. The cost was the whole pop-in: the player's
+/// own chunk needs tiles {0,1}x{0,1}, which are the first four the simulator
+/// ever finishes, but it was waiting on the far corner of a 4x4 block and so
+/// went unscattered for 15 s while a chunk 365 m away — the first whose
+/// sixteen happened to complete — planted the forest's first tree. Every
+/// chunk is now ready as soon as the ground under it is, and the nearest
+/// chunks come first rather than whichever one the tile order happened to
+/// finish.
 pub fn chunk_is_ready(cache: &ErosionCache, chunk: [i32; 2]) -> bool {
     let minimum = [
         chunk[0] as f32 * TREE_CHUNK_SIZE,
@@ -603,11 +814,8 @@ pub fn chunk_is_ready(cache: &ErosionCache, chunk: [i32; 2]) -> bool {
         minimum[0] + TREE_CHUNK_SIZE,
         minimum[1] + TREE_CHUNK_SIZE,
     ];
-    // The blend mask's support reaches half a footprint past a pass centre, so
-    // a chunk can be touched by a tile whose centre is outside it.
-    let reach = EROSION_FOOTPRINT_SIZE * 0.5;
-    let first = crate::erosion::erosion_candidate_minimum(minimum[0] - reach, minimum[1] - reach);
-    let last = crate::erosion::erosion_candidate_minimum(maximum[0] + reach, maximum[1] + reach);
+    let first = crate::erosion::erosion_candidate_minimum(minimum[0], minimum[1]);
+    let last = crate::erosion::erosion_candidate_minimum(maximum[0], maximum[1]);
     for z in first.z..=last.z + 1 {
         for x in first.x..=last.x + 1 {
             let found = cache.tiles.get(&crate::erosion::tile(x, z));

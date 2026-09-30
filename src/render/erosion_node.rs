@@ -232,6 +232,7 @@ impl Node for ForestErosionNode {
             return Ok(());
         };
 
+
         let mut skip_readback = consumed;
         if let Some(deferred) = sim.deferred.take() {
             skip_readback |= sim.apply_commands(

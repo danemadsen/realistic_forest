@@ -208,6 +208,7 @@ impl Node for ForestTerrainNode {
             return Ok(());
         };
 
+
         // DrawClipmap: uErosionVisibilityCenter is the player's XZ and every
         // level shares it (SetTerrainSharedUniforms runs once per frame).
         let visibility_center = [view.player_position[0], view.player_position[2]];

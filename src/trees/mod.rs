@@ -74,9 +74,16 @@ pub const PLAYER_RADIUS: f32 = 0.35;
 // Per-instance ABI
 // ---------------------------------------------------------------------------
 
-/// One scattered tree as the vertex shader sees it. 28 bytes, mirrored by
+/// One scattered tree as the vertex shader sees it. 40 bytes, mirrored by
 /// `TreeInstance` in assets/shaders/tree-vs.wgsl, which declares the same six
 /// fields at `@location(4..9)`.
+///
+/// 40 rather than 28 because the orientation is a quaternion: a yaw alone
+/// cannot express the lean a crooked tree needs, and three angles would cost
+/// the vertex shader six trigonometric calls per vertex to rebuild. See
+/// [`placement::tree_rotation`]. At 70,000 instances and an upload only when
+/// the buckets change, the twelve extra bytes are 840 KB of buffer that is
+/// written a few times a minute.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TreeInstance {
@@ -92,8 +99,9 @@ pub struct TreeInstance {
     pub ground: f32,
     /// Uniform object-space scale.
     pub scale: f32,
-    /// Yaw in radians.
-    pub rotation: f32,
+    /// World orientation as a unit quaternion, `[x, y, z, w]`. Full yaw, plus
+    /// a lean of at most `TREE_MAX_LEAN`.
+    pub rotation: [f32; 4],
     /// 0..1 stable per-tree random, driving the fragment stage's tint.
     pub variation: f32,
     /// Metres the trunk foot is pushed below ground, so a tree on a slope is
@@ -101,7 +109,7 @@ pub struct TreeInstance {
     pub sink: f32,
 }
 
-const _: () = assert!(std::mem::size_of::<TreeInstance>() == 28);
+const _: () = assert!(std::mem::size_of::<TreeInstance>() == 40);
 
 /// A scattered tree before LOD selection. This is what the main world stores
 /// and what crosses to the render world; the render node turns it into a
@@ -116,7 +124,9 @@ pub struct TreePlacement {
     pub size: u8,
     pub variant: u8,
     pub scale: f32,
-    pub rotation: f32,
+    /// World orientation as a unit quaternion, `[x, y, z, w]`; see
+    /// [`placement::tree_rotation`].
+    pub rotation: [f32; 4],
     pub variation: f32,
     pub sink: f32,
 }
@@ -160,6 +170,20 @@ pub struct TreeMaterialRange {
     pub first_index: u32,
     pub index_count: u32,
     pub is_branch: bool,
+    /// The glTF material's `doubleSided`, carried through so the tree pass can
+    /// pick a cull mode per material rather than one for the whole pack.
+    ///
+    /// This is not a cosmetic flag on this pack. The LOD-0/1/2 materials are
+    /// `doubleSided` — a fir's branch cards are flat planes and you are meant to
+    /// see them from behind — but every LOD-3 billboard material is
+    /// single-sided, and its geometry says why: the cross is authored as four
+    /// separate cards, one per axis direction, each with its own window of the
+    /// atlas (front view at u 0.67-0.99, back view at u 0.34-0.66, and so on).
+    /// Exactly one card of each of the two crossed planes faces any given
+    /// camera, so culling the back faces removes the other one and its
+    /// co-located pixels with it. Drawing them instead doubles the fragment
+    /// work of the largest band in the forest for an identical image.
+    pub double_sided: bool,
     pub roughness: f32,
     pub alpha_cutoff: f32,
     /// The material's `KHR_materials_specular` factor, carried to the tree
@@ -258,11 +282,24 @@ impl TrunkIndex {
 
 /// The main world's forest: which chunks have been scattered, the flattened
 /// placement list the render world reads, and the trunk index collision uses.
+/// One chunk's scattered trees, and which tier produced them.
+///
+/// The tier is stored beside the trees rather than in a set of its own so the
+/// two cannot disagree: the only thing the streaming logic needs to know about
+/// a chunk is whether the content it is holding is the decimated far version
+/// or the full near one, and that question has exactly one answer per chunk.
+struct ScatteredChunk {
+    placements: Vec<TreePlacement>,
+    /// Scattered on the far tier's decimated lattice; see
+    /// [`placement::TREE_FAR_STRIDE`].
+    coarse: bool,
+}
+
 #[derive(Resource, Default)]
 pub struct TreeField {
     /// One placement list per scattered chunk. Kept per chunk so eviction is
     /// a single `remove` rather than a scan of the flat list.
-    chunks: HashMap<[i32; 2], Vec<TreePlacement>>,
+    chunks: HashMap<[i32; 2], ScatteredChunk>,
     /// Chunks whose erosion tiles are not all final yet. Re-offered
     /// periodically; see [`TREE_CHUNK_RETRY_FRAMES`].
     deferred: HashMap<[i32; 2], u64>,
@@ -300,10 +337,11 @@ impl TreeField {
     /// publish the result to the render world.
     fn republish(&mut self, heights: [[f32; TREE_VARIANT_COUNT]; TREE_SIZE_COUNT], focus: Vec3) {
         self.generation += 1;
-        let mut placements = Vec::with_capacity(self.chunks.values().map(Vec::len).sum());
+        let mut placements =
+            Vec::with_capacity(self.chunks.values().map(|chunk| chunk.placements.len()).sum());
         let mut trunks = TrunkIndex::default();
         for chunk in self.chunks.values() {
-            for placement in chunk {
+            for placement in &chunk.placements {
                 let radius = TREE_TRUNK_RADIUS[placement.size as usize % TREE_SIZE_COUNT]
                     * placement.scale;
                 trunks.insert(placement.x, placement.z, radius);
@@ -311,43 +349,110 @@ impl TreeField {
             }
         }
         self.trunks = trunks;
-        // The nearest few trees, for aiming a `--camera` capture at one
-        // without having to guess coordinates — so "near" means near the
-        // player, not near the world origin, which is an arbitrary point the
-        // player may never visit. Debug level: it changes on every chunk
-        // crossing and is not a number anyone watches in normal play.
-        //
-        // Sorted from `placements`, the list just built, not from
-        // `self.scatter.placements`, which is still the previous generation's
-        // and is empty on the first call.
-        let mut nearest: Vec<&TreePlacement> = placements.iter().collect();
-        nearest.sort_by(|left, right| {
-            let a = (left.x - focus.x).powi(2) + (left.z - focus.z).powi(2);
-            let b = (right.x - focus.x).powi(2) + (right.z - focus.z).powi(2);
-            a.total_cmp(&b)
-        });
-        let sample: Vec<String> = nearest
-            .iter()
-            .take(4)
-            .map(|placement| {
-                format!(
-                    "({:.1}, {:.1}) h={:.1} size={} ground={:.1}",
-                    placement.x,
-                    placement.z,
-                    heights[placement.size as usize % TREE_SIZE_COUNT][placement.variant as usize % TREE_VARIANT_COUNT]
-                        * placement.scale,
-                    placement.size,
-                    placement.ground,
-                )
-            })
-            .collect();
-        log::debug!(
-            "TREES: {} chunks scattered, {} deferred, {} queued; nearest to player: {}",
-            self.chunks.len(),
-            self.deferred.len(),
-            self.queue.len(),
-            sample.join(", ")
-        );
+
+        // Everything below is the debug line, and none of it runs unless that
+        // line is going to be emitted. This matters more than the usual
+        // "diagnostics should be cheap": `republish` is called once per
+        // scattered chunk, up to `TREE_CHUNKS_PER_FRAME` times a frame, and
+        // during the fill that is every frame. The nearest-trees list used to
+        // be a full sort of every placement in the forest to name four of them
+        // — at 100,000 trees that is a few hundred thousand comparisons of two
+        // distances each, several times a frame, which is the hitch the player
+        // feels as the forest appears. A bounded selection is one pass and four
+        // steps of insertion instead; skipping it entirely at info level is
+        // nothing at all.
+        if log::log_enabled!(log::Level::Debug) {
+            // The nearest few trees, for aiming a `--camera` capture at one
+            // without having to guess coordinates — so "near" means near the
+            // player, not near the world origin, which is an arbitrary point
+            // the player may never visit. Debug level: it changes on every
+            // chunk crossing and is not a number anyone watches in normal play.
+            //
+            // Read from `placements`, the list just built, not from
+            // `self.scatter.placements`, which is still the previous
+            // generation's and is empty on the first call.
+            let mut nearest: Vec<(f32, &TreePlacement)> =
+                Vec::with_capacity(TREE_NEAREST_REPORTED);
+            for placement in &placements {
+                let distance =
+                    (placement.x - focus.x).powi(2) + (placement.z - focus.z).powi(2);
+                // Sorted ascending, so the last entry is the worst of the four
+                // kept and one comparison rejects most of the forest.
+                if nearest.len() == TREE_NEAREST_REPORTED
+                    && distance >= nearest[TREE_NEAREST_REPORTED - 1].0
+                {
+                    continue;
+                }
+                let index = nearest.partition_point(|entry| entry.0 <= distance);
+                nearest.insert(index, (distance, placement));
+                nearest.truncate(TREE_NEAREST_REPORTED);
+            }
+            // How the stand is spread over distance from the player, in eight
+            // bands. A capture that reads as parkland is usually not short of
+            // trees overall but short of them in one particular range — a hole
+            // in this histogram is a hole the camera sees as a bare band, and a
+            // hole here is a placement bug rather than a density one, which the
+            // pixel measurements cannot tell apart. Band edges are powers of
+            // two from 25 m, which is the order a 1.5 m sapling stops
+            // resolving; the last three also straddle the near/far tier
+            // boundary at `TREE_SCATTER_RADIUS`, where a hole would mean the
+            // far tier is missing rather than thin.
+            let mut bands = [0usize; 8];
+            for placement in &placements {
+                let distance = ((placement.x - focus.x).powi(2)
+                    + (placement.z - focus.z).powi(2))
+                .sqrt();
+                let band = if distance < 25.0 {
+                    0
+                } else if distance < 50.0 {
+                    1
+                } else if distance < 100.0 {
+                    2
+                } else if distance < 200.0 {
+                    3
+                } else if distance < 400.0 {
+                    4
+                } else if distance < 900.0 {
+                    5
+                } else if distance < 1300.0 {
+                    6
+                } else {
+                    7
+                };
+                bands[band] += 1;
+            }
+            let sample: Vec<String> = nearest
+                .iter()
+                .map(|(_, placement)| {
+                    format!(
+                        "({:.1}, {:.1}) h={:.1} size={} ground={:.1}",
+                        placement.x,
+                        placement.z,
+                        heights[placement.size as usize % TREE_SIZE_COUNT]
+                            [placement.variant as usize % TREE_VARIANT_COUNT]
+                            * placement.scale,
+                        placement.size,
+                        placement.ground,
+                    )
+                })
+                .collect();
+            log::debug!(
+                "TREES: {} chunks scattered, {} deferred, {} queued; \
+                 within 25/50/100/200/400/900/1300 m of the player: \
+                 {}/{}/{}/{}/{}/{}/{}; nearest: {}",
+                self.chunks.len(),
+                self.deferred.len(),
+                self.queue.len(),
+                bands[0],
+                bands[1],
+                bands[2],
+                bands[3],
+                bands[4],
+                bands[5],
+                bands[6],
+                sample.join(", ")
+            );
+        }
 
         self.scatter = Arc::new(TreeScatter {
             generation: self.generation,
@@ -367,6 +472,9 @@ const TREE_CHUNKS_PER_FRAME: usize = 4;
 /// is offered again. Long enough that the retry is not the thing that costs
 /// frames, short enough that the forest fills in as the tiles finalise.
 const TREE_CHUNK_RETRY_FRAMES: u64 = 30;
+
+/// How many trees the debug line names as the nearest. See `republish`.
+const TREE_NEAREST_REPORTED: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Scatter
@@ -388,28 +496,36 @@ fn chunk_centre(chunk: [i32; 2]) -> [f32; 2] {
 
 /// Scatter one chunk. Pure: everything it reads is world-space, and the only
 /// state it touches is the erosion cache, which is the ground itself.
+///
+/// `cache` is `None` for a far chunk, which is judged against the uneroded
+/// landform and therefore needs no erosion tiles to have finalised. `step` is
+/// the tier's lattice spacing; see [`placement::build_height_grid`].
 fn scatter_chunk(
-    cache: &ErosionCache,
+    cache: Option<&ErosionCache>,
     noise: &NoiseField,
     chunk: [i32; 2],
+    step: f32,
     heights: &[[f32; TREE_VARIANT_COUNT]; TREE_SIZE_COUNT],
 ) -> Vec<TreePlacement> {
     // The chunk's own centre, never the player's: see `evaluate_site`.
     let visibility_center = chunk_centre(chunk);
-    let grid = placement::build_height_grid(cache, noise, chunk, visibility_center);
+    let grid = placement::build_height_grid(cache, noise, chunk, step, visibility_center);
     let cell_count = grid.side;
 
     let mut placements = Vec::new();
     // Rejection tally, reported once per chunk at debug level. `candidates` is
     // the denominator every other number here is read against.
     let mut rejected = [0usize; 6];
+    // Ten bins of 0.1 across the vigour range, counted over the candidates that
+    // cleared the hard tests. This is the distribution `tree_size`'s boundaries
+    // are read against; see `TREE_SMALL_MAX_VIGOUR` for why it is measured
+    // rather than reasoned about.
+    let mut vigour_bins = [0usize; 10];
     for iz in 0..cell_count {
         for ix in 0..cell_count {
             let lattice = [
-                chunk[0] as f32 * placement::TREE_CHUNK_SIZE
-                    + ix as f32 * placement::TREE_LATTICE,
-                chunk[1] as f32 * placement::TREE_CHUNK_SIZE
-                    + iz as f32 * placement::TREE_LATTICE,
+                chunk[0] as f32 * placement::TREE_CHUNK_SIZE + ix as f32 * step,
+                chunk[1] as f32 * placement::TREE_CHUNK_SIZE + iz as f32 * step,
             ];
             let randoms = placement::cell_randoms(lattice);
             // Jitter stays inside the middle 80% of the cell so two candidates
@@ -441,6 +557,8 @@ fn scatter_chunk(
                 }
             };
 
+            vigour_bins[((site.vigour.clamp(0.0, 0.999) * 10.0) as usize).min(9)] += 1;
+
             // Acceptance is a roll against the site's density, so clearings
             // are simply the places the roll keeps failing — which is why they
             // have ragged, organic edges instead of the contour a threshold
@@ -455,6 +573,9 @@ fn scatter_chunk(
             // Height-relative size spread: a "large" fir is not one size, it is
             // one species, and a stand of identical trunks reads as a fence.
             let scale = 0.78 + 0.44 * randoms[4];
+            // Lean before yaw, so the tilt is in the tree's own frame; see
+            // `placement::tree_rotation`.
+            let rotation = placement::tree_rotation(randoms[7], randoms[5], randoms[6]);
             let trunk_height = heights[site.size][variant] * scale;
             // Seat the foot below the surface by a share of the local relief,
             // so a tree on a slope is not left standing on the downhill edge of
@@ -469,7 +590,7 @@ fn scatter_chunk(
                 size: site.size as u8,
                 variant: variant as u8,
                 scale,
-                rotation: randoms[3] * std::f32::consts::TAU,
+                rotation,
                 variation: randoms[4],
                 sink,
             });
@@ -481,11 +602,26 @@ fn scatter_chunk(
     // that is too small (a hard test is too strict) or a `roll` that is too
     // large (the density field is too low), and this line says which.
     let passed: usize = placements.len() + rejected[5];
+    // The size mix, small/medium/large. A stand that reads as parkland rather
+    // than forest is usually a size problem before it is a count problem: the
+    // three classes are 1.5 m, 4.4 m and 9.3 m tall, so one class's share of
+    // the plantings moves the canopy area far more than the total does, and
+    // `tree_size`'s thresholds are read against a vigour field whose own
+    // distribution is not obvious from its definition. This line shows it.
+    let mut sizes = [0usize; TREE_SIZE_COUNT];
+    for placement in &placements {
+        sizes[placement.size as usize] += 1;
+    }
     log::debug!(
-        "TREES: chunk {chunk:?} — {} candidates, {passed} passed, {} planted; \
-         rejected shore {} slope {} rock {} snow {} furrow {}, thinned {}",
+        "TREES: chunk {chunk:?} — {} candidates, {passed} passed, {} planted \
+         (small {} medium {} large {}); \
+         rejected shore {} slope {} rock {} snow {} furrow {}, thinned {}; \
+         vigour per 0.1 {vigour_bins:?}",
         cell_count * cell_count,
         placements.len(),
+        sizes[0],
+        sizes[1],
+        sizes[2],
         rejected[0],
         rejected[1],
         rejected[2],
@@ -496,6 +632,32 @@ fn scatter_chunk(
     placements
 }
 
+/// Which lattice a chunk at this distance should be scattered on.
+///
+/// The two radii overlap on purpose. A chunk is *promoted* — re-scattered on
+/// the full lattice — as soon as it comes inside [`TREE_SCATTER_RADIUS`], but
+/// it is not *demoted* until it is past [`TREE_RETAIN_RADIUS`], which is the
+/// same 150 m of hysteresis that keeps a chunk from being dropped and rebuilt
+/// as the player walks along the boundary. Without it, a player standing on the
+/// edge would have a ring of chunks re-scattered every time they crossed a
+/// chunk line in either direction.
+fn wants_coarse(distance: f32, currently_coarse: bool) -> bool {
+    if currently_coarse {
+        distance > placement::TREE_SCATTER_RADIUS
+    } else {
+        distance > placement::TREE_RETAIN_RADIUS
+    }
+}
+
+/// The lattice spacing a tier scatters at.
+fn lattice_step(coarse: bool) -> f32 {
+    if coarse {
+        placement::TREE_LATTICE * placement::TREE_FAR_STRIDE as f32
+    } else {
+        placement::TREE_LATTICE
+    }
+}
+
 /// Rebuild the chunk work queue around the player, farthest first so that
 /// `pop` hands back the nearest.
 ///
@@ -503,8 +665,14 @@ fn scatter_chunk(
 /// already scattered cost nothing. Rebuilding the whole list rather than
 /// diffing it is deliberate: the list is a few hundred entries of two integers,
 /// and a diff would be the more expensive and more fragile of the two.
+///
+/// A chunk already in `chunks` is not automatically done with: one holding far
+/// content that has come inside the near radius is re-queued so it can be
+/// re-scattered at full density. That is the one case where a chunk is
+/// scattered twice, and it is what keeps the far tier from leaving a sparse
+/// ring in the forest ahead of a player who walks toward it.
 fn refill_queue(field: &mut TreeField, centre: [i32; 2], cache: &ErosionCache) {
-    let span = (placement::TREE_SCATTER_RADIUS / placement::TREE_CHUNK_SIZE).ceil() as i32;
+    let span = (placement::TREE_FAR_RADIUS / placement::TREE_CHUNK_SIZE).ceil() as i32;
     // Distances are measured from the centre of the chunk the player is in,
     // not from the world origin: the origin is only where the player happens
     // to start, and a queue built around it stops following them the moment
@@ -520,19 +688,29 @@ fn refill_queue(field: &mut TreeField, centre: [i32; 2], cache: &ErosionCache) {
             let position = chunk_centre(chunk);
             let distance =
                 ((position[0] - anchor[0]).powi(2) + (position[1] - anchor[1]).powi(2)).sqrt();
-            if distance > placement::TREE_SCATTER_RADIUS {
+            if distance > placement::TREE_FAR_RADIUS {
                 continue;
             }
-            if field.chunks.contains_key(&chunk) || field.deferred.contains_key(&chunk) {
+            if field.deferred.contains_key(&chunk) {
                 continue;
             }
-            // A chunk whose erosion tiles have not finalised is deferred
-            // rather than skipped: skipping would drop it until the player
-            // crossed another chunk boundary, which can be a long walk away.
-            if !placement::chunk_is_ready(cache, chunk) {
-                let frame = field.frame;
-                field.deferred.insert(chunk, frame);
-                continue;
+            if let Some(existing) = field.chunks.get(&chunk) {
+                // Present and already at the density this distance wants — the
+                // common case, and it costs nothing.
+                if existing.coarse == wants_coarse(distance, existing.coarse) {
+                    continue;
+                }
+            } else {
+                // A chunk whose erosion tiles have not finalised is deferred
+                // rather than skipped: skipping would drop it until the player
+                // crossed another chunk boundary, which can be a long walk
+                // away. Only the near tier reads them, so only it waits.
+                let coarse = distance > placement::TREE_SCATTER_RADIUS;
+                if !coarse && !placement::chunk_is_ready(cache, chunk) {
+                    let frame = field.frame;
+                    field.deferred.insert(chunk, frame);
+                    continue;
+                }
             }
             wanted.push((chunk, distance));
         }
@@ -545,12 +723,19 @@ fn refill_queue(field: &mut TreeField, centre: [i32; 2], cache: &ErosionCache) {
 /// Drives the chunk stream: evict what is out of range, refill the queue when
 /// the player crosses a chunk boundary, and scatter a few chunks per frame.
 pub fn tree_stream_system(
+    automation: Res<crate::automation::AutomationSettings>,
     mut field: ResMut<TreeField>,
     cache: Res<ErosionCache>,
     noise: Res<NoiseField>,
     heights: Res<TreeHeights>,
     players: Query<&Player>,
 ) {
+    // `--no-trees` prices the forest: the pass still runs, but with no
+    // instances it draws nothing, so the frame time it leaves behind is the
+    // rest of the pipeline's.
+    if automation.no_trees {
+        return;
+    }
     let Ok(player) = players.single() else {
         return;
     };
@@ -558,8 +743,13 @@ pub fn tree_stream_system(
     field.frame += 1;
 
     // Eviction first: a chunk is dropped once the player is well past it, so
-    // the forest never grows without bound as they walk.
-    let retain = (placement::TREE_RETAIN_RADIUS / placement::TREE_CHUNK_SIZE).ceil() as i32;
+    // the forest never grows without bound as they walk. The box is the far
+    // tier's, and it is a box rather than a disc for the same reason it always
+    // was: the corners cost a little extra memory and the check costs one
+    // comparison. A near chunk inside a far-sized box is kept, which is the
+    // point — the alternative is a chunk that was dense when the player walked
+    // through it becoming sparse the moment they turned around.
+    let retain = (placement::TREE_FAR_RETAIN_RADIUS / placement::TREE_CHUNK_SIZE).ceil() as i32;
     let mut evicted = false;
     field.chunks.retain(|chunk, _| {
         let keep = (chunk[0] - centre[0]).abs() <= retain && (chunk[1] - centre[1]).abs() <= retain;
@@ -593,20 +783,33 @@ pub fn tree_stream_system(
 
     let mut scattered = false;
     let started = std::time::Instant::now();
+    let anchor = chunk_centre(centre);
     for _ in 0..TREE_CHUNKS_PER_FRAME {
         let Some(chunk) = field.queue.pop() else {
             break;
         };
-        if field.chunks.contains_key(&chunk) {
-            continue;
+        let position = chunk_centre(chunk);
+        let distance =
+            ((position[0] - anchor[0]).powi(2) + (position[1] - anchor[1]).powi(2)).sqrt();
+        // A chunk already holding the density this distance wants is done. The
+        // queue can hold one that is not — a far chunk the player has since
+        // walked up to — and that one is re-scattered, which is the whole
+        // reason the check is against the tier and not against presence.
+        let coarse = wants_coarse(distance, true);
+        if let Some(existing) = field.chunks.get(&chunk) {
+            if existing.coarse == coarse {
+                continue;
+            }
         }
-        if !placement::chunk_is_ready(&cache, chunk) {
+        if !coarse && !placement::chunk_is_ready(&cache, chunk) {
             let frame = field.frame;
             field.deferred.insert(chunk, frame);
             continue;
         }
-        let placements = scatter_chunk(&cache, &noise, chunk, &heights.heights);
-        field.chunks.insert(chunk, placements);
+        let source = if coarse { None } else { Some(&*cache) };
+        let placements =
+            scatter_chunk(source, &noise, chunk, lattice_step(coarse), &heights.heights);
+        field.chunks.insert(chunk, ScatteredChunk { placements, coarse });
         scattered = true;
     }
     let elapsed = started.elapsed().as_secs_f32();
@@ -702,12 +905,27 @@ fn decode_image(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     Ok((decoded.into_raw(), width, height))
 }
 
-/// Halve an RGBA8 image with a 2x2 box filter until it fits `maximum`.
+/// Halve an RGBA8 image with a 2x2 box filter until it fits `maximum`, keeping
+/// the alpha's *maximum* rather than its average.
 ///
-/// Box averaging is the right filter here rather than the terrain's
+/// Box averaging is the right filter for colour here rather than the terrain's
 /// wrap-aware one: a tree texture is not a tiling tile, so there is no seam to
 /// preserve and averaging the real neighbours is strictly better than
 /// averaging across the wrap.
+///
+/// Alpha is the exception, and it is the whole reason this function is not a
+/// plain box filter. A foliage texture's alpha is *coverage*, and its mean is
+/// low — the billboard textures run 0.18 and 0.24 opaque. Averaging preserves
+/// that mean at every mip level, so once minification reaches the mips the
+/// sampled alpha converges on 0.2 and every fragment fails the 0.5 cutout.
+/// Past `TREE_LOD_DISTANCE[2]` every tree is a billboard, so that is every tree
+/// further away than 24 m: measured, a fully-filled 68,480-tree forest and a
+/// third-filled 23,545-tree one rendered to images differing in 293 pixels of
+/// 1,440,000, because the 45,000 extra trees were all far enough to be lost
+/// this way. Taking the maximum instead keeps
+/// the silhouette at full extent, which is the standard dilation an alpha-tested
+/// foliage mip chain needs — the tree stays a tree, and at the coarsest levels
+/// it becomes a solid silhouette, which is what a tree 4 px wide should be.
 fn halve_rgba(src: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
     let (next_width, next_height) = ((width / 2).max(1), (height / 2).max(1));
     let mut dst = vec![0u8; (next_width * next_height * 4) as usize];
@@ -715,14 +933,22 @@ fn halve_rgba(src: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
         for x in 0..next_width {
             for channel in 0..4usize {
                 let mut total = 0u32;
+                let mut largest = 0u32;
                 for dy in 0..2u32 {
                     for dx in 0..2u32 {
                         let sx = (x * 2 + dx).min(width - 1);
                         let sy = (y * 2 + dy).min(height - 1);
-                        total += src[((sy * width + sx) * 4) as usize + channel] as u32;
+                        let texel = src[((sy * width + sx) * 4) as usize + channel] as u32;
+                        total += texel;
+                        largest = largest.max(texel);
                     }
                 }
-                dst[((y * next_width + x) * 4) as usize + channel] = ((total + 2) / 4) as u8;
+                let value = if channel == 3 {
+                    largest
+                } else {
+                    (total + 2) / 4
+                };
+                dst[((y * next_width + x) * 4) as usize + channel] = value as u8;
             }
         }
     }
@@ -825,14 +1051,9 @@ fn check_pack_assumptions(file: &GlbFile) {
         );
     }
     for material in &file.materials {
-        if !material.double_sided {
-            log::warn!(
-                "Tree {}: material {} is single-sided but the tree pipeline draws with \
-                 cull_mode: None, so its back faces will be shaded",
-                file.name,
-                material.name
-            );
-        }
+        // A single-sided material is no longer a warning: the tree pass reads
+        // `doubleSided` and builds a back-face-culling pipeline for it. See
+        // `TreeMaterialRange::double_sided`.
         if material.metallic > 0.2 {
             log::warn!(
                 "Tree {}: material {} is {:.2} metallic, and the tree material uniform \
@@ -887,6 +1108,10 @@ fn load_tree_mesh(
             // means a re-export that renames a material cannot silently turn
             // every branch card opaque.
             is_branch: material.is_some_and(|material| material.alpha_cutout),
+            // A primitive with no material has nothing to say about sidedness,
+            // and drawing both faces is the safe default: it can only cost
+            // fragments, where the other way can lose geometry.
+            double_sided: material.is_none_or(|material| material.double_sided),
             roughness: material.map(|material| material.roughness).unwrap_or(1.0),
             alpha_cutoff: match material {
                 Some(material) if material.alpha_cutout => material.alpha_cutoff.max(0.5),

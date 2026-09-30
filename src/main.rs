@@ -69,6 +69,11 @@ struct PrewarmRemaining(pub u32);
 /// `for (int pass = 0; pass < 4; ++pass)` in the C++.
 const PREWARM_PASSES: u32 = 4;
 
+/// Frames between the periodic `FRAME:` reports a `--shot` run logs. See
+/// `shot_scheduling_system` for why a run reports its frame time as a trace
+/// rather than as one number.
+const FRAME_REPORT_INTERVAL: u64 = 256;
+
 #[derive(Resource, Default)]
 struct FrameCounter(pub u64);
 
@@ -188,8 +193,8 @@ fn main() {
     let (screen_width, screen_height) =
         clamp_to_primary_work_area(automation.width as u32, automation.height as u32);
 
-    App::new()
-        .add_plugins(
+    let mut app = App::new();
+    app.add_plugins(
             bevy::DefaultPlugins
                 .set(bevy::window::WindowPlugin {
                     primary_window: Some(Window {
@@ -230,6 +235,15 @@ fn main() {
                         // error, and removing it is what makes the two
                         // binaries agree on the window they ask for.
                         resolution: WindowResolution::new(screen_width, screen_height),
+                        // Like the C++'s FLAG_VSYNC_HINT. `--no-vsync` asks for
+                        // the uncapped mode instead; measured, it does not
+                        // change the frame time — see the flag's comment in
+                        // automation.rs.
+                        present_mode: if automation.no_vsync {
+                            bevy::window::PresentMode::AutoNoVsync
+                        } else {
+                            bevy::window::PresentMode::AutoVsync
+                        },
                         ..default()
                     }),
                     exit_condition: bevy::window::ExitCondition::OnPrimaryClosed,
@@ -279,7 +293,9 @@ fn main() {
         })
         .insert_resource(ErosionBridge::default())
         .insert_resource(noise_field.clone())
-        .insert_resource(automation.clone())
+        .insert_resource(automation.clone());
+
+    app
         // The render plugin lifts the shared noise field and erosion bridge
         // into the render sub-app at build time, so they must exist first.
         .add_plugins(render::ForestRenderPlugin::new(noise_field.clone()))
@@ -313,6 +329,10 @@ fn main() {
                 // everything by a frame for no reason.
                 trees::tree_stream_system.run_if(not_in_measure_mode),
                 player::update_player_system,
+                // ...and immediately after it, so a pinned `--camera` capture
+                // cannot be flown off its pose by stray input. See
+                // `pin_automation_pose`.
+                pin_automation_pose,
                 // Collision sees the position the player actually moved to —
                 // that is what lets it push them out of a trunk rather than
                 // reject the step that put them there.
@@ -382,6 +402,54 @@ fn setup_blend_mask(mut cache: ResMut<ErosionCache>) {
     cache.blend_mask_samples = noise::erosion_blend_mask_samples();
 }
 
+/// The pose `--camera` pins: where the camera looks from and at what angle.
+///
+/// Shared between the Startup application and the per-frame re-pin below, so
+/// there is exactly one definition of what a pinned capture looks like.
+fn apply_automation_pose(player: &mut Player, automation: &AutomationSettings) {
+    player.position = bevy::math::Vec3::from(automation.position);
+    player.yaw = automation.yaw;
+    player.pitch = automation.pitch;
+    // Fly so gravity never fights a pinned pose.
+    player.flying = true;
+    // Mouse look off: `update_player_system` reads mouse motion whenever this
+    // is set, and a stray click in the capture window sets it.
+    player.mouse_captured = false;
+    player.vertical_velocity = 0.0;
+}
+
+/// Re-applies the `--camera` pose every frame, after the player update.
+///
+/// `setup_cursor_and_player` applies the pose once, which is enough only if
+/// nothing can move the player afterwards. Something can: the capture window
+/// takes focus, and a stray `W`/`A`/`S`/`D` reaches `update_player_system` and
+/// flies the camera off the pinned pose. That is invisible in the picture —
+/// it still looks like a forest — and it silently invalidates every comparison
+/// against another capture, which is the only thing `--camera` exists for.
+///
+/// Measured: two `--wait 4000` captures of the same command, whose only
+/// difference was a slower build, ended with the player at the origin and at
+/// (-256, -290) respectively. The tell is the erosion streaming footprint —
+/// `EROSION: generating tile` — because a stationary player only ever touches
+/// the tiles in a ±`EROSION_STREAMING_RADIUS` box around their own, and those
+/// runs reached z = -5 and x = -5. The direction was exactly -z and -x, which
+/// is `W` and `A` at the pinned yaw of 0, so the drift is real key input rather
+/// than a movement bug: there are three writers of `player.position` and only
+/// `update_player_system` can translate the player while flying.
+///
+/// Re-applying the pose rather than latching input off keeps the interactive
+/// path untouched, and it also undoes a stray `V` that would otherwise toggle
+/// flight off and drop the camera to the ground mid-capture.
+fn pin_automation_pose(automation: Res<AutomationSettings>, mut player: Query<&mut Player>) {
+    if !automation.has_camera {
+        return;
+    }
+    let Ok(mut player) = player.single_mut() else {
+        return;
+    };
+    apply_automation_pose(&mut player, &automation);
+}
+
 /// Applies the automation startup bits the C++ main does before the loop:
 /// the ground-level spawn height, the pinned pose for `--camera`, and the
 /// cursor state for unattended runs (DisableCursor in the normal case).
@@ -431,11 +499,7 @@ fn setup_cursor_and_player(
     }
     // Fly so gravity never fights a pinned pose; leave the cursor alone so
     // the capture window does not fight mouse input.
-    player.position = bevy::math::Vec3::from(automation.position);
-    player.yaw = automation.yaw;
-    player.pitch = automation.pitch;
-    player.flying = true;
-    player.mouse_captured = false;
+    apply_automation_pose(&mut player, &automation);
 }
 
 /// F1 toggles the diagnostics panel (releasing the pointer when it opens,
@@ -661,7 +725,9 @@ fn shot_scheduling_system(
     mut requested: ResMut<ShotRequested>,
     mut commands: Commands,
     time: Res<Time>,
+    players: Query<&Player>,
     mut window: Local<[f32; 4]>,
+    mut next_report: Local<u64>,
 ) {
     let Some(shot_path) = automation.shot_path.clone() else {
         return;
@@ -680,6 +746,22 @@ fn shot_scheduling_system(
             window[2] = window[0] / window[1];
             window[0] = 0.0;
             window[1] = 0.0;
+            // Also reported as it goes, not only at the capture. A single
+            // number at the end is the mean over a run whose first ninety
+            // seconds are spent streaming erosion tiles — six iterations of
+            // three compute passes a frame — and whose steady state is what
+            // the player actually lives in. One figure covering both is a
+            // figure that cannot be acted on, because the two want opposite
+            // fixes. The trace says which phase a cost belongs to.
+            if counter.0 >= *next_report {
+                *next_report = counter.0 + FRAME_REPORT_INTERVAL;
+                log::info!(
+                    "FRAME: {:.1} ms average ({:.0} fps) at frame {}",
+                    window[2] * 1000.0,
+                    1.0 / window[2],
+                    counter.0
+                );
+            }
         }
     }
     if requested.0 || counter.0 < automation.wait_frames as u64 {
@@ -689,6 +771,25 @@ fn shot_scheduling_system(
     }
     if window[2] > 0.0 {
         log::info!("FRAME: {:.1} ms average ({:.0} fps)", window[2] * 1000.0, 1.0 / window[2]);
+    }
+    // The pose the capture is actually taken from, recorded with it. Without
+    // `--camera` the player is not pinned: gravity integrates against `dt` and
+    // the ground clamp samples a height from an erosion cache that is still
+    // streaming in, so the settled pose differs from run to run — two captures
+    // of the same command can be pictures of two different places, and the
+    // frame times that come with them describe two different views. That is
+    // invisible unless the pose is written down. `--camera` is the fix; this
+    // line is how a capture proves it was pinned.
+    if let Ok(player) = players.single() {
+        log::info!(
+            "SHOT: pose {:.1},{:.1},{:.1} yaw {:.1} pitch {:.1} at frame {}",
+            player.position.x,
+            player.position.y,
+            player.position.z,
+            player.yaw.to_degrees(),
+            player.pitch.to_degrees(),
+            counter.0
+        );
     }
     requested.0 = true;
     // The observer outlives this system, so it owns the path rather than
