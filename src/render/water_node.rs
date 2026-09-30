@@ -606,7 +606,7 @@ fn build_stage_uniforms(
         if flat { 1.0 } else { 0.0 },
         amplitude,
         settings.wind_direction_degrees.to_radians(),
-        0.0,
+        rings::horizon_wave_fade_end(),
     ];
     block
 }

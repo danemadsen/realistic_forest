@@ -189,6 +189,15 @@ pub fn lod_scale(lod: usize) -> f32 {
     super::WATER_BASE_SCALE * (1u32 << lod) as f32
 }
 
+/// Camera distance at which waves must be completely flat. The horizon skirt
+/// starts at twice the outer tile scale, then stretches a single quad to the
+/// far horizon. Carrying a wave normal into that quad smears it over kilometres.
+/// Leave one snap step inside the skirt so it stays flat while the camera moves
+/// relative to the snapped ring centre (at most half a step on either axis).
+pub fn horizon_wave_fade_end() -> f32 {
+    2.0 * lod_scale(WATER_LOD_COUNT - 1) - super::WATER_SNAP
+}
+
 fn add_quad(indices: &mut Vec<u32>, column: u32, row: u32, columns: u32) {
     let lower_left = column + row * columns;
     let lower_right = lower_left + 1;
@@ -397,6 +406,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn horizon_triangles_start_beyond_the_wave_fade_for_every_camera_snap_offset() {
+        let lod = WATER_LOD_COUNT - 1;
+        let scale = lod_scale(lod);
+        let half_snap = super::super::WATER_SNAP * 0.5;
+        let mut skirt_triangles = 0;
+
+        for tile in tile_layout(lod) {
+            let mesh = build_patch(tile.patch);
+            let (sin_r, cos_r) = tile.rotation.sin_cos();
+            let positions: Vec<[f32; 2]> = mesh.positions.iter()
+                .map(|[x, z]| {
+                    [
+                        (x * cos_r - z * sin_r + tile.offset[0]) * scale,
+                        (x * sin_r + z * cos_r + tile.offset[1]) * scale,
+                    ]
+                })
+                .collect();
+            for triangle in mesh.indices.chunks_exact(3) {
+                let vertices: [[f32; 2]; 3] =
+                    std::array::from_fn(|i| positions[triangle[i] as usize]);
+                // Only the horizon skirt has edges longer than a whole tile.
+                if !(0..3).any(|i| {
+                    let a = vertices[i];
+                    let b = vertices[(i + 1) % 3];
+                    (a[0] - b[0]).hypot(a[1] - b[1]) > scale
+                }) {
+                    continue;
+                }
+                skirt_triangles += 1;
+                for [x, z] in vertices {
+                    // The closest point in the whole camera snap cell, covering
+                    // every offset rather than only its centre or corners.
+                    let camera_x = x.clamp(-half_snap, half_snap);
+                    let camera_z = z.clamp(-half_snap, half_snap);
+                    let distance = (x - camera_x).hypot(z - camera_z);
+                    assert!(
+                        distance >= horizon_wave_fade_end(),
+                        "tile {:?} has a horizon vertex at {distance} m inside \
+                         the wave fade for camera [{camera_x}, {camera_z}]",
+                        tile.offset,
+                    );
+                }
+            }
+        }
+        assert!(skirt_triangles > 0, "the test must exercise horizon geometry");
     }
 
     #[test]

@@ -106,7 +106,7 @@ pub struct WaterStageUniforms {
     pub sss_tint: [f32; 4],                            // 1424
     /// x refraction scale, y foam scale, z max wave amplitude, w reserved.
     pub misc: [f32; 4],                                // 1440
-    /// x flat-surface debug, y sea state amplitude, z wind radians, w reserved.
+    /// x flat-surface debug, y sea state amplitude, z wind radians, w wave fade end.
     pub flags: [f32; 4],                               // 1456
 }
 
@@ -141,7 +141,7 @@ impl Default for WaterStageUniforms {
             surface: [0.02, 5.0, -1.0, WATER_BASE_SCALE],
             sss_tint: [0.06, 0.55, 0.45, WATER_TILE_RESOLUTION as f32],
             misc: [0.5, 1.0, 1.0, 0.0],
-            flags: [0.0, 1.0, 0.0, 0.0],
+            flags: [0.0, 1.0, 0.0, rings::horizon_wave_fade_end()],
         }
     }
 }

@@ -92,7 +92,7 @@ struct WaterStageUniforms
     surface: vec4<f32>,       // x fresnel F0, y fresnel exponent, z sun roughness, w base scale
     sss_tint: vec4<f32>,      // rgb subsurface tint, w tile resolution
     misc: vec4<f32>,          // x refraction scale, y foam scale, z max amplitude, w unused
-    flags: vec4<f32>,         // x flat-surface debug, y sea state amplitude, z wind radians, w unused
+    flags: vec4<f32>,         // x flat-surface debug, y sea state amplitude, z wind radians, w wave fade end
 };
 @group(2) @binding(0) var<uniform> stage: WaterStageUniforms;
 
@@ -155,9 +155,9 @@ fn sampleFootprint(distance: f32, pixel_angle: f32) -> f32
     return max(max(distance*pixel_angle, mesh_bound), 0.02);
 }
 
-fn sampleSurface(world_xz: vec2<f32>, footprint: f32) -> SurfaceSample
+fn sampleSurface(world_xz: vec2<f32>, footprint: f32, wave_weight: f32) -> SurfaceSample
 {
-    if (stage.flags.x > 0.5)
+    if (stage.flags.x > 0.5 || wave_weight <= 0.0)
     {
         return SurfaceSample(vec3<f32>(world_xz.x, 0.0, world_xz.y),
                              vec3<f32>(0.0, 1.0, 0.0), 0.0, 1.0);
@@ -174,7 +174,7 @@ fn sampleSurface(world_xz: vec2<f32>, footprint: f32) -> SurfaceSample
     for (var index = 0u; index < WAVE_SLOTS; index += 1u)
     {
         let wave = stage.waves[index];
-        let attenuation = waveAttenuation(wave.wavelength, footprint);
+        let attenuation = waveAttenuation(wave.wavelength, footprint)*wave_weight;
         if (attenuation <= 0.0)
         {
             continue;
@@ -375,7 +375,13 @@ fn vs_main(
     let pixel_angle = 2.0/(globals.projection[1][1]*max(globals.viewport.y, 1.0));
     let distance = length(world_xz - globals.camera_position.xz);
 
-    let surface = sampleSurface(world_xz, sampleFootprint(distance, pixel_angle));
+    // The outer skirt spans kilometres in one quad. Its inner and outer
+    // vertices must both be flat: otherwise interpolation stretches the inner
+    // vertex's wave slope all the way to the horizon. Fade the whole spectrum
+    // across the last regular tiles, before the skirt starts. This distance is
+    // shared by all LODs and includes the ring centre's camera-snap allowance.
+    let wave_weight = 1.0 - smoothstepf(stage.flags.w*0.75, stage.flags.w, distance);
+    let surface = sampleSurface(world_xz, sampleFootprint(distance, pixel_angle), wave_weight);
     let world_position = vec3<f32>(surface.displaced.x,
                                    stage.params.z + surface.displaced.y,
                                    surface.displaced.z);

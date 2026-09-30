@@ -140,7 +140,10 @@ fn shapeElevation(macroIn: f32) -> f32
     var macroValue = macroIn;
     if (macroValue >= 0.0)
     {
-        macroValue += stage.waterline_clearance * tanh(macroValue/stage.waterline_clearance_scale)
+        // tanh is saturated to +/-1 at |x| = 10 in f32. Bound its input to
+        // avoid overflowing the GPU backend's exponential implementation.
+        macroValue += stage.waterline_clearance * tanh(clamp(
+                         macroValue/stage.waterline_clearance_scale, -10.0, 10.0))
                     * exp(-(macroValue*macroValue)
                           / (stage.waterline_clearance_decay*stage.waterline_clearance_decay));
         let t = macroValue/max(stage.land_profile_reference, 0.0001);
@@ -172,7 +175,10 @@ fn pushFromWaterline(height: f32) -> f32
     let scale = max(stage.waterline_push_scale, 0.0001);
     let push = select(stage.waterline_push_sea, stage.waterline_push_land,
                       height >= 0.0);
-    return height + push*tanh(height/scale);
+    // Unbounded tanh overflows on Metal at mountain elevations, producing
+    // NaN heights and normals. Saturation preserves the CPU profile while
+    // keeping the shader finite on summits and in deep ocean basins.
+    return height + push*tanh(clamp(height/scale, -10.0, 10.0));
 }
 
 fn baseHeight(p: vec2<f32>) -> f32

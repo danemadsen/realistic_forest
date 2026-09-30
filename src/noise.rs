@@ -260,3 +260,132 @@ pub fn run_probe(probe_extent: f32, probe_step: f32) {
         z += probe_step;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::tasks::block_on;
+    use wgpu::util::DeviceExt;
+
+    /// Run explicitly on a GPU: cargo test terrain_profiles_match_gpu -- --ignored
+    /// Shader validation alone cannot catch backend tanh overflow, which made
+    /// elevated vertices and deep seabeds non-finite on Metal.
+    #[test]
+    #[ignore = "requires a GPU adapter"]
+    fn terrain_profiles_match_gpu() {
+        let instance = wgpu::Instance::default();
+        let adapter = block_on(instance.request_adapter(&Default::default()))
+            .expect("GPU adapter required for terrain regression test");
+        let (device, queue) = block_on(adapter.request_device(&Default::default()))
+            .expect("create terrain regression device");
+
+        // Compile the production functions, with only the uniforms they read.
+        // Keep inputs in a buffer so the backend evaluates them at runtime.
+        let terrain = include_str!("../assets/shaders/terrain-vs.wgsl");
+        let start = terrain.find("fn shapeElevation(").unwrap();
+        let end = terrain.find("fn baseHeight(").unwrap();
+        let parameters = [
+            ("waterline_clearance", WATERLINE_CLEARANCE),
+            ("waterline_clearance_scale", WATERLINE_CLEARANCE_SCALE),
+            ("waterline_clearance_decay", WATERLINE_CLEARANCE_DECAY),
+            ("land_profile_curve", LAND_PROFILE_CURVE),
+            ("land_profile_reference", LAND_PROFILE_REFERENCE),
+            ("land_profile_peak", LAND_PROFILE_PEAK),
+            ("ocean_profile_curve", OCEAN_PROFILE_CURVE),
+            ("ocean_profile_reference", OCEAN_PROFILE_REFERENCE),
+            ("ocean_profile_depth", OCEAN_PROFILE_DEPTH),
+            ("waterline_push_land", WATERLINE_PUSH_LAND),
+            ("waterline_push_sea", WATERLINE_PUSH_SEA),
+            ("waterline_push_scale", WATERLINE_PUSH_SCALE),
+        ];
+        let fields = parameters.iter()
+            .map(|(name, _)| format!("{name}: f32,"))
+            .collect::<String>();
+        let source = format!(
+            "struct StageUniforms {{ {fields} }};
+             @group(0) @binding(0) var<uniform> stage: StageUniforms;
+             @group(0) @binding(1) var<storage, read_write> samples: array<vec4<f32>>;
+             {}
+             @compute @workgroup_size(1)
+             fn evaluate(@builtin(global_invocation_id) id: vec3<u32>) {{
+                 let height = samples[id.x].x;
+                 samples[id.x] = vec4<f32>(height, pushFromWaterline(height),
+                                          shapeElevation(height), 0.0);
+             }}",
+            &terrain[start..end],
+        );
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("terrain altitude regression"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("terrain altitude regression"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("evaluate"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let parameters: Vec<f32> = parameters.iter().map(|(_, value)| *value).collect();
+        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain profile parameters"),
+            contents: bytemuck::cast_slice(&parameters),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let heights = [
+            -1000.0, -500.0, -300.0, -180.0, -100.0, -90.0, -89.0, -88.0,
+            -50.0, -20.0, -2.0, -0.1, -0.001, 0.0, 0.001, 0.1, 2.0, 20.0,
+            50.0, 88.0, 89.0, 90.0, 100.0, 180.0, 300.0, 500.0, 1000.0,
+        ];
+        let samples: Vec<[f32; 4]> = heights.iter().map(|&h| [h, 0.0, 0.0, 0.0]).collect();
+        let output = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("terrain profile samples"),
+            contents: bytemuck::cast_slice(&samples),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("terrain profile readback"),
+            size: output.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("terrain altitude regression"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bindings, &[]);
+            pass.dispatch_workgroups(heights.len() as u32, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output.size());
+        queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        readback.map_async(wgpu::MapMode::Read, .., move |result| {
+            sender.send(result).unwrap();
+        });
+        device.poll(wgpu::PollType::Wait).unwrap();
+        receiver.recv().unwrap().unwrap();
+        let mapped = readback.get_mapped_range(..);
+        let samples: &[[f32; 4]] = bytemuck::cast_slice(&mapped);
+        for &[height, pushed, shaped, _] in samples {
+            for (profile, actual, expected) in [
+                ("pushFromWaterline", pushed, push_from_waterline(height)),
+                ("shapeElevation", shaped, shape_elevation(height)),
+            ] {
+                let tolerance = 2e-5 * expected.abs().max(1.0);
+                assert!(
+                    actual.is_finite() && (actual - expected).abs() <= tolerance,
+                    "{profile}({height}) on {:?}: GPU={actual}, CPU={expected}",
+                    adapter.get_info(),
+                );
+            }
+        }
+    }
+}
