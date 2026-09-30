@@ -9,6 +9,7 @@ pub mod terrain_node;
 pub mod water_node;
 
 use crate::constants::*;
+use crate::day_night::DayNightCycle;
 use crate::erosion::{ErosionBridge, ErosionCache};
 use crate::noise::NoiseField;
 use crate::player::{Player, PlayerCamera};
@@ -41,6 +42,7 @@ pub struct ExtractedForestView {
     pub physical_width: u32,
     pub physical_height: u32,
     pub settings: AppSettings,
+    pub day_night: DayNightCycle,
     pub draw_ocean: bool,
     pub lookup_minimum: (i64, i64),
     pub frame: u64,
@@ -52,7 +54,7 @@ pub struct ExtractedForestView {
 // silently drift.
 // ---------------------------------------------------------------------------
 
-/// The shared `GlobalUniforms` preamble (group 0, binding 0), 224 bytes.
+/// The shared `GlobalUniforms` preamble (group 0, binding 0), 304 bytes.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GlobalUniformsGpu {
@@ -64,8 +66,13 @@ pub struct GlobalUniformsGpu {
     pub params: [f32; 4],
     pub settings_a: [f32; 4],
     pub settings_b: [f32; 4],
+    pub sun_colour: [f32; 4],
+    pub moon_direction: [f32; 4],
+    pub atmosphere: [f32; 4],
+    pub raymarch: [f32; 4],
+    pub heightfield: [f32; 4],
 }
-const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 224);
+const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 304);
 
 /// terrain-vs + terrain-fs share one canonical StageUniforms layout
 /// (272 bytes); the WGSL files are reconciled to this exact field order.
@@ -278,11 +285,6 @@ pub struct ErosionTerrainStageUniforms {
 }
 const _: () = assert!(std::mem::size_of::<ErosionTerrainStageUniforms>() == 64);
 
-pub fn normalize3([x, y, z]: [f32; 3]) -> [f32; 4] {
-    let length = (x * x + y * y + z * z).sqrt();
-    [x / length, y / length, z / length, 0.0]
-}
-
 /// The group(0) bind group layout every pass shares: one uniform buffer.
 pub fn globals_layout(device: &RenderDevice) -> BindGroupLayout {
     device.create_bind_group_layout(
@@ -487,6 +489,7 @@ fn extract_forest_view(
     }
 
     view.settings = *world.resource::<AppSettings>();
+    view.day_night = *world.resource::<DayNightCycle>();
     view.draw_ocean = world.resource::<WorldOptions>().draw_ocean;
     let cache = world.resource::<ErosionCache>();
     view.lookup_minimum = (cache.lookup_minimum.x, cache.lookup_minimum.z);
@@ -526,12 +529,17 @@ pub fn prepare_forest_globals(
     };
     let camera = PlayerCamera::from_player(&player);
     let view_matrix = crate::matrices::view_matrix(camera.position, camera.target, camera.up);
-    let sun = normalize3(SUN_DIRECTION_WORLD);
+    let lighting = crate::day_night::sample(view.day_night.time_hours);
+    let heightfield_texel = terrain_node::LIGHTING_HEIGHTFIELD_SPAN
+        / terrain_node::LIGHTING_HEIGHTFIELD_SIZE as f32;
+    // Move by whole texels so the world-space sampling lattice stays fixed
+    // while travelling, avoiding shadow changes from a fractional grid shift.
+    let heightfield_snap = heightfield_texel * 8.0;
     globals.globals = GlobalUniformsGpu {
         view: view_matrix,
         projection,
         camera_position: [view.player_position[0], view.player_position[1], view.player_position[2], 0.0],
-        sun_direction: sun,
+        sun_direction: lighting.sun_direction,
         viewport: [width, height, 1.0 / width, 1.0 / height],
         params: [
             view.settings.fog_density,
@@ -540,7 +548,7 @@ pub fn prepare_forest_globals(
             view.settings.ssao_enabled as u32 as f32,
         ],
         settings_a: [
-            view.settings.sun_intensity,
+            view.settings.sun_intensity * lighting.sun_strength,
             view.settings.texture_scale,
             view.settings.ao_tex_strength,
             view.settings.variant_scale,
@@ -550,6 +558,28 @@ pub fn prepare_forest_globals(
             view.settings.sparkle_strength,
             view.settings.flow_debug as u32 as f32,
             view.settings.erosion_debug as u32 as f32,
+        ],
+        // The solar disc remains visible at the horizon even after ground
+        // irradiance fades out; w keeps the user's unattenuated source power.
+        sun_colour: [lighting.sun_colour[0], lighting.sun_colour[1], lighting.sun_colour[2], view.settings.sun_intensity],
+        moon_direction: lighting.moon_direction,
+        atmosphere: [
+            lighting.daylight,
+            lighting.moon_intensity,
+            view.day_night.time_hours,
+            view.settings.volumetric_strength,
+        ],
+        raymarch: [
+            view.settings.raymarched_shadows as u32 as f32,
+            view.settings.volumetric_lighting as u32 as f32,
+            view.settings.water_reflections as u32 as f32,
+            view.settings.raymarch_quality.min(2) as f32,
+        ],
+        heightfield: [
+            (view.player_position[0] / heightfield_snap).floor() * heightfield_snap,
+            (view.player_position[2] / heightfield_snap).floor() * heightfield_snap,
+            terrain_node::LIGHTING_HEIGHTFIELD_SPAN,
+            heightfield_texel,
         ],
     };
     if globals.buffer.is_none() {
@@ -574,4 +604,70 @@ pub fn globals_bind_group_entries(buffer: &wgpu::Buffer) -> [BindGroupEntry<'_>;
         binding: 0,
         resource: buffer.as_entire_binding(),
     }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GlobalUniformsGpu;
+
+    #[test]
+    fn water_and_visible_sky_share_the_same_atmosphere() {
+        let common = include_str!("../../assets/shaders/atmosphere-functions.wgslinc").trim();
+        for source in [
+            include_str!("../../assets/shaders/composite.wgsl"),
+            include_str!("../../assets/shaders/water-surface.wgsl"),
+            include_str!("../../assets/shaders/water-underwater.wgsl"),
+        ] {
+            assert!(source.contains(common), "visible and reflected sky helpers diverged");
+        }
+    }
+
+    /// A stale layout in even an unrelated pass can reinterpret daylight as
+    /// a matrix or bind too small a uniform range. Check the actual WGSL ABI
+    /// against Rust, including offsets, rather than just matching byte sizes.
+    #[test]
+    fn every_shader_uses_the_same_global_uniform_layout() {
+        let expected = [
+            ("view", std::mem::offset_of!(GlobalUniformsGpu, view)),
+            ("projection", std::mem::offset_of!(GlobalUniformsGpu, projection)),
+            ("camera_position", std::mem::offset_of!(GlobalUniformsGpu, camera_position)),
+            ("sun_direction", std::mem::offset_of!(GlobalUniformsGpu, sun_direction)),
+            ("viewport", std::mem::offset_of!(GlobalUniformsGpu, viewport)),
+            ("params", std::mem::offset_of!(GlobalUniformsGpu, params)),
+            ("settings_a", std::mem::offset_of!(GlobalUniformsGpu, settings_a)),
+            ("settings_b", std::mem::offset_of!(GlobalUniformsGpu, settings_b)),
+            ("sun_colour", std::mem::offset_of!(GlobalUniformsGpu, sun_colour)),
+            ("moon_direction", std::mem::offset_of!(GlobalUniformsGpu, moon_direction)),
+            ("atmosphere", std::mem::offset_of!(GlobalUniformsGpu, atmosphere)),
+            ("raymarch", std::mem::offset_of!(GlobalUniformsGpu, raymarch)),
+            ("heightfield", std::mem::offset_of!(GlobalUniformsGpu, heightfield)),
+        ];
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|v| v.to_str()) != Some("wgsl") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            let module = naga::front::wgsl::parse_str(&source)
+                .unwrap_or_else(|error| panic!("{}: {}", path.display(), error.emit_to_string(&source)));
+            for (_, ty) in module.types.iter() {
+                if ty.name.as_deref() != Some("GlobalUniforms") {
+                    continue;
+                }
+                let naga::TypeInner::Struct { members, span } = &ty.inner else {
+                    panic!("GlobalUniforms must be a struct");
+                };
+                assert_eq!(*span as usize, std::mem::size_of::<GlobalUniformsGpu>(), "{}", path.display());
+                assert_eq!(members.len(), expected.len(), "{}", path.display());
+                for (member, (name, offset)) in members.iter().zip(expected) {
+                    assert_eq!(member.name.as_deref(), Some(name), "{}", path.display());
+                    assert_eq!(member.offset as usize, offset, "{}: {name}", path.display());
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 10, "expected the complete render pipeline");
+    }
 }

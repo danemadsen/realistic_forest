@@ -80,6 +80,11 @@ struct GlobalUniforms {
     params: vec4<f32>,            // x fog_density, y z_far, z exposure, w ssao_enabled (1=on, 0=off)
     settings_a: vec4<f32>,        // x sun_intensity, y texture_scale, z ao_tex_strength, w variant_scale
     settings_b: vec4<f32>,        // x normal_strength, y sparkle_strength, z flow_debug(1/0), w erosion_debug(1/0)
+    sun_colour: vec4<f32>,       // RGB solar tint, w unattenuated sun intensity
+    moon_direction: vec4<f32>,   // xyz direction moonlight travels
+    atmosphere: vec4<f32>,       // daylight, moon intensity, hours, volumetric strength
+    raymarch: vec4<f32>,         // shadows, volumetrics, reflections, quality (0/1/2)
+    heightfield: vec4<f32>,      // world centre XZ, world span, texel size in metres
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 

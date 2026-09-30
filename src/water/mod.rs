@@ -124,7 +124,7 @@ pub struct UnderwaterUniforms {
     pub extinction: [f32; 4],
     /// rgb scatter tint, w asymmetry.
     pub scatter: [f32; 4],
-    /// rgb sun radiance reaching the surface, w reserved.
+    /// rgb sun radiance reaching the surface, w moon radiance scale.
     pub sun: [f32; 4],
 }
 

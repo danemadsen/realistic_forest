@@ -1,8 +1,14 @@
 //! Command-line automation, ported from the C++ `AutomationSettings` and
 //! `ParseAutomation`.
+//!
+//! `--time-of-day H` selects a celestial pose; `--day-length MIN` sets real
+//! minutes per full day. `--pause-time` freezes it, and screenshot runs freeze
+//! it automatically unless `--advance-time` is supplied. `--no-raymarch` turns
+//! off terrain shadows, volume integration and water reflection tracing;
+//! `--raymarch-quality low|balanced|high` selects their sampling budget.
 
-use bevy::prelude::Resource;
 use crate::erosion::TileKey;
+use bevy::prelude::Resource;
 
 /// `--camera x,y,z,yawDeg,pitchDeg` pins the player at a world pose (useful
 /// for reproducible before/after comparisons); `--shot path` saves a window
@@ -36,6 +42,11 @@ pub struct AutomationSettings {
     pub lattice: bool,
     pub no_fog: bool,
     pub no_water: bool,
+    pub time_of_day: f32,
+    pub day_length_minutes: f32,
+    pub pause_time: bool,
+    pub no_raymarch: bool,
+    pub raymarch_quality: u32,
     pub overlap_tile: TileKey,
 }
 
@@ -57,6 +68,11 @@ impl Default for AutomationSettings {
             lattice: false,
             no_fog: false,
             no_water: false,
+            time_of_day: 10.0,
+            day_length_minutes: 24.0,
+            pause_time: false,
+            no_raymarch: false,
+            raymarch_quality: 1,
             overlap_tile: TileKey { x: 0, z: 0 },
         }
     }
@@ -82,6 +98,7 @@ fn parse_ints(argument: &str, expected: usize) -> Option<Vec<i64>> {
 pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSettings {
     let arguments: Vec<String> = arguments.collect();
     let mut automation = AutomationSettings::default();
+    let mut advance_capture_time = false;
     let mut index = 0;
     while index < arguments.len() {
         let flag = arguments[index].as_str();
@@ -132,6 +149,57 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--lattice" => automation.lattice = true,
             "--no-fog" => automation.no_fog = true,
             "--no-water" => automation.no_water = true,
+            "--pause-time" => automation.pause_time = true,
+            "--advance-time" => advance_capture_time = true,
+            "--no-raymarch" => automation.no_raymarch = true,
+            "--time-of-day" | "--day-length" => {
+                let parsed = next
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .filter(|value| value.is_finite())
+                    .filter(|value| {
+                        if flag == "--time-of-day" {
+                            (0.0..24.0).contains(value)
+                        } else {
+                            *value > 0.0
+                        }
+                    });
+                if let Some(value) = parsed {
+                    if flag == "--time-of-day" {
+                        automation.time_of_day = value;
+                    } else {
+                        automation.day_length_minutes = value;
+                    }
+                    index += 1;
+                } else {
+                    let expected = if flag == "--time-of-day" {
+                        "an hour in [0, 24)"
+                    } else {
+                        "positive real minutes per day"
+                    };
+                    eprintln!("WARNING: {flag} expects {expected}; keeping the previous value");
+                    // Keep a following flag available to the parser.
+                    if next.is_some_and(|value| !value.starts_with("--")) {
+                        index += 1;
+                    }
+                }
+            }
+            "--raymarch-quality" => {
+                let quality = next.and_then(|value| match value.as_str() {
+                    "low" | "0" => Some(0),
+                    "balanced" | "1" => Some(1),
+                    "high" | "2" => Some(2),
+                    _ => None,
+                });
+                if let Some(quality) = quality {
+                    automation.raymarch_quality = quality;
+                    index += 1;
+                } else {
+                    eprintln!("WARNING: --raymarch-quality expects low, balanced or high");
+                    if next.is_some_and(|value| !value.starts_with("--")) {
+                        index += 1;
+                    }
+                }
+            }
             "--probe-extent" => {
                 if let Some(next) = next {
                     index += 1;
@@ -179,5 +247,68 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
         }
         index += 1;
     }
+    // Screenshot warm-up duration depends on GPU speed. Hold the celestial
+    // pose fixed so the selected lighting is reproducible across machines.
+    if automation.shot_path.is_some() && !advance_capture_time {
+        automation.pause_time = true;
+    }
     automation
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(arguments: &[&str]) -> AutomationSettings {
+        parse_automation(arguments.iter().map(|value| (*value).to_string()))
+    }
+
+    #[test]
+    fn lighting_arguments_override_defaults() {
+        let settings = parse(&[
+            "--time-of-day",
+            "18.5",
+            "--day-length",
+            "3",
+            "--pause-time",
+            "--no-raymarch",
+            "--raymarch-quality",
+            "high",
+        ]);
+        assert_eq!(settings.time_of_day, 18.5);
+        assert_eq!(settings.day_length_minutes, 3.0);
+        assert!(settings.pause_time && settings.no_raymarch);
+        assert_eq!(settings.raymarch_quality, 2);
+    }
+
+    #[test]
+    fn invalid_lighting_values_preserve_defaults_and_following_flags() {
+        for invalid in ["NaN", "inf", "-1", "24", "bad"] {
+            let settings = parse(&["--time-of-day", invalid, "--pause-time"]);
+            assert_eq!(settings.time_of_day, 10.0);
+            assert!(settings.pause_time);
+        }
+        for invalid in ["NaN", "inf", "-1", "0", "bad"] {
+            let settings = parse(&["--day-length", invalid]);
+            assert_eq!(settings.day_length_minutes, 24.0);
+        }
+        let settings = parse(&[
+            "--time-of-day",
+            "--pause-time",
+            "--raymarch-quality",
+            "ultra",
+        ]);
+        assert_eq!(settings.time_of_day, 10.0);
+        assert_eq!(settings.raymarch_quality, 1);
+        assert!(settings.pause_time);
+        assert_eq!(parse(&["--day-length"]).day_length_minutes, 24.0);
+    }
+
+    #[test]
+    fn captures_freeze_time_unless_explicitly_advanced() {
+        assert!(!parse(&[]).pause_time);
+        assert!(parse(&["--shot", "test.png"]).pause_time);
+        assert!(!parse(&["--shot", "test.png", "--advance-time"]).pause_time);
+        assert!(parse(&["--shot", "test.png", "--advance-time", "--pause-time"]).pause_time);
+    }
 }

@@ -31,30 +31,14 @@
 //   boundaries through the water, and it cannot tell a calm shallow flat from
 //   surf — which is exactly the mistake it made here. Foam is a property of the
 //   surface's own compression instead, and needs no depth at all.
-// - The reflected sky is this renderer's own skyColour() gradient, and the
-//   fog/tonemap match composite.wgsl so water dissolves into the same haze as
-//   the terrain behind it. Aqua uses an environment cubemap and an HDR target.
-//   Two conventions have to be matched for that to be true rather than
-//   approximate. The first is the gradient's *value*: it is display-encoded,
-//   which the composite decodes with `pow(sky, 2.2)` before lighting, and
-//   `skyLinear` below applies the same decode.
-//   The second is its *parameter*, which used to be deliberately mismatched
-//   and now is not. composite.wgsl once indexed the gradient by screen row —
-//   `skyColour(uv.x, 1 - uv.y)` — which puts the zenith at the top of the
-//   frame whatever the camera pitch and makes the horizon band unreachable.
-//   Neither pass can use that: for the reflection the reflected ray leaves the
-//   water pointing up, its screen projection clamps, and every water pixel
-//   pinned to the zenith end of the ramp; for the drawn sky a camera pitched
-//   down never shows the pale band at all. Both now index by the ray's own
-//   elevation through `skyParameter`, the same function with the same 0.85
-//   edge, so a water pixel mirrors exactly the sky the composite would have
-//   painted in that direction.
+// - Visible terrain reflections are raymarched against the view-position
+//   buffer. Offscreen and disoccluded rays fade to the same analytic sky the
+//   composite draws. Scene taps are gamma-decoded and inverse-ACES transformed
+//   before mixing with linear radiance; clipped highlights cannot be recovered.
 //
 // WGSL CONSTRAINT: `textureSample` uses implicit derivatives and is illegal in
-// non-uniform control flow, and this shader branches on sampled data (the
-// G-buffer depth test). Every texture read is therefore taken unconditionally
-// up front and the branches only select between values already fetched — the
-// same hoisting composite.wgsl documents.
+// non-uniform control flow. Refraction samples and wave derivatives are taken
+// before discard; raymarching uses textureLoad or textureSampleLevel explicitly.
 
 struct GlobalUniforms
 {
@@ -66,6 +50,11 @@ struct GlobalUniforms
     params: vec4<f32>,            // x fog_density, y z_far, z exposure, w ssao_enabled
     settings_a: vec4<f32>,        // x sun_intensity, y texture_scale, z ao_tex_strength, w variant_scale
     settings_b: vec4<f32>,        // x normal_strength, y sparkle_strength, z flow_debug, w erosion_debug
+    sun_colour: vec4<f32>,      // linear sunlight tint
+    moon_direction: vec4<f32>,  // direction moonlight travels
+    atmosphere: vec4<f32>,      // daylight, moon intensity, hours, volume strength
+    raymarch: vec4<f32>,        // shadows, volumes, reflections, quality
+    heightfield: vec4<f32>,     // world centre XZ, span, texel size
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
@@ -103,6 +92,8 @@ struct WaterStageUniforms
 @group(1) @binding(8) var scene_sampler: sampler;
 @group(1) @binding(1) var gbuffer_position: texture_2d<f32>;
 @group(1) @binding(9) var gbuffer_sampler: sampler;
+@group(1) @binding(2) var terrain_heightfield: texture_2d<f32>;
+@group(1) @binding(10) var terrain_heightfield_sampler: sampler;
 
 const PI: f32 = 3.141592653589793;
 const PATH_LENGTH_MAX: f32 = 256.0;
@@ -238,48 +229,180 @@ fn sampleSurface(world_xz: vec2<f32>, mesh_footprint: f32,
 // Sky and tone, matching composite.wgsl so water and terrain share one haze
 // ---------------------------------------------------------------------------
 
-/// The gradient itself, as a function of its own parameter: 0 at the horizon,
-/// 1 at the zenith. Byte-for-byte the copy composite.wgsl draws with.
-fn skyColour(parameter: f32) -> vec3<f32>
-{
-    let horizon = vec3<f32>(0.72, 0.82, 0.90);
-    let zenith = vec3<f32>(0.22, 0.46, 0.74);
-    return mix(horizon, zenith, parameter);
+// Shared linear atmosphere model. Kept byte-for-byte in the composite and
+// water passes so reflected skies and the visible horizon agree.
+fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
+    let ray = normalize(direction);
+    let to_sun = -normalize(globals.sun_direction.xyz);
+    let to_moon = -normalize(globals.moon_direction.xyz);
+    let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    let elevation = smoothstep(0.0, 0.85, ray.y);
+    let day_sky = mix(vec3<f32>(0.49, 0.64, 0.82),
+                      vec3<f32>(0.045, 0.175, 0.43), elevation);
+    let night_sky = mix(vec3<f32>(0.008, 0.013, 0.027),
+                        vec3<f32>(0.0014, 0.0025, 0.008), elevation);
+    var sky = mix(night_sky, day_sky, daylight);
+    let sunset = exp(-pow((to_sun.y + 0.025)/0.17, 2.0));
+    let horizon = exp(-abs(ray.y)*6.0);
+    let sunward = pow(max(dot(normalize(vec3<f32>(ray.x, 0.001, ray.z)),
+                              normalize(vec3<f32>(to_sun.x, 0.001, to_sun.z))), 0.0), 5.0);
+    sky += vec3<f32>(0.65, 0.16, 0.025)*sunset*horizon*(0.15 + 0.85*sunward);
+
+    let sun_mu = clamp(dot(ray, to_sun), -1.0, 1.0);
+    let sun_visible = smoothstep(-0.018, 0.012, to_sun.y);
+    let sun_disk = smoothstep(0.9999832, 0.9999905, sun_mu);
+    let sun_halo = exp(-(1.0 - sun_mu)*750.0)*0.10
+                   + pow(max(sun_mu, 0.0), 24.0)*0.035;
+    // Direct ground irradiance fades before the visible solar disc sets.
+    sky += globals.sun_colour.rgb*sun_visible
+           *(sun_disk*14.0*globals.sun_colour.w + sun_halo*globals.settings_a.x);
+
+    let moon_mu = clamp(dot(ray, to_moon), -1.0, 1.0);
+    let moon_disk = smoothstep(0.999978, 0.999986, moon_mu);
+    let moon_visible = smoothstep(-0.02, 0.03, to_moon.y)*(1.0 - daylight*0.9);
+    sky += vec3<f32>(0.63, 0.74, 1.0)*moon_visible
+           *(moon_disk*1.6 + exp(-(1.0 - moon_mu)*500.0)*0.025);
+
+    // Stars occupy a world-oriented angular grid and remain stationary when
+    // the camera rotates. Smooth small discs avoid binary sparkling.
+    let star_uv = vec2<f32>(atan2(ray.z, ray.x), asin(clamp(ray.y, -1.0, 1.0)))*360.0;
+    let star_cell = floor(star_uv);
+    let star_hash = fract(sin(dot(star_cell, vec2<f32>(127.1, 311.7)))*43758.5453);
+    let star_local = fract(star_uv) - vec2<f32>(0.5);
+    let star_disc = 1.0 - smoothstep(0.035, 0.18, length(star_local));
+    let star = step(0.997, star_hash)*star_disc*(0.25 + 0.75*star_hash);
+    sky += vec3<f32>(0.6, 0.73, 1.0)*star*pow(1.0 - daylight, 4.0)
+           *smoothstep(-0.03, 0.18, ray.y)*0.7;
+    return max(sky, vec3<f32>(0.0));
 }
 
-/// Sky gradient parameter for a ray whose sine of elevation is `direction_y`,
-/// matching composite.wgsl's.
-///
-/// The 0.85 edge is the one this shader's reflection has always been authored
-/// against; the sky now uses it as well, so the gradient a water pixel mirrors
-/// and the gradient the sky pass paints are the same function of elevation and
-/// agree at every angle, not only where both clamp to the horizon.
-fn skyParameter(direction_y: f32) -> f32
-{
-    return smoothstepf(0.0, 0.85, direction_y);
+// Hemisphere-integrated fill depends on the surface orientation and time of
+// day, never its screen row or camera pitch. Excludes the celestial discs.
+fn skyAmbient(normal_world: vec3<f32>) -> vec3<f32> {
+    let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    let upward = clamp(normal_world.y*0.5 + 0.5, 0.0, 1.0);
+    let day_fill = mix(vec3<f32>(0.13, 0.17, 0.22),
+                       vec3<f32>(0.32, 0.44, 0.62), upward);
+    let night_fill = mix(vec3<f32>(0.007, 0.011, 0.022),
+                         vec3<f32>(0.019, 0.029, 0.058), upward);
+    return mix(night_fill, day_fill, daylight);
 }
 
-/// `skyColour` in the linear space the rest of this shader lights in.
-///
-/// composite.wgsl authoring is display-referred: it decodes the gradient with
-/// `pow(sky, 2.2)` before lighting. Multiplying by exposure and running ACES +
-/// the gamma encode at the end then reproduces the sky pixel exactly, so a
-/// fogged or fully reflective water fragment lands on the same value as the sky
-/// behind it instead of banding at the horizon.
-fn skyLinear(parameter: f32) -> vec3<f32>
-{
-    return pow(max(skyColour(parameter), vec3<f32>(0.0)), vec3<f32>(2.2));
+// BEGIN SHARED TERRAIN SHADOWS
+// The map follows the camera, includes off-screen terrain, and contains the
+// same procedural + erosion height used by the terrain vertex shader.
+fn terrainHeightAt(world_xz: vec2<f32>) -> f32 {
+    let uv = (world_xz - globals.heightfield.xy)/globals.heightfield.z + vec2<f32>(0.5);
+    return textureSampleLevel(terrain_heightfield, terrain_heightfield_sampler, uv, 0.0).r;
+}
+fn terrainMapWeight(world_xz: vec2<f32>) -> f32 {
+    let uv = (world_xz - globals.heightfield.xy)/globals.heightfield.z + vec2<f32>(0.5);
+    let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
+    return smoothstep(0.0, 0.06, edge);
+}
+fn terrainShadow(world_position: vec3<f32>, normal_world: vec3<f32>, to_light: vec3<f32>) -> f32 {
+    if (globals.raymarch.x < 0.5 || globals.heightfield.z < 1.0) { return 1.0; }
+    if (to_light.y < -0.025) { return 0.0; }
+    // The map has metre-scale texels. Lift the origin above the local map
+    // mismatch and bias grazing slopes to avoid dark checkerboard acne.
+    let texel = globals.heightfield.w;
+    let bias = 1.5 + texel*(0.12 + 0.25*(1.0 - abs(normal_world.y)));
+    let local_height = terrainHeightAt(world_position.xz);
+    let lift = max(local_height - world_position.y, 0.0) + bias;
+    let origin = world_position + vec3<f32>(0.0, lift, 0.0);
+    let quality = clamp(globals.raymarch.w, 0.0, 2.0);
+    let count = 20u + u32(quality)*12u;
+    var visibility = 1.0;
+    for (var i = 0u; i < 44u; i += 1u) {
+        if (i >= count) { break; }
+        let f = (f32(i) + 1.0)/f32(count);
+        let distance = texel*1.2 + f*f*4800.0;
+        let sample_position = origin + to_light*distance;
+        let edge_weight = terrainMapWeight(sample_position.xz);
+        if (edge_weight <= 0.0) { break; }
+        let clearance = sample_position.y - terrainHeightAt(sample_position.xz);
+        // A finite solar disc makes the penumbra widen with occluder range.
+        let penumbra = max(1.2, distance*0.0047);
+        let sample_visibility = smoothstep(-penumbra, penumbra, clearance);
+        visibility = min(visibility, mix(1.0, sample_visibility, edge_weight));
+        if (visibility < 0.015) { break; }
+    }
+    return mix(1.0, visibility, terrainMapWeight(world_position.xz));
+}
+// END SHARED TERRAIN SHADOWS
+
+// Match the composite's atmosphere to the actual water depth. Water is drawn
+// after the half-resolution atmosphere target, whose depth is terrain/sky;
+// using that target would integrate fog behind the water. This smaller march
+// uses the same density, phase, shadow taps and source radiance at surface depth.
+// Volumes need fewer samples per light ray than visible surfaces. All taps
+// use explicit LOD because the ray loops have nonuniform termination.
+fn volumeLightVisibility(world_position: vec3<f32>, to_light: vec3<f32>) -> f32 {
+    if (globals.raymarch.x < 0.5 || globals.heightfield.z < 1.0) { return 1.0; }
+    if (to_light.y < -0.025) { return 0.0; }
+    var visibility = 1.0;
+    let count = 6u + u32(clamp(globals.raymarch.w, 0.0, 2.0))*2u;
+    for (var i = 0u; i < 10u; i += 1u) {
+        if (i >= count) { break; }
+        let f = (f32(i) + 0.4)/f32(count);
+        let sample_position = world_position + to_light*(16.0 + f*f*3600.0);
+        let edge_weight = terrainMapWeight(sample_position.xz);
+        if (edge_weight <= 0.0) { break; }
+        let clearance = sample_position.y - terrainHeightAt(sample_position.xz);
+        visibility = min(visibility, mix(1.0, smoothstep(-5.0, 5.0, clearance), edge_weight));
+        if (visibility < 0.02) { break; }
+    }
+    return visibility;
 }
 
-/// Elevation sine of the representative sky that lights the foam.
-///
-/// Foam is neither a mirror nor a view direction: it is a diffuse surface lit
-/// by the sky over the water, so it wants ONE colour rather than a ray, and it
-/// stays a constant under the elevation parameterisation. `0.85 * 0.75` is the
-/// old screen-row value carried across — under a ramp of
-/// `smoothstep(0, 1, x)` a value `x` and the elevation sine `0.85x` land on the
-/// same gradient parameter — so the foam is lit exactly as it was before.
-const FOAM_SKY_ELEVATION: f32 = 0.85 * 0.75;
+struct FogResult { scattering: vec3<f32>, transmittance: f32 };
+fn integrateAtmosphere(ray: vec3<f32>, distance_to_surface: f32) -> FogResult {
+    var result: FogResult;
+    result.scattering = vec3<f32>(0.0);
+    result.transmittance = 1.0;
+    let density = max(globals.params.x, 0.0);
+    if (density <= 0.0) { return result; }
+    let ray_length = min(distance_to_surface, 10000.0);
+    let ambient = mix(vec3<f32>(0.012, 0.019, 0.037),
+                      vec3<f32>(0.32, 0.44, 0.59), clamp(globals.atmosphere.x, 0.0, 1.0));
+    if (globals.raymarch.y < 0.5) {
+        result.transmittance = exp(-density*ray_length);
+        result.scattering = ambient*(1.0 - result.transmittance);
+        return result;
+    }
+    let quality = clamp(globals.raymarch.w, 0.0, 2.0);
+    let count = select(select(8u, 12u, quality >= 1.0), 16u, quality >= 2.0);
+    let to_sun = -normalize(globals.sun_direction.xyz);
+    let to_moon = -normalize(globals.moon_direction.xyz);
+    let sun_scatter = globals.sun_colour.rgb*globals.settings_a.x
+                      *henyeyGreenstein(dot(ray, to_sun), 0.68);
+    let moon_scatter = vec3<f32>(0.52, 0.65, 1.0)*globals.atmosphere.y
+                       *henyeyGreenstein(dot(ray, to_moon), 0.45);
+    let strength = max(globals.atmosphere.w, 0.0);
+    // Quadratic view steps keep close shafts detailed while reaching the
+    // distant landscape. Beer-Lambert accumulation conserves transmittance.
+    for (var i = 0u; i < 16u; i += 1u) {
+        if (i >= count) { break; }
+        let a = f32(i)/f32(count);
+        let b = (f32(i) + 1.0)/f32(count);
+        let start = a*a*ray_length;
+        let end = b*b*ray_length;
+        let midpoint = (start + end)*0.5;
+        let world_position = globals.camera_position.xyz + ray*midpoint;
+        let height_density = exp(-max(world_position.y - 20.0, 0.0)/450.0);
+        let extinction = density*(0.16 + 0.84*height_density);
+        let step_transmittance = exp(-extinction*(end - start));
+        var sunlight_visibility = 1.0;
+        if (globals.settings_a.x > 0.01 && strength > 0.0) {
+            sunlight_visibility = volumeLightVisibility(world_position, to_sun);
+        }
+        let lighting = ambient + (sun_scatter*sunlight_visibility + moon_scatter)*strength;
+        result.scattering += result.transmittance*(1.0 - step_transmittance)*lighting;
+        result.transmittance *= step_transmittance;
+        if (result.transmittance < 0.01) { break; }
+    }
+    return result;
+}
 
 fn acesFilm(x: vec3<f32>) -> vec3<f32>
 {
@@ -289,6 +412,128 @@ fn acesFilm(x: vec3<f32>) -> vec3<f32>
     const d: f32 = 0.59;
     const e: f32 = 0.14;
     return clamp((x*(a*x + b))/(x*(c*x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// The composite has already applied exposure, ACES and gamma. Undo all three
+// for both transmitted scene colours and reflected terrain, so neither is
+// tone-mapped twice. Saturated pixels recover a finite radiance estimate.
+fn sceneRadiance(encoded: vec3<f32>) -> vec3<f32>
+{
+    let y = clamp(pow(max(encoded, vec3<f32>(0.0)), vec3<f32>(2.2)),
+                  vec3<f32>(0.0), vec3<f32>(0.999));
+    let a = 2.51 - 2.43*y;
+    let b = 0.03 - 0.59*y;
+    let linear = (-b + sqrt(max(b*b + 0.56*a*y, vec3<f32>(0.0))))/(2.0*a);
+    return linear/max(globals.params.z, 0.001);
+}
+
+fn projectView(position: vec3<f32>) -> vec2<f32>
+{
+    let clip = globals.projection*vec4<f32>(position, 1.0);
+    let ndc = clip.xy/max(clip.w, 0.001);
+    return vec2<f32>(ndc.x*0.5 + 0.5, 0.5 - ndc.y*0.5);
+}
+
+fn reflectionDepth(uv: vec2<f32>) -> vec4<f32>
+{
+    let size = vec2<i32>(textureDimensions(gbuffer_position));
+    return textureLoad(gbuffer_position, clamp(vec2<i32>(uv*vec2<f32>(size)),
+                        vec2<i32>(0), size - vec2<i32>(1)), 0);
+}
+
+// RGB is incident radiance and A confidence. A miss never stretches an edge
+// texel across the sea: it leaves the analytic sky visible instead. Exponential
+// world-distance steps retain nearby detail while reaching distant headlands.
+fn marchWaterReflection(world_origin: vec3<f32>, world_normal: vec3<f32>,
+                         direction: vec3<f32>, roughness: f32) -> vec4<f32>
+{
+    if (globals.raymarch.z < 0.5)
+    {
+        return vec4<f32>(0.0);
+    }
+    let origin = (globals.view*vec4<f32>(world_origin + world_normal*0.12, 1.0)).xyz;
+    let ray = normalize((globals.view*vec4<f32>(direction, 0.0)).xyz);
+    var max_distance = min(globals.params.y*0.75, 2200.0);
+    if (ray.z > 0.0)
+    {
+        max_distance = min(max_distance, (-0.15 - origin.z)/ray.z);
+    }
+    if (max_distance <= 0.75 || origin.z > -0.1)
+    {
+        return vec4<f32>(0.0);
+    }
+
+    let quality = u32(clamp(globals.raymarch.w, 0.0, 2.0));
+    var steps = 24u;
+    if (quality == 1u) { steps = 40u; }
+    if (quality == 2u) { steps = 64u; }
+    let near_step = max(0.35, -origin.z*0.001);
+    let logarithmic_range = log(1.0 + max_distance/near_step);
+    var previous_distance = 0.0;
+    var previous_front = true;
+
+    for (var step = 0u; step < 64u; step += 1u)
+    {
+        if (step >= steps) { break; }
+        let progress = f32(step + 1u)/f32(steps);
+        let distance = near_step*(exp(logarithmic_range*progress) - 1.0);
+        let sample_position = origin + ray*distance;
+        let uv = projectView(sample_position);
+        if (any(uv <= vec2<f32>(0.001)) || any(uv >= vec2<f32>(0.999)))
+        {
+            break;
+        }
+        let packed = reflectionDepth(uv);
+        let behind = packed.a >= 0.5 && packed.z - sample_position.z > 0.0;
+        if (behind && previous_front)
+        {
+            var low = previous_distance;
+            var high = distance;
+            for (var refine = 0u; refine < 7u; refine += 1u)
+            {
+                if (refine >= 5u + quality) { break; }
+                let middle = (low + high)*0.5;
+                let candidate = origin + ray*middle;
+                let depth = reflectionDepth(projectView(candidate));
+                if (depth.a >= 0.5 && depth.z - candidate.z > 0.0)
+                {
+                    high = middle;
+                }
+                else
+                {
+                    low = middle;
+                }
+            }
+            let hit_position = origin + ray*high;
+            let hit_uv = projectView(hit_position);
+            let hit = reflectionDepth(hit_uv);
+            let thickness = clamp(0.4 - hit.z*0.0015, 0.4, 4.0);
+            let depth_error = hit.z - hit_position.z;
+            // Reject self hits, depth discontinuities and submerged geometry
+            // seen through the water's reflective side.
+            let world_hit = globals.camera_position.xyz
+                          + vec3<f32>(dot(globals.view[0].xyz, hit.xyz),
+                                      dot(globals.view[1].xyz, hit.xyz),
+                                      dot(globals.view[2].xyz, hit.xyz));
+            let above_surface = globals.camera_position.y < stage.params.z
+                             || world_hit.y >= stage.params.z - 0.25;
+            if (hit.a >= 0.5 && high > max(0.5, near_step)
+                && depth_error >= 0.0 && depth_error < thickness && above_surface)
+            {
+                let edge = min(min(hit_uv.x, hit_uv.y), min(1.0 - hit_uv.x, 1.0 - hit_uv.y));
+                let edge_fade = smoothstepf(0.005, 0.07, edge);
+                let distance_fade = 1.0 - smoothstepf(max_distance*0.65, max_distance, high);
+                let thickness_fade = 1.0 - smoothstepf(thickness*0.35, thickness, depth_error);
+                let confidence = edge_fade*distance_fade*thickness_fade
+                               * (1.0 - smoothstepf(0.15, 0.6, roughness));
+                let colour = textureSampleLevel(scene_texture, scene_sampler, hit_uv, 0.0).rgb;
+                return vec4<f32>(sceneRadiance(colour), confidence);
+            }
+        }
+        previous_front = !behind;
+        previous_distance = distance;
+    }
+    return vec4<f32>(0.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -476,7 +721,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     let accept_refraction = refracted_packed.a < 0.5
                          || refracted_packed.z <= water_view.z;
     let background = select(flat_background.rgb, refracted_background.rgb, accept_refraction);
-    let scene_linear = pow(max(background, vec3<f32>(0.0)), vec3<f32>(2.2));
+    let scene_linear = sceneRadiance(background);
 
     // --- Body: Beer-Lambert extinction plus in-scatter -----------------------
     let sea_level = stage.params.z;
@@ -486,7 +731,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     let transmittance = exp(-sigma_t*optical_path);
 
     let to_sun = normalize(-globals.sun_direction.xyz);
-    let sun_colour = vec3<f32>(1.0, 0.955, 0.90)*globals.settings_a.x;
+    let sun_visibility = terrainShadow(in.world_position, normal, to_sun);
+    let sun_colour = globals.sun_colour.rgb*globals.settings_a.x*sun_visibility;
+    let to_moon = normalize(-globals.moon_direction.xyz);
+    var moon_visibility = 1.0;
+    if (globals.atmosphere.y > 0.001)
+    {
+        moon_visibility = terrainShadow(in.world_position, normal, to_moon);
+    }
+    let moon_colour = vec3<f32>(0.63, 0.74, 1.0)*globals.atmosphere.y*moon_visibility;
     let cos_theta = dot(to_view, -to_sun);
     let phase = mix(henyeyGreenstein(cos_theta, clamp(stage.scatter.w, -0.99, 0.99)),
                     phaseRayleigh(cos_theta), 0.5);
@@ -495,7 +748,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     // the shaded point. Aqua's closed-form in-scatter integral reduces to this
     // for a single direction and a homogeneous medium.
     let sun_attenuation = exp(-sigma_t*max(sea_level - in.world_position.y, 0.0));
-    let scattered = sigma_s*sun_colour*sun_attenuation*phase*(1.0 - transmittance)/sigma_t;
+    let moon_phase = mix(henyeyGreenstein(dot(to_view, -to_moon),
+                         clamp(stage.scatter.w, -0.99, 0.99)),
+                         phaseRayleigh(dot(to_view, -to_moon)), 0.5);
+    let ambient_source = skyAmbient(vec3<f32>(0.0, 1.0, 0.0))*(0.35/(4.0*PI));
+    let scattered = sigma_s*sun_attenuation*(sun_colour*phase + moon_colour*moon_phase
+                    + ambient_source)*(1.0 - transmittance)/sigma_t;
     var body = scene_linear*transmittance + scattered;
 
     // --- Crest subsurface scattering ----------------------------------------
@@ -539,44 +797,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     // sky it is lit by — not the two-and-a-half times that `sun_colour*0.25`
     // produced, which clipped the shore break to flat white.
     let foam_colour = vec3<f32>(0.92, 0.95, 0.96)
-                    * (sun_colour*0.05
-                       + skyLinear(skyParameter(FOAM_SKY_ELEVATION))*0.75);
+                    * ((sun_colour*max(dot(normal, to_sun), 0.0)
+                        + moon_colour*max(dot(normal, to_moon), 0.0))*0.05
+                       + skyAmbient(normal)*0.75);
     body = mix(body, foam_colour, foam);
 
     // --- Reflection ----------------------------------------------------------
-    // No environment cubemap here, so the reflected sky is the same analytic
-    // gradient the sky pixels and the fog use. That is what the cubemap was
-    // providing: a distant water surface converging on the sky above it.
     let reflection_direction = reflect(-to_view, normal);
-    // Index the sky gradient by the reflected ray's own elevation.
-    //
-    // This used to project the reflected ray into screen space through the
-    // camera and read the gradient there. A reflected ray leaves the water
-    // pointing up, so that projection almost always landed off-screen and
-    // clamped — the measured reflection was a single constant (43,128,198) at
-    // every pixel, which is exactly the zenith end of the ramp. The water was
-    // therefore mirroring the deepest blue in the sky at every angle,
-    // including the grazing ones near the horizon that should be picking up
-    // the pale band instead. Driving it from `reflection_direction.y` — the
-    // sine of the reflected ray's elevation — lets grazing water converge on
-    // the horizon colour and steep views reach up to the zenith, which is the
-    // gradient real water shows.
-    //
-    // `skyParameter` is applied exactly once, here. It used to be applied
-    // twice — once here and again inside `skyColour`, which then carried its
-    // own `smoothstep(0, 1, ·)`. That was invisible while the drawn sky was
-    // indexed by screen row, because the reflection was not matching it
-    // anyway; now that both are functions of elevation, a second application
-    // would mirror a sky that is not there — about 0.09 of gradient parameter
-    // too dark from 10 to 30 degrees of elevation, a few luma of tone step
-    // through the mid-field.
-    let reflected = skyLinear(skyParameter(reflection_direction.y))*0.85;
+    let reflected_sky = skyRadiance(reflection_direction)*0.85;
 
     // Sun specular: GGX over the wave roughness, which is what produces a
     // glitter path rather than one broad highlight.
     let n_dot_l = max(dot(normal, to_sun), 0.0);
     let n_dot_v = max(dot(normal, to_view), 0.0);
-    let half_vector = normalize(to_sun + to_view);
+    let half_vector = (to_sun + to_view)/max(length(to_sun + to_view), 1e-4);
     let n_dot_h = max(dot(normal, half_vector), 0.0);
     var roughness = clamp(mix(0.18, 0.045, clamp(n_dot_l, 0.0, 1.0)), 0.02, 1.0);
     if (stage.surface.z > 0.0)
@@ -587,25 +821,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     // smooth mirror or aliasing into isolated bright pixels at the horizon.
     let alpha = clamp(sqrt(pow(roughness, 4.0) + surface.slope_variance), 1e-3, 1.0);
     let specular = dGGX(n_dot_h, alpha)*vSmithGGX(n_dot_l, n_dot_v, alpha)*n_dot_l*0.35;
+    let moon_half = (to_moon + to_view)/max(length(to_moon + to_view), 1e-4);
+    let moon_dot_l = max(dot(normal, to_moon), 0.0);
+    let moon_specular = dGGX(max(dot(normal, moon_half), 0.0), alpha)
+                      * vSmithGGX(moon_dot_l, n_dot_v, alpha)*moon_dot_l*0.35;
+    let terrain_reflection = marchWaterReflection(in.world_position, normal,
+                                                   reflection_direction, alpha);
+    let reflected = mix(reflected_sky, terrain_reflection.rgb, terrain_reflection.a);
 
     // --- Fresnel composition -------------------------------------------------
     let fresnel = clamp(godotFresnel(clamp(dot(normal, to_view), 0.0, 1.0),
                                      stage.surface.x, stage.surface.y), 0.0, 1.0);
-    var lit = mix(body, reflected, fresnel) + specular*sun_colour;
+    var lit = mix(body, reflected, fresnel) + specular*sun_colour + moon_specular*moon_colour;
 
-    // --- Aerial perspective, matching composite.wgsl -------------------------
-    let fog = 1.0 - exp(-max(globals.params.x, 0.0)*view_distance);
-    // The haze this water dissolves into is the sky along the same view ray,
-    // which is `-to_view`: `to_view` points from the surface back to the eye,
-    // so its negation is the eye's ray out to this fragment. Taking the
-    // elevation from the geometry rather than rebuilding it from `uv` gives
-    // exactly the direction composite.wgsl will use for the sky pixel at this
-    // position — the fragment lies on that ray — so water haze and terrain
-    // haze stay one colour where they meet instead of banding at the shoreline.
-    // (A `y` below zero is a ray that ends on the water rather than in the sky;
-    // `skyParameter` clamps it to the horizon end, the haze it is fading into.)
-    let sky_fog_linear = skyLinear(skyParameter(-to_view.y));
-    lit = mix(lit, sky_fog_linear, clamp(fog, 0.0, 1.0));
+    // Raymarch aerial scattering only up to this water surface. Height fog,
+    // sunset shafts and the volumetric switch now agree with the terrain pass.
+    let fog = integrateAtmosphere(-to_view, view_distance);
+    lit = lit*fog.transmittance + fog.scattering;
 
     return vec4<f32>(pow(acesFilm(lit*globals.params.z), vec3<f32>(1.0/2.2)), 1.0);
 }

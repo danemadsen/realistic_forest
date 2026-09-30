@@ -7,6 +7,7 @@
 
 mod automation;
 mod constants;
+mod day_night;
 mod erosion;
 mod matrices;
 mod noise;
@@ -166,6 +167,12 @@ fn main() {
         if automation.no_fog {
             settings.fog_density = 0.0;
         }
+        if automation.no_raymarch {
+            settings.raymarched_shadows = false;
+            settings.volumetric_lighting = false;
+            settings.water_reflections = false;
+        }
+        settings.raymarch_quality = automation.raymarch_quality;
         settings
     };
 
@@ -246,6 +253,11 @@ fn main() {
         // its pipeline into (see FlowPreviewRenderState in src/ui.rs).
         .add_plugins(ui::UiRenderPlugin)
         .insert_resource(startup_settings)
+        .insert_resource(day_night::DayNightCycle {
+            time_hours: automation.time_of_day,
+            paused: automation.pause_time,
+            day_length_minutes: automation.day_length_minutes,
+        })
         .init_resource::<ErosionCache>()
         .insert_resource(ErosionSettings::default())
         .insert_resource(AppliedErosionSettings(ErosionSettings::default()))
@@ -278,6 +290,7 @@ fn main() {
             Update,
             (
                 handle_global_keys,
+                day_night::advance_day_night,
                 ui::ui_wants_input_system,
                 // --measure-overlap replaces normal streaming with its own
                 // driver, mirroring the C++ short-circuit in main().

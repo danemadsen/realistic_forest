@@ -24,7 +24,7 @@ Requirements:
 From a fresh checkout:
 
 ```sh
-cargo run --release
+cargo run --release --bin realistic_forest
 ```
 
 A debug build also works and is much faster to compile; the shaders are compiled
@@ -41,10 +41,18 @@ by naga at runtime either way.
 | Left Control | Movement boost |
 | V | Toggle flight |
 | F1 | Toggle the diagnostics panel and release the cursor |
+| F12 | Save a timestamped screenshot |
 | Escape | Release the cursor |
 | Left click | Capture the cursor again |
 
 Movement is unbounded in both walking and flight modes.
+
+The F1 panel's **Sun and time** section sets the time of day, pauses the cycle,
+and changes its duration in real minutes. Dawn, Noon, Dusk and Night buttons
+quickly select a lighting setup. The default starts at 10:00 and completes a
+full day in 24 real minutes. **Raymarched lighting** exposes terrain shadows,
+volumetric sunlight, water reflections, quality and light shaft strength;
+**Rendering** includes fog density, sun intensity and exposure.
 
 ## Command line
 
@@ -60,6 +68,27 @@ Movement is unbounded in both walking and flight modes.
 | `--overlap-tile x,z` | Select the tile pair to compare |
 | `--lattice` | Draw the erosion lattice overlay |
 | `--no-fog`, `--no-water` | Disable those stages |
+| `--time-of-day H` | Start at hour `H` in `[0, 24)`; default `10` |
+| `--day-length MIN` | Positive real minutes per complete day; default `24` |
+| `--pause-time` | Hold the selected time of day |
+| `--advance-time` | Allow the day/night cycle to advance during a screenshot run |
+| `--raymarch-quality low\|balanced\|high` | Choose the ray sampling budget; default `balanced` (also accepts `0`, `1`, `2`) |
+| `--no-raymarch` | Disable raymarched terrain shadows, volumetric integration and terrain reflections on water |
+
+Screenshot runs freeze the celestial clock automatically, so erosion warm-up
+does not change the selected lighting. Keep the same camera and `--wait` value
+when comparing settings. For example, these capture noon, dusk and night from
+the same elevated position above spawn:
+
+```sh
+cargo run --release --bin realistic_forest -- --camera 0,80,0,45,-8 --time-of-day 12 --shot noon.png --wait 600
+cargo run --release --bin realistic_forest -- --camera 0,80,0,45,-8 --time-of-day 17.75 --shot dusk.png --wait 600
+cargo run --release --bin realistic_forest -- --camera 0,80,0,45,-8 --time-of-day 0 --shot night.png --wait 600
+```
+
+`--no-raymarch` retains the moving sun, moon, sky, analytic water reflection and
+simple atmospheric fog. Add `--no-fog` to remove atmospheric scattering and
+extinction as well; this leaves the water's underwater optics controls separate.
 
 ## Terrain and clipmap
 
@@ -234,21 +263,77 @@ erosion cache**. The panel also reports maximum incision, deposited height,
 small-scale detail within actively eroded ground, and flow-axis bias for the
 most recently completed tile.
 
-## SSAO pipeline
+## Day/night lighting and atmosphere
+
+The atmosphere takes inspiration from the coordinated sky, fog and lighting
+approach presented in Rockstar's
+[Creating the Atmospheric World of Red Dead Redemption 2](https://advances.realtimerendering.com/s2019/index.htm)
+at SIGGRAPH 2019. This prototype implements a smaller set of those ideas; it
+does not reproduce RDR2's renderer, volumetric cloud system or full path tracing.
+
+The sun rises in the east at 06:00, reaches its highest point at noon, and sets
+in the west at 18:00. Its colour warms toward the horizon and its direct light
+fades out at sunset, while twilight continues to light the sky. The moon follows
+the opposite orbit and provides subdued blue light at night, when stars become
+visible. Terrain, ocean highlights and reflected sky all use the same celestial
+state. Snow placement retains its fixed climate aspect; only its lighting and
+glints move with the sun.
+
+Terrain shadows march toward the light through a camera-centred world heightfield.
+The 1024×1024 map spans 12,288 metres and samples the same procedural terrain and
+streamed erosion as the visible geometry. Hills outside the camera view can
+therefore cast shadows and occlude sunlight in the fog. Shadow coverage and fine
+occluder detail remain limited by the map's extent and 12-metre texels, with a
+fade at its outer boundary.
+
+Volumetric lighting integrates scattering and Beer–Lambert transmittance along
+view rays at half resolution. Height-dependent density concentrates haze near
+the ground, and samples toward the sun through the heightfield produce shafts
+where terrain blocks light. A depth-aware bilateral upscale preserves terrain
+silhouettes when combining the fog with the full-resolution scene. Fog density
+controls the atmosphere's thickness; **Light shaft strength** controls direct
+light scattered into it. Turning off **Volumetric sunlight** keeps a cheaper
+uniform fog approximation.
+Water integrates the same atmosphere up to its own surface with a smaller
+sample budget, so haze and shafts follow the shoreline rather than the seabed.
+
+Water traces reflected rays against the terrain view-position buffer, refines
+depth crossings, and samples the lit scene at each valid hit. This adds visible
+coastlines and mountains to the wave-distorted reflections. Invalid hits and
+screen edges fade into the shared day/night sky. These screen-space reflections
+cannot recover terrain hidden behind other surfaces or outside the camera view;
+the world-heightfield shadows have different coverage from the reflections.
+
+| Quality | Cost and appearance |
+| --- | --- |
+| Low | Fewer shadow, fog and reflection samples; useful at high display resolutions or on slower GPUs |
+| Balanced | Default compromise between sampling detail and GPU cost |
+| High | More samples to resolve shadows, shafts and reflection intersections; higher GPU cost |
+
+All three presets keep the same effects enabled. The F1 switches can disable
+individual effects independently, and `--no-raymarch` disables all three traced
+effects together. The sampling budget and display resolution both affect cost;
+half-resolution fog reduces the number of rays without changing the scene's
+output resolution.
+
+## Render pipeline
 
 The renderer writes view position, view normal, and albedo to a three-target
 G-buffer. SSAO is evaluated at half resolution with a 24-sample rotated
-hemisphere kernel, followed by a depth/normal-aware bilateral blur and a final
-lighting/fog composite. Water opts out naturally through its smooth normal and
-geometry coverage. FXAA then smooths the composited frame, and the diagnostics
-panel draws on top. The G-buffer and AO targets are recreated for resize and
-HiDPI render-size changes.
+hemisphere kernel, followed by a depth/normal-aware bilateral blur. A separate
+half-resolution atmosphere pass supplies scattering and transmittance to the
+lighting composite, which also evaluates terrain shadows and the celestial sky.
+The water surface then samples the opaque scene for refraction and raymarched
+reflections, followed by underwater effects where applicable. FXAA smooths the
+completed scene, and the diagnostics panel draws on top. The G-buffer, AO and
+atmosphere targets follow window resize and HiDPI render-size changes.
 
-The composite and FXAA passes ping-pong between the view target's two main
-textures: composite reads the G-buffer and writes one, FXAA reads that one and
-writes the other, which the upscale node then presents. Both write into an
+The composite, water and FXAA stages use the view target's two main textures,
+with an opaque scene copy available to water. The composite reads the G-buffer;
+water adds its surface and medium effects; FXAA reads the completed scene and
+writes the texture the upscale node presents. The output passes write into an
 sRGB-format target, where the C++ wrote into a plain framebuffer with no
-conversion, so the two passes split the encode between them: the composite
+conversion, so the composite and FXAA split the encode between them: the composite
 writes its display-encoded value and lets the target encode it, FXAA's fetch of
 that same target decodes it straight back — which is what keeps FXAA filtering
 in the C++'s display-encoded domain, where its luma thresholds mean what the

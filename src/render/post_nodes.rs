@@ -8,11 +8,10 @@
 //! rather than translucent colour, so standard alpha blending would corrupt
 //! the channels (see `RenderPass` in the C++).
 
-use crate::constants::SUN_DIRECTION_WORLD;
 use crate::render::gpu_textures::GpuWorldTexturesOption;
 use crate::render::terrain_node::TerrainNodeState;
 use crate::render::{
-    globals_layout, normalize3, BlurStageUniforms, CompositeStageUniforms, ExtractedForestView,
+    globals_layout, BlurStageUniforms, CompositeStageUniforms, ExtractedForestView,
     ForestGlobals, ForestShaderHandles, GlobalUniformsGpu, SsaoStageUniforms,
 };
 use bevy::app::SubApp;
@@ -56,6 +55,7 @@ struct HalfResTargets {
     height: u32,
     ao_view: wgpu::TextureView,
     blur_view: wgpu::TextureView,
+    atmosphere_view: wgpu::TextureView,
 }
 
 /// The three samplers the C++ passes rely on: POINT/CLAMP for the G-buffer
@@ -77,6 +77,7 @@ struct PostLayouts {
     ssao: BindGroupLayout,
     blur: BindGroupLayout,
     composite: BindGroupLayout,
+    atmosphere: BindGroupLayout,
     fxaa: BindGroupLayout,
 }
 
@@ -112,6 +113,8 @@ struct SsaoNodeInner {
     ssao_group: Option<BindGroup>,
     blur_group: Option<BindGroup>,
     composite_group: Option<BindGroup>,
+    atmosphere_group: Option<BindGroup>,
+    atmosphere_pipeline: Option<CachedRenderPipelineId>,
     ssao_pipeline: Option<CachedRenderPipelineId>,
     blur_pipeline: Option<CachedRenderPipelineId>,
     /// The composite and FXAA pipelines are keyed by the main texture's format
@@ -168,8 +171,9 @@ fn resize_ssao_targets(
     inner.targets = Some(HalfResTargets {
         width: ao_width,
         height: ao_height,
-        ao_view: create_half_res_target(&device, "forest_ssao_ao_target", ao_width, ao_height),
-        blur_view: create_half_res_target(&device, "forest_ssao_blur_target", ao_width, ao_height),
+        ao_view: create_half_res_target(&device, "forest_ssao_ao_target", ao_width, ao_height, wgpu::TextureFormat::Rgba8Unorm),
+        blur_view: create_half_res_target(&device, "forest_ssao_blur_target", ao_width, ao_height, wgpu::TextureFormat::Rgba8Unorm),
+        atmosphere_view: create_half_res_target(&device, "forest_atmosphere_target", ao_width, ao_height, wgpu::TextureFormat::Rgba16Float),
     });
     // The group-1 bind groups read these views, so the next prepare rebuilds
     // them.
@@ -319,7 +323,12 @@ fn prepare_post_pipelines(
             composite: screen_group_layout(
                 &device,
                 "forest_composite_group_layout",
-                &[false, false, true, true],
+                &[false, false, true, true, true, true],
+            ),
+            atmosphere: screen_group_layout(
+                &device,
+                "forest_atmosphere_group_layout",
+                &[false, false, true, true, true],
             ),
             // fxaa: the composited LDR frame (bilinear).
             fxaa: screen_group_layout(&device, "forest_fxaa_group_layout", &[true]),
@@ -376,16 +385,40 @@ fn prepare_post_pipelines(
                 texture_entry(1, normal),
                 texture_entry(2, albedo),
                 texture_entry(3, blurred),
+                texture_entry(4, &gbuffer.heightfield_view),
+                texture_entry(5, &targets.atmosphere_view),
                 sampler_entry(8, &samplers.point_clamp),
                 sampler_entry(9, &samplers.point_clamp),
                 sampler_entry(10, &samplers.linear_clamp),
                 sampler_entry(11, &samplers.linear_clamp),
+                sampler_entry(12, &samplers.linear_clamp),
+                sampler_entry(13, &samplers.linear_clamp),
+            ],
+        );
+
+        // Keep the atmosphere output out of this bind group: a texture cannot
+        // be sampled and used as an attachment in the same render pass.
+        let atmosphere_group = device.create_bind_group(
+            "forest_atmosphere_group",
+            &layouts.atmosphere,
+            &[
+                texture_entry(0, position),
+                texture_entry(1, normal),
+                texture_entry(2, albedo),
+                texture_entry(3, blurred),
+                texture_entry(4, &gbuffer.heightfield_view),
+                sampler_entry(8, &samplers.point_clamp),
+                sampler_entry(9, &samplers.point_clamp),
+                sampler_entry(10, &samplers.linear_clamp),
+                sampler_entry(11, &samplers.linear_clamp),
+                sampler_entry(12, &samplers.linear_clamp),
             ],
         );
 
         inner.ssao_group = Some(ssao_group);
         inner.blur_group = Some(blur_group);
         inner.composite_group = Some(composite_group);
+        inner.atmosphere_group = Some(atmosphere_group);
         inner.bound_size = Some(gbuffer_size);
     }
 
@@ -438,7 +471,7 @@ fn prepare_post_pipelines(
         // uLightDirectionView is the world-space sun rotated into view space by
         // matView (the C++ rotated it on the CPU with the same matrix); it is a
         // different value from globals.sun_direction, which stays world-space.
-        let sun = normalize3(SUN_DIRECTION_WORLD);
+        let sun = globals.globals.sun_direction;
         let matrix = globals.globals.view;
         let uniforms = CompositeStageUniforms {
             light_direction_view: [
@@ -501,19 +534,16 @@ fn prepare_post_pipelines(
 /// Registers the two prepare systems of the post chain. They run in
 /// `RenderSystems::Prepare`, after the shared globals buffer exists.
 ///
-/// The C++ order also sets the G-buffer up first (`ResizeSSAO` recreates the
-/// G-buffer alongside the AO targets), but `prepare_terrain` is private to its
-/// own module, so no explicit edge can be spelled here. It is not needed:
-/// `prepare_post_pipelines` returns while `TerrainNodeState::gbuffer` is `None`
-/// and rebuilds its bind groups whenever the G-buffer size changes, so running
-/// before the terrain prepare costs one frame of resource creation at startup
-/// and nothing else.
+/// Resize the G-buffer first so the post passes bind the new position and
+/// heightfield views in the same frame, including during HiDPI changes.
 pub fn register_post_systems(render_app: &mut SubApp) {
     render_app.add_systems(
         Render,
         (
             resize_ssao_targets,
-            prepare_post_pipelines.after(crate::render::prepare_forest_globals),
+            prepare_post_pipelines
+                .after(crate::render::prepare_forest_globals)
+                .after(crate::render::terrain_node::resize_gbuffer),
         )
             .chain()
             .in_set(RenderSystems::Prepare),
@@ -678,6 +708,21 @@ impl ViewNode for ForestCompositeNode {
         // from here because only the view knows the format; a queued pipeline
         // becomes usable on the next frame.
         let format = view.main_texture_format();
+        if inner.atmosphere_pipeline.is_none() {
+            let (Some(globals_layout), Some(layouts), Some(stage)) = (
+                inner.globals_layout.clone(), inner.layouts.as_ref(), inner.composite_stage.as_ref(),
+            ) else {
+                return Ok(());
+            };
+            let mut descriptor = fullscreen_pipeline(
+                "forest_atmosphere_pipeline",
+                shaders.composite.clone(),
+                wgpu::TextureFormat::Rgba16Float,
+                vec![globals_layout, layouts.atmosphere.clone(), stage.layout.clone()],
+            );
+            descriptor.fragment.as_mut().unwrap().entry_point = Some("fs_atmosphere".into());
+            inner.atmosphere_pipeline = Some(pipeline_cache.queue_render_pipeline(descriptor));
+        }
         let pipeline_id = match inner.composite_pipelines.get(&format).copied() {
             Some(id) => id,
             None => {
@@ -707,6 +752,39 @@ impl ViewNode for ForestCompositeNode {
         ) else {
             return Ok(());
         };
+
+        let (Some(atmosphere_pipeline), Some(atmosphere_group), Some(half_globals), Some(targets)) = (
+            inner.atmosphere_pipeline.and_then(|id| pipeline_cache.get_render_pipeline(id)),
+            inner.atmosphere_group.as_ref(),
+            inner.half_res_globals.as_ref(),
+            inner.targets.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        {
+            let mut pass = render_context.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+                label: Some("forest_atmosphere_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.atmosphere_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            draw_fullscreen(
+                &mut pass,
+                atmosphere_pipeline,
+                &[&half_globals.group, atmosphere_group, &stage.group],
+                targets.width as f32,
+                targets.height as f32,
+            );
+        }
 
         let post_process = view.post_process_write();
         let destination: &wgpu::TextureView = post_process.destination;
@@ -1007,6 +1085,7 @@ fn create_half_res_target(
     label: &str,
     width: u32,
     height: u32,
+    format: wgpu::TextureFormat,
 ) -> wgpu::TextureView {
     let texture = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
@@ -1018,7 +1097,7 @@ fn create_half_res_target(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });

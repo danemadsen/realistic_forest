@@ -1,0 +1,58 @@
+// Shared linear atmosphere model. Kept byte-for-byte in the composite and
+// water passes so reflected skies and the visible horizon agree.
+fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
+    let ray = normalize(direction);
+    let to_sun = -normalize(globals.sun_direction.xyz);
+    let to_moon = -normalize(globals.moon_direction.xyz);
+    let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    let elevation = smoothstep(0.0, 0.85, ray.y);
+    let day_sky = mix(vec3<f32>(0.49, 0.64, 0.82),
+                      vec3<f32>(0.045, 0.175, 0.43), elevation);
+    let night_sky = mix(vec3<f32>(0.008, 0.013, 0.027),
+                        vec3<f32>(0.0014, 0.0025, 0.008), elevation);
+    var sky = mix(night_sky, day_sky, daylight);
+    let sunset = exp(-pow((to_sun.y + 0.025)/0.17, 2.0));
+    let horizon = exp(-abs(ray.y)*6.0);
+    let sunward = pow(max(dot(normalize(vec3<f32>(ray.x, 0.001, ray.z)),
+                              normalize(vec3<f32>(to_sun.x, 0.001, to_sun.z))), 0.0), 5.0);
+    sky += vec3<f32>(0.65, 0.16, 0.025)*sunset*horizon*(0.15 + 0.85*sunward);
+
+    let sun_mu = clamp(dot(ray, to_sun), -1.0, 1.0);
+    let sun_visible = smoothstep(-0.018, 0.012, to_sun.y);
+    let sun_disk = smoothstep(0.9999832, 0.9999905, sun_mu);
+    let sun_halo = exp(-(1.0 - sun_mu)*750.0)*0.10
+                   + pow(max(sun_mu, 0.0), 24.0)*0.035;
+    // Direct ground irradiance fades before the visible solar disc sets.
+    sky += globals.sun_colour.rgb*sun_visible
+           *(sun_disk*14.0*globals.sun_colour.w + sun_halo*globals.settings_a.x);
+
+    let moon_mu = clamp(dot(ray, to_moon), -1.0, 1.0);
+    let moon_disk = smoothstep(0.999978, 0.999986, moon_mu);
+    let moon_visible = smoothstep(-0.02, 0.03, to_moon.y)*(1.0 - daylight*0.9);
+    sky += vec3<f32>(0.63, 0.74, 1.0)*moon_visible
+           *(moon_disk*1.6 + exp(-(1.0 - moon_mu)*500.0)*0.025);
+
+    // Stars occupy a world-oriented angular grid and remain stationary when
+    // the camera rotates. Smooth small discs avoid binary sparkling.
+    let star_uv = vec2<f32>(atan2(ray.z, ray.x), asin(clamp(ray.y, -1.0, 1.0)))*360.0;
+    let star_cell = floor(star_uv);
+    let star_hash = fract(sin(dot(star_cell, vec2<f32>(127.1, 311.7)))*43758.5453);
+    let star_local = fract(star_uv) - vec2<f32>(0.5);
+    let star_disc = 1.0 - smoothstep(0.035, 0.18, length(star_local));
+    let star = step(0.997, star_hash)*star_disc*(0.25 + 0.75*star_hash);
+    sky += vec3<f32>(0.6, 0.73, 1.0)*star*pow(1.0 - daylight, 4.0)
+           *smoothstep(-0.03, 0.18, ray.y)*0.7;
+    return max(sky, vec3<f32>(0.0));
+}
+
+// Hemisphere-integrated fill depends on the surface orientation and time of
+// day, never its screen row or camera pitch. Excludes the celestial discs.
+fn skyAmbient(normal_world: vec3<f32>) -> vec3<f32> {
+    let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    let upward = clamp(normal_world.y*0.5 + 0.5, 0.0, 1.0);
+    let day_fill = mix(vec3<f32>(0.13, 0.17, 0.22),
+                       vec3<f32>(0.32, 0.44, 0.62), upward);
+    let night_fill = mix(vec3<f32>(0.007, 0.011, 0.022),
+                         vec3<f32>(0.019, 0.029, 0.058), upward);
+    return mix(night_fill, day_fill, daylight);
+}

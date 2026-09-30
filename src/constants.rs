@@ -92,10 +92,6 @@ pub const TERRAIN_ATLAS_SLOTS: usize = 8;
 pub const EROSION_REVEAL_SECONDS: f32 = 0.9;
 pub const SEA_LEVEL: f32 = 0.0;
 
-// World-space direction sunlight travels; shared by the composite (diffuse
-// and specular) and the terrain stage (snow glint alignment).
-pub const SUN_DIRECTION_WORLD: [f32; 3] = [0.35, -0.87, 0.32];
-
 pub const CLIP_CELLS: usize = 224;
 pub const CLIP_LEVELS: usize = 7;
 pub const CLIP_ANCHOR_SPACING: f32 = (1u32 << (CLIP_LEVELS - 1)) as f32;
@@ -157,6 +153,12 @@ pub struct AppSettings {
     pub ao_strength: f32,
     pub fog_density: f32,
     pub sun_intensity: f32,
+    pub raymarched_shadows: bool,
+    pub volumetric_lighting: bool,
+    pub water_reflections: bool,
+    /// 0 = low, 1 = balanced, 2 = high.
+    pub raymarch_quality: u32,
+    pub volumetric_strength: f32,
     pub texture_scale: f32,
     pub normal_strength: f32,
     pub ao_tex_strength: f32,
@@ -176,10 +178,15 @@ impl Default for AppSettings {
             ao_bias: 0.08,
             ao_power: 1.25,
             ao_strength: 0.72,
-            fog_density: 0.0,
+            fog_density: 0.00012,
             // Sun-facing diffuse equals the albedo; ~1.5x pi pushes sunlit
             // snow onto the tonemap's shoulder.
             sun_intensity: 4.8,
+            raymarched_shadows: true,
+            volumetric_lighting: true,
+            water_reflections: true,
+            raymarch_quality: 1,
+            volumetric_strength: 1.0,
             texture_scale: 0.16,
             normal_strength: 1.0,
             ao_tex_strength: 0.8,

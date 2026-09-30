@@ -36,8 +36,29 @@ struct GlobalUniforms {
     params: vec4<f32>,            // x fog_density, y z_far, z exposure, w ssao_enabled (1=on, 0=off)
     settings_a: vec4<f32>,        // x sun_intensity, y texture_scale, z ao_tex_strength, w variant_scale
     settings_b: vec4<f32>,        // x normal_strength, y sparkle_strength, z flow_debug(1/0), w erosion_debug(1/0)
+    sun_colour: vec4<f32>,       // RGB solar tint, w unattenuated sun intensity
+    moon_direction: vec4<f32>,   // xyz direction moonlight travels
+    atmosphere: vec4<f32>,       // daylight, moon intensity, hours, volumetric strength
+    raymarch: vec4<f32>,         // shadows, volumetrics, reflections, quality (0/1/2)
+    heightfield: vec4<f32>,      // world centre XZ, world span, texel size in metres
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
+
+// Independent fullscreen heightfield pass. Sharing terrainHeight below
+// avoids a second approximation of the terrain for off-screen sun occlusion.
+@vertex
+fn vs_heightfield(@builtin(vertex_index) vertex: u32) -> @builtin(position) vec4<f32> {
+    let corners = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(corners[vertex], 0.0, 1.0);
+}
+
+@fragment
+fn fs_heightfield(@builtin(position) position: vec4<f32>) -> @location(0) f32 {
+    let world_xz = globals.heightfield.xy
+        + position.xy * globals.heightfield.w - vec2<f32>(globals.heightfield.z * 0.5);
+    return terrainHeight(world_xz);
+}
 
 // Every terrain.vs uniform except matView/matProjection. model/inverse_model
 // carry matModel (see PORT NOTES for the inverse() substitution); the rest

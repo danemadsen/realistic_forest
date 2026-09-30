@@ -59,6 +59,11 @@ struct GlobalUniforms {
     params: vec4<f32>,            // x fog_density, y z_far, z exposure, w ssao_enabled (1=on, 0=off)
     settings_a: vec4<f32>,        // x sun_intensity, y texture_scale, z ao_tex_strength, w variant_scale
     settings_b: vec4<f32>,        // x normal_strength, y sparkle_strength, z flow_debug(1/0), w erosion_debug(1/0)
+    sun_colour: vec4<f32>,       // RGB solar tint, w unattenuated sun intensity
+    moon_direction: vec4<f32>,   // xyz direction moonlight travels
+    atmosphere: vec4<f32>,       // daylight, moon intensity, hours, volumetric strength
+    raymarch: vec4<f32>,         // shadows, volumetrics, reflections, quality (0/1/2)
+    heightfield: vec4<f32>,      // world centre XZ, world span, texel size in metres
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
@@ -650,9 +655,10 @@ fn fs_main(input: FsInput) -> FsOutput
     // the mirrored patch fields filtered without seams at their folds.
     let worldStepX = dpdx(worldXZ);
     let worldStepY = dpdy(worldXZ);
-    // Horizontal bearing toward the sun, for the mottle-to-drift coupling
-    // in the near-field detail block below.
-    let toSunXZ = normalize(vec2<f32>(-globals.sun_direction.x, -globals.sun_direction.z));
+    // Snow placement records long-term climate, not the instantaneous sun.
+    // Keep drifts and melt margins fixed while the daily lighting moves.
+    let climateSun = normalize(vec3<f32>(-0.35, 0.87, -0.32));
+    let toSunXZ = normalize(climateSun.xz);
 
     // Use the same four-tile reveal and distance fade as the actual landform.
     // Discharge concentration distinguishes channels from the thin sheet of
@@ -795,7 +801,7 @@ fn fs_main(input: FsInput) -> FsOutput
     // while continuously running beds lose all of it.
     let flushSnow = smoothHermite(0.08, 0.30, dischargeAmount);
     let dryHollow = hollow * (1.0 - channel * mix(0.45, 1.0, flushSnow));
-    let sunExposure = max(dot(normalWorld, -normalize(globals.sun_direction.xyz)), 0.0);
+    let sunExposure = max(dot(normalWorld, climateSun), 0.0);
     // Height supplies a broad climate bias, not a shared material cutoff.
     // Curvature and solar aspect shift local retention by comparable amounts
     // to the drift fields. Aspect remains active beyond the erosion cache.

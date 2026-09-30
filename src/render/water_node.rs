@@ -7,9 +7,9 @@
 //! here.
 //!
 //! Graph position: after `CompositePass`, before `FxaaPass`. The water shades
-//! in the same display-referred space the composite writes, so it takes the
-//! composited frame as its refraction source and the G-buffer only for depth —
-//! and FXAA must see the water, not the reverse.
+//! using the composite as its refraction/reflection source, undoing gamma and
+//! ACES before optical composition. The G-buffer supplies raymarch depth and
+//! the terrain heightfield supplies sun occlusion. FXAA sees the result.
 //!
 //! Neither pass has a depth attachment. The surface pass stands in for one by
 //! testing the G-buffer's view-space z against the water fragment's own (view
@@ -68,18 +68,9 @@ const FOAM_SCALE: f32 = 1.0;
 /// narrow enough that it never reaches the camera while walking a shore.
 const UNDERWATER_FADE_METRES: f32 = 0.6;
 
-/// Converts this renderer's sun intensity into the radiance scale aqua's
-/// medium was authored against.
-///
-/// Aqua's in-scatter is `sigma_s * sun * phase * (1 - T) / sigma_t`, linear in
-/// the source radiance, and its own `sun` is an HDR quantity — the medium's
-/// single-scattering albedo is only ~0.025, so it takes a large radiance to
-/// make the in-scattered term visible at all. This pass runs *after* the
-/// composite's tone curve, where 1.0 is already display white, so the same
-/// expression with a display-range radiance comes out roughly twenty times too
-/// dark and the water reads as black. The gain is that one conversion, applied
-/// here rather than inside the shader so the vendored medium expression stays
-/// exactly aqua's.
+/// Artistic gain for the medium's low single-scattering albedo (~0.025).
+/// Underwater lighting is reconstructed into HDR before attenuation; this gain
+/// preserves the authored water clarity while sunlight follows the day clock.
 const MEDIUM_SUN_GAIN: f32 = 15.0;
 
 /// Byte offset of `WaterStageUniforms::params` — 40 waves at 32 bytes plus five
@@ -209,7 +200,7 @@ struct WaterInner {
     globals_group: Option<BindGroup>,
     samplers: Option<WaterSamplers>,
     /// Group 1 for the surface and blit passes: the composited frame at 0/8,
-    /// the G-buffer position at 1/9.
+    /// the G-buffer position at 1/9 and terrain heightfield at 2/10.
     surface_screen: Option<BindGroupLayout>,
     /// Group 1 for the underwater pass; the same shape, its own layout so the
     /// two can diverge.
@@ -448,13 +439,12 @@ fn prepare_water(
         inner.samplers = Some(create_samplers(&device));
     }
     if inner.surface_screen.is_none() {
-        // Group 1: the composited frame (bilinear), the G-buffer position
-        // (point). Texture N pairs with sampler N + 8, the convention every
-        // post WGSL file and both water shaders use.
+        // Group 1: composited frame and terrain heightfield (bilinear), and
+        // G-buffer position (point). Texture N pairs with sampler N + 8.
         inner.surface_screen = Some(screen_layout(
             &device,
             "forest_water_surface_layout",
-            &[true, false],
+            &[true, false, true],
         ));
     }
     if inner.underwater_screen.is_none() {
@@ -534,6 +524,7 @@ fn prepare_water(
 
     let optics = settings.optics;
     let sun_intensity = globals.globals.settings_a[0];
+    let sun_colour = globals.globals.sun_colour;
     let underwater = UnderwaterUniforms {
         params: [
             SEA_LEVEL,
@@ -543,14 +534,12 @@ fn prepare_water(
         ],
         extinction: extinction_of(&optics),
         scatter: scatter_of(&optics),
-        // The sun radiance that reaches the surface, which is what the surface
-        // pass uses as its own in-scatter source, scaled into the space this
-        // pass runs in by `MEDIUM_SUN_GAIN`.
+        // Surface sunlight follows both the daylight intensity and sunset tint.
         sun: [
-            sun_intensity * 0.30 * MEDIUM_SUN_GAIN,
-            sun_intensity * 0.29 * MEDIUM_SUN_GAIN,
-            sun_intensity * 0.27 * MEDIUM_SUN_GAIN,
-            0.0,
+            sun_intensity * sun_colour[0] * 0.30 * MEDIUM_SUN_GAIN,
+            sun_intensity * sun_colour[1] * 0.30 * MEDIUM_SUN_GAIN,
+            sun_intensity * sun_colour[2] * 0.30 * MEDIUM_SUN_GAIN,
+            globals.globals.atmosphere[1] * 0.30 * MEDIUM_SUN_GAIN,
         ],
     };
     if let Some(stage) = inner.underwater_stage.as_ref() {
@@ -697,7 +686,13 @@ impl ViewNode for ForestWaterSurfaceNode {
             inner.globals_group.as_ref(),
             inner.surface_stage.as_ref(),
             inner.meshes.as_ref(),
-            surface_group(device, &inner, &gbuffer.position_view, post_process.source),
+            surface_group(
+                device,
+                &inner,
+                &gbuffer.position_view,
+                &gbuffer.heightfield_view,
+                post_process.source,
+            ),
         ) else {
             return Ok(());
         };
@@ -991,12 +986,13 @@ impl ViewNode for ForestUnderwaterNode {
 // Bind group helpers
 // ---------------------------------------------------------------------------
 
-/// The surface and blit passes' group-1 bind group: the composited frame at 0/8
-/// and the G-buffer position at 1/9.
+/// The surface and blit passes' group-1 bind group: the composited frame at 0/8,
+/// the G-buffer position at 1/9 and terrain heightfield at 2/10.
 fn surface_group(
     device: &RenderDevice,
     inner: &WaterInner,
     gbuffer_position: &wgpu::TextureView,
+    heightfield: &wgpu::TextureView,
     source: &wgpu::TextureView,
 ) -> Option<BindGroup> {
     screen_group(
@@ -1006,6 +1002,7 @@ fn surface_group(
         inner.samplers.as_ref()?,
         gbuffer_position,
         source,
+        Some(heightfield),
     )
 }
 
@@ -1022,6 +1019,7 @@ fn underwater_group(
         inner.samplers.as_ref()?,
         gbuffer_position,
         source,
+        None,
     )
 }
 
@@ -1032,29 +1030,39 @@ fn screen_group(
     samplers: &WaterSamplers,
     gbuffer_position: &wgpu::TextureView,
     source: &wgpu::TextureView,
+    heightfield: Option<&wgpu::TextureView>,
 ) -> Option<BindGroup> {
-    Some(device.create_bind_group(
-        label,
-        layout,
-        &[
+    let mut entries = vec![
+        BindGroupEntry {
+            binding: 0,
+            resource: BindingResource::TextureView(source),
+        },
+        BindGroupEntry {
+            binding: 1,
+            resource: BindingResource::TextureView(gbuffer_position),
+        },
+        BindGroupEntry {
+            binding: 8,
+            resource: BindingResource::Sampler(&samplers.linear_clamp),
+        },
+        BindGroupEntry {
+            binding: 9,
+            resource: BindingResource::Sampler(&samplers.point_clamp),
+        },
+    ];
+    if let Some(heightfield) = heightfield {
+        entries.extend([
             BindGroupEntry {
-                binding: 0,
-                resource: BindingResource::TextureView(source),
+                binding: 2,
+                resource: BindingResource::TextureView(heightfield),
             },
             BindGroupEntry {
-                binding: 1,
-                resource: BindingResource::TextureView(gbuffer_position),
-            },
-            BindGroupEntry {
-                binding: 8,
+                binding: 10,
                 resource: BindingResource::Sampler(&samplers.linear_clamp),
             },
-            BindGroupEntry {
-                binding: 9,
-                resource: BindingResource::Sampler(&samplers.point_clamp),
-            },
-        ],
-    ))
+        ]);
+    }
+    Some(device.create_bind_group(label, layout, &entries))
 }
 
 /// One group-1 layout: for every entry in `filterable`, a float texture at

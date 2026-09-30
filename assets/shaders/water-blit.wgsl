@@ -22,6 +22,11 @@ struct GlobalUniforms
     params: vec4<f32>,
     settings_a: vec4<f32>,
     settings_b: vec4<f32>,
+    sun_colour: vec4<f32>,
+    moon_direction: vec4<f32>,
+    atmosphere: vec4<f32>,
+    raymarch: vec4<f32>,
+    heightfield: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 

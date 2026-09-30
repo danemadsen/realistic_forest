@@ -58,6 +58,12 @@ const TERRAIN_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttri
 }];
 const TERRAIN_VERTEX_STRIDE: u64 = 12;
 
+/// World-space shadow coverage extends beyond the 5800 m camera horizon.
+/// Reusing terrainHeight in the vertex shader keeps streamed erosion and the
+/// procedural landform identical between visible geometry and raymarching.
+pub const LIGHTING_HEIGHTFIELD_SIZE: u32 = 1024;
+pub const LIGHTING_HEIGHTFIELD_SPAN: f32 = 12288.0;
+
 // ---------------------------------------------------------------------------
 // Public view/state types
 // ---------------------------------------------------------------------------
@@ -69,6 +75,7 @@ pub struct GbufferTargets {
     pub normal_view: wgpu::TextureView,   // Rgba16Float
     pub albedo_view: wgpu::TextureView,   // Rgba8Unorm
     pub depth_view: wgpu::TextureView,    // Depth32Float
+    pub heightfield_view: wgpu::TextureView, // R32Float world-space terrain height
     pub width: u32,
     pub height: u32,
 }
@@ -138,6 +145,7 @@ struct TerrainResources {
     /// group(1): the world textures.
     terrain_textures: BindGroup,
     terrain_pipeline: CachedRenderPipelineId,
+    heightfield_pipeline: CachedRenderPipelineId,
     center_mesh: GpuMesh,
     ring_mesh: GpuMesh,
     /// One stage block per clipmap level, matching `DrawClipmap`'s per-level
@@ -215,6 +223,35 @@ impl Node for ForestTerrainNode {
                 visibility_center,
             );
             queue.write_buffer(&stage.buffer, 0, bytemuck::bytes_of(&uniforms));
+        }
+
+        // This is independent of camera visibility: hills behind the camera
+        // still cast shadows and occlude light inside the fog. Updating after
+        // erosion and before lighting also follows tile reveals without a
+        // CPU height readback or stale lighting cache.
+        if view.settings.raymarched_shadows
+            && let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.heightfield_pipeline)
+        {
+            let mut pass = render_context.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+                label: Some("forest_lighting_heightfield"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &gbuffer.heightfield_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_render_pipeline(pipeline);
+            pass.set_bind_group(0, &resources.globals, &[]);
+            pass.set_bind_group(1, &resources.terrain_textures, &[]);
+            pass.set_bind_group(2, &resources.levels[0].bind_group, &[]);
+            pass.draw(0..3, 0..1);
         }
 
         // One pass, three colour targets + depth, cleared exactly like the
@@ -847,10 +884,36 @@ fn prepare_terrain(
         }],
         vec![
             globals_layout.clone(),
-            terrain_textures_layout,
+            terrain_textures_layout.clone(),
             terrain_stage_layout.clone(),
         ],
     );
+
+    let heightfield_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("forest_lighting_heightfield_pipeline".into()),
+        layout: vec![globals_layout, terrain_textures_layout, terrain_stage_layout.clone()],
+        push_constant_ranges: vec![],
+        vertex: VertexState {
+            shader: shaders.terrain_vs.clone(),
+            shader_defs: vec![],
+            entry_point: Some("vs_heightfield".into()),
+            buffers: vec![],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(FragmentState {
+            shader: shaders.terrain_vs.clone(),
+            shader_defs: vec![],
+            entry_point: Some("fs_heightfield".into()),
+            targets: vec![Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::R32Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        zero_initialize_workgroup_memory: false,
+    });
 
     let levels: [StageUniform; CLIP_LEVELS] = std::array::from_fn(|_| {
         StageUniform::new(
@@ -865,6 +928,7 @@ fn prepare_terrain(
         globals: globals_bind_group,
         terrain_textures,
         terrain_pipeline,
+        heightfield_pipeline,
         center_mesh: build_clip_mesh(device, false),
         ring_mesh: build_clip_mesh(device, true),
         levels,
@@ -880,7 +944,7 @@ fn prepare_terrain(
 /// ssao.height)`: (re)creates the colour targets and the depth texture
 /// whenever the physical window size changes, along with the three filter
 /// samplers the C++ sets on them.
-fn resize_gbuffer(
+pub(crate) fn resize_gbuffer(
     device: Res<RenderDevice>,
     view: Res<ExtractedForestView>,
     state: Res<TerrainNodeState>,
@@ -952,6 +1016,20 @@ fn resize_gbuffer(
             normal_view: normal_texture.create_view(&wgpu::TextureViewDescriptor::default()),
             albedo_view: albedo_texture.create_view(&wgpu::TextureViewDescriptor::default()),
             depth_view: depth_texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            heightfield_view: device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("forest_lighting_heightfield"),
+                size: wgpu::Extent3d {
+                    width: LIGHTING_HEIGHTFIELD_SIZE,
+                    height: LIGHTING_HEIGHTFIELD_SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }).create_view(&wgpu::TextureViewDescriptor::default()),
             width,
             height,
         });

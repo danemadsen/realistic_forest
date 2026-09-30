@@ -1,42 +1,7 @@
-// PORT NOTES (composite.fs -> composite.wgsl):
-// - Deferred composite pass: lighting from the g-buffers + blurred SSAO +
-//   fog + ACES tonemap + gamma encode. The output stays raw gamma-encoded
-//   bytes (the pow(1.0/2.2) is the final write of BOTH paths) because FXAA
-//   consumes them; nothing re-linearizes the result after this pass.
-// - HOISTED SAMPLES: the GLSL read the G-buffers after the early sky return
-//   (`if (packedPosition.a < 0.5) return;`), which leaves every statement
-//   after it in non-uniform control flow — WGSL forbids implicit-derivative
-//   sampling (textureSample) there. All four reads moved unconditionally
-//   above the branch; the sky path simply ignores them, and every decode
-//   computation keeps its original place, order and value. No flips were
-//   dropped (the source has none): fragTexCoord derives from
-//   @builtin(position) as position.xy * globals.viewport.zw. The G-buffer
-//   reads are a same-frame blit, so GL's bottom-left gl_FragCoord origin
-//   cancels out there. The sky/terrain branch keys off texture DATA
-//   (packedPosition.a), not screen orientation.
-// - DIVERGENCE FROM THE C++: the analytic sky gradient no longer takes a
-//   screen coordinate at all. The GLSL passed gl_FragCoord-derived screen
-//   rows, which ties the horizon band to the bottom of the frame instead of
-//   to the horizon; skyParameter/viewRayElevation below index it by the view
-//   ray's own elevation so the band lands on the horizon line at any pitch.
-//   Terrain ambient is the one consumer still on the old screen-row ramp
-//   (see ambient_ramp in fs_main) and is unchanged by design.
-// - texture1 was sampled twice in the GLSL (xyz for the normal, .a for
-//   roughness); one sample of the same texture at the same uv now feeds
-//   both reads — bit-identical values, one fewer fetch.
-// - Uniform mapping (the shared GlobalUniforms preamble owns these four):
-//   uFogDensity -> globals.params.x, uExposure -> globals.params.z,
-//   uSunIntensity -> globals.settings_a.x, uAoTexStrength ->
-//   globals.settings_a.z. uLightDirectionView and uAoStrength exist in no
-//   globals field, so they stay in StageUniforms (group 2). No inverse_*
-//   uniform fields were added (nothing inverts a matrix in this pass).
-// - uLightDirectionView is VIEW-space (the raylib build rotated the world
-//   sun direction by matView on the CPU); it is a different value from
-//   globals.sun_direction, which is WORLD-space. Rust can reproduce it with
-//   (globals.view * vec4<f32>(globals.sun_direction.xyz, 0.0)).xyz.
-// - fragColor was declared but never used in the GLSL; it is not carried
-//   over. Single output: @location(0) vec4<f32> (finalColor), no channel
-//   dropped or re-ordered.
+// Deferred HDR lighting, heightfield raymarched shadows and participating fog.
+// G-buffer positions/normals are in view space. All atmosphere and terrain
+// marching is in world space. ACES + gamma remain the final output contract
+// consumed by FXAA and the water compositor.
 
 struct GlobalUniforms {
     view: mat4x4<f32>,            // matView: column-major world->view
@@ -47,360 +12,357 @@ struct GlobalUniforms {
     params: vec4<f32>,            // x fog_density, y z_far, z exposure, w ssao_enabled (1=on, 0=off)
     settings_a: vec4<f32>,        // x sun_intensity, y texture_scale, z ao_tex_strength, w variant_scale
     settings_b: vec4<f32>,        // x normal_strength, y sparkle_strength, z flow_debug(1/0), w erosion_debug(1/0)
+    sun_colour: vec4<f32>,       // RGB solar tint, w unattenuated sun intensity
+    moon_direction: vec4<f32>,   // xyz direction moonlight travels
+    atmosphere: vec4<f32>,       // daylight, moon intensity, hours, volumetric strength
+    raymarch: vec4<f32>,         // shadows, volumetrics, reflections, quality (0/1/2)
+    heightfield: vec4<f32>,      // world centre XZ, world span, texel size in metres
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
-struct StageUniforms {                // uLightDirectionView, uAoStrength
-    // vec4, NOT vec3. WGSL packs the following f32 into the vec3's 12-byte
-    // slot, so `ao_strength` lands at offset 12; the Rust writer's
-    // #[repr(C, align(16))] CompositeStageUniforms declares
-    // light_direction_view as [f32; 4] (w unused) and writes ao_strength at
-    // offset 16. As a vec3 the shader read the pad float instead — a constant
-    // 0.0 — so `mix(1.0, ssao, 0.0)` dropped the blurred SSAO from every lit
-    // pixel while still paying for the pass. naga's layouter reports the two
-    // layouts; `cargo run --bin wgsl-layout -- assets/shaders/composite.wgsl`
-    // is how this was caught. The C++ has no packing to get wrong: GLSL
-    // uLightDirectionView and uAoStrength are separate uniforms with separate
-    // locations.
-    light_direction_view: vec4<f32>,  // uLightDirectionView: view-space direction travelled by sunlight (w unused)
-    ao_strength: f32,                 // uAoStrength: SSAO blend strength (clamped to [0,1] in-shader)
+
+struct StageUniforms {
+    light_direction_view: vec4<f32>,
+    ao_strength: f32,
 };
 @group(2) @binding(0) var<uniform> stage: StageUniforms;
-
-@group(1) @binding(0) var texture0: texture_2d<f32>;   // View-space position, alpha: 0 sky, 1 geometry,
-                                                       // 1 + snow mask (see terrain.fs gPosition).
+@group(1) @binding(0) var texture0: texture_2d<f32>;
 @group(1) @binding(8) var texture0_sampler: sampler;
-@group(1) @binding(1) var texture1: texture_2d<f32>;   // Encoded view-space normal (.a = roughness).
+@group(1) @binding(1) var texture1: texture_2d<f32>;
 @group(1) @binding(9) var texture1_sampler: sampler;
-@group(1) @binding(2) var texture2: texture_2d<f32>;   // sqrt-encoded albedo, 2.5x headroom (.a = texture AO).
+@group(1) @binding(2) var texture2: texture_2d<f32>;
 @group(1) @binding(10) var texture2_sampler: sampler;
-@group(1) @binding(3) var texture3: texture_2d<f32>;   // Bilaterally blurred SSAO.
+@group(1) @binding(3) var texture3: texture_2d<f32>;
 @group(1) @binding(11) var texture3_sampler: sampler;
+@group(1) @binding(4) var terrain_heightfield: texture_2d<f32>;
+@group(1) @binding(12) var terrain_heightfield_sampler: sampler;
+@group(1) @binding(5) var atmosphere_texture: texture_2d<f32>;
+@group(1) @binding(13) var atmosphere_sampler: sampler;
 
-struct VsOutput {
-    @builtin(position) position: vec4<f32>,
-};
+struct VsOutput { @builtin(position) position: vec4<f32> };
 @vertex
 fn vs_main(@builtin(vertex_index) vertex: u32) -> VsOutput {
-    var corner = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
-    var output: VsOutput;
-    output.position = vec4<f32>(corner[vertex], 0.0, 1.0);
-    return output;
+    var corners = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0),
+        vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var out: VsOutput;
+    out.position = vec4<f32>(corners[vertex], 0.0, 1.0);
+    return out;
 }
 
 const PI: f32 = 3.14159265;
+fn viewToWorld(direction: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(dot(globals.view[0].xyz, direction),
+                     dot(globals.view[1].xyz, direction),
+                     dot(globals.view[2].xyz, direction));
+}
+fn worldViewRay(uv: vec2<f32>) -> vec3<f32> {
+    let ndc = vec2<f32>(uv.x*2.0 - 1.0, 1.0 - uv.y*2.0);
+    return normalize(viewToWorld(vec3<f32>(ndc.x/globals.projection[0][0],
+                                           ndc.y/globals.projection[1][1], -1.0)));
+}
 
-// GGX distribution and the height-correlated Smith visibility term. Together
-// with the Schlick fresnel below they form a physically based specular lobe
-// that stays energy-conserving across the whole roughness range.
-fn D_GGX(n_dot_h: f32, alpha: f32) -> f32
-{
+// Shared linear atmosphere model. Kept byte-for-byte in the composite and
+// water passes so reflected skies and the visible horizon agree.
+fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
+    let ray = normalize(direction);
+    let to_sun = -normalize(globals.sun_direction.xyz);
+    let to_moon = -normalize(globals.moon_direction.xyz);
+    let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    let elevation = smoothstep(0.0, 0.85, ray.y);
+    let day_sky = mix(vec3<f32>(0.49, 0.64, 0.82),
+                      vec3<f32>(0.045, 0.175, 0.43), elevation);
+    let night_sky = mix(vec3<f32>(0.008, 0.013, 0.027),
+                        vec3<f32>(0.0014, 0.0025, 0.008), elevation);
+    var sky = mix(night_sky, day_sky, daylight);
+    let sunset = exp(-pow((to_sun.y + 0.025)/0.17, 2.0));
+    let horizon = exp(-abs(ray.y)*6.0);
+    let sunward = pow(max(dot(normalize(vec3<f32>(ray.x, 0.001, ray.z)),
+                              normalize(vec3<f32>(to_sun.x, 0.001, to_sun.z))), 0.0), 5.0);
+    sky += vec3<f32>(0.65, 0.16, 0.025)*sunset*horizon*(0.15 + 0.85*sunward);
+
+    let sun_mu = clamp(dot(ray, to_sun), -1.0, 1.0);
+    let sun_visible = smoothstep(-0.018, 0.012, to_sun.y);
+    let sun_disk = smoothstep(0.9999832, 0.9999905, sun_mu);
+    let sun_halo = exp(-(1.0 - sun_mu)*750.0)*0.10
+                   + pow(max(sun_mu, 0.0), 24.0)*0.035;
+    // Direct ground irradiance fades before the visible solar disc sets.
+    sky += globals.sun_colour.rgb*sun_visible
+           *(sun_disk*14.0*globals.sun_colour.w + sun_halo*globals.settings_a.x);
+
+    let moon_mu = clamp(dot(ray, to_moon), -1.0, 1.0);
+    let moon_disk = smoothstep(0.999978, 0.999986, moon_mu);
+    let moon_visible = smoothstep(-0.02, 0.03, to_moon.y)*(1.0 - daylight*0.9);
+    sky += vec3<f32>(0.63, 0.74, 1.0)*moon_visible
+           *(moon_disk*1.6 + exp(-(1.0 - moon_mu)*500.0)*0.025);
+
+    // Stars occupy a world-oriented angular grid and remain stationary when
+    // the camera rotates. Smooth small discs avoid binary sparkling.
+    let star_uv = vec2<f32>(atan2(ray.z, ray.x), asin(clamp(ray.y, -1.0, 1.0)))*360.0;
+    let star_cell = floor(star_uv);
+    let star_hash = fract(sin(dot(star_cell, vec2<f32>(127.1, 311.7)))*43758.5453);
+    let star_local = fract(star_uv) - vec2<f32>(0.5);
+    let star_disc = 1.0 - smoothstep(0.035, 0.18, length(star_local));
+    let star = step(0.997, star_hash)*star_disc*(0.25 + 0.75*star_hash);
+    sky += vec3<f32>(0.6, 0.73, 1.0)*star*pow(1.0 - daylight, 4.0)
+           *smoothstep(-0.03, 0.18, ray.y)*0.7;
+    return max(sky, vec3<f32>(0.0));
+}
+
+// Hemisphere-integrated fill depends on the surface orientation and time of
+// day, never its screen row or camera pitch. Excludes the celestial discs.
+fn skyAmbient(normal_world: vec3<f32>) -> vec3<f32> {
+    let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    let upward = clamp(normal_world.y*0.5 + 0.5, 0.0, 1.0);
+    let day_fill = mix(vec3<f32>(0.13, 0.17, 0.22),
+                       vec3<f32>(0.32, 0.44, 0.62), upward);
+    let night_fill = mix(vec3<f32>(0.007, 0.011, 0.022),
+                         vec3<f32>(0.019, 0.029, 0.058), upward);
+    return mix(night_fill, day_fill, daylight);
+}
+
+// BEGIN SHARED TERRAIN SHADOWS
+// The map follows the camera, includes off-screen terrain, and contains the
+// same procedural + erosion height used by the terrain vertex shader.
+fn terrainHeightAt(world_xz: vec2<f32>) -> f32 {
+    let uv = (world_xz - globals.heightfield.xy)/globals.heightfield.z + vec2<f32>(0.5);
+    return textureSampleLevel(terrain_heightfield, terrain_heightfield_sampler, uv, 0.0).r;
+}
+fn terrainMapWeight(world_xz: vec2<f32>) -> f32 {
+    let uv = (world_xz - globals.heightfield.xy)/globals.heightfield.z + vec2<f32>(0.5);
+    let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
+    return smoothstep(0.0, 0.06, edge);
+}
+fn terrainShadow(world_position: vec3<f32>, normal_world: vec3<f32>, to_light: vec3<f32>) -> f32 {
+    if (globals.raymarch.x < 0.5 || globals.heightfield.z < 1.0) { return 1.0; }
+    if (to_light.y < -0.025) { return 0.0; }
+    // The map has metre-scale texels. Lift the origin above the local map
+    // mismatch and bias grazing slopes to avoid dark checkerboard acne.
+    let texel = globals.heightfield.w;
+    let bias = 1.5 + texel*(0.12 + 0.25*(1.0 - abs(normal_world.y)));
+    let local_height = terrainHeightAt(world_position.xz);
+    let lift = max(local_height - world_position.y, 0.0) + bias;
+    let origin = world_position + vec3<f32>(0.0, lift, 0.0);
+    let quality = clamp(globals.raymarch.w, 0.0, 2.0);
+    let count = 20u + u32(quality)*12u;
+    var visibility = 1.0;
+    for (var i = 0u; i < 44u; i += 1u) {
+        if (i >= count) { break; }
+        let f = (f32(i) + 1.0)/f32(count);
+        let distance = texel*1.2 + f*f*4800.0;
+        let sample_position = origin + to_light*distance;
+        let edge_weight = terrainMapWeight(sample_position.xz);
+        if (edge_weight <= 0.0) { break; }
+        let clearance = sample_position.y - terrainHeightAt(sample_position.xz);
+        // A finite solar disc makes the penumbra widen with occluder range.
+        let penumbra = max(1.2, distance*0.0047);
+        let sample_visibility = smoothstep(-penumbra, penumbra, clearance);
+        visibility = min(visibility, mix(1.0, sample_visibility, edge_weight));
+        if (visibility < 0.015) { break; }
+    }
+    return mix(1.0, visibility, terrainMapWeight(world_position.xz));
+}
+// END SHARED TERRAIN SHADOWS
+
+// Volumes need fewer samples per light ray than visible surfaces. All taps
+// use explicit LOD because the ray loops have nonuniform termination.
+fn volumeLightVisibility(world_position: vec3<f32>, to_light: vec3<f32>) -> f32 {
+    if (globals.raymarch.x < 0.5 || globals.heightfield.z < 1.0) { return 1.0; }
+    if (to_light.y < -0.025) { return 0.0; }
+    var visibility = 1.0;
+    let count = 6u + u32(clamp(globals.raymarch.w, 0.0, 2.0))*2u;
+    for (var i = 0u; i < 10u; i += 1u) {
+        if (i >= count) { break; }
+        let f = (f32(i) + 0.4)/f32(count);
+        let sample_position = world_position + to_light*(16.0 + f*f*3600.0);
+        let edge_weight = terrainMapWeight(sample_position.xz);
+        if (edge_weight <= 0.0) { break; }
+        let clearance = sample_position.y - terrainHeightAt(sample_position.xz);
+        visibility = min(visibility, mix(1.0, smoothstep(-5.0, 5.0, clearance), edge_weight));
+        if (visibility < 0.02) { break; }
+    }
+    return visibility;
+}
+
+fn henyeyGreenstein(cos_angle: f32, anisotropy: f32) -> f32 {
+    let g2 = anisotropy*anisotropy;
+    return (1.0 - g2)/(4.0*PI*pow(max(1.0 + g2 - 2.0*anisotropy*cos_angle, 0.01), 1.5));
+}
+struct FogResult { scattering: vec3<f32>, transmittance: f32 };
+fn integrateAtmosphere(ray: vec3<f32>, distance_to_surface: f32) -> FogResult {
+    var result: FogResult;
+    result.scattering = vec3<f32>(0.0);
+    result.transmittance = 1.0;
+    let density = max(globals.params.x, 0.0);
+    if (density <= 0.0) { return result; }
+    let ray_length = min(distance_to_surface, 10000.0);
+    let ambient = mix(vec3<f32>(0.012, 0.019, 0.037),
+                      vec3<f32>(0.32, 0.44, 0.59), clamp(globals.atmosphere.x, 0.0, 1.0));
+    if (globals.raymarch.y < 0.5) {
+        result.transmittance = exp(-density*ray_length);
+        result.scattering = ambient*(1.0 - result.transmittance);
+        return result;
+    }
+    let quality = clamp(globals.raymarch.w, 0.0, 2.0);
+    let count = select(select(12u, 16u, quality >= 1.0), 24u, quality >= 2.0);
+    let to_sun = -normalize(globals.sun_direction.xyz);
+    let to_moon = -normalize(globals.moon_direction.xyz);
+    let sun_scatter = globals.sun_colour.rgb*globals.settings_a.x
+                      *henyeyGreenstein(dot(ray, to_sun), 0.68);
+    let moon_scatter = vec3<f32>(0.52, 0.65, 1.0)*globals.atmosphere.y
+                       *henyeyGreenstein(dot(ray, to_moon), 0.45);
+    let strength = max(globals.atmosphere.w, 0.0);
+    // Quadratic view steps keep close shafts detailed while reaching the
+    // distant landscape. Beer-Lambert accumulation conserves transmittance.
+    for (var i = 0u; i < 24u; i += 1u) {
+        if (i >= count) { break; }
+        let a = f32(i)/f32(count);
+        let b = (f32(i) + 1.0)/f32(count);
+        let start = a*a*ray_length;
+        let end = b*b*ray_length;
+        let midpoint = (start + end)*0.5;
+        let world_position = globals.camera_position.xyz + ray*midpoint;
+        let height_density = exp(-max(world_position.y - 20.0, 0.0)/450.0);
+        let extinction = density*(0.16 + 0.84*height_density);
+        let step_transmittance = exp(-extinction*(end - start));
+        var sunlight_visibility = 1.0;
+        if (globals.settings_a.x > 0.01 && strength > 0.0) {
+            sunlight_visibility = volumeLightVisibility(world_position, to_sun);
+        }
+        let lighting = ambient + (sun_scatter*sunlight_visibility + moon_scatter)*strength;
+        result.scattering += result.transmittance*(1.0 - step_transmittance)*lighting;
+        result.transmittance *= step_transmittance;
+        if (result.transmittance < 0.01) { break; }
+    }
+    return result;
+}
+
+fn D_GGX(n_dot_h: f32, alpha: f32) -> f32 {
     let a2 = alpha*alpha;
     let d = n_dot_h*n_dot_h*(a2 - 1.0) + 1.0;
     return a2/max(d*d, 1e-7);
 }
-
-fn V_SmithGGX(n_dot_l: f32, n_dot_v: f32, alpha: f32) -> f32
-{
+fn V_SmithGGX(n_dot_l: f32, n_dot_v: f32, alpha: f32) -> f32 {
     let a2 = alpha*alpha;
-    let ggxL = n_dot_v*sqrt(n_dot_l*n_dot_l*(1.0 - a2) + a2);
-    let ggxV = n_dot_l*sqrt(n_dot_v*n_dot_v*(1.0 - a2) + a2);
-    return 0.5/max(ggxL + ggxV, 1e-7);
+    let ggx_l = n_dot_v*sqrt(n_dot_l*n_dot_l*(1.0 - a2) + a2);
+    let ggx_v = n_dot_l*sqrt(n_dot_v*n_dot_v*(1.0 - a2) + a2);
+    return 0.5/max(ggx_l + ggx_v, 1e-7);
+}
+fn acesFilm(x: vec3<f32>) -> vec3<f32> {
+    return clamp((x*(2.51*x + 0.03))/(x*(2.43*x + 0.59) + 0.14),
+                  vec3<f32>(0.0), vec3<f32>(1.0));
+}
+fn encodeOutput(radiance: vec3<f32>) -> vec4<f32> {
+    return vec4<f32>(pow(acesFilm(max(radiance, vec3<f32>(0.0))*globals.params.z),
+                              vec3<f32>(1.0/2.2)), 1.0);
 }
 
-/// The gradient itself, as a function of its own parameter: 0 at the horizon,
-/// 1 at the zenith.
-///
-/// This takes a parameter rather than a direction on purpose. Three passes draw
-/// or sample this sky — this one, water-surface.wgsl and water-underwater.wgsl
-/// — and they only agree if they agree on how a direction becomes a parameter.
-/// Keeping the mix separate from the mapping leaves exactly one place where
-/// that conversion happens.
-fn skyColour(parameter: f32) -> vec3<f32>
-{
-    let horizon = vec3<f32>(0.72, 0.82, 0.90);
-    let zenith = vec3<f32>(0.22, 0.46, 0.74);
-    return mix(horizon, zenith, parameter);
+// Runs at half resolution before the composite. This entry point intentionally
+// does not access atmosphere_texture, which is its own render attachment.
+@fragment
+fn fs_atmosphere(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = position.xy*globals.viewport.zw;
+    let packed_position = textureSampleLevel(texture0, texture0_sampler, uv, 0.0);
+    let distance_to_surface = select(length(packed_position.xyz), globals.params.y,
+                                     packed_position.a < 0.5);
+    let fog = integrateAtmosphere(worldViewRay(uv), distance_to_surface);
+    return vec4<f32>(fog.scattering, fog.transmittance);
 }
 
-/// Sky gradient parameter for a ray whose sine of elevation is `direction_y`.
-///
-/// The 0.85 edge puts full zenith at asin(0.85) = 58 degrees above the horizon.
-/// That edge is not free to choose: water-surface.wgsl's reflection was
-/// authored against it, so the sky a water pixel mirrors and the sky this pass
-/// draws have to use the same one or the two disagree everywhere above the
-/// horizon. Below the horizon the clamp is what is wanted — a ray that ends on
-/// terrain is hazier than any sky, so it takes the horizon end.
-fn skyParameter(direction_y: f32) -> f32
-{
-    return smoothstep(0.0, 0.85, direction_y);
-}
-
-/// Sine of the elevation above the horizon of the view ray through `uv`.
-///
-/// No inverse matrix: for a symmetric perspective the view-space ray is
-/// `ndc / (projection[0][0], projection[1][1])` at unit depth, so only the
-/// projection's own scale terms are needed. uv.y counts down from the top of
-/// the frame while view space y counts up, so it flips.
-///
-/// The elevation is `dot(globals.view[1].xyz, view_direction)`. `globals.view`
-/// is world->view with the camera basis in its ROWS — row 0 right, row 1 up,
-/// row 2 backward — and WGSL stores it column-major, so `globals.view[1]` is
-/// not that up axis: it is column 1, the second component of each of the three
-/// axes. View->world is the transpose (the rotation is orthonormal), and the y
-/// of `transpose(view) * v` is exactly that dot product. Summing
-/// `v.x*view[0] + v.y*view[1] + v.z*view[2]` instead evaluates `view * v` —
-/// world->view applied to a view-space vector — which is what
-/// water-underwater.wgsl's rayDirection did. That is the wrong contraction
-/// rather than a fixed offset, so how wrong it is depends on where the camera
-/// points, and it is exactly right in two orientations that are easy to reach
-/// by accident: pitch 0, and yaw 180, where this matrix is symmetric and
-/// `view * v` coincides with its transpose. At the pose these sky captures use
-/// (yaw 90, pitch -25) the returned direction is 155 degrees from the true one
-/// and the horizon lands on row 225 instead of row 69.
-fn viewRayElevation(uv: vec2<f32>) -> f32
-{
-    let ndc = vec2<f32>(uv.x*2.0 - 1.0, 1.0 - uv.y*2.0);
-    let view_direction = normalize(vec3<f32>(ndc.x/max(globals.projection[0][0], 1e-6),
-                                             ndc.y/max(globals.projection[1][1], 1e-6),
-                                             -1.0));
-    return dot(globals.view[1].xyz, view_direction);
-}
-
-// Narkowicz's fitted ACES filmic curve. A tonemap replaces the raw gamma
-// encode: sun-facing snow and sun glints carry HDR values above 1.0 that a
-// plain gamma curve would clip into flat white patches, while the filmic
-// shoulder rolls them off with the desaturating compress real cameras show.
-// Sky pixels run through the same curve so fogged terrain converges to
-// exactly the sky behind it instead of banding at the horizon.
-fn acesFilm(x: vec3<f32>) -> vec3<f32>
-{
-    const a: f32 = 2.51;
-    const b: f32 = 0.03;
-    const c: f32 = 2.43;
-    const d: f32 = 0.59;
-    const e: f32 = 0.14;
-    // WGSL's clamp has no scalar-bounds vector overload, so the GLSL
-    // clamp(v, 0.0, 1.0) needs explicitly splatted bounds.
-    return clamp((x*(a*x + b))/(x*(c*x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+fn upsampleAtmosphere(uv: vec2<f32>, packed_position: vec4<f32>) -> vec4<f32> {
+    let size = vec2<i32>(textureDimensions(atmosphere_texture));
+    let texel = uv*vec2<f32>(size) - vec2<f32>(0.5);
+    let base = vec2<i32>(floor(texel));
+    let fraction = fract(texel);
+    let target_sky = packed_position.a < 0.5;
+    let target_depth = length(packed_position.xyz);
+    var fog = vec4<f32>(0.0);
+    var total_weight = 0.0;
+    for (var y = 0i; y < 2i; y += 1i) {
+        for (var x = 0i; x < 2i; x += 1i) {
+            let coord = clamp(base + vec2<i32>(x, y), vec2<i32>(0), size - vec2<i32>(1));
+            let tap_uv = (vec2<f32>(coord) + vec2<f32>(0.5))/vec2<f32>(size);
+            let tap_position = textureSampleLevel(texture0, texture0_sampler, tap_uv, 0.0);
+            let tap_sky = tap_position.a < 0.5;
+            let spatial = select(1.0 - fraction.x, fraction.x, x == 1i)
+                          *select(1.0 - fraction.y, fraction.y, y == 1i);
+            let depth_weight = exp(-abs(length(tap_position.xyz) - target_depth)
+                                   /max(target_depth*0.025, 5.0));
+            let weight = spatial*select(depth_weight, 1.0, target_sky && tap_sky)
+                         *select(0.0, 1.0, target_sky == tap_sky);
+            fog += textureLoad(atmosphere_texture, coord, 0)*weight;
+            total_weight += weight;
+        }
+    }
+    if (total_weight > 0.0001) { return fog/total_weight; }
+    // A subpixel ridge can have no matching half-resolution tap. Evaluate
+    // local extinction instead of borrowing sky fog across the silhouette.
+    let distance_to_surface = select(target_depth, globals.params.y, target_sky);
+    let transmission = exp(-max(globals.params.x, 0.0)*min(distance_to_surface, 10000.0));
+    let ambient = mix(vec3<f32>(0.012, 0.019, 0.037),
+                      vec3<f32>(0.32, 0.44, 0.59), clamp(globals.atmosphere.x, 0.0, 1.0));
+    return vec4<f32>(ambient*(1.0 - transmission), transmission);
 }
 
 @fragment
-fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
-{
-    let uv = position.xy * globals.viewport.zw;
-    // The G-buffer reads below are a same-frame blit and share wgpu's
-    // top-down origin with the passes that wrote them, so they use `uv`
-    // unchanged.
-    //
-    // The sky gradient is indexed by the ELEVATION of the fragment's own view
-    // ray, not by its screen row. The GLSL this port came from evaluated
-    // skyColour(gl_FragCoord.xy * uViewport.zw), which makes the parameter a
-    // screen row — and a screen-row sky draws its pale horizon band at the
-    // bottom of the frame wherever the camera points, so a camera pitched down
-    // never shows the band at all. This shot sees 0 to 9 degrees of sky, which
-    // a row-indexed ramp renders as the last 7 per cent of the gradient: pure
-    // zenith (49,141,206) across the entire visible band, with the sky's own
-    // horizon colour unreachable. Elevation puts the pale band back on the
-    // horizon line — where the terrain silhouette is, and where the water's
-    // grazing reflection already was — so the sea can sit below its sky instead
-    // of above it.
-    let sky_lin = pow(skyColour(skyParameter(viewRayElevation(uv))), vec3<f32>(2.2));
-
-    // Terrain ambient is NOT the sky along this fragment's ray: it is the
-    // skylight arriving AT the surface, which has nothing to do with which
-    // pixel the surface landed on. It therefore does not follow the sky onto
-    // the elevation parameterisation, and keeps the screen-row ramp it had, so
-    // nothing about terrain lighting moves in this change. That ramp is a
-    // per-fragment vertical gradient — the same meadow is lit differently when
-    // the camera tilts — which is a real defect, but it is a scene relight
-    // rather than a sky fix, so it is left alone here deliberately.
-    let ambient_ramp = smoothstep(0.0, 1.0, 1.0 - uv.y);
-    let ambient_sky_lin = pow(skyColour(ambient_ramp), vec3<f32>(2.2));
-
-    // Uniform mapping (see PORT NOTES): uFogDensity -> globals.params.x,
-    // uExposure -> globals.params.z, uSunIntensity -> globals.settings_a.x,
-    // uAoTexStrength -> globals.settings_a.z; stage.light_direction_view and
-    // stage.ao_strength carry uLightDirectionView and uAoStrength.
+fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = position.xy*globals.viewport.zw;
+    // Hoist derivative-dependent reads before the geometry/sky branch.
     let packed_position = textureSample(texture0, texture0_sampler, uv);
-
-    // HOISTED SAMPLES: the GLSL read these below the early sky return, where
-    // WGSL forbids implicit-derivative sampling (non-uniform control flow).
-    // They are taken unconditionally here; the sky path ignores them.
     let normal_sample = textureSample(texture1, texture1_sampler, uv);
     let albedo_sample = textureSample(texture2, texture2_sampler, uv);
-    let ssao_sample = textureSample(texture3, texture3_sampler, uv);
-
-    if (packed_position.a < 0.5)
-    {
-        return vec4<f32>(pow(acesFilm(sky_lin*globals.params.z), vec3<f32>(1.0/2.2)), 1.0);
+    let ssao = textureSample(texture3, texture3_sampler, uv).r;
+    let world_ray = worldViewRay(uv);
+    let is_sky = packed_position.a < 0.5;
+    let view_distance = select(length(packed_position.xyz), globals.params.y, is_sky);
+    let fog = upsampleAtmosphere(uv, packed_position);
+    if (is_sky) {
+        return encodeOutput(skyRadiance(world_ray)*fog.a + fog.rgb);
     }
-
-    // The terrain G-buffer packs biome weights above the sky flag: snow
-    // quantized to hundredths, grass in the 1e-4 residue (see terrain.fs).
-    // Snow is decoded by rounding, NOT by clamping the raw remainder: snow
-    // is a continuous field, and with grass packed anywhere inside its own
-    // precision a clamped decode absorbs the grass term and the grass
-    // decode below returns identically zero — which is what the original
-    // packing did. grassMask stuck at 0 meant the specular damper never
-    // engaged (full Fresnel GGX on every meadow: the pale sunward wash)
-    // and the anti-solar warm-up stayed dead. Snow's mask drives its
-    // multiply-scattered ambient; grass's damps the grazing Fresnel ramp
-    // that would otherwise paint a plastic sheen over meadows.
-    let snow_mask = clamp(floor((packed_position.a - 1.0)*100.0 + 0.5)*0.01,
-                           0.0, 1.0);
-    let grass_mask = clamp((packed_position.a - 1.0 - snow_mask)*10000.0,
-                            0.0, 1.0);
-
+    // G-buffer alpha stores snow to hundredths and grass in the residue.
+    let snow_mask = clamp(floor((packed_position.a - 1.0)*100.0 + 0.5)*0.01, 0.0, 1.0);
+    let grass_mask = clamp((packed_position.a - 1.0 - snow_mask)*10000.0, 0.0, 1.0);
     let normal_view = normalize(normal_sample.xyz*2.0 - 1.0);
-    let roughness = clamp(normal_sample.a, 0.0, 1.0);
-    // Albedo is sqrt-encoded against 2.5 of headroom by the G-buffer
-    // writers (see terrain.fs): sunlit snow's tinted albedo rides above
-    // 1.0, which a linear 8-bit write would clamp away — deleting the
-    // snow mottle/grain albedo texture and pinning the pack's brightness.
-    // Square the read back out of the encoded range.
+    let normal_world = normalize(viewToWorld(normal_view));
+    let world_position = globals.camera_position.xyz + viewToWorld(packed_position.xyz);
+    let roughness = clamp(normal_sample.a, 0.06, 1.0);
     let albedo = albedo_sample.rgb*albedo_sample.rgb*2.5;
-    let texture_ao = clamp(albedo_sample.a, 0.0, 1.0);
-    let ssao = ssao_sample.r;
     let ao_factor = mix(1.0, ssao, clamp(stage.ao_strength, 0.0, 1.0))
-                   * mix(1.0, texture_ao, clamp(globals.settings_a.z, 0.0, 1.0));
-
-    let light_direction = normalize(stage.light_direction_view.xyz);
-    let to_light = -light_direction;
+                    *mix(1.0, albedo_sample.a, clamp(globals.settings_a.z, 0.0, 1.0));
+    let to_light = -normalize(stage.light_direction_view.xyz);
     let to_camera = normalize(-packed_position.xyz);
     let half_vector = normalize(to_light + to_camera);
-
     let n_dot_l = max(dot(normal_view, to_light), 0.0);
     let n_dot_h = max(dot(normal_view, half_vector), 0.0);
     let n_dot_v = max(dot(normal_view, to_camera), 0.0);
     let v_dot_h = max(dot(to_camera, half_vector), 0.0);
-
-    // Roughness floor tames sub-pixel highlight aliasing on the smoothest
-    // surfaces (wet ground, the ocean, snow glints); alpha = roughness^2
-    // by convention.
-    var alpha = clamp(roughness, 0.06, 1.0);
-    alpha *= alpha;
-
-    // Warm noon sun. Lambert diffuse plus GGX specular, dielectric fresnel
-    // (F0 0.04) — terrain, water and rock are all non-metals. With
-    // uSunIntensity at pi the diffuse at normal incidence equals the albedo,
-    // so sun-facing slopes hold the brightness of the previous half-Lambert.
-    let sun_colour = vec3<f32>(1.0, 0.955, 0.90)*globals.settings_a.x;
+    var sun_visibility = 1.0;
+    if (globals.settings_a.x > 0.01) {
+        sun_visibility = terrainShadow(world_position, normal_world, -normalize(globals.sun_direction.xyz));
+    }
+    let sun_colour = globals.sun_colour.rgb*globals.settings_a.x*sun_visibility;
+    let alpha = roughness*roughness;
     let fresnel = vec3<f32>(0.04) + vec3<f32>(0.96)*pow(1.0 - v_dot_h, 5.0);
-    // A grass canopy is a volume of rough blades that mutually shadow each
-    // other's highlights: measured meadow BRDFs are diffuse-dominant, and
-    // the GGX lobe is only kept at all for the wet blades near waterlines.
-    // The grazing-angle Fresnel ramp paints a broad desaturated sheen band
-    // across every near hillside otherwise — the "too shiny" plastic wash
-    // — so vegetation specular runs near zero.
     let specular = D_GGX(n_dot_h, alpha)*V_SmithGGX(n_dot_l, n_dot_v, alpha)*fresnel
                    *mix(1.0, 0.10, grass_mask);
-
-    // Snow is a translucent pack: light diffuses through the top centimetres,
-    // so its sun-to-shadow terminator stays soft. The wrap touches diffuse
-    // only — snow's glints come from the sparkle path's mirror facets.
     let wrap = 0.22*snow_mask;
-    let n_dot_lw = clamp((n_dot_l + wrap)/(1.0 + wrap), 0.0, 1.0);
-    var lit = (albedo/PI)*n_dot_lw*sun_colour + specular*n_dot_l*sun_colour;
-
-    let view_distance = length(packed_position.xyz);
-
-    // Vegetation backscatter: looking sunward across a meadow shows a bright
-    // retroreflective wash — the anti-solar hotspot from blade geometry and
-    // translucency. This is the photographic grass signature the suppressed
-    // GGX lobe used to fake as sheen. The exponent is softer than the
-    // literature's tight hotspot because this sun sits high: at 60 degrees
-    // elevation the phase angle never approaches zero, so a broad, gentle
-    // directional warm-up is all the geometry can express. Two brakes keep
-    // it honest: the amplitude stays low — at full strength the additive
-    // lift washes ground out to a milky pastel that reads as fog lying on
-    // the field — and it is distance-gated, because the hotspot belongs to
-    // receding canopy while the nearest ground must keep its full
-    // saturation (vision rounds measured the ungated term as a pale
-    // desaturated wash across the sunward side of the closest metres, and
-    // as chartreuse drift where it stacked with warm-tinted clumps).
-    let v_dot_l = max(dot(to_camera, to_light), 0.0);
-    let hotspot_gate = smoothstep(15.0, 45.0, view_distance);
-    lit += albedo*sun_colour*pow(v_dot_l, 3.0)*0.048*hotspot_gate*grass_mask*max(n_dot_l, 0.15);
-
-    // AO primarily modulates indirect light; retaining a little direct light
-    // prevents deep terrain folds from becoming featureless black regions.
+    let wrapped_diffuse = clamp((n_dot_l + wrap)/(1.0 + wrap), 0.0, 1.0);
+    var lit = ((albedo/PI)*wrapped_diffuse + specular*n_dot_l)*sun_colour;
+    let hotspot = pow(max(dot(to_camera, to_light), 0.0), 3.0)
+                  *0.048*smoothstep(15.0, 45.0, view_distance)*grass_mask;
+    lit += albedo*sun_colour*hotspot*max(n_dot_l, 0.15);
     lit *= mix(ao_factor, 1.0, n_dot_l*0.35);
 
-    // Sky ambient fill. Snow is the exception every other material is not:
-    // a snowpack is strongly multiply-scattering, so its shaded side stays
-    // bright and — because ice preferentially absorbs red — sky-blue
-    // instead of falling toward black; that blue shadow tint is what makes
-    // snow read as snow. The mix keeps the cast mostly on the shaded side:
-    // sunlit faces are dominated by the warm direct term and read near
-    // neutral, as photographed snow does. Ambient stays a minority of the
-    // sun term so drifts and sastrugi keep visible sun-side/lee-side
-    // contrast instead of washing into a flat field. Grass ambient is
-    // canopy-filtered skylight, not open-sky azure: a woodland floor's
-    // fill light has already scattered through leaves, so the blue is
-    // tempered toward green and the fill runs slightly weaker — open-sky
-    // ambient painted a pale blue wash over near grass and, stacked with
-    // the warm-up, pushed the nearest field toward chartreuse. The snow
-    // path is unchanged (same 0.45 blue mix as before).
-    let ambient_strength = mix(0.12, 0.28, snow_mask);
-    let ambient_colour = mix(ambient_sky_lin*vec3<f32>(0.80, 1.00, 0.68),
-                             mix(ambient_sky_lin,
-                                 ambient_sky_lin*vec3<f32>(0.70, 0.90, 1.42), 0.45),
-                             snow_mask);
-    lit += albedo*ambient_colour*ambient_strength*ao_factor;
-
-    // Vegetation gains aerial perspective faster than bare ground: a
-    // canopy scatters the light a second time on the way out, so distant
-    // woodland washes toward haze sooner than rock or snow does. Round 7
-    // measured the spawn grass plain flat from horizon to feet (sat 0.581
-    // far vs 0.570 near, far luma no brighter) — no recession at all. The
-    // fog rate rises ~45% for grass only; snow keeps its rate (its
-    // verdicts pass, and its fog-relieved glints must not dim), and the
-    // nearest metres stay untouched either way.
-    var fog = 1.0 - exp(-max(globals.params.x, 0.0)*(1.0 + 0.45*grass_mask)
-                          *view_distance);
-    // Aerial perspective fades terrain into the same linear sky the sky
-    // pixels display, so distant land dissolves into the haze behind it.
-    // `sky_lin` is that sky for THIS fragment's view ray — the same ray, so
-    // the same elevation, so the same colour the sky pass would have painted
-    // had the terrain not been there. A fully fogged fragment lands on the sky
-    // byte-for-byte through the identical ACES path, and the horizon has no
-    // seam to band at.
-    // Surviving sun glints are the exception: a mirror facet's specular
-    // spike rides orders of magnitude above the diffuse field, and light
-    // haze attenuates such a spike without dissolving it into sky — the
-    // sun path on distant water stays visible through haze in real
-    // photographs. The sparkle path writes roughness 0.13 (the flash lobe
-    // widened to match its acceptance window, see terrain.fs) and wet
-    // ground/water writes 0.10-0.12; the window starts above both so those
-    // tight-mirror pixels halve their fog pull and distant sunlit
-    // snowfields keep their sparse shimmer instead of fogging flat (round
-    // 6 measured the far ridge at 2 px of surviving glint over a 650x340
-    // lit-snow region).
-    fog *= 1.0 - 0.55*(1.0 - smoothstep(0.13, 0.22, roughness));
-    lit = mix(lit, sky_lin, clamp(fog, 0.0, 1.0));
-
-    return vec4<f32>(pow(max(acesFilm(lit*globals.params.z), vec3<f32>(0.0)), vec3<f32>(1.0/2.2)), 1.0);
+    // Moonlight follows its own direction and terrain occlusion at night.
+    let to_moon = -normalize(globals.moon_direction.xyz);
+    var moon_visibility = 1.0;
+    if (globals.atmosphere.y > 0.001) {
+        moon_visibility = terrainShadow(world_position, normal_world, to_moon);
+    }
+    lit += albedo/PI*vec3<f32>(0.52, 0.65, 1.0)*globals.atmosphere.y
+           *max(dot(normal_world, to_moon), 0.0)*moon_visibility*ao_factor;
+    let ambient = skyAmbient(normal_world);
+    let ambient_colour = mix(ambient*vec3<f32>(0.80, 1.00, 0.68),
+                             ambient*vec3<f32>(0.865, 0.955, 1.189), snow_mask);
+    lit += albedo*ambient_colour*mix(0.22, 0.42, snow_mask)*ao_factor;
+    return encodeOutput(lit*fog.a + fog.rgb);
 }
-
-// STAGE UNIFORMS:
-//   light_direction_view : vec4<f32> - uLightDirectionView: view-space direction
-//       travelled by sunlight (already rotated by the view matrix; NOT the
-//       world-space globals.sun_direction). Rust can fill it with
-//       (globals.view * vec4<f32>(globals.sun_direction.xyz, 0.0)); only .xyz
-//       is read, w exists to keep the next member at offset 16.
-//   ao_strength : f32 - uAoStrength: SSAO blend strength, clamped to [0,1]
-//       in-shader (1.0 = full blurred-SSAO weighting, 0.0 = disabled).
-// Rust fill (uniform, 32 bytes, matching CompositeStageUniforms exactly):
-//   [0]  light_direction_view: [f32; 4] (w = 0.0),
-//   [16] ao_strength: f32, [20] pad: [f32; 3]
-// Composite uniforms carried by the SHARED GlobalUniforms (group 0/binding 0):
-//   params.x = uFogDensity, params.z = uExposure,
-//   settings_a.x = uSunIntensity, settings_a.z = uAoTexStrength
-// Textures (group 1, all linear-filtered, samplers at binding + 8):
-//   0 = gPosition (a = sky flag + packed biome masks),
-//   1 = gNormal (rgb view-space*0.5+0.5, a = roughness),
-//   2 = gAlbedo (sqrt-encoded rgb, a = texture AO),
-//   3 = bilaterally blurred SSAO (r channel)
-// Output: location 0 = gamma-encoded RGBA8 — the exact bytes FXAA consumes.

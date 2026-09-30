@@ -37,6 +37,7 @@
 use crate::RerunErosion;
 use crate::automation::AutomationSettings;
 use crate::constants::*;
+use crate::day_night::DayNightCycle;
 use crate::erosion::{self, ErosionCache, ErosionTileState};
 use crate::matrices;
 use crate::noise::NoiseField;
@@ -83,6 +84,7 @@ pub fn draw_diagnostics_ui(
     mut settings: ResMut<AppSettings>,
     mut erosion_settings: ResMut<ErosionSettings>,
     mut water_settings: ResMut<WaterSettings>,
+    mut day_night: ResMut<DayNightCycle>,
     cache: Res<ErosionCache>,
     noise: Res<NoiseField>,
     players: Query<&Player>,
@@ -102,6 +104,7 @@ pub fn draw_diagnostics_ui(
             &mut settings,
             &mut erosion_settings,
             &mut water_settings,
+            &mut day_night,
             &cache,
             player,
             &mut rerun,
@@ -146,11 +149,13 @@ pub fn draw_diagnostics_ui(
 
 /// The "Infinite Terrain Lab" window. Mirrors `DrawDiagnostics` widget for
 /// widget, including the ImGui formatting strings.
+#[allow(clippy::too_many_arguments)]
 fn draw_diagnostics_window(
     ctx: &mut egui::Context,
     settings: &mut AppSettings,
     erosion_settings: &mut ErosionSettings,
     water_settings: &mut WaterSettings,
+    day_night: &mut DayNightCycle,
     cache: &ErosionCache,
     player: &Player,
     rerun: &mut RerunErosion,
@@ -173,6 +178,7 @@ fn draw_diagnostics_window(
         .frame(frame)
         .default_pos(egui::pos2(16.0, 16.0))
         .default_size(egui::vec2(380.0, 520.0))
+        .vscroll(true)
         .open(&mut open)
         .show(ctx, |ui| {
             ui.label("GPU clipmap terrain + hydraulic erosion");
@@ -214,6 +220,53 @@ fn draw_diagnostics_window(
                 "Detail: {:.3}  flow axis bias: {:.3}",
                 cache.stats.erosion_detail, cache.stats.flow_axis_bias
             ));
+
+            separator_text(ui, "Sun and time");
+            ui.add(
+                egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99)
+                    .text("Time of day")
+                    .custom_formatter(|hours, _| {
+                        let minutes = (hours * 60.0).round() as u32 % (24 * 60);
+                        format!("{:02}:{:02}", minutes / 60, minutes % 60)
+                    }),
+            );
+            ui.checkbox(&mut day_night.paused, "Pause day/night cycle");
+            ui.add(
+                egui::Slider::new(&mut day_night.day_length_minutes, 1.0..=120.0)
+                    .text("Day duration")
+                    .suffix(" min")
+                    .logarithmic(true),
+            );
+            ui.horizontal(|ui| {
+                for (label, hour) in [("Dawn", 6.25), ("Noon", 12.0), ("Dusk", 17.75), ("Night", 0.0)] {
+                    if ui.button(label).clicked() {
+                        day_night.time_hours = hour;
+                    }
+                }
+            });
+
+            separator_text(ui, "Raymarched lighting");
+            ui.checkbox(&mut settings.raymarched_shadows, "Terrain shadows");
+            ui.checkbox(&mut settings.volumetric_lighting, "Volumetric sunlight");
+            ui.checkbox(&mut settings.water_reflections, "Water reflections");
+            let quality_name = match settings.raymarch_quality {
+                0 => "Low",
+                2 => "High",
+                _ => "Balanced",
+            };
+            egui::ComboBox::from_label("Raymarch quality")
+                .selected_text(quality_name)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut settings.raymarch_quality, 0, "Low");
+                    ui.selectable_value(&mut settings.raymarch_quality, 1, "Balanced");
+                    ui.selectable_value(&mut settings.raymarch_quality, 2, "High");
+                });
+            ui.add_enabled(
+                settings.volumetric_lighting,
+                egui::Slider::new(&mut settings.volumetric_strength, 0.0..=2.0)
+                    .text("Light shaft strength")
+                    .fixed_decimals(2),
+            );
 
             separator_text(ui, "Rendering");
             ui.checkbox(&mut settings.ssao_enabled, "SSAO");

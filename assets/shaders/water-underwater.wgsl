@@ -7,12 +7,10 @@
 // to the composited frame, which is equivalent for a single camera whose whole
 // frustum sits in one homogeneous medium, and skips the intermediate target.
 //
-// Applied in display-referred linear space: the frame handed in has already
-// been through the composite's ACES curve and gamma encode, and this pass
-// decodes it, attenuates and re-encodes. The medium therefore sits after the
-// tone curve rather than before it, which for an absorbing medium differs from
-// aqua in the highlight roll-off only — extinction and in-scatter are the same
-// expressions.
+// The incoming composite has been exposed, tone-mapped and gamma encoded.
+// Invert that transform before attenuation and apply it once to the final HDR
+// medium result. The original radiance of clipped highlights is unrecoverable.
+// Sunlight, moonlight and the sky through Snell's window follow the day clock.
 //
 // Not ported: caustics, god rays, bubble spray, and the post-process distortion
 // from aqua's `Effects`. None of them are part of the medium.
@@ -27,6 +25,11 @@ struct GlobalUniforms
     params: vec4<f32>,            // x fog_density, y z_far, z exposure, w ssao_enabled
     settings_a: vec4<f32>,        // x sun_intensity, y texture_scale, z ao_tex_strength, w variant_scale
     settings_b: vec4<f32>,        // x normal_strength, y sparkle_strength, z flow_debug, w erosion_debug
+    sun_colour: vec4<f32>,      // linear sunlight tint
+    moon_direction: vec4<f32>,  // direction moonlight travels
+    atmosphere: vec4<f32>,      // daylight, moon intensity, hours, volume strength
+    raymarch: vec4<f32>,        // shadows, volumes, reflections, quality
+    heightfield: vec4<f32>,     // world centre XZ, span, texel size
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
@@ -35,7 +38,7 @@ struct UnderwaterUniforms
     params: vec4<f32>,      // x sea level, y camera height above it, z elapsed seconds, w fade
     extinction: vec4<f32>,  // rgb extinction /m, w scatter scale
     scatter: vec4<f32>,     // rgb scatter tint, w asymmetry
-    sun: vec4<f32>,         // rgb sun radiance at the surface, w unused
+    sun: vec4<f32>,         // rgb sun radiance at the surface, w moon radiance scale
 };
 @group(2) @binding(0) var<uniform> medium: UnderwaterUniforms;
 
@@ -56,44 +59,87 @@ fn smoothstepf(edge0: f32, edge1: f32, x: f32) -> f32
     return t*t*(3.0 - 2.0*t);
 }
 
-/// The gradient itself, as a function of its own parameter: 0 at the horizon,
-/// 1 at the zenith. Byte-for-byte the copy composite.wgsl draws with.
-fn skyColour(parameter: f32) -> vec3<f32>
-{
-    let horizon = vec3<f32>(0.72, 0.82, 0.90);
-    let zenith = vec3<f32>(0.22, 0.46, 0.74);
-    return mix(horizon, zenith, parameter);
+// Shared linear atmosphere model. Kept byte-for-byte in the composite and
+// water passes so reflected skies and the visible horizon agree.
+fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
+    let ray = normalize(direction);
+    let to_sun = -normalize(globals.sun_direction.xyz);
+    let to_moon = -normalize(globals.moon_direction.xyz);
+    let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    let elevation = smoothstep(0.0, 0.85, ray.y);
+    let day_sky = mix(vec3<f32>(0.49, 0.64, 0.82),
+                      vec3<f32>(0.045, 0.175, 0.43), elevation);
+    let night_sky = mix(vec3<f32>(0.008, 0.013, 0.027),
+                        vec3<f32>(0.0014, 0.0025, 0.008), elevation);
+    var sky = mix(night_sky, day_sky, daylight);
+    let sunset = exp(-pow((to_sun.y + 0.025)/0.17, 2.0));
+    let horizon = exp(-abs(ray.y)*6.0);
+    let sunward = pow(max(dot(normalize(vec3<f32>(ray.x, 0.001, ray.z)),
+                              normalize(vec3<f32>(to_sun.x, 0.001, to_sun.z))), 0.0), 5.0);
+    sky += vec3<f32>(0.65, 0.16, 0.025)*sunset*horizon*(0.15 + 0.85*sunward);
+
+    let sun_mu = clamp(dot(ray, to_sun), -1.0, 1.0);
+    let sun_visible = smoothstep(-0.018, 0.012, to_sun.y);
+    let sun_disk = smoothstep(0.9999832, 0.9999905, sun_mu);
+    let sun_halo = exp(-(1.0 - sun_mu)*750.0)*0.10
+                   + pow(max(sun_mu, 0.0), 24.0)*0.035;
+    // Direct ground irradiance fades before the visible solar disc sets.
+    sky += globals.sun_colour.rgb*sun_visible
+           *(sun_disk*14.0*globals.sun_colour.w + sun_halo*globals.settings_a.x);
+
+    let moon_mu = clamp(dot(ray, to_moon), -1.0, 1.0);
+    let moon_disk = smoothstep(0.999978, 0.999986, moon_mu);
+    let moon_visible = smoothstep(-0.02, 0.03, to_moon.y)*(1.0 - daylight*0.9);
+    sky += vec3<f32>(0.63, 0.74, 1.0)*moon_visible
+           *(moon_disk*1.6 + exp(-(1.0 - moon_mu)*500.0)*0.025);
+
+    // Stars occupy a world-oriented angular grid and remain stationary when
+    // the camera rotates. Smooth small discs avoid binary sparkling.
+    let star_uv = vec2<f32>(atan2(ray.z, ray.x), asin(clamp(ray.y, -1.0, 1.0)))*360.0;
+    let star_cell = floor(star_uv);
+    let star_hash = fract(sin(dot(star_cell, vec2<f32>(127.1, 311.7)))*43758.5453);
+    let star_local = fract(star_uv) - vec2<f32>(0.5);
+    let star_disc = 1.0 - smoothstep(0.035, 0.18, length(star_local));
+    let star = step(0.997, star_hash)*star_disc*(0.25 + 0.75*star_hash);
+    sky += vec3<f32>(0.6, 0.73, 1.0)*star*pow(1.0 - daylight, 4.0)
+           *smoothstep(-0.03, 0.18, ray.y)*0.7;
+    return max(sky, vec3<f32>(0.0));
 }
 
-/// Sky gradient parameter for a ray whose sine of elevation is `direction_y`,
-/// matching composite.wgsl's and water-surface.wgsl's.
-fn skyParameter(direction_y: f32) -> f32
-{
-    return smoothstepf(0.0, 0.85, direction_y);
+// Hemisphere-integrated fill depends on the surface orientation and time of
+// day, never its screen row or camera pitch. Excludes the celestial discs.
+fn skyAmbient(normal_world: vec3<f32>) -> vec3<f32> {
+    let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    let upward = clamp(normal_world.y*0.5 + 0.5, 0.0, 1.0);
+    let day_fill = mix(vec3<f32>(0.13, 0.17, 0.22),
+                       vec3<f32>(0.32, 0.44, 0.62), upward);
+    let night_fill = mix(vec3<f32>(0.007, 0.011, 0.022),
+                         vec3<f32>(0.019, 0.029, 0.058), upward);
+    return mix(night_fill, day_fill, daylight);
 }
 
-/// `skyColour` decoded into the linear space this pass lights in.
-///
-/// The gradient is authored display-referred — composite.wgsl decodes it with
-/// `pow(sky, 2.2)` before use — and this shader decodes the incoming frame the
-/// same way, so the light pouring through Snell's window has to be decoded too
-/// or it lands about 2.5x too bright.
-fn skyLinear(parameter: f32) -> vec3<f32>
+fn acesFilm(x: vec3<f32>) -> vec3<f32>
 {
-    return pow(max(skyColour(parameter), vec3<f32>(0.0)), vec3<f32>(2.2));
+    const a: f32 = 2.51;
+    const b: f32 = 0.03;
+    const c: f32 = 2.43;
+    const d: f32 = 0.59;
+    const e: f32 = 0.14;
+    return clamp((x*(a*x + b))/(x*(c*x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-/// Elevation sine of the representative sky that pours through Snell's window.
-///
-/// The window is not a view direction: it is the whole sky dome refracted into
-/// a cone, so it wants ONE colour and stays a constant under the elevation
-/// parameterisation. `0.85 * 0.85` is the old screen-row value carried across —
-/// under a ramp of `smoothstep(0, 1, x)` a value `x` and the elevation sine
-/// `0.85x` land on the same gradient parameter — so the window light is
-/// unchanged. (The same literal 0.85 in water-surface.wgsl's `skyParameter` is
-/// a ramp EDGE; here it is a sample point. Unrelated meanings, kept apart by
-/// naming this one for what it is.)
-const WINDOW_SKY_ELEVATION: f32 = 0.85 * 0.85;
+// The composite has already applied exposure, ACES and gamma. Undo all three
+// for both transmitted scene colours and reflected terrain, so neither is
+// tone-mapped twice. Saturated pixels recover a finite radiance estimate.
+fn sceneRadiance(encoded: vec3<f32>) -> vec3<f32>
+{
+    let y = clamp(pow(max(encoded, vec3<f32>(0.0)), vec3<f32>(2.2)),
+                  vec3<f32>(0.0), vec3<f32>(0.999));
+    let a = 2.51 - 2.43*y;
+    let b = 0.03 - 0.59*y;
+    let linear = (-b + sqrt(max(b*b + 0.56*a*y, vec3<f32>(0.0))))/(2.0*a);
+    return linear/max(globals.params.z, 0.001);
+}
 
 fn henyeyGreenstein(cos_theta: f32, g: f32) -> f32
 {
@@ -173,8 +219,7 @@ fn fs_main(in: VsOutput) -> @location(0) vec4<f32>
     }
 
     // Optical path: the world distance from the eye to whatever the ray hits,
-    // capped at the medium's maximum. A sky ray leaves the medium, so it takes
-    // the cap — that is what aqua does there too.
+    // capped at the medium's maximum and, for upward rays, at the sea surface.
     var optical_path = PATH_LENGTH_MAX;
     if (packed.a >= 0.5)
     {
@@ -183,7 +228,13 @@ fn fs_main(in: VsOutput) -> @location(0) vec4<f32>
         optical_path = min(length(packed.xyz), PATH_LENGTH_MAX);
     }
 
-    let scene_linear = pow(max(scene.rgb, vec3<f32>(0.0)), vec3<f32>(2.2));
+    let to_view = rayDirection(uv);
+    if (to_view.y > 0.001)
+    {
+        let surface_path = max(medium.params.x - globals.camera_position.y, 0.0)/to_view.y;
+        optical_path = min(optical_path, surface_path);
+    }
+    let scene_linear = sceneRadiance(scene.rgb);
     let sigma_t = max(medium.extinction.xyz, vec3<f32>(1e-4));
     let sigma_s = min(sigma_t,
                       PARTICLE_SCATTER*medium.extinction.w*medium.scatter.xyz + RAYLEIGH);
@@ -192,12 +243,20 @@ fn fs_main(in: VsOutput) -> @location(0) vec4<f32>
     // In-scattered sunlight. The eye is inside the medium, so the whole path is
     // the water column — there is nothing above the shaded point to attenuate
     // first, unlike the surface pass.
-    let to_view = rayDirection(uv);
     let to_sun = normalize(-globals.sun_direction.xyz);
-    let cos_theta = dot(to_view, -to_sun);
+    // rayDirection points from the eye toward the scene, so forward
+    // scattering peaks while looking toward the source.
+    let cos_theta = dot(to_view, to_sun);
     let phase = mix(henyeyGreenstein(cos_theta, clamp(medium.scatter.w, -0.99, 0.99)),
                     phaseRayleigh(cos_theta), 0.5);
-    let scattered = sigma_s*medium.sun.rgb*phase*(1.0 - transmittance)/sigma_t;
+    let to_moon = normalize(-globals.moon_direction.xyz);
+    let moon_phase = mix(henyeyGreenstein(dot(to_view, to_moon),
+                        clamp(medium.scatter.w, -0.99, 0.99)),
+                        phaseRayleigh(dot(to_view, to_moon)), 0.5);
+    let moon_radiance = vec3<f32>(0.63, 0.74, 1.0)*medium.sun.w;
+    let ambient = skyAmbient(vec3<f32>(0.0, 1.0, 0.0))*(0.35/(4.0*PI));
+    let scattered = sigma_s*(medium.sun.rgb*phase + moon_radiance*moon_phase + ambient)
+                   *(1.0 - transmittance)/sigma_t;
 
     // Snell's window: seen from below, the surface transmits only within a cone
     // of asin(1/n) of the vertical; outside it the surface mirrors the dark
@@ -206,10 +265,13 @@ fn fs_main(in: VsOutput) -> @location(0) vec4<f32>
     let critical_cosine = sqrt(max(1.0 - 1.0/(N_WATER*N_WATER), 0.0));
     let window = smoothstepf(critical_cosine - 0.12, critical_cosine + 0.03,
                              max(to_view.y, 0.0));
-    let window_light = skyLinear(skyParameter(WINDOW_SKY_ELEVATION))*globals.params.z;
+    let window_direction = vec3<f32>(to_view.x*N_WATER,
+                          sqrt(max(1.0 - N_WATER*N_WATER*(1.0 - to_view.y*to_view.y), 0.001)),
+                          to_view.z*N_WATER);
+    let window_light = skyRadiance(window_direction);
 
     let lit = scene_linear*transmittance + scattered + window_light*window*0.28;
-    let medium_result = pow(max(lit, vec3<f32>(0.0)), vec3<f32>(1.0/2.2));
+    let medium_result = pow(acesFilm(lit*globals.params.z), vec3<f32>(1.0/2.2));
     return vec4<f32>(mix(scene.rgb, clamp(medium_result, vec3<f32>(0.0), vec3<f32>(1.0)), fade),
                      1.0);
 }
