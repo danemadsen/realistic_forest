@@ -16,6 +16,21 @@ log = "0.4"
 image = "0.25"
 chrono = "0.4"
 
+# macOS only, and only for `clamp_to_primary_work_area`: raylib clamps
+# `InitWindow`'s screen size to the primary monitor's work area before creating
+# the window, and `NSScreen.visibleFrame` is the only way to read that — winit
+# exposes no work-area query at all. Both crates are already in the tree via
+# accesskit/arboard (objc2 0.6.4, objc2-app-kit 0.3.2), so no versions move.
+# `default-features = false` matters: objc2-app-kit's defaults are the whole
+# AppKit surface, and taking them pulls in a dozen more objc2-* crates
+# (quartz-core, core-text, cloud-kit, ...) that this one call never touches.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSScreen",
+] }
+
 [profile.dev]
 opt-level = 1
 

@@ -97,7 +97,7 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                             automation.yaw = v[3] * DEG_TO_RAD;
                             automation.pitch = v[4] * DEG_TO_RAD;
                         }
-                        None => log::warn!("--camera expects x,y,z,yawDeg,pitchDeg"),
+                        None => println!("WARNING: --camera expects x,y,z,yawDeg,pitchDeg"),
                     }
                 }
             }
@@ -125,7 +125,7 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                     index += 1;
                     match parse_ints(next, 2) {
                         Some(v) => automation.overlap_tile = TileKey { x: v[0], z: v[1] },
-                        None => log::warn!("--overlap-tile expects x,z tile keys"),
+                        None => println!("WARNING: --overlap-tile expects x,z tile keys"),
                     }
                 }
             }
@@ -167,7 +167,11 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                     } else {
                         automation.width = 1600;
                         automation.height = 900;
-                        log::warn!("--size expects WxH, keeping 1600x900");
+                        // The C++ prints this verbatim (main.cpp's sscanf on
+                        // "%d,%d" falls through to the same default) and it
+                        // is the reader's only clue that a malformed --size
+                        // was ignored, so it must reach the terminal.
+                        println!("WARNING: --size expects WxH, keeping 1600x900");
                     }
                 }
             }

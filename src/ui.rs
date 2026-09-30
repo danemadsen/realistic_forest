@@ -397,7 +397,20 @@ fn draw_crosshair(painter: &egui::Painter, viewport: (u32, u32), pixels_per_poin
         (viewport.0 / 2) as f32 / pixels_per_point,
         (viewport.1 / 2) as f32 / pixels_per_point,
     );
-    let arm = 6.0 / pixels_per_point;
+    // The 6 is raylib *screen* (logical) points, not framebuffer pixels:
+    // DrawLine rasterised through rlOrtho(0, GetScreenWidth(), ...), and
+    // FLAG_WINDOW_HIGHDPI's screenScale then doubles the framebuffer under it.
+    // Measured, that is what makes the reference's arm 12 framebuffer rows on
+    // a 1x window and 24 on this 2x panel (/tmp/ab_cpp_1.png at 1470x900 vs
+    // /tmp/cpp_shot.png at 2940x1782). egui already paints in logical points,
+    // so the constant carries across unchanged — dividing it by
+    // pixels_per_point, as this did, halved the crosshair on Retina (12 rows
+    // instead of 24 at 2940x1782).
+    let arm = 6.0;
+    // The hairline is the one part that does NOT scale: raylib rasterised it
+    // at one framebuffer pixel wide whatever the screenScale, and the
+    // reference measures 1 column thick at both factors, so this stays a
+    // single physical pixel expressed in logical points.
     let stroke = egui::Stroke::new(
         1.0 / pixels_per_point,
         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 216),
