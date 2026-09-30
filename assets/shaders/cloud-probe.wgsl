@@ -113,7 +113,8 @@ fn marchClouds(origin: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, q
     result.distance = maximum_distance;
     if (globals.clouds.x < 0.5 || globals.clouds.y <= 0.001 || globals.clouds.z <= 0.001) { return result; }
     let ray = normalize(direction);
-    let limit = min(maximum_distance, max(globals.cloud_motion.w, 1000.0));
+    let cloud_range = max(globals.cloud_motion.w, 1000.0);
+    let limit = min(maximum_distance, cloud_range);
     let interval = cloudInterval(origin, ray, limit);
     if (interval.y <= interval.x) { return result; }
     let count = select(select(32u, 48u, quality >= 1.0), 72u, quality >= 2.0);
@@ -130,7 +131,7 @@ fn marchClouds(origin: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, q
         let distance = interval.x + (f32(i) + 0.5)*step_length;
         let world_position = origin + ray*distance;
         let density = cloudDensity(world_position, true)
-                      *(1.0 - smoothstep(limit*0.60, limit, distance));
+                      *(1.0 - smoothstep(cloud_range*0.60, cloud_range, distance));
         if (density <= 0.001) { continue; }
         let height = clamp((world_position.y - globals.clouds.w)/max(globals.cloud_layer.x, 50.0), 0.0, 1.0);
         let step_transmittance = exp(-density*CLOUD_EXTINCTION*step_length);

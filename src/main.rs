@@ -387,9 +387,11 @@ fn setup_cursor_and_player(
     // pinned --camera pose, the whole point of an unattended capture, would
     // silently never be applied.
     let Ok((mut cursor,)) = windows.single_mut() else {
+        log::warn!("AUTOMATION: no primary window yet; retrying the startup pose");
         return;
     };
     let Ok(mut player) = player.single_mut() else {
+        log::warn!("AUTOMATION: no player entity yet; retrying the startup pose");
         return;
     };
     *local = true;
@@ -420,6 +422,14 @@ fn setup_cursor_and_player(
     player.pitch = automation.pitch;
     player.flying = true;
     player.mouse_captured = false;
+    log::info!(
+        "SHOT: pose pinned at {:.1},{:.1},{:.1} yaw {:.1} pitch {:.1}",
+        player.position.x,
+        player.position.y,
+        player.position.z,
+        player.yaw.to_degrees(),
+        player.pitch.to_degrees(),
+    );
 }
 
 /// F1 toggles the diagnostics panel (releasing the pointer when it opens,
