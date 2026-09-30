@@ -16,6 +16,12 @@ log = "0.4"
 image = "0.25"
 chrono = "0.4"
 
+# The runtime GLB reader (`src/render/glb.rs`). Only the JSON chunk of the
+# container is parsed with it — accessors are read straight out of the binary
+# chunk by offset — so this is `serde_json::Value` navigation, not a derive
+# surface. Already in the lock as a bevy dependency, so nothing new is built.
+serde_json = "1"
+
 # macOS only, and only for `clamp_to_primary_work_area`: raylib clamps
 # `InitWindow`'s screen size to the primary monitor's work area before creating
 # the window, and `NSScreen.visibleFrame` is the only way to read that — winit

@@ -54,6 +54,16 @@ fn vs_main(@builtin(vertex_index) vertex: u32) -> VsOutput {
 
 const PI: f32 = 3.14159265;
 
+// The G-buffer position target's alpha is a material tag above its coverage
+// meaning. Terrain packs two biome masks into [1.0, 1.01]; trees write
+// TREE_POSITION_ALPHA plus their glTF specular factor. Both constants are
+// spelled out again in tree-fs.wgsl — WGSL has no #include — and a unit test in
+// src/render/mod.rs asserts the two spellings have not drifted apart.
+const TREE_POSITION_ALPHA: f32 = 1.5;
+// Halfway between the terrain band's ceiling and a tree's tag: comfortably
+// clear of the 1.01 that snow plus grass can reach, and of the 1.5 floor.
+const FOLIAGE_ALPHA_FLOOR: f32 = 1.25;
+
 // BEGIN SHARED VOLUMETRIC CLOUDS
 // Periodic world-space noise keeps the volume stationary as the camera moves.
 // RG: smooth fractal / inverted Worley shape; B: fine detail; A: broad weather.
@@ -504,8 +514,16 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         return encodeOutput(skyRadiance(world_ray)*fog.a + fog.rgb);
     }
     // G-buffer alpha stores snow to hundredths and grass in the residue.
-    let snow_mask = clamp(floor((packed_position.a - 1.0)*100.0 + 0.5)*0.01, 0.0, 1.0);
-    let grass_mask = clamp((packed_position.a - 1.0 - snow_mask)*10000.0, 0.0, 1.0);
+    // A tree writes a tag above the terrain's band instead (tree-fs.wgsl); it
+    // carries no biome masks, so both decode to zero for it.
+    let is_foliage = packed_position.a >= FOLIAGE_ALPHA_FLOOR;
+    let snow_mask = select(
+        clamp(floor((packed_position.a - 1.0)*100.0 + 0.5)*0.01, 0.0, 1.0), 0.0, is_foliage);
+    let grass_mask = select(
+        clamp((packed_position.a - 1.0 - snow_mask)*10000.0, 0.0, 1.0), 0.0, is_foliage);
+    // The pack's own `KHR_materials_specular` factor, which tree-fs.wgsl put in
+    // the tag's fraction. Terrain is not foliage and keeps an unmodified F0.
+    let material_specular = select(1.0, packed_position.a - TREE_POSITION_ALPHA, is_foliage);
     let normal_view = normalize(normal_sample.xyz*2.0 - 1.0);
     let normal_world = normalize(viewToWorld(normal_view));
     let world_position = globals.camera_position.xyz + viewToWorld(packed_position.xyz);
@@ -527,7 +545,16 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     }
     let sun_colour = globals.sun_colour.rgb*globals.settings_a.x*sun_visibility;
     let alpha = roughness*roughness;
-    let fresnel = vec3<f32>(0.04) + vec3<f32>(0.96)*pow(1.0 - v_dot_h, 5.0);
+    // A canopy is a volume of rough cards that mutually shadow each other's
+    // highlights, so measured foliage BRDFs are diffuse-dominant — the same
+    // argument the reference makes for grass, and trees belong in that class.
+    // Without this the grazing Fresnel ramp (0.96 at VdotH 0) paints a broad
+    // desaturated sheen over every crown, which on cards whose normals point
+    // in every direction reads as pale speckle rather than as gloss.
+    // `material_specular` is the glTF material's own factor: 0.096 for the
+    // pack's branch cards, 0.022 for the billboards.
+    let fresnel = (vec3<f32>(0.04) + vec3<f32>(0.96)*pow(1.0 - v_dot_h, 5.0))
+                  * material_specular;
     let specular = D_GGX(n_dot_h, alpha)*V_SmithGGX(n_dot_l, n_dot_v, alpha)*fresnel
                    *mix(1.0, 0.10, grass_mask);
     let wrap = 0.22*snow_mask;

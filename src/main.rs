@@ -13,6 +13,7 @@ mod matrices;
 mod noise;
 mod player;
 mod render;
+mod trees;
 mod ui;
 mod water;
 mod weather;
@@ -282,6 +283,9 @@ fn main() {
         // The render plugin lifts the shared noise field and erosion bridge
         // into the render sub-app at build time, so they must exist first.
         .add_plugins(render::ForestRenderPlugin::new(noise_field.clone()))
+        // The fir catalogue loads in PreStartup, before the first Update tick
+        // can ask the scatter for a tree it does not have heights for.
+        .add_plugins(trees::TreePlugin)
         .add_systems(Startup, spawn_scene)
         .add_systems(
             Startup,
@@ -303,7 +307,16 @@ fn main() {
                 // --measure-overlap replaces normal streaming with its own
                 // driver, mirroring the C++ short-circuit in main().
                 erosion_stream_system.run_if(not_in_measure_mode),
+                // The forest reads the cache the line above just filled: a
+                // chunk is only scattered once the erosion tiles under it have
+                // finalised, so running before the stream would defer
+                // everything by a frame for no reason.
+                trees::tree_stream_system.run_if(not_in_measure_mode),
                 player::update_player_system,
+                // Collision sees the position the player actually moved to —
+                // that is what lets it push them out of a trunk rather than
+                // reject the step that put them there.
+                trees::tree_collision_system,
                 player::sync_player_camera_transform,
                 measure_overlap_system.run_if(in_measure_mode),
                 shot_scheduling_system,
@@ -647,15 +660,35 @@ fn shot_scheduling_system(
     mut counter: ResMut<FrameCounter>,
     mut requested: ResMut<ShotRequested>,
     mut commands: Commands,
+    time: Res<Time>,
+    mut window: Local<[f32; 4]>,
 ) {
     let Some(shot_path) = automation.shot_path.clone() else {
         return;
     };
     counter.0 += 1;
+    // Rolling mean frame time over the last 64 frames, reported with the
+    // capture. A `--shot` run is otherwise silent about cost, and the frame
+    // time is the number a density change has to be judged against: the tree
+    // scatter is a one-off, but what it scatters is submitted every frame from
+    // then on. Startup frames are excluded because erosion tiles are still
+    // being simulated then and would swamp the figure.
+    if counter.0 > 120 {
+        window[0] += time.delta_secs();
+        window[1] += 1.0;
+        if window[1] >= 64.0 {
+            window[2] = window[0] / window[1];
+            window[0] = 0.0;
+            window[1] = 0.0;
+        }
+    }
     if requested.0 || counter.0 < automation.wait_frames as u64 {
         // A request already made and not yet captured; AppExit is written by
         // the capture observer once the image lands.
         return;
+    }
+    if window[2] > 0.0 {
+        log::info!("FRAME: {:.1} ms average ({:.0} fps)", window[2] * 1000.0, 1.0 / window[2]);
     }
     requested.0 = true;
     // The observer outlives this system, so it owns the path rather than

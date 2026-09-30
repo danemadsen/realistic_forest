@@ -4,9 +4,11 @@
 
 pub mod erosion_node;
 pub mod cloud_node;
+pub mod glb;
 pub mod gpu_textures;
 pub mod post_nodes;
 pub mod terrain_node;
+pub mod tree_node;
 pub mod water_node;
 
 use crate::constants::*;
@@ -330,6 +332,8 @@ pub struct ForestShaderHandles {
     pub water_underwater: Handle<Shader>,
     pub water_blit: Handle<Shader>,
     pub cloud_probe: Handle<Shader>,
+    pub tree_vs: Handle<Shader>,
+    pub tree_fs: Handle<Shader>,
 }
 
 pub struct ForestRenderPlugin {
@@ -371,6 +375,8 @@ impl Plugin for ForestRenderPlugin {
                 water_underwater: asset_server.load::<Shader>("shaders/water-underwater.wgsl"),
                 water_blit: asset_server.load::<Shader>("shaders/water-blit.wgsl"),
                 cloud_probe: asset_server.load::<Shader>("shaders/cloud-probe.wgsl"),
+                tree_vs: asset_server.load::<Shader>("shaders/tree-vs.wgsl"),
+                tree_fs: asset_server.load::<Shader>("shaders/tree-fs.wgsl"),
             }
         };
         // The main world's terrain layer images (and the erosion blend mask)
@@ -401,6 +407,7 @@ impl Plugin for ForestRenderPlugin {
         gpu_textures::register_gpu_texture_systems(render_app);
         erosion_node::register_erosion_systems(render_app);
         terrain_node::register_terrain_systems(render_app);
+        tree_node::register_tree_systems(render_app);
         post_nodes::register_post_systems(render_app);
         cloud_node::register_cloud_systems(render_app);
 
@@ -435,6 +442,7 @@ fn build_forest_graph(render_app: &mut bevy::app::SubApp) -> RenderGraph {
     graph.add_sub_graph(bevy_egui::render::graph::SubGraphEgui, egui_graph);
     graph.add_node(erosion_node::NodeErosion::ErosionSim, erosion_node::ForestErosionNode);
     graph.add_node(terrain_node::NodeTerrain::TerrainPass, terrain_node::ForestTerrainNode);
+    graph.add_node(tree_node::NodeTrees::TreePass, tree_node::ForestTreeNode);
     graph.add_node(post_nodes::NodeSsao::SsaoPass, post_nodes::ForestSsaoNode);
     graph.add_node(post_nodes::NodeSsao::BlurPass, post_nodes::ForestBlurNode);
     graph.add_node(cloud_node::NodeClouds, cloud_node::CloudProbeNode);
@@ -461,7 +469,10 @@ fn build_forest_graph(render_app: &mut bevy::app::SubApp) -> RenderGraph {
     );
 
     graph.add_node_edge(erosion_node::NodeErosion::ErosionSim, terrain_node::NodeTerrain::TerrainPass);
-    graph.add_node_edge(terrain_node::NodeTerrain::TerrainPass, post_nodes::NodeSsao::SsaoPass);
+    // Trees write the same G-buffer the terrain writes, so they must come
+    // after the terrain's clear and before SSAO reads the result.
+    graph.add_node_edge(terrain_node::NodeTerrain::TerrainPass, tree_node::NodeTrees::TreePass);
+    graph.add_node_edge(tree_node::NodeTrees::TreePass, post_nodes::NodeSsao::SsaoPass);
     graph.add_node_edge(post_nodes::NodeSsao::SsaoPass, post_nodes::NodeSsao::BlurPass);
     graph.add_node_edge(post_nodes::NodeSsao::BlurPass, cloud_node::NodeClouds);
     graph.add_node_edge(cloud_node::NodeClouds, post_nodes::NodeSsao::CompositePass);
@@ -662,6 +673,33 @@ mod tests {
         }
     }
 
+    /// `terrainHeight` decides where the ground *is*. The clipmap surface and
+    /// the lighting heightfield the shadow march reads are the same module and
+    /// must agree with each other, and the CPU's `sample_eroded_height` — which
+    /// places the player's feet and every tree's trunk foot — must agree with
+    /// both to the millimetre, because a second copy of the eroded-height blend
+    /// puts trees floating over or sunk into the ground and the divergence
+    /// would move as erosion tiles stream. WGSL has no #include, so the helper
+    /// text is pasted; this is what stops the copies from drifting.
+    ///
+    /// The trees are *not* on this list. `tree-vs.wgsl` used to paste the same
+    /// text and call `terrainHeight` per vertex, and that is exactly what the
+    /// instance's `ground` field replaced: the scatter already evaluated the
+    /// model once per tree (see the header of src/trees/placement.rs), and
+    /// twenty noise samples and four atlas fetches per vertex is not a price a
+    /// pass that shades a million vertices a frame can pay to recompute a
+    /// number it was handed.
+    #[test]
+    fn terrain_height_helpers_are_shared_verbatim() {
+        let common = include_str!("../../assets/shaders/terrain-height-functions.wgslinc").trim();
+        for source in [include_str!("../../assets/shaders/terrain-vs.wgsl")] {
+            assert!(
+                source.contains(common),
+                "a shader re-implements the terrain height model instead of sharing it"
+            );
+        }
+    }
+
     /// A stale layout in even an unrelated pass can reinterpret daylight as
     /// a matrix or bind too small a uniform range. Check the actual WGSL ABI
     /// against Rust, including offsets, rather than just matching byte sizes.
@@ -712,5 +750,102 @@ mod tests {
             }
         }
         assert!(checked >= 10, "expected the complete render pipeline");
+    }
+
+    /// The tree tag lives in the G-buffer's position alpha, which
+    /// `tree-fs.wgsl` writes and `composite.wgsl` reads. WGSL has no
+    /// `#include`, so each file spells the constants out; if the writer's tag
+    /// and the reader's floor ever disagree the foliage specular silently
+    /// stops being applied — or, if the floor drops below the terrain band's
+    /// 1.01 ceiling, a snow-covered meadow decodes as a tree.
+    #[test]
+    fn the_foliage_tag_and_its_reader_agree() {
+        // Pulls `const NAME: f32 = <value>;` out of one shader's source.
+        fn read_const(source: &str, name: &str) -> f32 {
+            let declaration = format!("const {name}: f32 =");
+            let line = source
+                .lines()
+                .find(|line| line.trim_start().starts_with(&declaration))
+                .unwrap_or_else(|| panic!("no declaration of {name}"));
+            line.split_once('=')
+                .unwrap()
+                .1
+                .trim()
+                .trim_end_matches(';')
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} is not a literal: {line}"))
+        }
+
+        let tree = include_str!("../../assets/shaders/tree-fs.wgsl");
+        let composite = include_str!("../../assets/shaders/composite.wgsl");
+        assert_eq!(
+            read_const(tree, "TREE_POSITION_ALPHA"),
+            read_const(composite, "TREE_POSITION_ALPHA"),
+            "tree-fs.wgsl tags a tree at an alpha composite.wgsl does not decode"
+        );
+        // Terrain's masks top out at 1.0 + 1.0/100 (snow) + 1.0/10000 (grass),
+        // measured at the decode's own rounding: a tag at or below that would
+        // be read as a snowed-over meadow rather than as foliage.
+        let floor = read_const(composite, "FOLIAGE_ALPHA_FLOOR");
+        assert!(
+            floor > 1.01,
+            "the foliage floor {floor} overlaps the terrain biome band"
+        );
+        assert!(
+            floor <= read_const(tree, "TREE_POSITION_ALPHA"),
+            "a tree's tag {floor} falls below the floor meant to recognise it"
+        );
+    }
+
+    /// The tree pass's material block is the one uniform whose WGSL and Rust
+    /// declarations are hand-written twice, and a mismatch is not a wrong
+    /// picture but a panic at pipeline creation — wgpu rejects the bind group
+    /// layout before a single frame is drawn. It has already caught a
+    /// `vec3<f32>` pad, whose 16-byte alignment silently took the struct from
+    /// 32 bytes to 48; parse the shader rather than trusting the two lists to
+    /// stay in step.
+    #[test]
+    fn the_tree_material_block_matches_its_shader() {
+        let source = include_str!("../../assets/shaders/tree-fs.wgsl");
+        let module = naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
+        let block = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some("TreeMaterialUniforms"))
+            .map(|(_, ty)| ty)
+            .expect("tree-fs.wgsl no longer declares TreeMaterialUniforms");
+        let naga::TypeInner::Struct { members, span } = &block.inner else {
+            panic!("TreeMaterialUniforms must be a struct");
+        };
+        assert_eq!(
+            *span as usize,
+            std::mem::size_of::<crate::render::tree_node::TreeMaterialUniforms>(),
+            "tree-fs.wgsl's material block no longer matches its Rust counterpart"
+        );
+        // A `uniform` struct must also be a multiple of 16 bytes or the
+        // declaration does not compile at all; assert it here so the failure
+        // names this contract rather than surfacing from naga.
+        assert_eq!(*span % 16, 0, "a uniform block must be 16-byte aligned");
+        let names: Vec<_> = members.iter().filter_map(|m| m.name.as_deref()).collect();
+        assert_eq!(
+            names,
+            ["is_branch", "roughness", "alpha_cutoff", "tint_strength",
+             "specular_factor", "_padding0", "_padding1", "_padding2"],
+            "the material block's fields or their order changed"
+        );
+        // `specular_factor` is what the fragment stage adds to the G-buffer's
+        // foliage tag, so a field that drifted to another offset would put a
+        // wrong number in the alpha channel rather than fail loudly.
+        let specular = members
+            .iter()
+            .find(|m| m.name.as_deref() == Some("specular_factor"))
+            .expect("specular_factor is gone");
+        assert_eq!(
+            specular.offset as usize,
+            std::mem::offset_of!(crate::render::tree_node::TreeMaterialUniforms, specular_factor),
+            "specular_factor sits at a different offset in the shader than in Rust"
+        );
     }
 }

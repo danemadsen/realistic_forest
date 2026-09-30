@@ -10,7 +10,7 @@ struct EntryPoint {
     name: String,
 }
 
-fn validate_file(path: &std::path::Path, entry_points: &[EntryPoint]) -> Result<(), String> {
+fn validate_file(path: &std::path::Path) -> Result<(), String> {
     let source = std::fs::read_to_string(path).map_err(|e| format!("read {path:?}: {e}"))?;
     let module = naga::front::wgsl::parse_str(&source)
         .map_err(|error| format!("{path:?} parse: {}", error.emit_to_string(&source)))?;
@@ -19,7 +19,16 @@ fn validate_file(path: &std::path::Path, entry_points: &[EntryPoint]) -> Result<
     validator
         .validate(&module)
         .map_err(|errors| format!("{path:?} validate: {errors:?}"))?;
-    for entry in entry_points {
+    if module.entry_points.is_empty() {
+        return Err(format!(
+            "{path:?}: declares no entry point; shared helper text belongs in a .wgslinc"
+        ));
+    }
+    let entry_points = required_entry_points(&module);
+    // naga only type-checks the entry points a module actually declares, so an
+    // entry point that the pipelines expect but the file no longer defines is
+    // exactly the mistake this tool exists to catch.
+    for entry in &entry_points {
         if module
             .entry_points
             .iter()
@@ -34,6 +43,24 @@ fn validate_file(path: &std::path::Path, entry_points: &[EntryPoint]) -> Result<
     }
     println!("{} OK", path.display());
     Ok(())
+}
+
+/// The entry points a file must define, derived from the stages it declares.
+///
+/// A module that ships a vertex stage has to call it `vs_main` — that is the
+/// name the pipelines look up, so a rename is exactly the break this tool
+/// exists to catch. A file with no vertex stage at all is not asked for one:
+/// `tree-fs.wgsl` is a fragment-only asset paired with `tree-vs.wgsl`, and the
+/// dummy `vs_main` stub it would otherwise need is dead code that only ever
+/// confuses the next reader. Extra entry points beyond these are fine —
+/// `terrain-vs.wgsl` also carries the erosion heightfield capture's
+/// `fs_heightfield` in the same module.
+fn required_entry_points(module: &naga::Module) -> Vec<EntryPoint> {
+    let mut required = Vec::new();
+    if module.entry_points.iter().any(|point| point.stage == naga::ShaderStage::Vertex) {
+        required.push(EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_main".into() });
+    }
+    required
 }
 
 fn main() {
@@ -54,10 +81,7 @@ fn main() {
     };
     let mut failures = false;
     for path in paths {
-        // Fullscreen passes (SSAO/blur/composite/fxaa) use `vs_main` +
-        // `fs_main`; clipmap/geometry passes name their vs entry `vs_main` too.
-        let entry_points = [EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_main".into() }];
-        match validate_file(&path, &entry_points) {
+        match validate_file(&path) {
             Ok(()) => {}
             Err(error) => {
                 eprintln!("{error}");

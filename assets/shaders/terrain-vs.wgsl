@@ -113,6 +113,29 @@ struct StageUniforms {
 @group(1) @binding(4) var tex4: texture_2d<f32>;   // texture4: Raylib square-gradient tile blend mask.
 @group(1) @binding(12) var tex4_sampler: sampler;  // linear on the Rust side
 
+// ---------------------------------------------------------------------------
+// SHARED TERRAIN HEIGHT MODEL — pasted verbatim into every shader that needs
+// to know where the ground is.
+//
+// This exact text must appear, byte for byte, inside each of:
+//   assets/shaders/terrain-vs.wgsl   (the clipmap surface and the lighting
+//                                     heightfield the shadow march reads)
+//   assets/shaders/tree-vs.wgsl      (each tree's trunk foot)
+// The unit test `terrain_height_helpers_are_shared_verbatim` in
+// src/render/mod.rs enforces it. WGSL has no #include, so the copy *is* the
+// mechanism; the test is what keeps the copies from drifting.
+//
+// Why it matters: the terrain's height is `baseHeight + eroded delta`, and a
+// second implementation of either half puts trees at a slightly different
+// height than the ground they stand on. The eroded half reads the same
+// streamed atlases the terrain surface reads, so a tree's foot follows a tile
+// finalizing exactly as the ground under it does.
+//
+// Required in scope at the paste site: tex0/tex0_sampler (R32 base noise),
+// tex1/tex1_sampler (surface atlas, R = eroded height delta), tex3 (RGBA32F
+// point-filtered tile lookup), tex4/tex4_sampler (square-gradient blend mask)
+// and stage (TerrainStageUniforms). smoothHermite is defined here, first.
+// ---------------------------------------------------------------------------
 fn smoothHermite(edge0: f32, edge1: f32, value: f32) -> f32
 {
     let t = clamp((value - edge0)/max(edge1 - edge0, 0.0001), 0.0, 1.0);

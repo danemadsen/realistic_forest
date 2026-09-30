@@ -87,6 +87,7 @@ pub fn draw_diagnostics_ui(
     mut day_night: ResMut<DayNightCycle>,
     cache: Res<ErosionCache>,
     noise: Res<NoiseField>,
+    trees: Res<crate::trees::TreeField>,
     players: Query<&Player>,
     automation: Res<AutomationSettings>,
     mut rerun: ResMut<RerunErosion>,
@@ -106,6 +107,7 @@ pub fn draw_diagnostics_ui(
             &mut water_settings,
             &mut day_night,
             &cache,
+            trees.tree_count(),
             player,
             &mut rerun,
         );
@@ -157,6 +159,7 @@ fn draw_diagnostics_window(
     water_settings: &mut WaterSettings,
     day_night: &mut DayNightCycle,
     cache: &ErosionCache,
+    tree_count: usize,
     player: &Player,
     rerun: &mut RerunErosion,
 ) {
@@ -220,6 +223,7 @@ fn draw_diagnostics_window(
                 "Detail: {:.3}  flow axis bias: {:.3}",
                 cache.stats.erosion_detail, cache.stats.flow_axis_bias
             ));
+            ui.label(format!("Trees in field: {tree_count}"));
 
             separator_text(ui, "Sun and time");
             ui.add(
