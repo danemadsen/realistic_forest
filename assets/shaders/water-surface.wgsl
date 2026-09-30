@@ -14,10 +14,11 @@
 // - Aqua bakes the spectrum into a five-layer cascade texture array and
 //   samples it, giving each cascade LOD only the wavelength band it newly
 //   resolves (see `ranges` in src/water/waves.rs). Here the 40-component sum
-//   is evaluated per vertex and every component is faded by the pixel's own
-//   world footprint, so the visible wave content is a continuous function of
-//   screen position. That is what removes the seam a discrete per-LOD band
-//   would otherwise show at a ring boundary; `ranges` is uploaded for parity
+//   displaces vertices with a continuous mesh limit, while fragments evaluate
+//   normals and compression using the projected footprint of each wave.
+//   Lighting therefore retains waves beyond the geometry's 744 m fade, even
+//   on the flat horizon skirt. Unresolved waves become specular roughness.
+//   Neither limit depends on the tile's LOD; `ranges` is uploaded for parity
 //   but not read.
 // - Aqua's shoaling reads a BedHeightMap texture. The optical path here comes
 //   from the G-buffer: the distance from the water surface to whatever the ray
@@ -121,6 +122,8 @@ struct SurfaceSample
     height: f32,
     /// Horizontal Jacobian determinant; below 1 means the surface is pinched.
     jacobian: f32,
+    /// Mean squared slope of waves too small for the pixel to resolve.
+    slope_variance: f32,
 };
 
 fn smoothstepf(edge0: f32, edge1: f32, x: f32) -> f32
@@ -155,26 +158,39 @@ fn sampleFootprint(distance: f32, pixel_angle: f32) -> f32
     return max(max(distance*pixel_angle, mesh_bound), 0.02);
 }
 
-fn sampleSurface(world_xz: vec2<f32>, footprint: f32, wave_weight: f32) -> SurfaceSample
+fn sampleSurface(world_xz: vec2<f32>, mesh_footprint: f32,
+                 pixel_dx: vec2<f32>, pixel_dy: vec2<f32>, wave_weight: f32) -> SurfaceSample
 {
     if (stage.flags.x > 0.5 || wave_weight <= 0.0)
     {
         return SurfaceSample(vec3<f32>(world_xz.x, 0.0, world_xz.y),
-                             vec3<f32>(0.0, 1.0, 0.0), 0.0, 1.0);
+                             vec3<f32>(0.0, 1.0, 0.0), 0.0, 1.0, 0.0);
     }
 
     let time = stage.params.x;
     var offset = vec3<f32>(0.0);
     var derivative_x = vec3<f32>(0.0);
     var derivative_z = vec3<f32>(0.0);
+    var slope_variance = 0.0;
 
-    // `waves` is sorted ascending by wavelength, so attenuation rises with the
-    // index: the leading entries are the ones a distant tile cannot resolve
-    // and the loop skips them without evaluating a sine.
+    // Skip unresolved components before evaluating trigonometry. Geometry
+    // filters the shortest wavelengths first; pixels also account for each
+    // wave's orientation inside their anisotropic footprint.
     for (var index = 0u; index < WAVE_SLOTS; index += 1u)
     {
         let wave = stage.waves[index];
-        let attenuation = waveAttenuation(wave.wavelength, footprint)*wave_weight;
+        // Project the pixel footprint onto this wave's travel direction. A
+        // grazing pixel stretches along the view ray, but can still resolve
+        // waves running across it. Using only distance or the longest pixel
+        // axis would erase that visible detail too early.
+        let cycles_per_pixel = max(abs(dot(wave.direction, pixel_dx)),
+                                   abs(dot(wave.direction, pixel_dy)))/wave.wavelength;
+        // Full detail at eight pixels/cycle; gone before the Nyquist limit.
+        let pixel_weight = 1.0 - smoothstepf(0.125, 0.5, cycles_per_pixel);
+        let slope = wave.amplitude*wave.wave_number;
+        slope_variance += 0.5*slope*slope*(1.0 - pixel_weight*pixel_weight);
+        let attenuation = waveAttenuation(wave.wavelength, mesh_footprint)
+                        * wave_weight*pixel_weight;
         if (attenuation <= 0.0)
         {
             continue;
@@ -190,15 +206,16 @@ fn sampleSurface(world_xz: vec2<f32>, footprint: f32, wave_weight: f32) -> Surfa
                             amplitude*cos_phase,
                             chop*wave.direction.y*sin_phase);
 
-        // d(phase)/dx and d(phase)/dz, for the analytic tangents.
+        // d(phase)/dx and d(phase)/dz, for the analytic tangents. The horizontal
+        // derivative keeps chop's sign: negative chop compresses the crest.
         let dphx = wave.wave_number*wave.direction.x;
         let dphz = wave.wave_number*wave.direction.y;
-        derivative_x += vec3<f32>(-chop*wave.direction.x*dphx*cos_phase,
+        derivative_x += vec3<f32>(chop*wave.direction.x*dphx*cos_phase,
                                   -amplitude*dphx*sin_phase,
-                                  -chop*wave.direction.y*dphx*cos_phase);
-        derivative_z += vec3<f32>(-chop*wave.direction.x*dphz*cos_phase,
+                                  chop*wave.direction.y*dphx*cos_phase);
+        derivative_z += vec3<f32>(chop*wave.direction.x*dphz*cos_phase,
                                   -amplitude*dphz*sin_phase,
-                                  -chop*wave.direction.y*dphz*cos_phase);
+                                  chop*wave.direction.y*dphz*cos_phase);
     }
 
     let tangent_x = vec3<f32>(1.0, 0.0, 0.0) + derivative_x;
@@ -213,6 +230,7 @@ fn sampleSurface(world_xz: vec2<f32>, footprint: f32, wave_weight: f32) -> Surfa
         normal,
         offset.y,
         jacobian,
+        slope_variance,
     );
 }
 
@@ -311,9 +329,7 @@ fn vSmithGGX(n_dot_l: f32, n_dot_v: f32, alpha: f32) -> f32
     return 0.5/max(ggx_l + ggx_v, 1e-7);
 }
 
-/// Cheap value noise, used only to break up the shoreline foam edge. Aqua
-/// simulates foam in a ping-pong texture; a shoreline band does not need a
-/// simulation, just a non-uniform edge.
+/// Cheap value noise to break up whitecaps.
 fn hash21(p: vec2<f32>) -> f32
 {
     var q = fract(p*vec2<f32>(0.1031, 0.1030));
@@ -334,10 +350,12 @@ fn valueNoise(p: vec2<f32>) -> f32
 }
 
 /// Two octaves is enough to break a contour line; this is not a detail layer.
-fn foamBreakup(world_xz: vec2<f32>) -> f32
+fn foamBreakup(world_xz: vec2<f32>, footprint: f32) -> f32
 {
-    let a = valueNoise(world_xz*0.35);
-    let b = valueNoise(world_xz*1.10 + vec2<f32>(31.7, 11.3));
+    // Average subpixel noise away instead of letting distant caps sparkle.
+    let a = mix(valueNoise(world_xz*0.35), 0.5, smoothstepf(0.25, 0.75, footprint*0.35));
+    let b = mix(valueNoise(world_xz*1.10 + vec2<f32>(31.7, 11.3)), 0.5,
+                smoothstepf(0.25, 0.75, footprint*1.10));
     return clamp(mix(0.55, 1.35, a*0.65 + b*0.35), 0.0, 1.4);
 }
 
@@ -349,9 +367,7 @@ struct VertexOutput
 {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) world_position: vec3<f32>,
-    @location(1) world_normal: vec3<f32>,
-    @location(2) water_height: f32,
-    @location(3) jacobian: f32,
+    @location(1) wave_position: vec2<f32>,
 };
 
 @vertex
@@ -377,11 +393,13 @@ fn vs_main(
 
     // The outer skirt spans kilometres in one quad. Its inner and outer
     // vertices must both be flat: otherwise interpolation stretches the inner
-    // vertex's wave slope all the way to the horizon. Fade the whole spectrum
-    // across the last regular tiles, before the skirt starts. This distance is
-    // shared by all LODs and includes the ring centre's camera-snap allowance.
+    // vertex's displacement all the way to the horizon. Fade geometry across
+    // the last regular tiles, before the skirt starts. Fragment lighting has
+    // its own pixel limit and continues smoothly over this flat geometry.
+    // The shared distance includes the ring centre's camera-snap allowance.
     let wave_weight = 1.0 - smoothstepf(stage.flags.w*0.75, stage.flags.w, distance);
-    let surface = sampleSurface(world_xz, sampleFootprint(distance, pixel_angle), wave_weight);
+    let surface = sampleSurface(world_xz, sampleFootprint(distance, pixel_angle),
+                                vec2<f32>(0.0), vec2<f32>(0.0), wave_weight);
     let world_position = vec3<f32>(surface.displaced.x,
                                    stage.params.z + surface.displaced.y,
                                    surface.displaced.z);
@@ -389,9 +407,9 @@ fn vs_main(
     var out: VertexOutput;
     out.clip_position = globals.projection*globals.view*vec4<f32>(world_position, 1.0);
     out.world_position = world_position;
-    out.world_normal = surface.normal;
-    out.water_height = surface.height;
-    out.jacobian = surface.jacobian;
+    // Preserve the Gerstner parameter position, before horizontal chop, so
+    // fragment crests and their displaced geometry have the same phase.
+    out.wave_position = world_xz;
     return out;
 }
 
@@ -407,18 +425,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     let to_camera = camera_position - in.world_position;
     let view_distance = length(to_camera);
     let to_view = to_camera/max(view_distance, 1e-3);
+    // Derivatives must be evaluated before any data-dependent branch/discard.
+    let pixel_dx = dpdx(in.wave_position);
+    let pixel_dy = dpdy(in.wave_position);
+    let pixel_footprint = max(length(pixel_dx), length(pixel_dy));
+    let surface = sampleSurface(in.wave_position, 0.0, pixel_dx, pixel_dy, 1.0);
 
     // View space looks down -Z, so a *greater* z is nearer. The water
     // surface's own view-space z, to compare against the G-buffer's.
     let water_view = (globals.view*vec4<f32>(in.world_position, 1.0)).xyz;
 
-    // Every sample this shader will need, taken unconditionally: `normal` and
-    // `uv` come from the vertex stage and are uniform, so these are legal, and
-    // everything downstream only selects between values already in hand.
+    // Every texture sample is taken in uniform control flow, before discard.
     // Two-sided: seen from below, the surface is the same sheet of water lit
     // from the other side, so the geometric normal is flipped toward the eye
     // rather than the pass culling backfaces.
-    var normal = normalize(in.world_normal);
+    var normal = surface.normal;
     if (dot(normal, to_view) < 0.0)
     {
         normal = -normal;
@@ -487,7 +508,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     // half strength *everywhere*, and since this term is a flat cyan-green
     // additive it then dominates the water body and washes the whole sea out
     // to a pale mint that no water ever is.
-    let crest = clamp(1.0 - in.jacobian, 0.0, 1.0);
+    let crest = clamp(1.0 - surface.jacobian, 0.0, 1.0);
     let sss = pow(crest, 2.0)*stage.sss_tint.rgb*max(to_sun.y, 0.0);
     body += sss*sun_colour*0.35;
 
@@ -512,7 +533,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     // the measured distribution of that pinch (median 0.014, 99th percentile
     // 0.23), not against a guess.
     let whitecap = smoothstepf(0.10, 0.30, crest);
-    let foam = clamp(whitecap*0.70*foamBreakup(in.world_position.xz)*stage.misc.y, 0.0, 1.0);
+    let foam = clamp(whitecap*0.70*foamBreakup(in.wave_position, pixel_footprint)
+                     *stage.misc.y, 0.0, 1.0);
     // Foam is a bright diffuse surface, so its radiance sits a little above the
     // sky it is lit by — not the two-and-a-half times that `sun_colour*0.25`
     // produced, which clipped the shore break to flat white.
@@ -561,7 +583,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     {
         roughness = clamp(stage.surface.z, 0.01, 1.0);
     }
-    let alpha = max(roughness*roughness, 1e-3);
+    // Filtered-out slopes broaden the glitter instead of leaving a perfectly
+    // smooth mirror or aliasing into isolated bright pixels at the horizon.
+    let alpha = clamp(sqrt(pow(roughness, 4.0) + surface.slope_variance), 1e-3, 1.0);
     let specular = dGGX(n_dot_h, alpha)*vSmithGGX(n_dot_l, n_dot_v, alpha)*n_dot_l*0.35;
 
     // --- Fresnel composition -------------------------------------------------

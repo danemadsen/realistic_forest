@@ -6,15 +6,12 @@
 //! `OceanWaveSpectrum.cs` defaults. See `src/water/ATTRIBUTION.md`.
 //!
 //! DIVERGENCE: aqua bakes this sum into a five-layer `rgba16float` texture
-//! array with a compute pass and samples it per fragment, so the same 40 sines
-//! are evaluated once per cascade texel instead of once per vertex. This port
-//! evaluates the sum directly in the water vertex shader. The scene has a
-//! single camera and no per-fragment wave queries, so the bake's only real win
-//! was amortisation across fragments; 40 sines over a few hundred thousand
-//! vertices is cheaper than a compute pass, a texture array, and the cascade
-//! LOD bookkeeping that the bake needs to stay seamless. The band split and
-//! the shoaling profile are kept, because those are what make the surface look
-//! right, not what make it fast.
+//! array with a compute pass and samples it per fragment. This port evaluates
+//! displacement per vertex with a continuous mesh limit, and normals and
+//! compression per fragment with a directional pixel-footprint filter. That
+//! keeps distant wave lighting independent of the coarse mesh and flat horizon
+//! skirt. Unresolved components skip trigonometry and contribute slope variance
+//! to specular roughness. The band partition is retained for the GPU contract.
 
 use bevy::math::Vec2;
 
@@ -72,7 +69,7 @@ pub struct WaveComponent {
     pub phase: f32,
     /// Horizontal amplitude; negative by convention, so crests sharpen.
     pub chop_amplitude: f32,
-    /// Retained for the band partition; not uploaded.
+    /// Uploaded for mesh and pixel-footprint filtering, and used by the band partition.
     pub wavelength: f32,
 }
 

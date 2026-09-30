@@ -189,9 +189,10 @@ pub fn lod_scale(lod: usize) -> f32 {
     super::WATER_BASE_SCALE * (1u32 << lod) as f32
 }
 
-/// Camera distance at which waves must be completely flat. The horizon skirt
+/// Camera distance at which wave displacement must be completely flat. The horizon skirt
 /// starts at twice the outer tile scale, then stretches a single quad to the
-/// far horizon. Carrying a wave normal into that quad smears it over kilometres.
+/// far horizon. Carrying displacement into that quad smears it over kilometres.
+/// Fragment normals are evaluated independently and remain detailed on the skirt.
 /// Leave one snap step inside the skirt so it stays flat while the camera moves
 /// relative to the snapped ring centre (at most half a step on either axis).
 pub fn horizon_wave_fade_end() -> f32 {

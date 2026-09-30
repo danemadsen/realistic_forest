@@ -127,6 +127,12 @@ smoother, while snow retains its wind relief and glints. A camera-centred
 sea-level plane creates ocean and shorelines. The **Dirt/gravel variant scale**
 control affects scan variation within soil and gravel.
 
+Ocean wave lighting is evaluated per pixel, so distant waves stay visible
+beyond the mesh's displacement fade and across the flat horizon skirt.
+Each wave filters against its projected pixel footprint; unresolved ripples
+broaden the sun reflection instead of shimmering. Crest compression drives
+whitecaps and subsurface light, with foam detail also filtered at distance.
+
 ## Fidelity of the noise substitution
 
 The C++ samples FastNoiseLite's OpenSimplex2S; the port samples quick-noise's
