@@ -72,15 +72,38 @@ impl WaterOptics {
     };
 
     /// Coastal water, and the default. This is the preset the reference
-    /// calibration above was solved against: it measures hue 210, saturation
-    /// 35, value 44 at the view angles where the body dominates.
+    /// calibration above was solved against: at the level that solve produced
+    /// it measured hue 210, saturation 35, value 44 at the view angles where
+    /// the body dominates.
     ///
     /// It attenuates slightly harder than the open ocean at every wavelength —
     /// more suspended matter, so a shorter path carries the colour — and its
     /// red-to-blue contrast is a touch softer, which is what keeps the shallows
     /// and the shore break reading green-teal over sand.
+    ///
+    /// The extinction below is that solved level scaled uniformly by 1.3,
+    /// because the sea read a shade too pale for a coastal water. A common
+    /// factor is the only edit that can darken the body without disturbing the
+    /// calibration: optically deep water converges on `sigma_s / sigma_t`, and
+    /// `sigma_s` does not move with `sigma_t` here — it is the white particle
+    /// term, and it stays under `sigma_t` on every channel, so the `min()` in
+    /// the shader never binds. Dividing by 1.3 therefore takes the level down
+    /// by exactly 1.3 and leaves the ratio untouched, which means hue 213 and
+    /// the 48.5% linear saturation are invariant and only the value falls;
+    /// through ACES the measured 44 is expected to land near 37, still inside
+    /// the 30-48 window above. That figure is a prediction from the model and
+    /// has not been re-measured — treat the 210/35/44 as the recorded
+    /// measurement and this as the expected consequence.
+    ///
+    /// Two side effects are intended, not incidental. Extinction is shared with
+    /// the submerged-camera medium, so the view from below darkens by the same
+    /// 1.3 and its 99% convergence depth shortens from 21.7/30.1/38.7 m to
+    /// 16.7/23.2/29.8 m — the single-source optics contract means this cannot be
+    /// split without letting the surface and the medium disagree. And the
+    /// shallow shelf loses transmittance fastest in red (5 m falls R 0.346 to
+    /// 0.251, B 0.552 to 0.461), so the green-teal band over sand narrows.
     pub const COASTAL: Self = Self {
-        extinction: [0.2125, 0.153, 0.119],
+        extinction: [0.27625, 0.1989, 0.1547],
         scatter_scale: 2.0,
         scatter_tint: [1.0, 1.0, 1.0],
         scattering_asymmetry: 0.8,

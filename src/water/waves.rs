@@ -12,6 +12,11 @@
 //! keeps distant wave lighting independent of the coarse mesh and flat horizon
 //! skirt. Unresolved components skip trigonometry and contribute slope variance
 //! to specular roughness. The band partition is retained for the GPU contract.
+//!
+//! DIVERGENCE: [`RIPPLE_GAIN`] additionally scales the uploaded amplitude of
+//! everything shorter than [`RIPPLE_BAND_METRES`]. Aqua carries no such gain;
+//! it is this port's look tuning, applied on top of the verbatim Crest power
+//! table rather than inside it, and its doc comment carries the calibration.
 
 use bevy::math::Vec2;
 
@@ -35,6 +40,39 @@ const GRAVITY: f32 = 9.81;
 /// Horizontal chop as a fraction of amplitude. Aqua's `ANALYTIC_CHOP`; above
 /// about 1.7 the Gerstner sum starts folding over itself and crests invert.
 const ANALYTIC_CHOP: f32 = 1.6;
+
+/// Upper wavelength of the ripple band, in metres. 8.0 is an octave boundary
+/// (octave 6 spans `[4, 8)`), so the gain's edge always falls between two
+/// octaves and never half-scales an LOD band; `ripple_band_starts_on_an_octave`
+/// below pins that.
+///
+/// The two octaves under it are where the surface's slope lives. At
+/// `sea_state_amplitude` 0.28 the 40 uploaded components give an RMS surface
+/// tilt of 4.154 degrees, and the 2-8 m octaves carry 53.9% of that slope
+/// variance on 1.8% of the wave height. The 16-64 m swell owns the height, so
+/// this is the only band a strength change can move without the sea going flat.
+const RIPPLE_BAND_METRES: f32 = 8.0;
+
+/// Amplitude gain for everything shorter than [`RIPPLE_BAND_METRES`].
+///
+/// This is layered on top of `POWER_LOG10`, not written into it. That table is
+/// Crest's `OceanWaveSpectrum.cs` defaults ported verbatim, and it also could
+/// not express this gain: a component's power is interpolated between adjacent
+/// entries (see `spectrum_amplitude`), so editing an index tapers across its
+/// octave instead of scaling a band.
+///
+/// Calibration, measured against the exact float32 generator at
+/// `sea_state_amplitude` 0.28 (baseline: RMS tilt 4.154 degrees, H_s 1.0672 m,
+/// far-field GGX alpha 0.07952, Gerstner fold metric 0.9116):
+///   0.7 -> <8 m RMS slope -30.0%, whole-surface tilt 3.539 deg (-14.8%),
+///          H_s -0.45%, alpha -12.2%, fold 0.7826, mean whitecap weight
+///          0.0593 -> 0.0382.
+///   0.6 -> -40.0%, tilt 3.364 deg, H_s -0.57%, alpha -15.6%.
+///   0.5 -> -50.0%, tilt 3.209 deg, H_s -0.67%, alpha -18.6%.
+/// The height cost is under 1% at every rung, because the swell is on the other
+/// side of the band edge. 0.7 is the shipped value; the rungs below it are the
+/// pre-computed next steps if the sea still reads too busy.
+const RIPPLE_GAIN: f32 = 0.7;
 
 const MIN_AMPLITUDE: f32 = 0.001;
 const TAU: f32 = std::f32::consts::TAU;
@@ -154,6 +192,23 @@ fn generate_components(
             *amplitude = 0.0;
         }
         *amplitude *= amplitude_multiplier;
+        // The ripple taper. Applied after the multiplier and after the
+        // MIN_AMPLITUDE gate: this scales how much amplitude the sea carries,
+        // never which components exist. The live set is therefore identical to
+        // upstream's — a nonzero amplitude times 0.7 is still nonzero — so the
+        // WAVE_SLOTS assert and the LOD partition below are untouched. One
+        // component in the band does land under MIN_AMPLITUDE as a result
+        // (3.33 m, 0.465 mm). That is harmless: the constant is only a
+        // generation-time gate and nothing downstream treats it as a floor.
+        //
+        // `chop_amplitude` is derived from `amplitude` further down, so the
+        // displacement, the analytic normals and the crest pinch all fall
+        // together. That is the property a shader-side weight cut cannot have:
+        // scaling amplitude at the upload point keeps the drawn geometry and
+        // its shading the same surface.
+        if wavelength < RIPPLE_BAND_METRES {
+            *amplitude *= RIPPLE_GAIN;
+        }
     }
 
     let mut phase_random = Random::new(0);
@@ -244,6 +299,27 @@ mod tests {
         assert_eq!(
             spectrum.ranges[super::super::WATER_LOD_COUNT - 1][1] as usize,
             WAVE_SLOTS,
+        );
+    }
+
+    #[test]
+    fn ripple_band_starts_on_an_octave_boundary() {
+        // The gain's edge must fall between octaves. If it landed inside one,
+        // part of that octave would be scaled and part not, and the band
+        // partition (which splits on octave boundaries) would disagree with it.
+        // `RIPPLE_BAND_METRES` is exactly octave 7's lower edge, so the scaled
+        // set is whole octaves 5 and 6.
+        assert_eq!(RIPPLE_BAND_METRES, lod_max_wavelength(1));
+        let spectrum = build(1.0, 0.0);
+        let shorter = spectrum
+            .waves
+            .iter()
+            .filter(|wave| wave.wavelength < RIPPLE_BAND_METRES)
+            .count();
+        assert_eq!(
+            shorter,
+            2 * COMPONENTS_PER_OCTAVE,
+            "the scaled set must be the two whole octaves under the edge",
         );
     }
 

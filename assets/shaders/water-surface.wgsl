@@ -988,8 +988,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     body = mix(body, foam_colour, foam);
 
     // --- Reflection ----------------------------------------------------------
+    //
+    // The 0.75 gain is authored, and it is the one number in this block that is
+    // not trying to be physical. Fresnel pins the far sea at roughly full
+    // reflectance — a grazing ray reflects 0.92 of its radiance into the eye,
+    // measured on this scene at a 10 m eye height — so the far water can only
+    // ever be as dark as the sky it mirrors. That is correct optics and it is
+    // also why the horizon reads as a continuation of the sky here: this sea is
+    // kilometres wide, so a grazing ray finds sky, where the reference lake
+    // found a dark forested shore. The optics doc already names that difference
+    // as the reason the reference's water looks darker than this renderer's.
+    //
+    // Dimming the mirrored copy stands in for it. It is deliberately applied
+    // here, at the call site, and not to `cloudSkyRadiance` itself: the sky the
+    // camera sees directly must stay exactly as the composite pass draws it, or
+    // the waterline gains a step in the wrong direction. Note the asymmetry
+    // that follows — the raymarched terrain reflection below is mixed in
+    // unscaled, so a dark headland mirrored in the water now sits against a
+    // dimmed sky. Over open water the march returns no hit and the two never
+    // meet; near shore it is the one visible cost of this constant.
+    //
+    // 0.85 was the previous value. The step to 0.75 is a 12% cut in the
+    // reflection, which moves the far band about 10 luma against an unchanged
+    // sky; the Fresnel exponent handles 60-85 degrees incidence and this
+    // handles the 85-90 degree band where the curve is pinned flat.
     let reflection_direction = reflect(-to_view, normal);
-    let reflected_sky = cloudSkyRadiance(reflection_direction)*0.85;
+    let reflected_sky = cloudSkyRadiance(reflection_direction)*0.75;
 
     // Sun specular: GGX over the wave roughness, which is what produces a
     // glitter path rather than one broad highlight.

@@ -30,7 +30,7 @@ use crate::render::{globals_layout, ExtractedForestView, ForestGlobals, ForestSh
 use crate::water::rings::{self, Patch};
 use crate::water::{
     displacement_bounds, waves, GpuWave, UnderwaterUniforms, WaterSettings, WaterStageUniforms,
-    WATER_LOD_COUNT, WATER_SNAP,
+    FRESNEL_EXPONENT, WATER_LOD_COUNT, WATER_SNAP,
 };
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::mesh::VertexBufferLayout;
@@ -581,7 +581,23 @@ fn build_stage_uniforms(
     block.params = [0.0, amplitude, SEA_LEVEL, 1.0];
     block.extinction = extinction_of(&optics);
     block.scatter = scatter_of(&optics);
-    block.surface = [0.02, 5.0, optics.sun_roughness, crate::water::WATER_BASE_SCALE];
+    // The surface's Fresnel inputs, and the only two. `F0` stays at water's own
+    // 0.0204 for n = 1.333 — rounding it to 0.02 costs 0.0004 of reflectance at
+    // normal incidence and nothing worth the extra constant. The exponent is
+    // `FRESNEL_EXPONENT`, whose doc comment carries the fit against the exact
+    // curve; it was 5.0 inline here, which is Schlick's general-dielectric fit
+    // and reads glossier than water through the 80-88 degree band.
+    //
+    // Both are written here rather than authored into `WaterOptics` because the
+    // underwater pass has no Fresnel: a per-preset value would let the surface
+    // and the medium disagree about the same water, which is the one thing the
+    // shared-optics contract exists to prevent.
+    block.surface = [
+        0.02,
+        FRESNEL_EXPONENT,
+        optics.sun_roughness,
+        crate::water::WATER_BASE_SCALE,
+    ];
     block.sss_tint = [
         optics.sss_tint[0],
         optics.sss_tint[1],

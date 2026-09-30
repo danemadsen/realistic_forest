@@ -58,6 +58,33 @@ pub const WATER_TILE_RESOLUTION: usize = 64;
 /// Width of an LOD 0 tile in metres. Matches aqua's `BASE_SCALE`.
 pub const WATER_BASE_SCALE: f32 = 24.0;
 
+/// Exponent of the surface's Fresnel mix, `F0 + (1 - F0)*(1 - cos)^e`: the
+/// shape of how reflectance climbs from the near-normal floor to the grazing
+/// mirror. Aqua exposes it as a free authoring value rather than deriving it,
+/// so this is the named home for that freedom.
+///
+/// It is not a free parameter in practice, because the exact Fresnel curve for
+/// water fixes it. For n = 1.333, a least-squares fit of this curve gives
+/// e = 5.58 over 0-89 degrees, 5.70 over 70-88, and 5.97 over 80-89. The old
+/// value of 5.0 is Schlick's fit for a *dielectric in general*, and over water
+/// it runs four to six points of reflectance high through exactly the band a
+/// standing eye reads as the mirror — +5.0 points at 80 degrees incidence,
+/// +5.9 at 84, +3.7 at 88. That is the sea looking glossier than water does,
+/// and it is what this constant corrects.
+///
+/// 6.0 is the fit weighted to that band rather than the uniform one. It lands
+/// within 0.8 points of the exact curve from 84 to 88 degrees (84 is +0.02),
+/// and pays for it with 2.4 to 3.4 points of *under*-reflectance at 60-70
+/// degrees, where the surface is mostly body colour anyway. Nothing here can
+/// soften the last degree or two of horizon: `(1 - cos)^e` still reaches 1 at
+/// cos = 0 for every exponent, so the true horizon stays a full mirror.
+///
+/// It applies to all three optics presets, to the surface seen from below, and
+/// it cannot be reached from the diagnostics window — it is not a `WaterOptics`
+/// field, by the same argument that keeps `F0` out of one: the underwater pass
+/// has no Fresnel at all, so a per-preset value would let the two views drift.
+pub const FRESNEL_EXPONENT: f32 = 6.0;
+
 /// How far the tile layout is snapped, in metres, before the ring centre
 /// moves. Coarser than one LOD 0 tile, so the innermost ring never crawls.
 /// Aqua snaps and geomorphs instead; without vertex morphing a plain snap is
@@ -138,7 +165,7 @@ impl Default for WaterStageUniforms {
             params: [0.0, 1.0, crate::constants::SEA_LEVEL, 1.0],
             extinction: [0.86, 0.24, 0.39, 1.0],
             scatter: [1.0, 1.0, 1.0, 0.8],
-            surface: [0.02, 5.0, -1.0, WATER_BASE_SCALE],
+            surface: [0.02, FRESNEL_EXPONENT, -1.0, WATER_BASE_SCALE],
             sss_tint: [0.06, 0.55, 0.45, WATER_TILE_RESOLUTION as f32],
             misc: [0.5, 1.0, 1.0, 0.0],
             flags: [0.0, 1.0, 0.0, rings::horizon_wave_fade_end()],
