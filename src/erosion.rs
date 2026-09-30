@@ -276,8 +276,52 @@ impl ErosionBridge {
         std::mem::take(&mut self.0.lock().unwrap().events)
     }
 
-    pub fn set_frame(&self, commands: ErosionFrameCommands, lookup_records: Option<Vec<f32>>) {
+    /// Hands one frame of work to the render world.
+    ///
+    /// The render world consumes at most one command set per frame, and only
+    /// once its GPU state exists — for the first frames of the app the node
+    /// returns before `take_commands` while `prepare_erosion_sim` builds the
+    /// pipelines, textures and bind groups. Whatever is still pending when the
+    /// next frame arrives is therefore *merged into* it rather than replaced.
+    ///
+    /// Without the merge a dropped frame takes its work with it, and `init` is
+    /// the one command that cannot be re-sent: `BeginErosionTile` is called
+    /// exactly once per tile, so a lost init leaves the main world's cache
+    /// holding an active tile in `Simulating` that the render world has never
+    /// heard of. The node then bails at its `active_tile.is_none() &&
+    /// init.is_none()` guard every frame and no tile ever finalizes — the
+    /// whole erosion cache stays empty. Iteration counts are additive (the
+    /// main world advances its own `completed_iterations` as it sends them, so
+    /// each frame's count is fresh work) and `finalize` is idempotent, so both
+    /// survive the same way.
+    pub fn set_frame(&self, mut commands: ErosionFrameCommands, lookup_records: Option<Vec<f32>>) {
         let mut state = self.0.lock().unwrap();
+        // `sim_min` is a bijection of the tile key, so it identifies which tile
+        // a command set describes. Work may only be carried across frames that
+        // describe the *same* tile: once the main world moves on, its previous
+        // tile has already finalized (that is what lets it move on), so
+        // anything still pending for it is a duplicate re-send of `finalize`
+        // and merging it into the new tile's frame would finalize the new tile
+        // after a single batch.
+        let same_tile = state
+            .commands
+            .as_ref()
+            .is_some_and(|pending| pending.sim_min == commands.sim_min);
+        if let Some(pending) = state.commands.take().filter(|_| same_tile) {
+            if commands.init.is_none() {
+                // `sim_min` belongs to the newest frame's active tile, which
+                // is the same tile a carried-over init refers to: the main
+                // world only clears `has_active_tile` once the finalize event
+                // comes back, so its `sim_min` still describes that tile.
+                commands.init = pending.init;
+            }
+            match (commands.iterate.as_mut(), pending.iterate) {
+                (Some(current), Some(earlier)) => current.count += earlier.count,
+                (None, Some(earlier)) => commands.iterate = Some(earlier),
+                _ => {}
+            }
+            commands.finalize |= pending.finalize;
+        }
         state.commands = Some(commands);
         state.lookup_records = lookup_records;
     }
@@ -691,4 +735,77 @@ pub fn measure_overlap(first: &ErosionTile, second: &ErosionTile) {
              overall_mean as f32,
              percentile(0.99),
              differences.last().copied().unwrap_or(0.0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame of work for one tile, with no init (the common case: only the
+    /// frame that calls `BeginErosionTile` carries one).
+    fn frame_for(sim_min: [f32; 2], iterate: usize, finalize: bool) -> ErosionFrameCommands {
+        ErosionFrameCommands {
+            sim_min,
+            init: None,
+            iterate: (iterate > 0).then(|| IterateCommand {
+                count: iterate,
+                settings: ErosionSettings::default(),
+            }),
+            finalize,
+        }
+    }
+
+    /// The render world misses frames while `prepare_erosion_sim` builds its
+    /// GPU state, and the `init` `BeginErosionTile` sends is one-shot: losing
+    /// it leaves a tile `Simulating` with nothing to simulate and no erosion
+    /// ever finalizes.
+    #[test]
+    fn set_frame_carries_a_pending_init_to_the_next_frame() {
+        let bridge = ErosionBridge::default();
+        bridge.set_frame(
+            ErosionFrameCommands {
+                sim_min: [0.0, 0.0],
+                init: Some(InitTileCommand {
+                    key: tile(0, 0),
+                    base_height: vec![1.0, 2.0],
+                }),
+                iterate: Some(IterateCommand {
+                    count: 6,
+                    settings: ErosionSettings::default(),
+                }),
+                finalize: false,
+            },
+            None,
+        );
+        // Nothing consumed it, and the next frame carries no init of its own.
+        bridge.set_frame(frame_for([0.0, 0.0], 6, false), None);
+
+        let taken = bridge.take_commands().expect("commands survived");
+        assert!(taken.init.is_some(), "the pending init must not be dropped");
+        assert_eq!(taken.iterate.expect("iterate").count, 12);
+    }
+
+    /// Once the main world moves to another tile, anything still pending for
+    /// the old one is a redundant re-send and must not leak into the new
+    /// tile's frame — merging its `finalize` would end the new tile after a
+    /// single batch.
+    #[test]
+    fn set_frame_does_not_carry_work_across_tiles() {
+        let bridge = ErosionBridge::default();
+        bridge.set_frame(frame_for([0.0, 0.0], 6, true), None);
+        bridge.set_frame(frame_for([512.0, 0.0], 6, false), None);
+
+        let taken = bridge.take_commands().expect("commands");
+        assert!(!taken.finalize);
+        assert_eq!(taken.iterate.expect("iterate").count, 6);
+    }
+
+    /// The ordinary path: a frame that is consumed leaves nothing behind.
+    #[test]
+    fn take_commands_empties_the_bridge() {
+        let bridge = ErosionBridge::default();
+        bridge.set_frame(frame_for([0.0, 0.0], 6, false), None);
+        assert!(bridge.take_commands().is_some());
+        assert!(bridge.take_commands().is_none());
+    }
 }

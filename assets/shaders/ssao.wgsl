@@ -15,9 +15,10 @@
 //   derivatives already selected level 0 — results are unchanged.
 // - No blit flips existed to drop and the GLSL never reads gl_FragCoord, so
 //   fragTexCoord becomes position.xy * globals.viewport.zw per spec. sampleUV
-//   still maps NDC*0.5+0.5 to a UV: in the WGSL port the G-buffer pass and
-//   this pass share ONE top-left-origin convention and the same projection
-//   shape, so it lands on the matching texel unchanged (spec no-flip rule).
+//   maps NDC*0.5+0.5 to a UV and NEEDS the y flip the GLSL did not: clip-space
+//   y counts up while the WGSL port's framebuffer rows count down from the top,
+//   so it is written as (0.5 + 0.5*x, 0.5 - 0.5*y). See the note at the
+//   sampleUV line.
 // - The remaining scalar/vector uniforms (uScreenSize, uRadius, uBias, uPower)
 //   moved into the group-2 StageUniforms below; the ?: in the tangent fallback
 //   became select(). Everything else is a 1:1 translation with comments kept.
@@ -119,7 +120,18 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
         let projected = globals.projection*vec4<f32>(samplePosition, 1.0);
         if (projected.w <= 0.0) { continue; }
 
-        let sampleUV = projected.xy/projected.w*0.5 + 0.5;
+        // NDC -> target uv. Clip-space y counts UP while @builtin(position).y
+        // (and therefore the uv derived from it) counts DOWN from the top of
+        // the target, so the y half of the mapping is flipped; x is not. The
+        // GLSL this is ported from had no flip to make: its framebuffer origin
+        // was bottom-left, so clip +y and texture row +v already agreed. With
+        // the sign dropped the sample lands on the mirrored row — the whole
+        // screen's depth is wrong by the vertical distance to its own mirror,
+        // rangeWeight collapses to zero and the SSAO silently returns 1.0
+        // everywhere except the one screen row where the mirror is the
+        // identity, which paints a single dark band across the centre.
+        let sampleUV = vec2<f32>(projected.x/projected.w*0.5 + 0.5,
+                                 0.5 - projected.y/projected.w*0.5);
         if (any(sampleUV < vec2<f32>(0.0)) || any(sampleUV > vec2<f32>(1.0)))
         {
             continue;

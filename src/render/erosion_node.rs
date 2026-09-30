@@ -38,7 +38,14 @@
 //!   same numbers the C++ uploads from), then uploaded to that slot.
 //! * Bevy's pipeline compilation is asynchronous: a frame whose shaders are
 //!   still compiling is held and replayed rather than dropped, because `init`
-//!   in particular is one-shot.
+//!   in particular is one-shot. The same holds one level up: a frame the node
+//!   never reached — it returns before `take_commands` until the sim exists —
+//!   is merged into the next one by `ErosionBridge::set_frame`, so a command
+//!   set can carry more than one frame's iteration count.
+//! * The finalize readback is asynchronous, so the frame that records the copy
+//!   is not the frame that finalizes the tile. `apply_commands` skips issuing a
+//!   new readback on a frame that consumed one, and never records a second
+//!   copy for a tile it already delivered.
 
 use crate::constants::*;
 use crate::erosion::{
@@ -969,7 +976,10 @@ impl ErosionSim {
         let Some(staged) = self.staged.take() else {
             return;
         };
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        // One per half: each `map_readback` callback subtracts one, and the
+        // count has to land back on exactly zero or `issue_readback` (which
+        // refuses to start while a readback is outstanding) never runs again.
+        self.in_flight.fetch_add(2, Ordering::SeqCst);
         map_readback(
             staged.terrain,
             self.readback.clone(),

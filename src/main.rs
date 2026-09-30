@@ -466,7 +466,14 @@ fn measure_overlap_system(
     applied: Res<AppliedErosionSettings>,
     automation: Res<AutomationSettings>,
     mut exits: MessageWriter<AppExit>,
+    // `AppExit` is applied after the schedule finishes, not the instant it is
+    // written, so this system can still run again and print the whole CSV a
+    // second time. The C++ returns straight out of `main` and prints once.
+    mut done: Local<bool>,
 ) {
+    if *done {
+        return;
+    }
     erosion::apply_erosion_events(&mut cache, &bridge);
 
     let first = automation.overlap_tile;
@@ -485,6 +492,7 @@ fn measure_overlap_system(
         let second_tile = cache.tiles.get(&second).unwrap();
         erosion::measure_overlap(first_tile, second_tile);
         exits.write(AppExit::Success);
+        *done = true;
         return;
     }
 
@@ -513,26 +521,25 @@ fn measure_overlap_system(
     // `RunOverlapMeasurement`'s inner loop feeds the full per-frame budget
     // without clamping to the remaining count, unlike `UpdateErosionCache`, so
     // the last batch can overshoot `settings.iterations`; `140` iterations at
-    // six per frame ends on `144`. Reproduce that exactly.
+    // six per frame ends on `144`. Reproduce that exactly — but only while the
+    // budget is still outstanding: `FinalizeErosionTile` runs inside that loop
+    // and clears `hasActiveTile`, which ends it, so past that point the only
+    // work left is the readback. That repeats here until the async map lands
+    // and `apply_erosion_events` clears `has_active_tile`; without the guard
+    // the driver would keep feeding six more iterations per frame while the
+    // readback was in flight and the tile would run well past the C++'s 144.
     if let Some(active) = cache.tiles.get_mut(&target) {
-        active.completed_iterations += EROSION_ITERATIONS_PER_FRAME;
-        commands.iterate = Some(IterateCommand {
-            count: EROSION_ITERATIONS_PER_FRAME,
-            settings: applied.0,
-        });
+        if active.completed_iterations < applied.0.iterations {
+            active.completed_iterations += EROSION_ITERATIONS_PER_FRAME;
+            commands.iterate = Some(IterateCommand {
+                count: EROSION_ITERATIONS_PER_FRAME,
+                settings: applied.0,
+            });
+        }
         if active.completed_iterations >= applied.0.iterations {
             commands.finalize = true;
         }
     }
-    log::info!(
-        "MEASUREDBG target=({}, {}) completed={} finalize={} state={:?} active={}",
-        target.x,
-        target.z,
-        cache.tiles.get(&target).map(|t| t.completed_iterations).unwrap_or(0),
-        commands.finalize,
-        state_of(&cache, target),
-        cache.has_active_tile,
-    );
     bridge.set_frame(commands, Some(erosion::erosion_lookup_records(&cache)));
 }
 
