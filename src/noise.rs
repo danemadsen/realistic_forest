@@ -370,7 +370,7 @@ mod tests {
         readback.map_async(wgpu::MapMode::Read, .., move |result| {
             sender.send(result).unwrap();
         });
-        device.poll(wgpu::PollType::Wait).unwrap();
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
         receiver.recv().unwrap().unwrap();
         let mapped = readback.get_mapped_range(..);
         let samples: &[[f32; 4]] = bytemuck::cast_slice(&mapped);

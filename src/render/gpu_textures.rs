@@ -327,7 +327,7 @@ pub fn register_main_texture_systems(app: &mut bevy::app::App) {
 
 pub const SIM_TEXTURE_SIZE: u32 = EROSION_RESOLUTION as u32;
 
-/// All world textures held by the render nodes; created once by
+/// All world textures held by the render passes; created once by
 /// `prepare_gpu_textures` after CPU data extraction.
 pub struct GpuWorldTextures {
     /// R32 1024², 11 mips, trilinear + repeat (base noise). Held so the

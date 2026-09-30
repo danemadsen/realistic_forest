@@ -1,6 +1,6 @@
 //! Hydraulic erosion simulation: ports the GPU half of the C++
 //! `HydraulicErosion` (`InitErosion`, `InitializeErosionTextures`,
-//! `RunErosionIterations`, `FinalizeErosionTile`) into one render graph node.
+//! `RunErosionIterations`, `FinalizeErosionTile`) into one render pass.
 //!
 //! Frame flow, in the C++ order:
 //!
@@ -16,7 +16,7 @@
 //!
 //! The main world hands one frame of work over through [`ErosionBridge`]; the
 //! render world owns every GPU object behind [`ErosionSimState`]'s mutex,
-//! because a graph node only ever sees `&World`.
+//! because a render pass only ever sees `&World`.
 //!
 //! PORT NOTES (deliberate deviations, all forced by the API):
 //!
@@ -60,9 +60,8 @@ use crate::render::{
     ForestShaderHandles,
 };
 use bevy::prelude::*;
-use bevy::render::render_graph::{Node, NodeRunError, RenderGraphContext, RenderLabel};
 use bevy::render::render_resource::{
-    BindGroup, BindGroupLayout, CachedRenderPipelineId, FragmentState, PipelineCache,
+    BindGroup, BindGroupLayoutDescriptor, CachedRenderPipelineId, FragmentState, PipelineCache,
     RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
     VertexState,
 };
@@ -111,8 +110,8 @@ const MAX_PENDING_ATLAS_AGE: u32 = 600;
 
 /// Render-world state for the erosion simulation.
 ///
-/// Interior mutability is required because `Node::run` only ever gets `&World`
-/// while the render graph is executing; everything the node touches lives
+/// Interior mutability is required because a render pass only ever gets
+/// `&World` while its schedule is executing; everything the pass touches lives
 /// behind this mutex.
 #[derive(Resource)]
 pub struct ErosionSimState {
@@ -128,134 +127,122 @@ impl Default for ErosionSimState {
     }
 }
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-pub enum NodeErosion {
-    ErosionSim,
-}
+/// One frame of the erosion simulation. Consumes the command list the main
+/// world left in `ErosionBridge`, runs the requested iterations against the
+/// GPU world textures, and reads the results back.
+pub fn forest_erosion_pass(world: &World, mut ctx: RenderContext) {
+    let Some(state) = world.get_resource::<ErosionSimState>() else {
+        return;
+    };
+    let Some(texture_option) = world.get_resource::<GpuWorldTexturesOption>() else {
+        return;
+    };
+    let Some(textures) = texture_option.0.as_deref() else {
+        return;
+    };
+    let Some(queue) = world.get_resource::<RenderQueue>() else {
+        return;
+    };
+    let Some(device) = world.get_resource::<RenderDevice>() else {
+        return;
+    };
+    let Some(bridge) = world.get_resource::<ErosionBridge>() else {
+        return;
+    };
+    let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
+        return;
+    };
+    let Ok(mut guard) = state.sim.lock() else {
+        return;
+    };
+    let Some(sim) = guard.as_mut() else {
+        return;
+    };
 
-pub struct ForestErosionNode;
+    sim.frame += 1;
 
-impl Node for ForestErosionNode {
-    fn run<'w>(
-        &self,
-        _graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext<'w>,
-        world: &'w World,
-    ) -> Result<(), NodeRunError> {
-        let Some(state) = world.get_resource::<ErosionSimState>() else {
-            return Ok(());
-        };
-        let Some(texture_option) = world.get_resource::<GpuWorldTexturesOption>() else {
-            return Ok(());
-        };
-        let Some(textures) = texture_option.0.as_deref() else {
-            return Ok(());
-        };
-        let Some(queue) = world.get_resource::<RenderQueue>() else {
-            return Ok(());
-        };
-        let Some(device) = world.get_resource::<RenderDevice>() else {
-            return Ok(());
-        };
-        let Some(bridge) = world.get_resource::<ErosionBridge>() else {
-            return Ok(());
-        };
-        let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
-            return Ok(());
-        };
-        let Ok(mut guard) = state.sim.lock() else {
-            return Ok(());
-        };
-        let Some(sim) = guard.as_mut() else {
-            return Ok(());
-        };
-
-        sim.frame += 1;
-
-        // The C++ refreshes the 11x11 lookup from `UpdateErosionLookup` at the
-        // end of every cache update; the bridge carries those records across,
-        // and they also carry the atlas slots the pending patches wait for.
-        let records = bridge.take_lookup();
-        if let Some(records) = records.as_deref() {
-            if records.len() == EROSION_LOOKUP_DIAMETER * EROSION_LOOKUP_DIAMETER * 4 {
-                write_padded_at(
-                    queue,
-                    &textures.lookup_texture,
-                    &f32_to_bytes(records),
-                    LOOKUP_TEXTURE_SIZE,
-                    LOOKUP_TEXTURE_SIZE,
-                    SIM_TEXEL_BYTES,
-                    [0, 0],
-                    0,
-                );
-            }
-        }
-
-        // Start the maps whose copy commands were submitted on an earlier
-        // frame, then give the device a chance to run their callbacks.
-        sim.begin_mapping();
-        if sim.in_flight.load(Ordering::SeqCst) > 0 {
-            let _ = device.poll(wgpu::PollType::Poll);
-        }
-
-        // Consume whatever landed since the last frame. The C++ reads its
-        // pixels inside FinalizeErosionTile, at the end of the finalize frame;
-        // the port consumes the previous frame's readback here, before this
-        // frame's commands, so a finished tile is applied as early as
-        // possible.
-        let outcome = sim.consume_readback();
-        let consumed = !matches!(outcome, ReadbackOutcome::Idle);
-        match outcome {
-            ReadbackOutcome::Finalized(tile) => {
-                bridge.push_event(ErosionEvent::TileFinalized(tile));
-            }
-            ReadbackOutcome::Failed(key) => bridge.push_event(ErosionEvent::ReadbackFailed(key)),
-            ReadbackOutcome::Idle => {}
-        }
-
-        // Atlas patches whose slot is now published.
-        if let (Some(records), Some(view)) = (
-            records.as_deref(),
-            world.get_resource::<ExtractedForestView>(),
-        ) {
-            sim.flush_pending_atlas(queue, textures, view.lookup_minimum, records);
-        }
-
-        let Some(commands) = bridge.take_commands() else {
-            return Ok(());
-        };
-
-        // The pipelines compile asynchronously; hold the frame (and any
-        // `init` it carries) until they are ready instead of dropping it.
-        let Some(pipelines) = sim.pipelines(pipeline_cache) else {
-            sim.defer_commands(commands);
-            return Ok(());
-        };
-
-        let mut skip_readback = consumed;
-        if let Some(deferred) = sim.deferred.take() {
-            skip_readback |= sim.apply_commands(
-                &deferred,
-                &pipelines,
-                render_context,
-                device,
+    // The C++ refreshes the 11x11 lookup from `UpdateErosionLookup` at the
+    // end of every cache update; the bridge carries those records across,
+    // and they also carry the atlas slots the pending patches wait for.
+    let records = bridge.take_lookup();
+    if let Some(records) = records.as_deref() {
+        if records.len() == EROSION_LOOKUP_DIAMETER * EROSION_LOOKUP_DIAMETER * 4 {
+            write_padded_at(
                 queue,
-                textures,
-                skip_readback,
+                &textures.lookup_texture,
+                &f32_to_bytes(records),
+                LOOKUP_TEXTURE_SIZE,
+                LOOKUP_TEXTURE_SIZE,
+                SIM_TEXEL_BYTES,
+                [0, 0],
+                0,
             );
         }
-        sim.apply_commands(
-            &commands,
+    }
+
+    // Start the maps whose copy commands were submitted on an earlier
+    // frame, then give the device a chance to run their callbacks.
+    sim.begin_mapping();
+    if sim.in_flight.load(Ordering::SeqCst) > 0 {
+        let _ = device.poll(wgpu::PollType::Poll);
+    }
+
+    // Consume whatever landed since the last frame. The C++ reads its
+    // pixels inside FinalizeErosionTile, at the end of the finalize frame;
+    // the port consumes the previous frame's readback here, before this
+    // frame's commands, so a finished tile is applied as early as
+    // possible.
+    let outcome = sim.consume_readback();
+    let consumed = !matches!(outcome, ReadbackOutcome::Idle);
+    match outcome {
+        ReadbackOutcome::Finalized(tile) => {
+            bridge.push_event(ErosionEvent::TileFinalized(tile));
+        }
+        ReadbackOutcome::Failed(key) => bridge.push_event(ErosionEvent::ReadbackFailed(key)),
+        ReadbackOutcome::Idle => {}
+    }
+
+    // Atlas patches whose slot is now published.
+    if let (Some(records), Some(view)) = (
+        records.as_deref(),
+        world.get_resource::<ExtractedForestView>(),
+    ) {
+        sim.flush_pending_atlas(queue, textures, view.lookup_minimum, records);
+    }
+
+    let Some(commands) = bridge.take_commands() else {
+        return;
+    };
+
+    // The pipelines compile asynchronously; hold the frame (and any
+    // `init` it carries) until they are ready instead of dropping it.
+    let Some(pipelines) = sim.pipelines(pipeline_cache) else {
+        sim.defer_commands(commands);
+        return;
+    };
+
+    let mut skip_readback = consumed;
+    if let Some(deferred) = sim.deferred.take() {
+        skip_readback |= sim.apply_commands(
+            &deferred,
             &pipelines,
-            render_context,
+            &mut ctx,
             device,
             queue,
             textures,
             skip_readback,
         );
-
-        Ok(())
     }
+    sim.apply_commands(
+        &commands,
+        &pipelines,
+        &mut ctx,
+        device,
+        queue,
+        textures,
+        skip_readback,
+    );
+
 }
 
 // ---------------------------------------------------------------------------
@@ -404,18 +391,20 @@ impl ErosionSim {
         // group(0) is the frame's shared globals. It is created here rather
         // than through `globals_bind_group` so the bind group is bevy's
         // wrapper, which is what `TrackedRenderPass::set_bind_group` takes.
-        let globals_layout = globals_layout(device);
-        let globals = device.create_bind_group(
+        let globals_layout = globals_layout();
+        let globals = super::bind_group(
+            device,
+            pipeline_cache,
             "erosion_globals",
             &globals_layout,
             &globals_bind_group_entries(globals_buffer),
         );
 
-        let stage_layout = stage_uniform_layout(device);
-        let init_inputs_layout = sim_inputs_layout(device, 1);
-        let flux_inputs_layout = sim_inputs_layout(device, 3);
-        let water_inputs_layout = sim_inputs_layout(device, 3);
-        let terrain_inputs_layout = sim_inputs_layout(device, 2);
+        let stage_layout = stage_uniform_layout();
+        let init_inputs_layout = sim_inputs_layout(1);
+        let flux_inputs_layout = sim_inputs_layout(3);
+        let water_inputs_layout = sim_inputs_layout(3);
+        let terrain_inputs_layout = sim_inputs_layout(2);
 
         // The C++ sets TEXTURE_FILTER_POINT on the base map and keeps every
         // simulation texture point-sampled; the sim shaders only ever
@@ -453,6 +442,7 @@ impl ErosionSim {
         let base_view = base_texture.create_view(&Default::default());
         let init_inputs = target_bind_group(
             device,
+            pipeline_cache,
             "erosion_init_inputs",
             &init_inputs_layout,
             &[&base_view],
@@ -467,6 +457,7 @@ impl ErosionSim {
                 std::array::from_fn(|water_index| {
                     target_bind_group(
                         device,
+                        pipeline_cache,
                         "erosion_flux_inputs",
                         &flux_inputs_layout,
                         &[
@@ -484,6 +475,7 @@ impl ErosionSim {
                 std::array::from_fn(|terrain_index| {
                     target_bind_group(
                         device,
+                        pipeline_cache,
                         "erosion_water_inputs",
                         &water_inputs_layout,
                         &[
@@ -500,6 +492,7 @@ impl ErosionSim {
             std::array::from_fn(|water_index| {
                 target_bind_group(
                     device,
+                    pipeline_cache,
                     "erosion_terrain_inputs",
                     &terrain_inputs_layout,
                     &[&terrain_views[terrain_index], &water_views[water_index]],
@@ -516,7 +509,9 @@ impl ErosionSim {
             stage_buffer(device, "erosion_init_mode_1"),
         ];
         let init_stage_groups = [
-            device.create_bind_group(
+            super::bind_group(
+                device,
+                pipeline_cache,
                 "erosion_init_stage_0",
                 &stage_layout,
                 &[wgpu::BindGroupEntry {
@@ -524,7 +519,9 @@ impl ErosionSim {
                     resource: init_stage_buffers[0].as_entire_binding(),
                 }],
             ),
-            device.create_bind_group(
+            super::bind_group(
+                device,
+                pipeline_cache,
                 "erosion_init_stage_1",
                 &stage_layout,
                 &[wgpu::BindGroupEntry {
@@ -536,16 +533,23 @@ impl ErosionSim {
         let flux_stage_buffer = stage_buffer(device, "erosion_flux_stage");
         let water_stage_buffer = stage_buffer(device, "erosion_water_stage");
         let terrain_stage_buffer = stage_buffer(device, "erosion_terrain_stage");
-        let flux_stage_group =
-            stage_bind_group(device, &stage_layout, "erosion_flux_stage_group", &flux_stage_buffer);
+        let flux_stage_group = stage_bind_group(
+            device,
+            pipeline_cache,
+            &stage_layout,
+            "erosion_flux_stage_group",
+            &flux_stage_buffer,
+        );
         let water_stage_group = stage_bind_group(
             device,
+            pipeline_cache,
             &stage_layout,
             "erosion_water_stage_group",
             &water_stage_buffer,
         );
         let terrain_stage_group = stage_bind_group(
             device,
+            pipeline_cache,
             &stage_layout,
             "erosion_terrain_stage_group",
             &terrain_stage_buffer,
@@ -645,7 +649,7 @@ impl ErosionSim {
         base_height: &[f32],
         sim_min: [f32; 2],
         queue: &RenderQueue,
-        context: &mut RenderContext<'_>,
+        context: &mut RenderContext<'_, '_>,
         pipelines: &ErosionPipelines<'_>,
     ) {
         if base_height.len() == SIM_PIXELS {
@@ -770,7 +774,7 @@ impl ErosionSim {
     fn run_iterations(
         &mut self,
         count: usize,
-        context: &mut RenderContext<'_>,
+        context: &mut RenderContext<'_, '_>,
         pipelines: &ErosionPipelines<'_>,
     ) {
         for _ in 0..count {
@@ -856,7 +860,7 @@ impl ErosionSim {
         &mut self,
         commands: &ErosionFrameCommands,
         pipelines: &ErosionPipelines<'_>,
-        context: &mut RenderContext<'_>,
+        context: &mut RenderContext<'_, '_>,
         device: &RenderDevice,
         queue: &RenderQueue,
         textures: &GpuWorldTextures,
@@ -1284,8 +1288,8 @@ fn finalize_erosion_tile(
 // ---------------------------------------------------------------------------
 
 /// group(2): one uniform buffer.
-fn stage_uniform_layout(device: &RenderDevice) -> BindGroupLayout {
-    device.create_bind_group_layout(
+fn stage_uniform_layout() -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
         "erosion_stage_layout",
         &[wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -1302,7 +1306,7 @@ fn stage_uniform_layout(device: &RenderDevice) -> BindGroupLayout {
 
 /// group(1): `count` RGBA32F textures at bindings 0..count and the samplers
 /// the WGSL declares at 8..8+count.
-fn sim_inputs_layout(device: &RenderDevice, count: usize) -> BindGroupLayout {
+fn sim_inputs_layout(count: usize) -> BindGroupLayoutDescriptor {
     let mut entries = Vec::with_capacity(count * 2);
     for index in 0..count {
         entries.push(wgpu::BindGroupLayoutEntry {
@@ -1324,14 +1328,15 @@ fn sim_inputs_layout(device: &RenderDevice, count: usize) -> BindGroupLayout {
             count: None,
         });
     }
-    device.create_bind_group_layout("erosion_inputs_layout", &entries)
+    BindGroupLayoutDescriptor::new("erosion_inputs_layout", &entries)
 }
 
 /// The group(1) bind group for one pass.
 fn target_bind_group(
     device: &RenderDevice,
-    label: &str,
-    layout: &BindGroupLayout,
+    cache: &PipelineCache,
+    label: &'static str,
+    layout: &BindGroupLayoutDescriptor,
     views: &[&wgpu::TextureView],
     sampler: &wgpu::Sampler,
 ) -> BindGroup {
@@ -1348,7 +1353,7 @@ fn target_bind_group(
             resource: wgpu::BindingResource::Sampler(sampler),
         });
     }
-    device.create_bind_group(label, layout, &entries)
+    super::bind_group(device, cache, label, layout, &entries)
 }
 
 /// `SetTextureFilter(base, TEXTURE_FILTER_POINT)`: the simulation state is
@@ -1361,7 +1366,7 @@ fn make_sim_sampler(device: &RenderDevice) -> wgpu::Sampler {
         address_mode_w: wgpu::AddressMode::ClampToEdge,
         mag_filter: wgpu::FilterMode::Nearest,
         min_filter: wgpu::FilterMode::Nearest,
-        mipmap_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         ..Default::default()
     })
 }
@@ -1377,11 +1382,14 @@ fn stage_buffer(device: &RenderDevice, label: &str) -> wgpu::Buffer {
 
 fn stage_bind_group(
     device: &RenderDevice,
-    layout: &BindGroupLayout,
-    label: &str,
+    cache: &PipelineCache,
+    layout: &BindGroupLayoutDescriptor,
+    label: &'static str,
     buffer: &wgpu::Buffer,
 ) -> BindGroup {
-    device.create_bind_group(
+    super::bind_group(
+        device,
+        cache,
         label,
         layout,
         &[wgpu::BindGroupEntry {
@@ -1399,12 +1407,12 @@ fn queue_erosion_pipeline(
     cache: &PipelineCache,
     label: &'static str,
     shader: Handle<Shader>,
-    layouts: Vec<BindGroupLayout>,
+    layouts: Vec<BindGroupLayoutDescriptor>,
 ) -> CachedRenderPipelineId {
     cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some(label.into()),
         layout: layouts,
-        push_constant_ranges: vec![],
+        immediate_size: 0,
         vertex: VertexState {
             shader: shader.clone(),
             shader_defs: vec![],
@@ -1439,7 +1447,7 @@ fn queue_erosion_pipeline(
 }
 
 fn record_erosion_pass(
-    context: &mut RenderContext<'_>,
+    context: &mut RenderContext<'_, '_>,
     pipeline: &RenderPipeline,
     globals: &BindGroup,
     inputs: &BindGroup,
@@ -1463,6 +1471,7 @@ fn record_erosion_pass(
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     });
     pass.set_render_pipeline(pipeline);
     pass.set_bind_group(0, globals, &[]);

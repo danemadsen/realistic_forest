@@ -16,9 +16,9 @@ use crate::render::{
 use bevy::asset::Handle;
 use bevy::mesh::VertexBufferLayout;
 use bevy::prelude::*;
-use bevy::render::render_graph::{Node, NodeRunError, RenderGraphContext, RenderLabel};
 use bevy::render::render_resource::{
-    BindGroup, BindGroupLayout, Buffer, CachedRenderPipelineId, FragmentState, PipelineCache,
+    BindGroup, BindGroupLayoutDescriptor, Buffer, CachedRenderPipelineId, FragmentState,
+    PipelineCache,
     RenderPipelineDescriptor, VertexState,
 };
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
@@ -110,14 +110,22 @@ struct StageUniform {
 }
 
 impl StageUniform {
-    fn new(device: &RenderDevice, layout: &BindGroupLayout, label: &str, size: u64) -> Self {
+    fn new(
+        device: &RenderDevice,
+        cache: &PipelineCache,
+        layout: &BindGroupLayoutDescriptor,
+        label: &'static str,
+        size: u64,
+    ) -> Self {
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = device.create_bind_group(
+        let bind_group = super::bind_group(
+            device,
+            cache,
             label,
             layout,
             &[wgpu::BindGroupEntry {
@@ -154,186 +162,175 @@ struct TerrainResources {
 }
 
 // ---------------------------------------------------------------------------
-// Graph label + node
+// The terrain G-buffer pass
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-pub enum NodeTerrain {
-    TerrainPass,
-}
+/// Draws the clipmap G-buffer: view-space position, encoded normal +
+/// roughness and albedo + masks, plus the shared depth buffer.
+pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
+    let Some(state) = world.get_resource::<TerrainNodeState>() else {
+        return;
+    };
+    // Both slots are filled by the prepare systems above; an empty slot
+    // just means "nothing to draw yet" (first frame, or before the world
+    // textures exist). Never panic on it.
+    //
+    // Lock order: gbuffer first, then resources. No other system ever
+    // holds both, so this cannot deadlock.
+    let gbuffer_guard = state
+        .gbuffer
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let resources_guard = state
+        .resources
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let (Some(gbuffer), Some(resources)) = (gbuffer_guard.as_ref(), resources_guard.as_ref())
+    else {
+        return;
+    };
+    let Some(view) = world.get_resource::<ExtractedForestView>() else {
+        return;
+    };
+    // The globals resource is not read here — the terrain's group-0 bind
+    // group already wraps its buffer — but the pass must not run before it
+    // exists, so the lookup stays as an ordering guard.
+    let Some(_globals) = world.get_resource::<ForestGlobals>() else {
+        return;
+    };
+    let Some(queue) = world.get_resource::<RenderQueue>() else {
+        return;
+    };
+    let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
+        return;
+    };
 
-pub struct ForestTerrainNode;
+    // DrawClipmap: uErosionVisibilityCenter is the player's XZ and every
+    // level shares it (SetTerrainSharedUniforms runs once per frame).
+    let visibility_center = [view.player_position[0], view.player_position[2]];
+    for (level, stage) in resources.levels.iter().enumerate() {
+        let uniforms = TerrainStageUniforms::build(
+            // The C++ hands MatrixIdentity() to DrawMesh for every level:
+            // a level's world placement comes from uClipOrigin, not from
+            // the model matrix.
+            bevy::math::Mat4::IDENTITY.to_cols_array(),
+            level as u32,
+            view.player_position,
+            view.lookup_minimum,
+            visibility_center,
+        );
+        queue.write_buffer(&stage.buffer, 0, bytemuck::bytes_of(&uniforms));
+    }
 
-impl Node for ForestTerrainNode {
-    fn run<'w>(
-        &self,
-        _graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext<'w>,
-        world: &'w World,
-    ) -> Result<(), NodeRunError> {
-        let Some(state) = world.get_resource::<TerrainNodeState>() else {
-            return Ok(());
-        };
-        // Both slots are filled by the prepare systems above; an empty slot
-        // just means "nothing to draw yet" (first frame, or before the world
-        // textures exist). Never panic on it.
-        //
-        // Lock order: gbuffer first, then resources. No other system ever
-        // holds both, so this cannot deadlock.
-        let gbuffer_guard = state
-            .gbuffer
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let resources_guard = state
-            .resources
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let (Some(gbuffer), Some(resources)) = (gbuffer_guard.as_ref(), resources_guard.as_ref())
-        else {
-            return Ok(());
-        };
-        let Some(view) = world.get_resource::<ExtractedForestView>() else {
-            return Ok(());
-        };
-        // The globals resource is not read here — the terrain's group-0 bind
-        // group already wraps its buffer — but the pass must not run before it
-        // exists, so the lookup stays as an ordering guard.
-        let Some(_globals) = world.get_resource::<ForestGlobals>() else {
-            return Ok(());
-        };
-        let Some(queue) = world.get_resource::<RenderQueue>() else {
-            return Ok(());
-        };
-        let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
-            return Ok(());
-        };
-
-        // DrawClipmap: uErosionVisibilityCenter is the player's XZ and every
-        // level shares it (SetTerrainSharedUniforms runs once per frame).
-        let visibility_center = [view.player_position[0], view.player_position[2]];
-        for (level, stage) in resources.levels.iter().enumerate() {
-            let uniforms = TerrainStageUniforms::build(
-                // The C++ hands MatrixIdentity() to DrawMesh for every level:
-                // a level's world placement comes from uClipOrigin, not from
-                // the model matrix.
-                bevy::math::Mat4::IDENTITY.to_cols_array(),
-                level as u32,
-                view.player_position,
-                view.lookup_minimum,
-                visibility_center,
-            );
-            queue.write_buffer(&stage.buffer, 0, bytemuck::bytes_of(&uniforms));
-        }
-
-        // This is independent of camera visibility: hills behind the camera
-        // still cast shadows and occlude light inside the fog. Updating after
-        // erosion and before lighting also follows tile reveals without a
-        // CPU height readback or stale lighting cache.
-        if view.settings.raymarched_shadows
-            && let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.heightfield_pipeline)
-        {
-            let mut pass = render_context.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
-                label: Some("forest_lighting_heightfield"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &gbuffer.heightfield_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_render_pipeline(pipeline);
-            pass.set_bind_group(0, &resources.globals, &[]);
-            pass.set_bind_group(1, &resources.terrain_textures, &[]);
-            pass.set_bind_group(2, &resources.levels[0].bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
-
-        // One pass, three colour targets + depth, cleared exactly like the
-        // C++: rlClearColor(112, 173, 214, 0), rlClearScreenBuffers() (which
-        // also clears depth to GL's default 1.0), then rlViewport over the
-        // SSAO-sized target.
-        let color_attachments = [
-            Some(wgpu::RenderPassColorAttachment {
-                view: &gbuffer.position_view,
+    // This is independent of camera visibility: hills behind the camera
+    // still cast shadows and occlude light inside the fog. Updating after
+    // erosion and before lighting also follows tile reveals without a
+    // CPU height readback or stale lighting cache.
+    if view.settings.raymarched_shadows
+        && let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.heightfield_pipeline)
+    {
+        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+            label: Some("forest_lighting_heightfield"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &gbuffer.heightfield_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(GBUFFER_CLEAR_COLOR),
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     store: wgpu::StoreOp::Store,
                 },
-            }),
-            Some(wgpu::RenderPassColorAttachment {
-                view: &gbuffer.normal_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(GBUFFER_CLEAR_COLOR),
-                    store: wgpu::StoreOp::Store,
-                },
-            }),
-            Some(wgpu::RenderPassColorAttachment {
-                view: &gbuffer.albedo_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(GBUFFER_CLEAR_COLOR),
-                    store: wgpu::StoreOp::Store,
-                },
-            }),
-        ];
-        let pass_descriptor = wgpu::RenderPassDescriptor {
-            label: Some("forest_terrain_gbuffer"),
-            color_attachments: &color_attachments,
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &gbuffer.depth_view,
-                depth_ops: Some(wgpu::Operations {
-                    // Reverse-Z: the far plane is 0, so the clear value is the
-                    // far distance rather than the near one.
-                    load: wgpu::LoadOp::Clear(0.0),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
+            })],
+            depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
-        };
-        let mut pass = render_context.begin_tracked_render_pass(pass_descriptor);
-        pass.set_viewport(
-            0.0,
-            0.0,
-            gbuffer.width as f32,
-            gbuffer.height as f32,
-            0.0,
-            1.0,
-        );
-
-        // The C++ walks the levels in order and draws
-        // `level == 0 ? center : ring` for each of them.
-        if let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.terrain_pipeline) {
-            pass.set_render_pipeline(pipeline);
-            pass.set_bind_group(0, &resources.globals, &[]);
-            pass.set_bind_group(1, &resources.terrain_textures, &[]);
-            for (level, stage) in resources.levels.iter().enumerate() {
-                let mesh = if level == 0 {
-                    &resources.center_mesh
-                } else {
-                    &resources.ring_mesh
-                };
-                pass.set_bind_group(2, &stage.bind_group, &[]);
-                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                pass.set_index_buffer(mesh.indices.slice(..), 0, wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.index_count, 0, 0..1);
-            }
-        }
-
-        Ok(())
+            multiview_mask: None,
+        });
+        pass.set_render_pipeline(pipeline);
+        pass.set_bind_group(0, &resources.globals, &[]);
+        pass.set_bind_group(1, &resources.terrain_textures, &[]);
+        pass.set_bind_group(2, &resources.levels[0].bind_group, &[]);
+        pass.draw(0..3, 0..1);
     }
+
+    // One pass, three colour targets + depth, cleared exactly like the
+    // C++: rlClearColor(112, 173, 214, 0), rlClearScreenBuffers() (which
+    // also clears depth to GL's default 1.0), then rlViewport over the
+    // SSAO-sized target.
+    let color_attachments = [
+        Some(wgpu::RenderPassColorAttachment {
+            view: &gbuffer.position_view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(GBUFFER_CLEAR_COLOR),
+                store: wgpu::StoreOp::Store,
+            },
+        }),
+        Some(wgpu::RenderPassColorAttachment {
+            view: &gbuffer.normal_view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(GBUFFER_CLEAR_COLOR),
+                store: wgpu::StoreOp::Store,
+            },
+        }),
+        Some(wgpu::RenderPassColorAttachment {
+            view: &gbuffer.albedo_view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(GBUFFER_CLEAR_COLOR),
+                store: wgpu::StoreOp::Store,
+            },
+        }),
+    ];
+    let pass_descriptor = wgpu::RenderPassDescriptor {
+        label: Some("forest_terrain_gbuffer"),
+        color_attachments: &color_attachments,
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: &gbuffer.depth_view,
+            depth_ops: Some(wgpu::Operations {
+                // Reverse-Z: the far plane is 0, so the clear value is the
+                // far distance rather than the near one.
+                load: wgpu::LoadOp::Clear(0.0),
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    };
+    let mut pass = ctx.begin_tracked_render_pass(pass_descriptor);
+    pass.set_viewport(
+        0.0,
+        0.0,
+        gbuffer.width as f32,
+        gbuffer.height as f32,
+        0.0,
+        1.0,
+    );
+
+    // The C++ walks the levels in order and draws
+    // `level == 0 ? center : ring` for each of them.
+    if let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.terrain_pipeline) {
+        pass.set_render_pipeline(pipeline);
+        pass.set_bind_group(0, &resources.globals, &[]);
+        pass.set_bind_group(1, &resources.terrain_textures, &[]);
+        for (level, stage) in resources.levels.iter().enumerate() {
+            let mesh = if level == 0 {
+                &resources.center_mesh
+            } else {
+                &resources.ring_mesh
+            };
+            pass.set_bind_group(2, &stage.bind_group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+    }
+
 }
 
 // ---------------------------------------------------------------------------
@@ -428,8 +425,8 @@ fn build_clip_mesh(device: &RenderDevice, ring: bool) -> GpuMesh {
 /// preserved, so texture unit N binds at binding N with its sampler at binding
 /// N + 8. Unit 2 (the flow atlas, used by terrain-fs.wgsl) keeps its slot, and
 /// the two PBR arrays added by the port live at units 5 and 6.
-fn terrain_texture_layout(device: &RenderDevice) -> BindGroupLayout {
-    device.create_bind_group_layout(
+fn terrain_texture_layout() -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
         "forest_terrain_textures_layout",
         &[
             wgpu::BindGroupLayoutEntry {
@@ -558,8 +555,8 @@ fn terrain_texture_layout(device: &RenderDevice) -> BindGroupLayout {
 }
 
 /// The group(2) stage-uniform layout both pipelines share.
-fn stage_uniform_layout(device: &RenderDevice, label: &str, size: u64) -> BindGroupLayout {
-    device.create_bind_group_layout(
+fn stage_uniform_layout(label: &'static str, size: u64) -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
         label,
         &[wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -602,6 +599,15 @@ struct TerrainSamplers {
 /// does when the extension is missing.
 const TERRAIN_ANISOTROPY_CLAMP: u16 = 16;
 
+/// wgpu 29 split the mip filter into its own type; map the mag/min filter
+/// across so the three stay in step.
+fn mipmap_mode(filter: wgpu::FilterMode) -> wgpu::MipmapFilterMode {
+    match filter {
+        wgpu::FilterMode::Nearest => wgpu::MipmapFilterMode::Nearest,
+        wgpu::FilterMode::Linear => wgpu::MipmapFilterMode::Linear,
+    }
+}
+
 fn make_sampler(
     device: &RenderDevice,
     label: &str,
@@ -617,7 +623,7 @@ fn make_sampler(
             address_mode_w: address,
             mag_filter: filter,
             min_filter: filter,
-            mipmap_filter: filter,
+            mipmap_filter: mipmap_mode(filter),
             ..Default::default()
         })
 }
@@ -640,7 +646,7 @@ fn make_anisotropic_sampler(
             address_mode_w: address,
             mag_filter: filter,
             min_filter: filter,
-            mipmap_filter: filter,
+            mipmap_filter: mipmap_mode(filter),
             anisotropy_clamp: TERRAIN_ANISOTROPY_CLAMP,
             ..Default::default()
         })
@@ -667,7 +673,8 @@ fn build_terrain_samplers(device: &RenderDevice) -> TerrainSamplers {
 /// The group(1) bind group over the shared world textures.
 fn terrain_texture_bind_group(
     device: &RenderDevice,
-    layout: &BindGroupLayout,
+    cache: &PipelineCache,
+    layout: &BindGroupLayoutDescriptor,
     textures: &GpuWorldTextures,
     samplers: &TerrainSamplers,
 ) -> BindGroup {
@@ -729,7 +736,7 @@ fn terrain_texture_bind_group(
             resource: wgpu::BindingResource::Sampler(&samplers.normal_rough_array),
         },
     ];
-    device.create_bind_group("forest_terrain_textures", layout, &entries)
+    super::bind_group(device, cache, "forest_terrain_textures", layout, &entries)
 }
 
 /// Builds one of the two G-buffer pipelines. Both write the same three targets
@@ -741,12 +748,12 @@ fn queue_gbuffer_pipeline(
     vertex_shader: Handle<Shader>,
     fragment_shader: Handle<Shader>,
     vertex_buffers: Vec<VertexBufferLayout>,
-    layouts: Vec<BindGroupLayout>,
+    layouts: Vec<BindGroupLayoutDescriptor>,
 ) -> CachedRenderPipelineId {
     cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some(label.into()),
         layout: layouts,
-        push_constant_ranges: vec![],
+        immediate_size: 0,
         vertex: VertexState {
             shader: vertex_shader,
             shader_defs: vec![],
@@ -777,13 +784,13 @@ fn queue_gbuffer_pipeline(
             // CreateGBuffer uses rlLoadTextureDepth(w, h, true): a real depth
             // texture, not a renderbuffer.
             format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: true,
+            depth_write_enabled: Some(true),
             // DIVERGENCE FROM THE C++: rlgl runs glDepthFunc(GL_LEQUAL) against
             // a forward projection. The projection is reverse-Z now (see
             // crate::matrices::perspective), so the comparison flips with it:
             // GreaterEqual keeps the same "an exact tie goes to the later draw,
             // so the water surface wins against terrain at identical depth".
-            depth_compare: wgpu::CompareFunction::GreaterEqual,
+            depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
@@ -851,21 +858,27 @@ fn prepare_terrain(
 
     // group(0): the frame's shared globals, created through the same layout
     // and entries every other pass uses.
-    let globals_layout = crate::render::globals_layout(device);
+    let globals_layout = crate::render::globals_layout();
     let globals_entries = crate::render::globals_bind_group_entries(globals_buffer);
-    let globals_bind_group = device.create_bind_group(
+    let globals_bind_group = super::bind_group(
+        device,
+        &pipeline_cache,
         "forest_terrain_globals_bind_group",
         &globals_layout,
         &globals_entries,
     );
 
     // group(1): the world textures; group(2): the per-draw stage blocks.
-    let terrain_textures_layout = terrain_texture_layout(device);
+    let terrain_textures_layout = terrain_texture_layout();
     let samplers = build_terrain_samplers(device);
-    let terrain_textures =
-        terrain_texture_bind_group(device, &terrain_textures_layout, textures, &samplers);
-    let terrain_stage_layout = stage_uniform_layout(
+    let terrain_textures = terrain_texture_bind_group(
         device,
+        &pipeline_cache,
+        &terrain_textures_layout,
+        textures,
+        &samplers,
+    );
+    let terrain_stage_layout = stage_uniform_layout(
         "forest_terrain_stage_layout",
         std::mem::size_of::<TerrainStageUniforms>() as u64,
     );
@@ -892,7 +905,7 @@ fn prepare_terrain(
     let heightfield_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("forest_lighting_heightfield_pipeline".into()),
         layout: vec![globals_layout, terrain_textures_layout, terrain_stage_layout.clone()],
-        push_constant_ranges: vec![],
+        immediate_size: 0,
         vertex: VertexState {
             shader: shaders.terrain_vs.clone(),
             shader_defs: vec![],
@@ -918,6 +931,7 @@ fn prepare_terrain(
     let levels: [StageUniform; CLIP_LEVELS] = std::array::from_fn(|_| {
         StageUniform::new(
             device,
+            &pipeline_cache,
             &terrain_stage_layout,
             "forest_terrain_stage_uniform",
             std::mem::size_of::<TerrainStageUniforms>() as u64,

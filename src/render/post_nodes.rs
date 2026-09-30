@@ -1,9 +1,9 @@
 //! The deferred post passes: SSAO -> bilateral blur -> composite -> FXAA.
 //!
 //! Ports `RenderSSAO`, `CompositeScene` and `PresentFxaa` from the C++ main
-//! loop, plus the half-res target bookkeeping `ResizeSSAO` performs. The graph
-//! order wired up in `render/mod.rs` (SsaoPass -> BlurPass -> CompositePass ->
-//! FxaaPass) is the C++ call order, and every pass is the same fullscreen
+//! loop, plus the half-res target bookkeeping `ResizeSSAO` performs. The
+//! schedule order wired up in `render/mod.rs` (Ssao -> Blur -> Composite ->
+//! Fxaa) is the C++ call order, and every pass is the same fullscreen
 //! triangle drawn with blending disabled: these passes write numerical state
 //! rather than translucent colour, so standard alpha blending would corrupt
 //! the channels (see `RenderPass` in the C++).
@@ -18,29 +18,18 @@ use bevy::app::SubApp;
 use bevy::asset::Handle;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::prelude::{Res, Resource, World};
-use bevy::render::render_graph::{Node, NodeRunError, RenderGraphContext, RenderLabel, ViewNode};
 use bevy::render::render_phase::TrackedRenderPass;
 use bevy::render::render_resource::{
-    BindGroup, BindGroupEntry, BindGroupLayout, CachedRenderPipelineId, ColorTargetState,
+    BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, CachedRenderPipelineId, ColorTargetState,
     ColorWrites, FragmentState, MultisampleState, PipelineCache, PrimitiveState, RenderPipeline,
     RenderPipelineDescriptor, VertexState,
 };
-use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
+use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::view::ViewTarget;
 use bevy::render::{Render, RenderSystems};
 use bevy::shader::Shader;
 use std::collections::HashMap;
 use std::sync::Mutex;
-
-/// The post-pass render labels. `render/mod.rs` wires them into the camera's
-/// sub-graph in this order.
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-pub enum NodeSsao {
-    SsaoPass,
-    BlurPass,
-    CompositePass,
-    FxaaPass,
-}
 
 // ---------------------------------------------------------------------------
 // Prepared GPU state
@@ -74,17 +63,17 @@ struct PostSamplers {
 /// post WGSL files use.
 #[derive(Clone)]
 struct PostLayouts {
-    ssao: BindGroupLayout,
-    blur: BindGroupLayout,
-    composite: BindGroupLayout,
-    atmosphere: BindGroupLayout,
-    fxaa: BindGroupLayout,
+    ssao: BindGroupLayoutDescriptor,
+    blur: BindGroupLayoutDescriptor,
+    composite: BindGroupLayoutDescriptor,
+    atmosphere: BindGroupLayoutDescriptor,
+    fxaa: BindGroupLayoutDescriptor,
 }
 
 /// One pass's group-2 stage uniforms: the layout, the buffer and the bind
 /// group wrapping its whole range.
 struct Stage {
-    layout: BindGroupLayout,
+    layout: BindGroupLayoutDescriptor,
     buffer: wgpu::Buffer,
     group: BindGroup,
 }
@@ -102,7 +91,7 @@ struct SsaoNodeInner {
     /// The G-buffer size the group-1 bind groups were built for; anything else
     /// (including a G-buffer rebuilt at a different size) rebuilds them.
     bound_size: Option<(u32, u32)>,
-    globals_layout: Option<BindGroupLayout>,
+    globals_layout: Option<BindGroupLayoutDescriptor>,
     globals_group: Option<BindGroup>,
     half_res_globals: Option<HalfResGlobals>,
     samplers: Option<PostSamplers>,
@@ -128,8 +117,8 @@ struct SsaoNodeInner {
 }
 
 /// Shared, interior-mutable state for the SSAO, blur, composite and FXAA
-/// passes; the graph nodes and the prepare systems run in different schedules,
-/// so the CPU-side resources live behind one mutex.
+/// passes; the passes and the prepare systems run in different schedules, so
+/// the CPU-side resources live behind one mutex.
 #[derive(Resource)]
 pub struct SsaoNodeState {
     inner: Mutex<SsaoNodeInner>,
@@ -211,7 +200,7 @@ fn prepare_post_pipelines(
     };
 
     if inner.globals_layout.is_none() {
-        inner.globals_layout = Some(globals_layout(&device));
+        inner.globals_layout = Some(globals_layout());
     }
     let Some(globals_group_layout) = inner.globals_layout.clone() else {
         return;
@@ -219,7 +208,9 @@ fn prepare_post_pipelines(
 
     // Group 0 for the full-resolution passes: the shared globals buffer.
     if inner.globals_group.is_none() {
-        inner.globals_group = Some(device.create_bind_group(
+        inner.globals_group = Some(super::bind_group(
+            &device,
+            &pipeline_cache,
             "forest_post_globals_group",
             &globals_group_layout,
             &[BindGroupEntry {
@@ -246,7 +237,9 @@ fn prepare_post_pipelines(
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let group = device.create_bind_group(
+        let group = super::bind_group(
+            &device,
+            &pipeline_cache,
             "forest_half_res_globals_group",
             &globals_group_layout,
             &[BindGroupEntry {
@@ -282,7 +275,7 @@ fn prepare_post_pipelines(
                 address_mode_w: wgpu::AddressMode::ClampToEdge,
                 mag_filter: wgpu::FilterMode::Nearest,
                 min_filter: wgpu::FilterMode::Nearest,
-                mipmap_filter: wgpu::FilterMode::Nearest,
+                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
                 ..Default::default()
             }),
             // TEXTURE_WRAP_REPEAT for the 4x4 rotation noise, which is why the
@@ -294,7 +287,7 @@ fn prepare_post_pipelines(
                 address_mode_w: wgpu::AddressMode::Repeat,
                 mag_filter: wgpu::FilterMode::Nearest,
                 min_filter: wgpu::FilterMode::Nearest,
-                mipmap_filter: wgpu::FilterMode::Nearest,
+                mipmap_filter: wgpu::MipmapFilterMode::Nearest,
                 ..Default::default()
             }),
             // FXAA blends taps at sub-texel offsets, which needs the hardware's
@@ -307,7 +300,7 @@ fn prepare_post_pipelines(
                 address_mode_w: wgpu::AddressMode::ClampToEdge,
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
-                mipmap_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
                 ..Default::default()
             }),
         });
@@ -316,22 +309,20 @@ fn prepare_post_pipelines(
     if inner.layouts.is_none() {
         inner.layouts = Some(PostLayouts {
             // ssao: position, normal, rotation noise (all point-filtered).
-            ssao: screen_group_layout(&device, "forest_ssao_group_layout", &[false, false, false]),
+            ssao: screen_group_layout("forest_ssao_group_layout", &[false, false, false]),
             // blur: raw SSAO (bilinear), position, normal.
-            blur: screen_group_layout(&device, "forest_blur_group_layout", &[true, false, false]),
+            blur: screen_group_layout("forest_blur_group_layout", &[true, false, false]),
             // composite: position, normal, albedo, blurred SSAO.
             composite: screen_group_layout(
-                &device,
                 "forest_composite_group_layout",
                 &[false, false, true, true, true, true],
             ),
             atmosphere: screen_group_layout(
-                &device,
                 "forest_atmosphere_group_layout",
                 &[false, false, true, true, true],
             ),
             // fxaa: the composited LDR frame (bilinear).
-            fxaa: screen_group_layout(&device, "forest_fxaa_group_layout", &[true]),
+            fxaa: screen_group_layout("forest_fxaa_group_layout", &[true]),
         });
     }
 
@@ -353,7 +344,9 @@ fn prepare_post_pipelines(
         let ao: &wgpu::TextureView = &targets.ao_view;
         let blurred: &wgpu::TextureView = &targets.blur_view;
 
-        let ssao_group = device.create_bind_group(
+        let ssao_group = super::bind_group(
+            &device,
+            &pipeline_cache,
             "forest_ssao_group",
             &layouts.ssao,
             &[
@@ -365,7 +358,9 @@ fn prepare_post_pipelines(
                 sampler_entry(10, &samplers.point_repeat),
             ],
         );
-        let blur_group = device.create_bind_group(
+        let blur_group = super::bind_group(
+            &device,
+            &pipeline_cache,
             "forest_blur_group",
             &layouts.blur,
             &[
@@ -377,7 +372,9 @@ fn prepare_post_pipelines(
                 sampler_entry(10, &samplers.point_clamp),
             ],
         );
-        let composite_group = device.create_bind_group(
+        let composite_group = super::bind_group(
+            &device,
+            &pipeline_cache,
             "forest_composite_group",
             &layouts.composite,
             &[
@@ -398,7 +395,9 @@ fn prepare_post_pipelines(
 
         // Keep the atmosphere output out of this bind group: a texture cannot
         // be sampled and used as an attachment in the same render pass.
-        let atmosphere_group = device.create_bind_group(
+        let atmosphere_group = super::bind_group(
+            &device,
+            &pipeline_cache,
             "forest_atmosphere_group",
             &layouts.atmosphere,
             &[
@@ -425,6 +424,7 @@ fn prepare_post_pipelines(
     if inner.ssao_stage.is_none() {
         inner.ssao_stage = Some(create_stage(
             &device,
+            &pipeline_cache,
             "forest_ssao_stage",
             std::mem::size_of::<SsaoStageUniforms>() as u64,
         ));
@@ -432,6 +432,7 @@ fn prepare_post_pipelines(
     if inner.blur_stage.is_none() {
         inner.blur_stage = Some(create_stage(
             &device,
+            &pipeline_cache,
             "forest_blur_stage",
             std::mem::size_of::<BlurStageUniforms>() as u64,
         ));
@@ -439,6 +440,7 @@ fn prepare_post_pipelines(
     if inner.composite_stage.is_none() {
         inner.composite_stage = Some(create_stage(
             &device,
+            &pipeline_cache,
             "forest_composite_stage",
             std::mem::size_of::<CompositeStageUniforms>() as u64,
         ));
@@ -556,118 +558,100 @@ pub fn register_post_systems(render_app: &mut SubApp) {
 
 /// `RenderSSAO`'s first half: the raw ambient occlusion term into the half-res
 /// AO target.
-pub struct ForestSsaoNode;
+pub fn forest_ssao_pass(world: &World, mut ctx: RenderContext) {
+    let Some(state) = world.get_resource::<SsaoNodeState>() else {
+        return;
+    };
+    let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
+        return;
+    };
+    let Ok(inner) = state.inner.lock() else {
+        return;
+    };
+    let (Some(targets), Some(globals), Some(group), Some(stage), Some(pipeline)) = (
+        inner.targets.as_ref(),
+        inner.half_res_globals.as_ref(),
+        inner.ssao_group.as_ref(),
+        inner.ssao_stage.as_ref(),
+        inner
+            .ssao_pipeline
+            .and_then(|id| pipeline_cache.get_render_pipeline(id)),
+    ) else {
+        return;
+    };
 
-impl Node for ForestSsaoNode {
-    fn run<'w>(
-        &self,
-        _graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext<'w>,
-        world: &'w World,
-    ) -> Result<(), NodeRunError> {
-        let Some(state) = world.get_resource::<SsaoNodeState>() else {
-            return Ok(());
-        };
-        let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
-            return Ok(());
-        };
-        let Ok(inner) = state.inner.lock() else {
-            return Ok(());
-        };
-        let (Some(targets), Some(globals), Some(group), Some(stage), Some(pipeline)) = (
-            inner.targets.as_ref(),
-            inner.half_res_globals.as_ref(),
-            inner.ssao_group.as_ref(),
-            inner.ssao_stage.as_ref(),
-            inner
-                .ssao_pipeline
-                .and_then(|id| pipeline_cache.get_render_pipeline(id)),
-        ) else {
-            return Ok(());
-        };
-
-        let mut render_pass = render_context.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
-            label: Some("forest_ssao_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &targets.ao_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        draw_fullscreen(
-            &mut render_pass,
-            pipeline,
-            &[&globals.group, group, &stage.group],
-            targets.width as f32,
-            targets.height as f32,
-        );
-        Ok(())
-    }
+    let mut render_pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        label: Some("forest_ssao_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &targets.ao_view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    draw_fullscreen(
+        &mut render_pass,
+        pipeline,
+        &[&globals.group, group, &stage.group],
+        targets.width as f32,
+        targets.height as f32,
+    );
 }
 
 /// `RenderSSAO`'s second half: the bilateral, depth/normal-weighted blur of the
 /// raw AO buffer into the second half-res target.
-pub struct ForestBlurNode;
+pub fn forest_blur_pass(world: &World, mut ctx: RenderContext) {
+    let Some(state) = world.get_resource::<SsaoNodeState>() else {
+        return;
+    };
+    let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
+        return;
+    };
+    let Ok(inner) = state.inner.lock() else {
+        return;
+    };
+    let (Some(targets), Some(globals), Some(group), Some(stage), Some(pipeline)) = (
+        inner.targets.as_ref(),
+        inner.half_res_globals.as_ref(),
+        inner.blur_group.as_ref(),
+        inner.blur_stage.as_ref(),
+        inner
+            .blur_pipeline
+            .and_then(|id| pipeline_cache.get_render_pipeline(id)),
+    ) else {
+        return;
+    };
 
-impl Node for ForestBlurNode {
-    fn run<'w>(
-        &self,
-        _graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext<'w>,
-        world: &'w World,
-    ) -> Result<(), NodeRunError> {
-        let Some(state) = world.get_resource::<SsaoNodeState>() else {
-            return Ok(());
-        };
-        let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
-            return Ok(());
-        };
-        let Ok(inner) = state.inner.lock() else {
-            return Ok(());
-        };
-        let (Some(targets), Some(globals), Some(group), Some(stage), Some(pipeline)) = (
-            inner.targets.as_ref(),
-            inner.half_res_globals.as_ref(),
-            inner.blur_group.as_ref(),
-            inner.blur_stage.as_ref(),
-            inner
-                .blur_pipeline
-                .and_then(|id| pipeline_cache.get_render_pipeline(id)),
-        ) else {
-            return Ok(());
-        };
-
-        let mut render_pass = render_context.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
-            label: Some("forest_ssao_blur_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &targets.blur_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        draw_fullscreen(
-            &mut render_pass,
-            pipeline,
-            &[&globals.group, group, &stage.group],
-            targets.width as f32,
-            targets.height as f32,
-        );
-        Ok(())
-    }
+    let mut render_pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        label: Some("forest_ssao_blur_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &targets.blur_view,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    draw_fullscreen(
+        &mut render_pass,
+        pipeline,
+        &[&globals.group, group, &stage.group],
+        targets.width as f32,
+        targets.height as f32,
+    );
 }
 
 /// `CompositeScene`: lighting, fog, tonemap and gamma encode from the
@@ -676,254 +660,243 @@ impl Node for ForestBlurNode {
 /// The finished image does not go straight to the screen: FXAA needs the
 /// neighbouring final pixels, which only exist once the whole frame has been
 /// composited. The next node blits it out.
-pub struct ForestCompositeNode;
+pub fn forest_composite_pass(
+    view: ViewQuery<&ViewTarget>,
+    world: &World,
+    mut ctx: RenderContext,
+) {
+    let view = view.into_inner();
+    let Some(state) = world.get_resource::<SsaoNodeState>() else {
+        return;
+    };
+    let Some(shaders) = world.get_resource::<ForestShaderHandles>() else {
+        return;
+    };
+    let Some(extracted) = world.get_resource::<ExtractedForestView>() else {
+        return;
+    };
+    let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
+        return;
+    };
+    let Some(clouds) = world.get_resource::<super::cloud_node::CloudRenderState>()
+        .and_then(|state| state.resources.as_ref()) else {
+        return;
+    };
+    let Ok(mut inner) = state.inner.lock() else {
+        return;
+    };
 
-impl ViewNode for ForestCompositeNode {
-    type ViewQuery = &'static ViewTarget;
-
-    fn run<'w>(
-        &self,
-        _graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext<'w>,
-        view: &'w ViewTarget,
-        world: &'w World,
-    ) -> Result<(), NodeRunError> {
-        let Some(state) = world.get_resource::<SsaoNodeState>() else {
-            return Ok(());
+    // One pipeline per main-texture format (see `SsaoNodeInner`), queued
+    // from here because only the view knows the format; a queued pipeline
+    // becomes usable on the next frame.
+    let format = view.main_texture_format();
+    if inner.atmosphere_pipeline.is_none() {
+        let (Some(globals_layout), Some(layouts), Some(stage)) = (
+            inner.globals_layout.clone(), inner.layouts.as_ref(), inner.composite_stage.as_ref(),
+        ) else {
+            return;
         };
-        let Some(shaders) = world.get_resource::<ForestShaderHandles>() else {
-            return Ok(());
-        };
-        let Some(extracted) = world.get_resource::<ExtractedForestView>() else {
-            return Ok(());
-        };
-        let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
-            return Ok(());
-        };
-        let Some(clouds) = world.get_resource::<super::cloud_node::CloudRenderState>()
-            .and_then(|state| state.resources.as_ref()) else {
-            return Ok(());
-        };
-        let Ok(mut inner) = state.inner.lock() else {
-            return Ok(());
-        };
-
-        // One pipeline per main-texture format (see `SsaoNodeInner`), queued
-        // from here because only the view knows the format; a queued pipeline
-        // becomes usable on the next frame.
-        let format = view.main_texture_format();
-        if inner.atmosphere_pipeline.is_none() {
-            let (Some(globals_layout), Some(layouts), Some(stage)) = (
-                inner.globals_layout.clone(), inner.layouts.as_ref(), inner.composite_stage.as_ref(),
+        let mut descriptor = fullscreen_pipeline(
+            "forest_atmosphere_pipeline",
+            shaders.composite.clone(),
+            wgpu::TextureFormat::Rgba16Float,
+            vec![globals_layout, layouts.atmosphere.clone(), stage.layout.clone(), clouds.layout.clone()],
+        );
+        descriptor.fragment.as_mut().unwrap().entry_point = Some("fs_atmosphere".into());
+        inner.atmosphere_pipeline = Some(pipeline_cache.queue_render_pipeline(descriptor));
+    }
+    let pipeline_id = match inner.composite_pipelines.get(&format).copied() {
+        Some(id) => id,
+        None => {
+            let (Some(globals_group_layout), Some(layouts), Some(stage)) = (
+                inner.globals_layout.clone(),
+                inner.layouts.clone(),
+                inner.composite_stage.as_ref(),
             ) else {
-                return Ok(());
+                return;
             };
-            let mut descriptor = fullscreen_pipeline(
-                "forest_atmosphere_pipeline",
+            let descriptor = fullscreen_pipeline(
+                "forest_composite_pipeline",
                 shaders.composite.clone(),
-                wgpu::TextureFormat::Rgba16Float,
-                vec![globals_layout, layouts.atmosphere.clone(), stage.layout.clone(), clouds.layout.clone()],
+                format,
+                vec![globals_group_layout, layouts.composite.clone(), stage.layout.clone(), clouds.layout.clone()],
             );
-            descriptor.fragment.as_mut().unwrap().entry_point = Some("fs_atmosphere".into());
-            inner.atmosphere_pipeline = Some(pipeline_cache.queue_render_pipeline(descriptor));
+            let id = pipeline_cache.queue_render_pipeline(descriptor);
+            inner.composite_pipelines.insert(format, id);
+            id
         }
-        let pipeline_id = match inner.composite_pipelines.get(&format).copied() {
-            Some(id) => id,
-            None => {
-                let (Some(globals_group_layout), Some(layouts), Some(stage)) = (
-                    inner.globals_layout.clone(),
-                    inner.layouts.clone(),
-                    inner.composite_stage.as_ref(),
-                ) else {
-                    return Ok(());
-                };
-                let descriptor = fullscreen_pipeline(
-                    "forest_composite_pipeline",
-                    shaders.composite.clone(),
-                    format,
-                    vec![globals_group_layout, layouts.composite.clone(), stage.layout.clone(), clouds.layout.clone()],
-                );
-                let id = pipeline_cache.queue_render_pipeline(descriptor);
-                inner.composite_pipelines.insert(format, id);
-                id
-            }
-        };
-        let (Some(pipeline), Some(globals_group), Some(group), Some(stage)) = (
-            pipeline_cache.get_render_pipeline(pipeline_id),
-            inner.globals_group.as_ref(),
-            inner.composite_group.as_ref(),
-            inner.composite_stage.as_ref(),
-        ) else {
-            return Ok(());
-        };
+    };
+    let (Some(pipeline), Some(globals_group), Some(group), Some(stage)) = (
+        pipeline_cache.get_render_pipeline(pipeline_id),
+        inner.globals_group.as_ref(),
+        inner.composite_group.as_ref(),
+        inner.composite_stage.as_ref(),
+    ) else {
+        return;
+    };
 
-        let (Some(atmosphere_pipeline), Some(atmosphere_group), Some(half_globals), Some(targets)) = (
-            inner.atmosphere_pipeline.and_then(|id| pipeline_cache.get_render_pipeline(id)),
-            inner.atmosphere_group.as_ref(),
-            inner.half_res_globals.as_ref(),
-            inner.targets.as_ref(),
-        ) else {
-            return Ok(());
-        };
-        {
-            let mut pass = render_context.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
-                label: Some("forest_atmosphere_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.atmosphere_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            draw_fullscreen(
-                &mut pass,
-                atmosphere_pipeline,
-                &[&half_globals.group, atmosphere_group, &stage.group, &clouds.group],
-                targets.width as f32,
-                targets.height as f32,
-            );
-        }
-
-        let post_process = view.post_process_write();
-        let destination: &wgpu::TextureView = post_process.destination;
-        let width = extracted.physical_width.max(1) as f32;
-        let height = extracted.physical_height.max(1) as f32;
-
-        let mut render_pass = render_context.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
-            label: Some("forest_composite_pass"),
+    let (Some(atmosphere_pipeline), Some(atmosphere_group), Some(half_globals), Some(targets)) = (
+        inner.atmosphere_pipeline.and_then(|id| pipeline_cache.get_render_pipeline(id)),
+        inner.atmosphere_group.as_ref(),
+        inner.half_res_globals.as_ref(),
+        inner.targets.as_ref(),
+    ) else {
+        return;
+    };
+    {
+        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+            label: Some("forest_atmosphere_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: destination,
+                view: &targets.atmosphere_view,
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 }),
                     store: wgpu::StoreOp::Store,
                 },
             })],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         draw_fullscreen(
-            &mut render_pass,
-            pipeline,
-            &[globals_group, group, &stage.group, &clouds.group],
-            width,
-            height,
+            &mut pass,
+            atmosphere_pipeline,
+            &[&half_globals.group, atmosphere_group, &stage.group, &clouds.group],
+            targets.width as f32,
+            targets.height as f32,
         );
-        Ok(())
     }
+
+    let post_process = view.post_process_write();
+    let destination: &wgpu::TextureView = post_process.destination;
+    let width = extracted.physical_width.max(1) as f32;
+    let height = extracted.physical_height.max(1) as f32;
+
+    let mut render_pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        label: Some("forest_composite_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: destination,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    draw_fullscreen(
+        &mut render_pass,
+        pipeline,
+        &[globals_group, group, &stage.group, &clouds.group],
+        width,
+        height,
+    );
 }
 
 /// `PresentFxaa`: edge smoothing of the composited frame, blitted out to the
 /// screen. The primary texture (unit 0) comes from the draw call itself
 /// (`post_process.source`), matching how the composite receives its G-buffer
 /// position texture.
-pub struct ForestFxaaNode;
+pub fn forest_fxaa_pass(
+    view: ViewQuery<&ViewTarget>,
+    world: &World,
+    mut ctx: RenderContext,
+) {
+    let view = view.into_inner();
+    let Some(state) = world.get_resource::<SsaoNodeState>() else {
+        return;
+    };
+    let Some(shaders) = world.get_resource::<ForestShaderHandles>() else {
+        return;
+    };
+    let Some(extracted) = world.get_resource::<ExtractedForestView>() else {
+        return;
+    };
+    let Some(device) = world.get_resource::<RenderDevice>() else {
+        return;
+    };
+    let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
+        return;
+    };
+    let Ok(mut inner) = state.inner.lock() else {
+        return;
+    };
 
-impl ViewNode for ForestFxaaNode {
-    type ViewQuery = &'static ViewTarget;
+    let format = view.main_texture_format();
+    let pipeline_id = match inner.fxaa_pipelines.get(&format).copied() {
+        Some(id) => id,
+        None => {
+            let (Some(globals_group_layout), Some(layouts)) =
+                (inner.globals_layout.clone(), inner.layouts.clone())
+            else {
+                return;
+            };
+            let descriptor = fullscreen_pipeline(
+                "forest_fxaa_pipeline",
+                shaders.fxaa.clone(),
+                format,
+                vec![globals_group_layout, layouts.fxaa.clone()],
+            );
+            let id = pipeline_cache.queue_render_pipeline(descriptor);
+            inner.fxaa_pipelines.insert(format, id);
+            id
+        }
+    };
+    let (Some(pipeline), Some(globals_group), Some(layouts), Some(samplers)) = (
+        pipeline_cache.get_render_pipeline(pipeline_id),
+        inner.globals_group.as_ref(),
+        inner.layouts.as_ref(),
+        inner.samplers.as_ref(),
+    ) else {
+        return;
+    };
 
-    fn run<'w>(
-        &self,
-        _graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext<'w>,
-        view: &'w ViewTarget,
-        world: &'w World,
-    ) -> Result<(), NodeRunError> {
-        let Some(state) = world.get_resource::<SsaoNodeState>() else {
-            return Ok(());
-        };
-        let Some(shaders) = world.get_resource::<ForestShaderHandles>() else {
-            return Ok(());
-        };
-        let Some(extracted) = world.get_resource::<ExtractedForestView>() else {
-            return Ok(());
-        };
-        let Some(device) = world.get_resource::<RenderDevice>() else {
-            return Ok(());
-        };
-        let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
-            return Ok(());
-        };
-        let Ok(mut inner) = state.inner.lock() else {
-            return Ok(());
-        };
+    let post_process = view.post_process_write();
+    let source: &wgpu::TextureView = post_process.source;
+    let destination: &wgpu::TextureView = post_process.destination;
+    // The composite writes into whichever main texture is not currently
+    // being read, and the two alternate every frame, so this group is
+    // rebuilt per frame from the source view handed back above.
+    let group = super::bind_group(
+        &device,
+        &pipeline_cache,
+        "forest_fxaa_group",
+        &layouts.fxaa,
+        &[
+            texture_entry(0, source),
+            sampler_entry(8, &samplers.linear_clamp),
+        ],
+    );
 
-        let format = view.main_texture_format();
-        let pipeline_id = match inner.fxaa_pipelines.get(&format).copied() {
-            Some(id) => id,
-            None => {
-                let (Some(globals_group_layout), Some(layouts)) =
-                    (inner.globals_layout.clone(), inner.layouts.clone())
-                else {
-                    return Ok(());
-                };
-                let descriptor = fullscreen_pipeline(
-                    "forest_fxaa_pipeline",
-                    shaders.fxaa.clone(),
-                    format,
-                    vec![globals_group_layout, layouts.fxaa.clone()],
-                );
-                let id = pipeline_cache.queue_render_pipeline(descriptor);
-                inner.fxaa_pipelines.insert(format, id);
-                id
-            }
-        };
-        let (Some(pipeline), Some(globals_group), Some(layouts), Some(samplers)) = (
-            pipeline_cache.get_render_pipeline(pipeline_id),
-            inner.globals_group.as_ref(),
-            inner.layouts.as_ref(),
-            inner.samplers.as_ref(),
-        ) else {
-            return Ok(());
-        };
-
-        let post_process = view.post_process_write();
-        let source: &wgpu::TextureView = post_process.source;
-        let destination: &wgpu::TextureView = post_process.destination;
-        // The composite writes into whichever main texture is not currently
-        // being read, and the two alternate every frame, so this group is
-        // rebuilt per frame from the source view handed back above.
-        let group = device.create_bind_group(
-            "forest_fxaa_group",
-            &layouts.fxaa,
-            &[
-                texture_entry(0, source),
-                sampler_entry(8, &samplers.linear_clamp),
-            ],
-        );
-
-        let mut render_pass = render_context.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
-            label: Some("forest_fxaa_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: destination,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        draw_fullscreen(
-            &mut render_pass,
-            pipeline,
-            &[globals_group, &group],
-            extracted.physical_width.max(1) as f32,
-            extracted.physical_height.max(1) as f32,
-        );
-        Ok(())
-    }
+    let mut render_pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        label: Some("forest_fxaa_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: destination,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    draw_fullscreen(
+        &mut render_pass,
+        pipeline,
+        &[globals_group, &group],
+        extracted.physical_width.max(1) as f32,
+        extracted.physical_height.max(1) as f32,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -957,12 +930,12 @@ fn fullscreen_pipeline(
     label: &'static str,
     shader: Handle<Shader>,
     format: wgpu::TextureFormat,
-    layout: Vec<BindGroupLayout>,
+    layout: Vec<BindGroupLayoutDescriptor>,
 ) -> RenderPipelineDescriptor {
     RenderPipelineDescriptor {
         label: Some(label.into()),
         layout,
-        push_constant_ranges: Vec::new(),
+        immediate_size: 0,
         vertex: VertexState {
             shader: shader.clone(),
             shader_defs: Vec::new(),
@@ -994,10 +967,9 @@ fn fullscreen_pipeline(
 /// layout; naga only distinguishes the image class for provided layouts, while
 /// the sampler/texture pairing is what wgpu validates.
 fn screen_group_layout(
-    device: &RenderDevice,
-    label: &str,
+    label: &'static str,
     filterable: &[bool],
-) -> BindGroupLayout {
+) -> BindGroupLayoutDescriptor {
     let mut entries: Vec<wgpu::BindGroupLayoutEntry> = Vec::with_capacity(filterable.len() * 2);
     for (index, filterable) in filterable.iter().enumerate() {
         entries.push(wgpu::BindGroupLayoutEntry {
@@ -1025,7 +997,7 @@ fn screen_group_layout(
             count: None,
         });
     }
-    device.create_bind_group_layout(label, &entries)
+    BindGroupLayoutDescriptor::new(label, &entries)
 }
 
 /// Binds a sampled texture at `binding`.
@@ -1046,8 +1018,13 @@ fn sampler_entry<'a>(binding: u32, sampler: &'a wgpu::Sampler) -> BindGroupEntry
 
 /// Creates one pass's group-2 uniform buffer, its single-entry layout and the
 /// bind group wrapping the whole buffer.
-fn create_stage(device: &RenderDevice, label: &str, size: u64) -> Stage {
-    let layout = device.create_bind_group_layout(
+fn create_stage(
+    device: &RenderDevice,
+    cache: &PipelineCache,
+    label: &'static str,
+    size: u64,
+) -> Stage {
+    let layout = BindGroupLayoutDescriptor::new(
         label,
         &[wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -1066,7 +1043,9 @@ fn create_stage(device: &RenderDevice, label: &str, size: u64) -> Stage {
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let group = device.create_bind_group(
+    let group = super::bind_group(
+        device,
+        cache,
         label,
         &layout,
         &[BindGroupEntry {

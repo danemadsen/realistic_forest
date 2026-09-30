@@ -3,9 +3,8 @@
 
 use super::{globals_layout, ForestGlobals, ForestShaderHandles};
 use bevy::prelude::*;
-use bevy::render::render_graph::{Node, NodeRunError, RenderGraphContext, RenderLabel};
 use bevy::render::render_resource::{
-    BindGroup, BindGroupLayout, CachedRenderPipelineId, FragmentState, PipelineCache,
+    BindGroup, BindGroupLayoutDescriptor, CachedRenderPipelineId, FragmentState, PipelineCache,
     RenderPipelineDescriptor, VertexState,
 };
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
@@ -21,7 +20,7 @@ pub struct CloudRenderState {
 
 pub struct CloudGpuResources {
     /// Shared group 3: density noise and the completed sky reflection probe.
-    pub layout: BindGroupLayout,
+    pub layout: BindGroupLayoutDescriptor,
     pub group: BindGroup,
     noise_group: BindGroup,
     globals_group: BindGroup,
@@ -30,57 +29,48 @@ pub struct CloudGpuResources {
     pipeline: CachedRenderPipelineId,
 }
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-pub struct NodeClouds;
-
-pub struct CloudProbeNode;
-
-impl Node for CloudProbeNode {
-    fn run<'w>(
-        &self,
-        _graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext<'w>,
-        world: &'w World,
-    ) -> Result<(), NodeRunError> {
-        let Some(resources) = world
-            .get_resource::<CloudRenderState>()
-            .and_then(|state| state.resources.as_ref())
-        else {
-            return Ok(());
-        };
-        let cache = world.resource::<PipelineCache>();
-        let Some(pipeline) = cache.get_render_pipeline(resources.pipeline) else {
-            return Ok(());
-        };
-        let mut pass = render_context.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
-            label: Some("forest_cloud_sky_probe"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &resources.probe,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.0,
-                        g: 0.0,
-                        b: 0.0,
-                        a: 1.0,
-                    }),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        pass.set_render_pipeline(pipeline);
-        pass.set_bind_group(0, &resources.globals_group, &[]);
-        pass.set_bind_group(1, &resources.empty_group, &[]);
-        pass.set_bind_group(2, &resources.empty_group, &[]);
-        // This group omits the probe: sampling an active attachment is invalid.
-        pass.set_bind_group(3, &resources.noise_group, &[]);
-        pass.draw(0..3, 0..1);
-        Ok(())
-    }
+/// Renders the raymarched all-direction cloud reflection probe. Binds the
+/// noise group in slot 3 rather than the resource group: sampling the probe
+/// texture while it is the active attachment is invalid.
+pub fn cloud_probe_pass(world: &World, mut ctx: RenderContext) {
+    let Some(resources) = world
+        .get_resource::<CloudRenderState>()
+        .and_then(|state| state.resources.as_ref())
+    else {
+        return;
+    };
+    let cache = world.resource::<PipelineCache>();
+    let Some(pipeline) = cache.get_render_pipeline(resources.pipeline) else {
+        return;
+    };
+    let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        label: Some("forest_cloud_sky_probe"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &resources.probe,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                }),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_render_pipeline(pipeline);
+    pass.set_bind_group(0, &resources.globals_group, &[]);
+    pass.set_bind_group(1, &resources.empty_group, &[]);
+    pass.set_bind_group(2, &resources.empty_group, &[]);
+    // This group omits the probe: sampling an active attachment is invalid.
+    pass.set_bind_group(3, &resources.noise_group, &[]);
+    pass.draw(0..3, 0..1);
 }
 
 fn texture_layout(
@@ -218,8 +208,8 @@ fn prepare_clouds(
         texture_layout(0, wgpu::TextureViewDimension::D3),
         sampler_layout(1),
     ];
-    let noise_layout = device.create_bind_group_layout("forest_cloud_noise_layout", &noise_entries);
-    let layout = device.create_bind_group_layout(
+    let noise_layout = BindGroupLayoutDescriptor::new("forest_cloud_noise_layout", &noise_entries);
+    let layout = BindGroupLayoutDescriptor::new(
         "forest_cloud_resources_layout",
         &[
             noise_entries[0],
@@ -239,8 +229,10 @@ fn prepare_clouds(
         },
     ];
     let noise_group =
-        device.create_bind_group("forest_cloud_noise", &noise_layout, &noise_bindings);
-    let group = device.create_bind_group(
+        super::bind_group(&device, &cache, "forest_cloud_noise", &noise_layout, &noise_bindings);
+    let group = super::bind_group(
+        &device,
+        &cache,
         "forest_cloud_resources",
         &layout,
         &[
@@ -256,14 +248,17 @@ fn prepare_clouds(
             },
         ],
     );
-    let global_layout = globals_layout(&device);
-    let globals_group = device.create_bind_group(
+    let global_layout = globals_layout();
+    let globals_group = super::bind_group(
+        &device,
+        &cache,
         "forest_cloud_globals",
         &global_layout,
         &super::globals_bind_group_entries(globals_buffer),
     );
-    let empty_layout = device.create_bind_group_layout("forest_cloud_empty_layout", &[]);
-    let empty_group = device.create_bind_group("forest_cloud_empty_group", &empty_layout, &[]);
+    let empty_layout = BindGroupLayoutDescriptor::new("forest_cloud_empty_layout", &[]);
+    let empty_group =
+        super::bind_group(&device, &cache, "forest_cloud_empty_group", &empty_layout, &[]);
     let pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("forest_cloud_probe_pipeline".into()),
         layout: vec![
@@ -272,7 +267,7 @@ fn prepare_clouds(
             empty_layout,
             noise_layout,
         ],
-        push_constant_ranges: vec![],
+        immediate_size: 0,
         vertex: VertexState {
             shader: shaders.cloud_probe.clone(),
             shader_defs: vec![],

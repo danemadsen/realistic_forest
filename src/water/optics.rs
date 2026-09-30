@@ -142,7 +142,7 @@ impl Default for WaterOptics {
 /// Runtime-selectable sea state and optics, driven from the diagnostics
 /// window the way aqua's `OceanWaves` and `WaterOptics` are authoring inputs.
 ///
-/// `PartialEq` is load-bearing: the render node compares successive values to
+/// `PartialEq` is load-bearing: the water pass compares successive values to
 /// decide whether the wave block needs rebuilding, so the 40-component spectrum
 /// is only regenerated when a field it depends on actually changes.
 #[derive(Resource, Clone, Copy, Debug, PartialEq)]

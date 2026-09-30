@@ -1,6 +1,11 @@
-//! The forest render graph: erosion simulation -> terrain G-buffer -> SSAO
+//! The forest render schedule: erosion simulation -> terrain G-buffer -> SSAO
 //! -> blur -> composite -> FXAA -> egui -> upscale. Ports the C++ main loop
 //! render order 1:1 on wgpu.
+//!
+//! bevy 0.19 replaced render graphs with per-camera schedules, so the order
+//! above is an ordered [`ForestRender`] schedule rather than a graph of nodes;
+//! `spawn_scene` points the camera at it with
+//! `CameraRenderGraph::new(ForestRender)`.
 
 pub mod erosion_node;
 pub mod cloud_node;
@@ -16,23 +21,68 @@ use crate::noise::NoiseField;
 use crate::player::{Player, PlayerCamera};
 use crate::WorldOptions;
 use bevy::asset::Handle;
+use bevy::ecs::schedule::ScheduleLabel;
 use bevy::prelude::*;
-use bevy::render::render_graph::{RenderGraph, RenderSubGraph, ViewNodeRunner};
-use bevy::render::render_resource::{BindGroupEntry, BindGroupLayout};
+use bevy::render::render_resource::{
+    BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, PipelineCache,
+};
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::{ExtractSchedule, MainWorld, RenderApp};
 use bevy::shader::Shader;
 use bevy::window::PrimaryWindow;
 
-/// The camera render sub-graph label; cameras point at it via
-/// `CameraRenderGraph::new(ForestSubGraph)`.
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderSubGraph)]
-pub struct ForestSubGraph;
+/// The camera render schedule; cameras point at it via
+/// `CameraRenderGraph::new(ForestRender)`.
+///
+/// bevy 0.19 renders each camera by running a *schedule* of systems rather
+/// than a render graph of nodes, so the pass order the port used to encode
+/// with node edges now lives in [`ForestRenderSystems`].
+#[derive(ScheduleLabel, Debug, Hash, PartialEq, Eq, Clone)]
+pub struct ForestRender;
 
-/// Graph-local label for the final upscale/blit node. bevy's `UpscalingNode`
-/// deliberately carries no public name of its own.
-#[derive(Debug, Hash, PartialEq, Eq, Clone, bevy::render::render_graph::RenderLabel)]
-pub struct NodeForestUpscale;
+/// The ordered stages of the forest pipeline. Mirrors the render order the
+/// port's render graph used to encode with node edges: erosion -> terrain ->
+/// SSAO -> blur -> clouds -> composite -> water -> FXAA -> egui -> upscale.
+#[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone)]
+pub enum ForestRenderSystems {
+    Erosion,
+    Terrain,
+    Ssao,
+    Blur,
+    Clouds,
+    Composite,
+    WaterSurface,
+    WaterUnderwater,
+    Fxaa,
+    Egui,
+    Upscale,
+}
+
+impl ForestRender {
+    /// An empty schedule with the pass stages chained in order. The passes
+    /// themselves are added as systems by [`ForestRenderPlugin`].
+    pub fn base_schedule() -> bevy::ecs::schedule::Schedule {
+        use ForestRenderSystems::*;
+        let mut schedule = bevy::ecs::schedule::Schedule::new(Self);
+        schedule.configure_sets(
+            (
+                Erosion,
+                Terrain,
+                Ssao,
+                Blur,
+                Clouds,
+                Composite,
+                WaterSurface,
+                WaterUnderwater,
+                Fxaa,
+                Egui,
+                Upscale,
+            )
+                .chain(),
+        );
+        schedule
+    }
+}
 
 /// Camera-attached data extracted from the main world each frame.
 #[derive(Resource, Default)]
@@ -291,8 +341,13 @@ pub struct ErosionTerrainStageUniforms {
 const _: () = assert!(std::mem::size_of::<ErosionTerrainStageUniforms>() == 64);
 
 /// The group(0) bind group layout every pass shares: one uniform buffer.
-pub fn globals_layout(device: &RenderDevice) -> BindGroupLayout {
-    device.create_bind_group_layout(
+///
+/// bevy 0.19 pipelines take layout *descriptors* (`RenderPipelineDescriptor`
+/// gained a `Vec<BindGroupLayoutDescriptor>`), and the concrete
+/// `BindGroupLayout` is resolved through `PipelineCache::get_bind_group_layout`
+/// only when a bind group is actually built. So this returns the descriptor.
+pub fn globals_layout() -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
         "forest_globals_layout",
         &[wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -412,65 +467,35 @@ impl Plugin for ForestRenderPlugin {
                 .in_set(bevy::render::RenderSystems::Prepare),
         );
 
-        // Build the graph first: `ViewNodeRunner::new` needs the render world,
-        // and the `RenderGraph` resource borrow must not overlap it.
-        let graph = build_forest_graph(render_app);
-        render_app
-            .world_mut()
-            .resource_mut::<RenderGraph>()
-            .add_sub_graph(ForestSubGraph, graph);
+        // The per-camera pass order. Each pass is a system in this schedule
+        // rather than a node in a render graph; the camera opts in through
+        // `CameraRenderGraph::new(ForestRender)` in `spawn_scene`.
+        render_app.add_schedule(ForestRender::base_schedule());
+        render_app.add_systems(
+            ForestRender,
+            (
+                erosion_node::forest_erosion_pass.in_set(ForestRenderSystems::Erosion),
+                terrain_node::forest_terrain_pass.in_set(ForestRenderSystems::Terrain),
+                post_nodes::forest_ssao_pass.in_set(ForestRenderSystems::Ssao),
+                post_nodes::forest_blur_pass.in_set(ForestRenderSystems::Blur),
+                cloud_node::cloud_probe_pass.in_set(ForestRenderSystems::Clouds),
+                post_nodes::forest_composite_pass.in_set(ForestRenderSystems::Composite),
+                water_node::forest_water_surface_pass.in_set(ForestRenderSystems::WaterSurface),
+                water_node::forest_underwater_pass.in_set(ForestRenderSystems::WaterUnderwater),
+                post_nodes::forest_fxaa_pass.in_set(ForestRenderSystems::Fxaa),
+                // bevy_egui draws through `egui_pass`, with `prepare_egui_pass`
+                // immediately before it to resolve paint callbacks. bevy_egui
+                // wires the same pair into its own Core2d/Core3d schedules.
+                (
+                    bevy_egui::render::prepare_egui_pass,
+                    bevy_egui::render::egui_pass,
+                )
+                    .chain()
+                    .in_set(ForestRenderSystems::Egui),
+                bevy::core_pipeline::upscaling::upscaling.in_set(ForestRenderSystems::Upscale),
+            ),
+        );
     }
-}
-
-/// Builds the ForestSubGraph render graph on the render app's sub-app.
-fn build_forest_graph(render_app: &mut bevy::app::SubApp) -> RenderGraph {
-    use bevy::core_pipeline::upscaling::UpscalingNode;
-    use bevy_egui::render::{RunEguiSubgraphOnEguiViewNode, graph::NodeEgui};
-
-    let mut graph = RenderGraph::default();
-    // bevy_egui attaches its subgraph to the built-in Core2d/Core3d graphs
-    // only; this camera renders through ForestSubGraph, so the same subgraph
-    // has to be attached here for `RunEguiSubgraphOnEguiViewNode` to find it.
-    let egui_graph = bevy_egui::render::get_egui_graph(render_app);
-    graph.add_sub_graph(bevy_egui::render::graph::SubGraphEgui, egui_graph);
-    graph.add_node(erosion_node::NodeErosion::ErosionSim, erosion_node::ForestErosionNode);
-    graph.add_node(terrain_node::NodeTerrain::TerrainPass, terrain_node::ForestTerrainNode);
-    graph.add_node(post_nodes::NodeSsao::SsaoPass, post_nodes::ForestSsaoNode);
-    graph.add_node(post_nodes::NodeSsao::BlurPass, post_nodes::ForestBlurNode);
-    graph.add_node(cloud_node::NodeClouds, cloud_node::CloudProbeNode);
-    graph.add_node(
-        post_nodes::NodeSsao::CompositePass,
-        ViewNodeRunner::new(post_nodes::ForestCompositeNode, render_app.world_mut()),
-    );
-    graph.add_node(
-        water_node::NodeWater::SurfacePass,
-        ViewNodeRunner::new(water_node::ForestWaterSurfaceNode, render_app.world_mut()),
-    );
-    graph.add_node(
-        water_node::NodeWater::UnderwaterPass,
-        ViewNodeRunner::new(water_node::ForestUnderwaterNode, render_app.world_mut()),
-    );
-    graph.add_node(
-        post_nodes::NodeSsao::FxaaPass,
-        ViewNodeRunner::new(post_nodes::ForestFxaaNode, render_app.world_mut()),
-    );
-    graph.add_node(NodeEgui::EguiPass, RunEguiSubgraphOnEguiViewNode);
-    graph.add_node(
-        NodeForestUpscale,
-        ViewNodeRunner::new(UpscalingNode::default(), render_app.world_mut()),
-    );
-
-    graph.add_node_edge(erosion_node::NodeErosion::ErosionSim, terrain_node::NodeTerrain::TerrainPass);
-    graph.add_node_edge(terrain_node::NodeTerrain::TerrainPass, post_nodes::NodeSsao::SsaoPass);
-    graph.add_node_edge(post_nodes::NodeSsao::SsaoPass, post_nodes::NodeSsao::BlurPass);
-    graph.add_node_edge(post_nodes::NodeSsao::BlurPass, cloud_node::NodeClouds);
-    graph.add_node_edge(cloud_node::NodeClouds, post_nodes::NodeSsao::CompositePass);
-    graph.add_node_edge(post_nodes::NodeSsao::CompositePass, water_node::NodeWater::SurfacePass);
-    graph.add_node_edge(water_node::NodeWater::SurfacePass, water_node::NodeWater::UnderwaterPass);
-    graph.add_node_edge(water_node::NodeWater::UnderwaterPass, post_nodes::NodeSsao::FxaaPass);
-    graph.add_node_edge(post_nodes::NodeSsao::FxaaPass, NodeEgui::EguiPass);
-    graph.add_node_edge(NodeEgui::EguiPass, NodeForestUpscale);
-    graph
 }
 
 // ---------------------------------------------------------------------------
@@ -631,6 +656,23 @@ pub fn globals_bind_group_entries(buffer: &wgpu::Buffer) -> [BindGroupEntry<'_>;
         binding: 0,
         resource: buffer.as_entire_binding(),
     }]
+}
+
+/// Builds a bind group from a layout *descriptor*, resolving the cached
+/// `BindGroupLayout` through the pipeline cache.
+///
+/// bevy 0.19 keys pipeline layouts by descriptor, so the passes hold
+/// [`BindGroupLayoutDescriptor`]s and only materialise a `BindGroupLayout`
+/// here, where wgpu actually needs one.
+pub fn bind_group<'a>(
+    device: &RenderDevice,
+    cache: &PipelineCache,
+    label: &'static str,
+    descriptor: &BindGroupLayoutDescriptor,
+    entries: &'a [BindGroupEntry<'a>],
+) -> BindGroup {
+    let layout = cache.get_bind_group_layout(descriptor);
+    device.create_bind_group(label, &layout, entries)
 }
 
 #[cfg(test)]

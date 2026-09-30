@@ -44,14 +44,12 @@ use crate::noise::NoiseField;
 use crate::player::{Player, PlayerCamera, UiWantsInput};
 use crate::render::gpu_textures::GpuWorldTexturesOption;
 use crate::water::{WaterOptics, WaterSettings};
-use bevy::image::BevyDefault;
 use bevy::math::Vec3;
 use bevy::prelude::*;
 use bevy::render::render_phase::TrackedRenderPass;
 use bevy::render::render_resource::{BindGroup, BindGroupLayout, RenderPipeline};
 use bevy::render::renderer::RenderDevice;
 use bevy::render::sync_world::RenderEntity;
-use bevy::render::view::ViewTarget;
 use bevy::render::RenderApp;
 use bevy_egui::render::{EguiBevyPaintCallback, EguiBevyPaintCallbackImpl, EguiPipelineKey};
 use bevy_egui::input::EguiWantsInput;
@@ -161,7 +159,7 @@ fn draw_diagnostics_window(
     rerun: &mut RerunErosion,
 ) {
     // ImGui's background alpha is a multiplier on the theme's window colour.
-    let style = ctx.style();
+    let style = ctx.style_of(ctx.theme());
     let base_fill = style.visuals.window_fill();
     let window_fill = egui::Color32::from_rgba_unmultiplied(
         base_fill.r(),
@@ -703,11 +701,7 @@ fn build_flow_preview_pipeline(
                 "../assets/shaders/flow-preview.wgsl"
             ))),
         });
-    let target = if key.hdr {
-        ViewTarget::TEXTURE_FORMAT_HDR
-    } else {
-        wgpu::TextureFormat::bevy_default()
-    };
+    let target = key.target_format;
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("flow_preview_pipeline"),
         layout: None,
@@ -744,7 +738,7 @@ fn build_flow_preview_pipeline(
         primitive: wgpu::PrimitiveState::default(),
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
     let layout = BindGroupLayout::from(pipeline.get_bind_group_layout(0));

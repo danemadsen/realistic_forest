@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = "0.17.3"
-bevy_egui = "0.38.1"
+bevy = "0.19.1"
+bevy_egui = "0.42.0"
 quick-noise = "0.2.0"
 bytemuck = { version = "1", features = ["derive"] }
 
-wgpu = "26.0.1"
-naga = { version = "26.0.0", features = ["wgsl-in"] }
+wgpu = "29.0.3"
+naga = { version = "29.0.3", features = ["wgsl-in"] }
 
 log = "0.4"
 image = "0.25"

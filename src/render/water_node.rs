@@ -35,28 +35,19 @@ use crate::water::{
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::mesh::VertexBufferLayout;
 use bevy::prelude::{Res, ResMut, Resource, World};
-use bevy::render::render_graph::{NodeRunError, RenderGraphContext, RenderLabel, ViewNode};
 use bevy::render::render_resource::{
-    BindGroup, BindGroupEntry, BindGroupLayout, BindGroupLayoutEntry, BindingResource,
+    BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource,
     BindingType, Buffer, BufferDescriptor, BufferSize, BufferUsages,
     CachedRenderPipelineId, ColorTargetState, ColorWrites, FragmentState, IndexFormat,
     MultisampleState, PipelineCache, PrimitiveState, RenderPipelineDescriptor, SamplerBindingType,
     ShaderStages, TextureFormat, TextureSampleType, TextureViewDimension, VertexAttribute,
     VertexFormat, VertexState, VertexStepMode,
 };
-use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
+use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::view::ViewTarget;
 use bevy::render::{ExtractSchedule, Render, RenderSystems};
 use std::collections::HashMap;
 use std::sync::Mutex;
-
-/// The water render labels. `render/mod.rs` wires them between the composite
-/// and FXAA passes.
-#[derive(Debug, Hash, PartialEq, Eq, Clone, RenderLabel)]
-pub enum NodeWater {
-    SurfacePass,
-    UnderwaterPass,
-}
 
 /// Screen-uv offset applied to the refraction tap, as a fraction of the surface
 /// slope, at one metre of optical path and one metre of view distance.
@@ -193,21 +184,21 @@ struct WaterSamplers {
 
 /// One pass's group-2 uniform slot.
 struct WaterStage {
-    layout: BindGroupLayout,
+    layout: BindGroupLayoutDescriptor,
     buffer: Buffer,
     group: BindGroup,
 }
 
 struct WaterInner {
-    globals_layout: Option<BindGroupLayout>,
+    globals_layout: Option<BindGroupLayoutDescriptor>,
     globals_group: Option<BindGroup>,
     samplers: Option<WaterSamplers>,
     /// Group 1 for the surface and blit passes: the composited frame at 0/8,
     /// the G-buffer position at 1/9 and terrain heightfield at 2/10.
-    surface_screen: Option<BindGroupLayout>,
+    surface_screen: Option<BindGroupLayoutDescriptor>,
     /// Group 1 for the underwater pass; the same shape, its own layout so the
     /// two can diverge.
-    underwater_screen: Option<BindGroupLayout>,
+    underwater_screen: Option<BindGroupLayoutDescriptor>,
     surface_stage: Option<WaterStage>,
     underwater_stage: Option<WaterStage>,
     meshes: Option<WaterMeshes>,
@@ -229,9 +220,9 @@ struct WaterInner {
     underwater_fade: f32,
 }
 
-/// Shared, interior-mutable state for the two water passes; the graph nodes run
-/// in the render graph and the prepare systems in the `Render` schedule, so the
-/// CPU-side resources live behind one mutex.
+/// Shared, interior-mutable state for the two water passes; the passes run in
+/// the `ForestRender` schedule and the prepare systems in the `Render`
+/// schedule, so the CPU-side resources live behind one mutex.
 #[derive(Resource)]
 pub struct WaterNodeState {
     inner: Mutex<WaterInner>,
@@ -410,6 +401,7 @@ fn prepare_water(
     water: Res<ExtractedWater>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
+    pipeline_cache: Res<PipelineCache>,
 ) {
     let Ok(mut inner) = state.inner.lock() else {
         return;
@@ -425,10 +417,12 @@ fn prepare_water(
     }
 
     if inner.globals_layout.is_none() {
-        inner.globals_layout = Some(globals_layout(&device));
+        inner.globals_layout = Some(globals_layout());
     }
     if inner.globals_group.is_none() {
-        let group = device.create_bind_group(
+        let group = super::bind_group(
+            &device,
+            &pipeline_cache,
             "forest_water_globals_group",
             inner.globals_layout.as_ref().expect("just built"),
             &[BindGroupEntry {
@@ -445,14 +439,12 @@ fn prepare_water(
         // Group 1: composited frame and terrain heightfield (bilinear), and
         // G-buffer position (point). Texture N pairs with sampler N + 8.
         inner.surface_screen = Some(screen_layout(
-            &device,
             "forest_water_surface_layout",
             &[true, false, true],
         ));
     }
     if inner.underwater_screen.is_none() {
         inner.underwater_screen = Some(screen_layout(
-            &device,
             "forest_water_underwater_layout",
             &[true, false],
         ));
@@ -460,6 +452,7 @@ fn prepare_water(
     if inner.surface_stage.is_none() {
         inner.surface_stage = Some(create_stage(
             &device,
+            &pipeline_cache,
             "forest_water_surface_stage",
             std::mem::size_of::<WaterStageUniforms>() as u64,
         ));
@@ -467,6 +460,7 @@ fn prepare_water(
     if inner.underwater_stage.is_none() {
         inner.underwater_stage = Some(create_stage(
             &device,
+            &pipeline_cache,
             "forest_water_underwater_stage",
             std::mem::size_of::<UnderwaterUniforms>() as u64,
         ));
@@ -638,141 +632,135 @@ fn scatter_of(optics: &crate::water::WaterOptics) -> [f32; 4] {
 }
 
 // ---------------------------------------------------------------------------
-// Graph nodes
+// Render passes
 // ---------------------------------------------------------------------------
 
 /// The ocean surface: nine instanced patch draws, one per Crest patch variant,
 /// covering the camera's whole ring stack.
-pub struct ForestWaterSurfaceNode;
+pub fn forest_water_surface_pass(
+    view: ViewQuery<&ViewTarget>,
+    world: &World,
+    mut ctx: RenderContext,
+) {
+    let view = view.into_inner();
+    let Some(state) = world.get_resource::<WaterNodeState>() else {
+        return;
+    };
+    let Some(water) = world.get_resource::<ExtractedWater>() else {
+        return;
+    };
+    if !water.draw {
+        return;
+    }
+    let (Some(shaders), Some(extracted)) = (
+        world.get_resource::<ForestShaderHandles>(),
+        world.get_resource::<ExtractedForestView>(),
+    ) else {
+        return;
+    };
+    let Some(terrain) = world.get_resource::<TerrainNodeState>() else {
+        return;
+    };
+    let Some(device) = world.get_resource::<RenderDevice>() else {
+        return;
+    };
+    let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
+        return;
+    };
+    let Ok(mut inner) = state.inner.lock() else {
+        return;
+    };
+    let Ok(gbuffer_guard) = terrain.gbuffer.lock() else {
+        return;
+    };
+    let Some(gbuffer) = gbuffer_guard.as_ref() else {
+        return;
+    };
+    let Some(cloud_state) = world.get_resource::<CloudRenderState>() else {
+        return;
+    };
+    let Some(clouds) = cloud_state.resources.as_ref() else {
+        return;
+    };
 
-impl ViewNode for ForestWaterSurfaceNode {
-    type ViewQuery = &'static ViewTarget;
-
-    fn run<'w>(
-        &self,
-        _graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext<'w>,
-        view: &'w ViewTarget,
-        world: &'w World,
-    ) -> Result<(), NodeRunError> {
-        let Some(state) = world.get_resource::<WaterNodeState>() else {
-            return Ok(());
-        };
-        let Some(water) = world.get_resource::<ExtractedWater>() else {
-            return Ok(());
-        };
-        if !water.draw {
-            return Ok(());
-        }
-        let (Some(shaders), Some(extracted)) = (
-            world.get_resource::<ForestShaderHandles>(),
-            world.get_resource::<ExtractedForestView>(),
-        ) else {
-            return Ok(());
-        };
-        let Some(terrain) = world.get_resource::<TerrainNodeState>() else {
-            return Ok(());
-        };
-        let Some(device) = world.get_resource::<RenderDevice>() else {
-            return Ok(());
-        };
-        let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
-            return Ok(());
-        };
-        let Ok(mut inner) = state.inner.lock() else {
-            return Ok(());
-        };
-        let Ok(gbuffer_guard) = terrain.gbuffer.lock() else {
-            return Ok(());
-        };
-        let Some(gbuffer) = gbuffer_guard.as_ref() else {
-            return Ok(());
-        };
-        let Some(cloud_state) = world.get_resource::<CloudRenderState>() else {
-            return Ok(());
-        };
-        let Some(clouds) = cloud_state.resources.as_ref() else {
-            return Ok(());
-        };
-
-        let Some((pipeline_id, blit_id)) = surface_pipelines(
-            &mut inner,
+    let Some((pipeline_id, blit_id)) = surface_pipelines(
+        &mut inner,
+        pipeline_cache,
+        shaders,
+        view.main_texture_format(),
+        &clouds.layout,
+    ) else {
+        return;
+    };
+    let (Some(pipeline), Some(blit)) = (
+        pipeline_cache.get_render_pipeline(pipeline_id),
+        pipeline_cache.get_render_pipeline(blit_id),
+    ) else {
+        return;
+    };
+    // Wait for both asynchronous pipelines before swapping the frame;
+    // otherwise a shader still compiling would leave an unwritten target.
+    // Rebuild group 1 from the source the ping-pong hands back each frame.
+    let post_process = view.post_process_write();
+    let destination: &wgpu::TextureView = post_process.destination;
+    let (Some(globals_group), Some(stage), Some(meshes), Some(group)) = (
+        inner.globals_group.as_ref(),
+        inner.surface_stage.as_ref(),
+        inner.meshes.as_ref(),
+        surface_group(
+            device,
             pipeline_cache,
-            shaders,
-            view.main_texture_format(),
-            &clouds.layout,
-        ) else {
-            return Ok(());
-        };
-        let (Some(pipeline), Some(blit)) = (
-            pipeline_cache.get_render_pipeline(pipeline_id),
-            pipeline_cache.get_render_pipeline(blit_id),
-        ) else {
-            return Ok(());
-        };
-        // Wait for both asynchronous pipelines before swapping the frame;
-        // otherwise a shader still compiling would leave an unwritten target.
-        // Rebuild group 1 from the source the ping-pong hands back each frame.
-        let post_process = view.post_process_write();
-        let destination: &wgpu::TextureView = post_process.destination;
-        let (Some(globals_group), Some(stage), Some(meshes), Some(group)) = (
-            inner.globals_group.as_ref(),
-            inner.surface_stage.as_ref(),
-            inner.meshes.as_ref(),
-            surface_group(
-                device,
-                &inner,
-                &gbuffer.position_view,
-                &gbuffer.heightfield_view,
-                post_process.source,
-            ),
-        ) else {
-            return Ok(());
-        };
+            &inner,
+            &gbuffer.position_view,
+            &gbuffer.heightfield_view,
+            post_process.source,
+        ),
+    ) else {
+        return;
+    };
 
-        let width = extracted.physical_width.max(1) as f32;
-        let height = extracted.physical_height.max(1) as f32;
-        let mut render_pass = render_context.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
-            label: Some("forest_water_surface_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: destination,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    // The blit below writes every pixel, so nothing is loaded
-                    // and nothing is cleared.
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        render_pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
-        render_pass.set_bind_group(0, globals_group, &[]);
-        render_pass.set_bind_group(1, &group, &[]);
+    let width = extracted.physical_width.max(1) as f32;
+    let height = extracted.physical_height.max(1) as f32;
+    let mut render_pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        label: Some("forest_water_surface_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: destination,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                // The blit below writes every pixel, so nothing is loaded
+                // and nothing is cleared.
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    render_pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
+    render_pass.set_bind_group(0, globals_group, &[]);
+    render_pass.set_bind_group(1, &group, &[]);
 
-        // The ping-pong's output target holds nothing yet, and the water covers
-        // only the pixels it draws, so the composite's frame is copied across
-        // first. This is why the pass exists at all rather than drawing the
-        // patches straight into the destination.
-        render_pass.set_render_pipeline(blit);
-        render_pass.draw(0..3, 0..1);
+    // The ping-pong's output target holds nothing yet, and the water covers
+    // only the pixels it draws, so the composite's frame is copied across
+    // first. This is why the pass exists at all rather than drawing the
+    // patches straight into the destination.
+    render_pass.set_render_pipeline(blit);
+    render_pass.draw(0..3, 0..1);
 
-        render_pass.set_render_pipeline(pipeline);
-        render_pass.set_bind_group(2, &stage.group, &[]);
-        render_pass.set_bind_group(3, &clouds.group, &[]);
-        for patch in meshes.patches.iter() {
-            if patch.instance_count == 0 {
-                continue;
-            }
-            render_pass.set_vertex_buffer(0, patch.vertex.slice(..));
-            render_pass.set_vertex_buffer(1, patch.instance.slice(..));
-            render_pass.set_index_buffer(patch.index.slice(..), 0, IndexFormat::Uint32);
-            render_pass.draw_indexed(0..patch.index_count, 0, 0..patch.instance_count);
+    render_pass.set_render_pipeline(pipeline);
+    render_pass.set_bind_group(2, &stage.group, &[]);
+    render_pass.set_bind_group(3, &clouds.group, &[]);
+    for patch in meshes.patches.iter() {
+        if patch.instance_count == 0 {
+            continue;
         }
-        Ok(())
+        render_pass.set_vertex_buffer(0, patch.vertex.slice(..));
+        render_pass.set_vertex_buffer(1, patch.instance.slice(..));
+        render_pass.set_index_buffer(patch.index.slice(..), IndexFormat::Uint32);
+        render_pass.draw_indexed(0..patch.index_count, 0, 0..patch.instance_count);
     }
 }
 
@@ -783,7 +771,7 @@ fn surface_pipelines(
     pipeline_cache: &PipelineCache,
     shaders: &ForestShaderHandles,
     format: TextureFormat,
-    cloud_layout: &BindGroupLayout,
+    cloud_layout: &BindGroupLayoutDescriptor,
 ) -> Option<(CachedRenderPipelineId, CachedRenderPipelineId)> {
     let _ = pipeline_cache;
     let surface = match inner.surface_pipeline.get(&format).copied() {
@@ -797,7 +785,7 @@ fn surface_pipelines(
                 let descriptor = RenderPipelineDescriptor {
                     label: Some("forest_water_surface_pipeline".into()),
                     layout,
-                    push_constant_ranges: Vec::new(),
+                    immediate_size: 0,
                     vertex: VertexState {
                         shader: shaders.water_surface.clone(),
                         shader_defs: Vec::new(),
@@ -841,7 +829,7 @@ fn surface_pipelines(
             let descriptor = RenderPipelineDescriptor {
                 label: Some("forest_water_blit_pipeline".into()),
                 layout,
-                push_constant_ranges: Vec::new(),
+                immediate_size: 0,
                 vertex: VertexState {
                     shader: shaders.water_blit.clone(),
                     shader_defs: Vec::new(),
@@ -873,7 +861,7 @@ fn surface_pipelines(
 
 /// The three group layouts every water pipeline shares, cloned out of the
 /// cached state once `prepare_water` has built them.
-fn water_layouts(inner: &WaterInner) -> Option<Vec<BindGroupLayout>> {
+fn water_layouts(inner: &WaterInner) -> Option<Vec<BindGroupLayoutDescriptor>> {
     Some(vec![
         inner.globals_layout.clone()?,
         inner.surface_screen.clone()?,
@@ -883,148 +871,147 @@ fn water_layouts(inner: &WaterInner) -> Option<Vec<BindGroupLayout>> {
 
 /// The submerged-camera medium, applied to the whole composited frame once the
 /// eye crosses the surface.
-pub struct ForestUnderwaterNode;
-
-impl ViewNode for ForestUnderwaterNode {
-    type ViewQuery = &'static ViewTarget;
-
-    fn run<'w>(
-        &self,
-        _graph: &mut RenderGraphContext,
-        render_context: &mut RenderContext<'w>,
-        view: &'w ViewTarget,
-        world: &'w World,
-    ) -> Result<(), NodeRunError> {
-        let Some(state) = world.get_resource::<WaterNodeState>() else {
-            return Ok(());
-        };
-        let Some(water) = world.get_resource::<ExtractedWater>() else {
-            return Ok(());
-        };
-        if !water.draw {
-            return Ok(());
-        }
-        let (Some(shaders), Some(extracted)) = (
-            world.get_resource::<ForestShaderHandles>(),
-            world.get_resource::<ExtractedForestView>(),
-        ) else {
-            return Ok(());
-        };
-        let Some(terrain) = world.get_resource::<TerrainNodeState>() else {
-            return Ok(());
-        };
-        let Some(device) = world.get_resource::<RenderDevice>() else {
-            return Ok(());
-        };
-        let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
-            return Ok(());
-        };
-        let Ok(mut inner) = state.inner.lock() else {
-            return Ok(());
-        };
-        // Above the surface the medium contributes nothing, so the node is pure
-        // overhead and is skipped rather than drawn with a zero fade.
-        if inner.underwater_fade <= 0.0 {
-            return Ok(());
-        }
-        let Ok(gbuffer_guard) = terrain.gbuffer.lock() else {
-            return Ok(());
-        };
-        let Some(gbuffer) = gbuffer_guard.as_ref() else {
-            return Ok(());
-        };
-        let Some(cloud_state) = world.get_resource::<CloudRenderState>() else {
-            return Ok(());
-        };
-        let Some(clouds) = cloud_state.resources.as_ref() else {
-            return Ok(());
-        };
-
-        let format = view.main_texture_format();
-        let pipeline_id = match inner.underwater_pipeline.get(&format).copied() {
-            Some(id) => id,
-            None => {
-                let Some((globals_group_layout, screen, stage)) = (|| {
-                    Some((
-                        inner.globals_layout.clone()?,
-                        inner.underwater_screen.clone()?,
-                        inner.underwater_stage.as_ref()?.layout.clone(),
-                    ))
-                })() else {
-                    return Ok(());
-                };
-                let descriptor = RenderPipelineDescriptor {
-                    label: Some("forest_water_underwater_pipeline".into()),
-                    layout: vec![globals_group_layout, screen, stage, clouds.layout.clone()],
-                    push_constant_ranges: Vec::new(),
-                    vertex: VertexState {
-                        shader: shaders.water_underwater.clone(),
-                        shader_defs: Vec::new(),
-                        entry_point: Some("vs_main".into()),
-                        buffers: Vec::new(),
-                    },
-                    primitive: PrimitiveState::default(),
-                    depth_stencil: None,
-                    multisample: MultisampleState::default(),
-                    fragment: Some(FragmentState {
-                        shader: shaders.water_underwater.clone(),
-                        shader_defs: Vec::new(),
-                        entry_point: Some("fs_main".into()),
-                        targets: vec![Some(ColorTargetState {
-                            format,
-                            blend: None,
-                            write_mask: ColorWrites::ALL,
-                        })],
-                    }),
-                    zero_initialize_workgroup_memory: true,
-                };
-                let id = pipeline_cache.queue_render_pipeline(descriptor);
-                inner.underwater_pipeline.insert(format, id);
-                id
-            }
-        };
-
-        let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
-            return Ok(());
-        };
-        let post_process = view.post_process_write();
-        let destination: &wgpu::TextureView = post_process.destination;
-        let (Some(globals_group), Some(stage), Some(group)) = (
-            inner.globals_group.as_ref(),
-            inner.underwater_stage.as_ref(),
-            underwater_group(device, &inner, &gbuffer.position_view, post_process.source),
-        ) else {
-            return Ok(());
-        };
-
-        let width = extracted.physical_width.max(1) as f32;
-        let height = extracted.physical_height.max(1) as f32;
-        let mut render_pass = render_context.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
-            label: Some("forest_water_underwater_pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: destination,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    // The fullscreen triangle covers every pixel, so the target's
-                    // previous contents are never read.
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        render_pass.set_render_pipeline(pipeline);
-        render_pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
-        render_pass.set_bind_group(0, globals_group, &[]);
-        render_pass.set_bind_group(1, &group, &[]);
-        render_pass.set_bind_group(2, &stage.group, &[]);
-        render_pass.set_bind_group(3, &clouds.group, &[]);
-        render_pass.draw(0..3, 0..1);
-        Ok(())
+pub fn forest_underwater_pass(
+    view: ViewQuery<&ViewTarget>,
+    world: &World,
+    mut ctx: RenderContext,
+) {
+    let view = view.into_inner();
+    let Some(state) = world.get_resource::<WaterNodeState>() else {
+        return;
+    };
+    let Some(water) = world.get_resource::<ExtractedWater>() else {
+        return;
+    };
+    if !water.draw {
+        return;
     }
+    let (Some(shaders), Some(extracted)) = (
+        world.get_resource::<ForestShaderHandles>(),
+        world.get_resource::<ExtractedForestView>(),
+    ) else {
+        return;
+    };
+    let Some(terrain) = world.get_resource::<TerrainNodeState>() else {
+        return;
+    };
+    let Some(device) = world.get_resource::<RenderDevice>() else {
+        return;
+    };
+    let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
+        return;
+    };
+    let Ok(mut inner) = state.inner.lock() else {
+        return;
+    };
+    // Above the surface the medium contributes nothing, so the node is pure
+    // overhead and is skipped rather than drawn with a zero fade.
+    if inner.underwater_fade <= 0.0 {
+        return;
+    }
+    let Ok(gbuffer_guard) = terrain.gbuffer.lock() else {
+        return;
+    };
+    let Some(gbuffer) = gbuffer_guard.as_ref() else {
+        return;
+    };
+    let Some(cloud_state) = world.get_resource::<CloudRenderState>() else {
+        return;
+    };
+    let Some(clouds) = cloud_state.resources.as_ref() else {
+        return;
+    };
+
+    let format = view.main_texture_format();
+    let pipeline_id = match inner.underwater_pipeline.get(&format).copied() {
+        Some(id) => id,
+        None => {
+            let Some((globals_group_layout, screen, stage)) = (|| {
+                Some((
+                    inner.globals_layout.clone()?,
+                    inner.underwater_screen.clone()?,
+                    inner.underwater_stage.as_ref()?.layout.clone(),
+                ))
+            })() else {
+                return;
+            };
+            let descriptor = RenderPipelineDescriptor {
+                label: Some("forest_water_underwater_pipeline".into()),
+                layout: vec![globals_group_layout, screen, stage, clouds.layout.clone()],
+                immediate_size: 0,
+                vertex: VertexState {
+                    shader: shaders.water_underwater.clone(),
+                    shader_defs: Vec::new(),
+                    entry_point: Some("vs_main".into()),
+                    buffers: Vec::new(),
+                },
+                primitive: PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                fragment: Some(FragmentState {
+                    shader: shaders.water_underwater.clone(),
+                    shader_defs: Vec::new(),
+                    entry_point: Some("fs_main".into()),
+                    targets: vec![Some(ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                zero_initialize_workgroup_memory: true,
+            };
+            let id = pipeline_cache.queue_render_pipeline(descriptor);
+            inner.underwater_pipeline.insert(format, id);
+            id
+        }
+    };
+
+    let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
+        return;
+    };
+    let post_process = view.post_process_write();
+    let destination: &wgpu::TextureView = post_process.destination;
+    let (Some(globals_group), Some(stage), Some(group)) = (
+        inner.globals_group.as_ref(),
+        inner.underwater_stage.as_ref(),
+        underwater_group(
+            device,
+            pipeline_cache,
+            &inner,
+            &gbuffer.position_view,
+            post_process.source,
+        ),
+    ) else {
+        return;
+    };
+
+    let width = extracted.physical_width.max(1) as f32;
+    let height = extracted.physical_height.max(1) as f32;
+    let mut render_pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        label: Some("forest_water_underwater_pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: destination,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                // The fullscreen triangle covers every pixel, so the target's
+                // previous contents are never read.
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    render_pass.set_render_pipeline(pipeline);
+    render_pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
+    render_pass.set_bind_group(0, globals_group, &[]);
+    render_pass.set_bind_group(1, &group, &[]);
+    render_pass.set_bind_group(2, &stage.group, &[]);
+    render_pass.set_bind_group(3, &clouds.group, &[]);
+    render_pass.draw(0..3, 0..1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,6 +1022,7 @@ impl ViewNode for ForestUnderwaterNode {
 /// the G-buffer position at 1/9 and terrain heightfield at 2/10.
 fn surface_group(
     device: &RenderDevice,
+    cache: &PipelineCache,
     inner: &WaterInner,
     gbuffer_position: &wgpu::TextureView,
     heightfield: &wgpu::TextureView,
@@ -1042,6 +1030,7 @@ fn surface_group(
 ) -> Option<BindGroup> {
     screen_group(
         device,
+        cache,
         "forest_water_surface_group",
         inner.surface_screen.as_ref()?,
         inner.samplers.as_ref()?,
@@ -1053,12 +1042,14 @@ fn surface_group(
 
 fn underwater_group(
     device: &RenderDevice,
+    cache: &PipelineCache,
     inner: &WaterInner,
     gbuffer_position: &wgpu::TextureView,
     source: &wgpu::TextureView,
 ) -> Option<BindGroup> {
     screen_group(
         device,
+        cache,
         "forest_water_underwater_group",
         inner.underwater_screen.as_ref()?,
         inner.samplers.as_ref()?,
@@ -1070,8 +1061,9 @@ fn underwater_group(
 
 fn screen_group(
     device: &RenderDevice,
-    label: &str,
-    layout: &BindGroupLayout,
+    cache: &PipelineCache,
+    label: &'static str,
+    layout: &BindGroupLayoutDescriptor,
     samplers: &WaterSamplers,
     gbuffer_position: &wgpu::TextureView,
     source: &wgpu::TextureView,
@@ -1107,13 +1099,13 @@ fn screen_group(
             },
         ]);
     }
-    Some(device.create_bind_group(label, layout, &entries))
+    Some(super::bind_group(device, cache, label, layout, &entries))
 }
 
 /// One group-1 layout: for every entry in `filterable`, a float texture at
 /// binding N whose sampler sits at binding N + 8. The same shape the post
 /// passes' `screen_group_layout` builds.
-fn screen_layout(device: &RenderDevice, label: &str, filterable: &[bool]) -> BindGroupLayout {
+fn screen_layout(label: &'static str, filterable: &[bool]) -> BindGroupLayoutDescriptor {
     let mut entries: Vec<BindGroupLayoutEntry> = Vec::with_capacity(filterable.len() * 2);
     for (index, filterable) in filterable.iter().enumerate() {
         entries.push(BindGroupLayoutEntry {
@@ -1139,7 +1131,7 @@ fn screen_layout(device: &RenderDevice, label: &str, filterable: &[bool]) -> Bin
             count: None,
         });
     }
-    device.create_bind_group_layout(label, &entries)
+    BindGroupLayoutDescriptor::new(label, &entries)
 }
 
 fn create_samplers(device: &RenderDevice) -> WaterSamplers {
@@ -1152,7 +1144,7 @@ fn create_samplers(device: &RenderDevice) -> WaterSamplers {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         }),
         point_clamp: wgpu_device.create_sampler(&wgpu::SamplerDescriptor {
@@ -1162,7 +1154,7 @@ fn create_samplers(device: &RenderDevice) -> WaterSamplers {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             ..Default::default()
         }),
     }
@@ -1170,8 +1162,13 @@ fn create_samplers(device: &RenderDevice) -> WaterSamplers {
 
 /// Creates one pass's group-2 uniform buffer, its single-entry layout and the
 /// bind group wrapping the whole buffer.
-fn create_stage(device: &RenderDevice, label: &str, size: u64) -> WaterStage {
-    let layout = device.create_bind_group_layout(
+fn create_stage(
+    device: &RenderDevice,
+    cache: &PipelineCache,
+    label: &'static str,
+    size: u64,
+) -> WaterStage {
+    let layout = BindGroupLayoutDescriptor::new(
         label,
         &[BindGroupLayoutEntry {
             binding: 0,
@@ -1192,7 +1189,9 @@ fn create_stage(device: &RenderDevice, label: &str, size: u64) -> WaterStage {
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let group = device.create_bind_group(
+    let group = super::bind_group(
+        device,
+        cache,
         label,
         &layout,
         &[BindGroupEntry {

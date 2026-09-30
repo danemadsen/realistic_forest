@@ -2,7 +2,7 @@
 //!
 //! Frame order mirrors the C++ main loop: keyed settings changes, the egui
 //! input check, erosion streaming (which reads the pre-update player
-//! position), the player update, and then the render graph (erosion sim ->
+//! position), the player update, and then the render schedule (erosion sim ->
 //! terrain G-buffer -> SSAO -> blur -> composite -> FXAA -> egui -> upscale).
 
 mod automation;
@@ -24,16 +24,14 @@ use crate::noise::NoiseField;
 use crate::player::Player;
 use bevy::camera::primitives::Frustum;
 use bevy::camera::visibility::VisibleEntities;
-use bevy::camera::{
-    Camera, ClearColorConfig, PerspectiveProjection, Projection, RenderTarget,
-};
+use bevy::camera::{Camera, ClearColorConfig, PerspectiveProjection, Projection};
 use bevy::prelude::*;
 use bevy::render::camera::CameraRenderGraph;
 use bevy::render::settings::{RenderCreation, WgpuSettings};
 use bevy::render::view::window::screenshot::{Screenshot, ScreenshotCaptured};
 use bevy::render::view::Msaa;
 use bevy::render::RenderPlugin;
-use bevy::window::{CursorOptions, PrimaryWindow, WindowRef, WindowResolution};
+use bevy::window::{CursorOptions, PrimaryWindow, WindowResolution};
 use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
 use std::path::Path;
 
@@ -246,11 +244,11 @@ fn main() {
                 // request by default. TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
                 // is bevy's own default and must be kept alongside it.
                 .set(RenderPlugin {
-                    render_creation: RenderCreation::Automatic(WgpuSettings {
+                    render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
                         features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
                             | wgpu::Features::FLOAT32_FILTERABLE,
                         ..default()
-                    }),
+                    })),
                     ..default()
                 }),
         )
@@ -352,10 +350,9 @@ fn spawn_scene(mut commands: Commands) {
             // The composite pass fully covers the view every frame, matching
             // the C++ render pass into the deferred G-buffer.
             clear_color: ClearColorConfig::None,
-            target: RenderTarget::Window(WindowRef::Primary),
             ..default()
         },
-        CameraRenderGraph::new(render::ForestSubGraph),
+        CameraRenderGraph::new(render::ForestRender),
         Frustum::default(),
         VisibleEntities::default(),
         Msaa::Off,
