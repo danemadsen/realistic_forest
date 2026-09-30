@@ -87,7 +87,9 @@ pub const EROSION_ITERATIONS_PER_FRAME: usize = 6;
 
 // PBR terrain texture array: one set each for snow, grass, sand and rock,
 // plus two sets each for soil within the grass cover and for gravel.
-pub const TERRAIN_TILE_SIZE: usize = 512;
+// Retain the source scans' small stones and grass detail near the camera.
+// Two eight-layer RGBA mip arrays use about 85 MiB at this resolution.
+pub const TERRAIN_TILE_SIZE: usize = 1024;
 pub const TERRAIN_ATLAS_SLOTS: usize = 8;
 pub const EROSION_REVEAL_SECONDS: f32 = 0.9;
 pub const SEA_LEVEL: f32 = 0.0;

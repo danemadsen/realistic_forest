@@ -24,66 +24,87 @@ fn load_image_rgba(path: &PathBuf) -> Option<(Vec<u8>, usize)> {
     Some((decoded.to_rgba8().into_raw(), size))
 }
 
-/// `DownscaleTileWrapping`: box filter averaging each ratio x ratio block
-/// with modular indices so the downscaled tile stays truly periodic under
-/// REPEAT wrap (raylib's ImageResize clamps borders and breaks seams).
-/// Both images are square; `size` divides `src_size` exactly.
-///
-/// `round_nearest` picks the per-channel quantisation, and the two callers
-/// genuinely differ because the C++ uses two different downsamplers:
-///
-/// - The BASE level passes `false`. `DownscaleTileWrapping` truncates
-///   (`static_cast<unsigned char>(r / n)`, main.cpp:886), so truncation here
-///   is the faithful choice, however lossy.
-/// - The MIP levels pass `true`, because the C++ never downsamples those on
-///   the CPU at all — it hands the whole chain to `glGenerateMipmap`
-///   (main.cpp:967), whose box filter rounds to nearest with ties away from
-///   zero. Measured on this machine's GL 4.1 (Apple M3) with a 4x4 RGBA8
-///   array of probe blocks: means 1.25, 1.50, 1.75 and 2.50 come back as
-///   1, 2, 2, 3, where truncation gives 1, 1, 1, 2. The 2.50 -> 3 result
-///   rules out round-half-to-even as well. Without the bias every mip level
-///   sits up to one 8-bit step dark, and the deficit compounds down the
-///   chain: the probe's level 2 reads 2 against truncation's 1.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextureEncoding {
+    /// Albedo RGB is sRGB; the packed ambient occlusion alpha is linear.
+    Srgb,
+    /// Normal vectors, roughness and grayscale masks are linear data.
+    Linear,
+}
+
+fn srgb_to_linear(value: f32) -> f32 {
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(value: f32) -> f32 {
+    if value <= 0.0031308 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Average each ratio x ratio block in linear light, then encode color
+/// back to sRGB for storage. Averaging encoded albedo darkens fine gravel
+/// and grass as they recede into the distance. Alpha always remains linear
+/// because it contains a material parameter, not color or transparency.
+/// Both images are square; `size` divides `src_size` exactly. Tile-aligned
+/// blocks preserve the periodic boundary used by the repeat sampler.
 fn downscale_tile_wrapping(
     src: &[u8],
     src_size: usize,
     size: usize,
-    round_nearest: bool,
+    encoding: TextureEncoding,
 ) -> Vec<u8> {
+    assert!(size > 0 && src_size.is_multiple_of(size));
+    assert_eq!(src.len(), src_size * src_size * 4);
+    if src_size == size {
+        return src.to_vec();
+    }
     let ratio = src_size / size;
     let count = ratio * ratio;
-    // (sum + count/2) / count is round-half-up for non-negative sums; the
-    // C++'s truncating path is the same expression with a zero bias.
-    let bias = if round_nearest { count / 2 } else { 0 };
+    // Decode once per possible byte instead of applying the transfer
+    // function to every source texel in every material.
+    let srgb_lookup: [f32; 256] = std::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0));
     let mut dst = vec![0u8; size * size * 4];
     for oy in 0..size {
         for ox in 0..size {
-            let (mut r, mut g, mut b, mut a) = (0usize, 0usize, 0usize, 0usize);
+            let mut sum = [0usize; 4];
+            let mut linear_rgb = [0.0; 3];
             for dy in 0..ratio {
                 for dx in 0..ratio {
                     let sx = (ox * ratio + dx) % src_size;
                     let sy = (oy * ratio + dy) % src_size;
                     let base = (sy * src_size + sx) * 4;
-                    r += src[base] as usize;
-                    g += src[base + 1] as usize;
-                    b += src[base + 2] as usize;
-                    a += src[base + 3] as usize;
+                    for channel in 0..4 {
+                        sum[channel] += src[base + channel] as usize;
+                    }
+                    if encoding == TextureEncoding::Srgb {
+                        for channel in 0..3 {
+                            linear_rgb[channel] += srgb_lookup[src[base + channel] as usize];
+                        }
+                    }
                 }
             }
             let base = (oy * size + ox) * 4;
-            dst[base] = ((r + bias) / count) as u8;
-            dst[base + 1] = ((g + bias) / count) as u8;
-            dst[base + 2] = ((b + bias) / count) as u8;
-            dst[base + 3] = ((a + bias) / count) as u8;
+            for channel in 0..4 {
+                // Round to nearest at the base and each mip to avoid
+                // systematically darkening material data at every level.
+                dst[base + channel] = if channel < 3 && encoding == TextureEncoding::Srgb {
+                    (linear_to_srgb(linear_rgb[channel] / count as f32) * 255.0)
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                } else {
+                    ((sum[channel] + count / 2) / count) as u8
+                };
+            }
         }
     }
     dst
-}
-
-/// One mip level down, 2x2 wrap-aware averaging (GL's glGenerateMipmap under
-/// REPEAT wrap). Rounds to nearest — see `downscale_tile_wrapping`.
-fn downscale_half(src: &[u8], src_size: usize) -> Vec<u8> {
-    downscale_tile_wrapping(src, src_size, src_size / 2, true)
 }
 
 #[cfg(test)]
@@ -97,15 +118,12 @@ mod tests {
             4, 0, 0, 255, 8, 0, 0, 255, //
             16, 0, 0, 255, 32, 0, 0, 255,
         ];
-        let out = downscale_tile_wrapping(&src, 2, 1, false);
+        let out = downscale_tile_wrapping(&src, 2, 1, TextureEncoding::Linear);
         assert_eq!(out, vec![15, 0, 0, 255]);
     }
 
-    /// The four blocks of the GL probe, replayed against the CPU path. GL's
-    /// glGenerateMipmap returned 1, 2, 2, 3 for these means (1.25, 1.50,
-    /// 1.75, 2.50); the truncating base-level path returns 1, 1, 1, 2.
     #[test]
-    fn mip_downscale_matches_gl_rounding() {
+    fn linear_mips_round_without_a_dark_bias() {
         let blocks: [[u8; 4]; 4] = [[1, 1, 1, 2], [1, 1, 1, 3], [1, 1, 1, 4], [1, 1, 2, 6]];
         let mut src = vec![0u8; 4 * 4 * 4];
         for block in 0..4 {
@@ -119,18 +137,47 @@ mod tests {
             }
         }
 
-        let mip = downscale_tile_wrapping(&src, 4, 2, true);
-        let base = downscale_tile_wrapping(&src, 4, 2, false);
-        let red = |bytes: &[u8]| -> Vec<u8> {
-            (0..bytes.len() / 4).map(|i| bytes[i * 4]).collect()
-        };
-        assert_eq!(red(&mip), vec![1, 2, 2, 3]); // what glGenerateMipmap produced
-        assert_eq!(red(&base), vec![1, 1, 1, 2]); // what the C++'s own downscaler produces
+        let mip = downscale_tile_wrapping(&src, 4, 2, TextureEncoding::Linear);
+        let red =
+            |bytes: &[u8]| -> Vec<u8> { (0..bytes.len() / 4).map(|i| bytes[i * 4]).collect() };
+        assert_eq!(red(&mip), vec![1, 2, 2, 3]);
+        assert_eq!(
+            red(&downscale_tile_wrapping(
+                &mip,
+                2,
+                1,
+                TextureEncoding::Linear
+            )),
+            vec![2]
+        );
+    }
 
-        // The deficit compounds: GL's level 2 over 1,2,2,3 is 2, truncation's
-        // over 1,1,1,2 is 1.
-        assert_eq!(red(&downscale_tile_wrapping(&mip, 2, 1, true)), vec![2]);
-        assert_eq!(red(&downscale_tile_wrapping(&base, 2, 1, false)), vec![1]);
+    #[test]
+    fn albedo_filters_in_linear_light_but_occlusion_stays_linear() {
+        // Half black, half white has 50% linear reflectance (sRGB 188).
+        // The same values in the AO channel must average to 128 instead.
+        let src = vec![
+            0, 0, 0, 0, 255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255,
+        ];
+        assert_eq!(
+            downscale_tile_wrapping(&src, 2, 1, TextureEncoding::Srgb),
+            vec![188, 188, 188, 128]
+        );
+        assert_eq!(
+            downscale_tile_wrapping(&src, 2, 1, TextureEncoding::Linear),
+            vec![128, 128, 128, 128]
+        );
+    }
+
+    #[test]
+    fn srgb_transfer_preserves_shadows_and_round_trips_bytes() {
+        // A power-of-2.2 approximation loses the sRGB linear shadow segment.
+        assert!((srgb_to_linear(0.02) - 0.02 / 12.92).abs() < 1e-7);
+        assert!((linear_to_srgb(0.001) - 0.01292).abs() < 1e-7);
+        for byte in 0..=255 {
+            let encoded = linear_to_srgb(srgb_to_linear(byte as f32 / 255.0));
+            assert_eq!((encoded * 255.0).round() as u32, byte);
+        }
     }
 }
 
@@ -138,7 +185,7 @@ mod tests {
 // Data movement
 // ---------------------------------------------------------------------------
 
-/// One layer's mip chain, level 0 at 512², RGBA8.
+/// One layer's mip chain, level 0 at TERRAIN_TILE_SIZE², RGBA8.
 #[derive(Debug)]
 pub struct MipChain8 {
     pub levels: Vec<Vec<u8>>,
@@ -196,6 +243,7 @@ pub fn extract_blend_mask(main_world: Res<MainWorld>, mut data: ResMut<BlendMask
 fn build_terrain_layers(
     map_suffix: &str,
     mask_suffix: Option<&str>,
+    encoding: TextureEncoding,
 ) -> [MipChain8; TERRAIN_ATLAS_SLOTS] {
     let tile_area = TERRAIN_TILE_SIZE * TERRAIN_TILE_SIZE;
     let mut layers: Vec<Option<MipChain8>> = (0..TERRAIN_ATLAS_SLOTS).map(|_| None).collect();
@@ -205,27 +253,37 @@ fn build_terrain_layers(
             log::warn!("Terrain texture missing: {}", map_path.display());
             continue;
         };
-        let mut tile_bytes = downscale_tile_wrapping(&map_rgba, map_size, TERRAIN_TILE_SIZE, false);
+        let mut tile_bytes =
+            downscale_tile_wrapping(&map_rgba, map_size, TERRAIN_TILE_SIZE, encoding);
 
         if let Some(mask_suffix) = mask_suffix {
             let mask_path = asset_path(&format!("textures/{folder}/{folder}{mask_suffix}"));
             if let Some((mask_rgba, mask_size)) = load_image_rgba(&mask_path) {
-                let mask_bytes =
-                    downscale_tile_wrapping(&mask_rgba, mask_size, TERRAIN_TILE_SIZE, false);
+                let mask_bytes = downscale_tile_wrapping(
+                    &mask_rgba,
+                    mask_size,
+                    TERRAIN_TILE_SIZE,
+                    TextureEncoding::Linear,
+                );
                 for pixel in 0..tile_area {
                     tile_bytes[pixel * 4 + 3] = mask_bytes[pixel * 4];
                 }
             }
         }
 
-        // glGenerateMipmap under REPEAT wrap: successive 2x2 wrap-aware
-        // averages until 1x1 (10 levels for a 512 tile).
+        // Successive 2x2 averages until 1x1, in the same color space used
+        // by GPU filtering. Normals stay linear and normalize in the shader.
         let mut chain = vec![tile_bytes];
         while chain.last().unwrap().len() > 4 {
             let previous = chain.last().unwrap();
             let previous_size = previous.len() / 4;
             let previous_size = (previous_size as f32).sqrt() as usize;
-            chain.push(downscale_half(previous, previous_size));
+            chain.push(downscale_tile_wrapping(
+                previous,
+                previous_size,
+                previous_size / 2,
+                encoding,
+            ));
         }
         layers[index] = Some(MipChain8 { levels: chain });
     }
@@ -242,8 +300,16 @@ fn build_terrain_layers(
 /// pair then the normal pair). Startup-only; heavy.
 fn load_terrain_layers(mut commands: Commands) {
     log::info!("TERRAIN TEXTURES: loading PBR arrays");
-    let albedo_layers = build_terrain_layers("_Color.png", Some("_AmbientOcclusion.png"));
-    let normal_rough_layers = build_terrain_layers("_NormalGL.png", Some("_Roughness.png"));
+    let albedo_layers = build_terrain_layers(
+        "_Color.png",
+        Some("_AmbientOcclusion.png"),
+        TextureEncoding::Srgb,
+    );
+    let normal_rough_layers = build_terrain_layers(
+        "_NormalGL.png",
+        Some("_Roughness.png"),
+        TextureEncoding::Linear,
+    );
     commands.insert_resource(TerrainLayerDataLoaded {
         albedo_layers: Box::new(albedo_layers),
         normal_rough_layers: Box::new(normal_rough_layers),
@@ -291,22 +357,24 @@ pub struct GpuWorldTextures {
 pub const SSAO_NOISE_WIDTH: u32 = 4;
 
 fn sim_texture(device: &RenderDevice, label: &str) -> wgpu::Texture {
-    device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: SIM_TEXTURE_SIZE,
-            height: SIM_TEXTURE_SIZE,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-            | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    })
+    device
+        .wgpu_device()
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: SIM_TEXTURE_SIZE,
+                height: SIM_TEXTURE_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
 }
 
 fn float_texture(
@@ -318,20 +386,22 @@ fn float_texture(
     mips: u32,
     usage: wgpu::TextureUsages,
 ) -> wgpu::Texture {
-    device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: mips,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage,
-        view_formats: &[],
-    })
+    device
+        .wgpu_device()
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: mips,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        })
 }
 
 /// Default SSAO 4x4 rotation-noise pixels, ported from `CreateSSAONoise`.
@@ -450,8 +520,7 @@ pub fn write_padded_at(
     let rows = height as usize;
     let mut padded = vec![0u8; row * rows];
     for y in 0..rows {
-        padded[y * row..y * row + raw_row]
-            .copy_from_slice(&data[y * raw_row..(y + 1) * raw_row]);
+        padded[y * row..y * row + raw_row].copy_from_slice(&data[y * raw_row..(y + 1) * raw_row]);
     }
     queue.write_texture(
         destination,
@@ -556,9 +625,10 @@ pub fn prepare_gpu_textures(
     let lookup_view = lookup_texture.create_view(&Default::default());
 
     // Blend mask: R32, bilinear, CLAMP (the C++ sets CLAMP here).
-    let blend_samples = blend_mask.0.clone().unwrap_or_else(|| {
-        vec![1.0f32; EROSION_OUTPUT_RESOLUTION * EROSION_OUTPUT_RESOLUTION]
-    });
+    let blend_samples = blend_mask
+        .0
+        .clone()
+        .unwrap_or_else(|| vec![1.0f32; EROSION_OUTPUT_RESOLUTION * EROSION_OUTPUT_RESOLUTION]);
     let blend_texture = float_texture(
         device,
         "erosion_blend_mask",
@@ -593,32 +663,41 @@ pub fn prepare_gpu_textures(
         sim_texture(device, "sim_terrain_0"),
         sim_texture(device, "sim_terrain_1"),
     ];
-    let sim_water =
-        [sim_texture(device, "sim_water_0"), sim_texture(device, "sim_water_1")];
-    let sim_flux = [sim_texture(device, "sim_flux_0"), sim_texture(device, "sim_flux_1")];
+    let sim_water = [
+        sim_texture(device, "sim_water_0"),
+        sim_texture(device, "sim_water_1"),
+    ];
+    let sim_flux = [
+        sim_texture(device, "sim_flux_0"),
+        sim_texture(device, "sim_flux_1"),
+    ];
 
     // PBR texture arrays with CPU-built mip chains (wgpu cannot generate
     // array mips on the GPU), trilinear + repeat + max anisotropy.
-    let make_array = |label: &str, layers: &Box<[MipChain8; TERRAIN_ATLAS_SLOTS]>| {
+    let make_array = |label: &str,
+                      layers: &Box<[MipChain8; TERRAIN_ATLAS_SLOTS]>,
+                      format: wgpu::TextureFormat| {
         let max_levels = layers
             .iter()
             .map(|layer| layer.levels.len())
             .max()
             .unwrap_or(1) as u32;
-        let texture = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width: TERRAIN_TILE_SIZE as u32,
-                height: TERRAIN_TILE_SIZE as u32,
-                depth_or_array_layers: TERRAIN_ATLAS_SLOTS as u32,
-            },
-            mip_level_count: max_levels,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+        let texture = device
+            .wgpu_device()
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: TERRAIN_TILE_SIZE as u32,
+                    height: TERRAIN_TILE_SIZE as u32,
+                    depth_or_array_layers: TERRAIN_ATLAS_SLOTS as u32,
+                },
+                mip_level_count: max_levels,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
         for level in 0..max_levels as usize {
             let size = (TERRAIN_TILE_SIZE >> level).max(1) as u32;
             // Layers contiguous, each row padded to 256.
@@ -663,25 +742,37 @@ pub fn prepare_gpu_textures(
         }
         texture.create_view(&Default::default())
     };
-    let albedo_array_view = make_array("terrain_albedo_array", &layers.albedo_layers);
-    let normal_rough_array_view =
-        make_array("terrain_normal_rough_array", &layers.normal_rough_layers);
+    // sRGB views decode RGB before bilinear/trilinear interpolation. Doing
+    // that in the shader after sampling averages encoded color incorrectly;
+    // alpha is deliberately exempt from the GPU's sRGB conversion.
+    let albedo_array_view = make_array(
+        "terrain_albedo_array",
+        &layers.albedo_layers,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+    );
+    let normal_rough_array_view = make_array(
+        "terrain_normal_rough_array",
+        &layers.normal_rough_layers,
+        wgpu::TextureFormat::Rgba8Unorm,
+    );
 
     // SSAO 4x4 rotation noise (point, repeat).
-    let ssao_noise_texture = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
-        label: Some("ssao_noise"),
-        size: wgpu::Extent3d {
-            width: SSAO_NOISE_WIDTH,
-            height: SSAO_NOISE_WIDTH,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
+    let ssao_noise_texture = device
+        .wgpu_device()
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("ssao_noise"),
+            size: wgpu::Extent3d {
+                width: SSAO_NOISE_WIDTH,
+                height: SSAO_NOISE_WIDTH,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
     write_padded(
         queue,
         &ssao_noise_texture,
@@ -719,5 +810,8 @@ pub fn register_gpu_texture_systems(render_app: &mut bevy::app::SubApp) {
         .init_resource::<TerrainLayerDataSlot>()
         .init_resource::<BlendMaskData>()
         .init_resource::<GpuWorldTexturesOption>()
-        .add_systems(ExtractSchedule, (extract_terrain_layers, extract_blend_mask));
+        .add_systems(
+            ExtractSchedule,
+            (extract_terrain_layers, extract_blend_mask),
+        );
 }

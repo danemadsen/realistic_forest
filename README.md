@@ -137,17 +137,23 @@ Terrain uses triplanar PBR textures with a muted, earthy palette. Grass004
 covers stable ground; erosion and fresh deposition can replace it with
 Ground103 soil and subtle Ground106 variation, without a minimum grass share.
 Deposited fines favour flats, while scouring also exposes soil on banks.
-Grass gives way to soil before Rock032 appears: both transitions follow the
-same exposure field, with grass fully replaced by dirt before rock begins.
+Grass, shallow soil and Rock032 outcrops overlap through a shared exposure
+field, allowing grass to meet exposed stone without a continuous dirt belt.
+Material contacts use the scans' cavity information as a local relief proxy;
+colour, normals, roughness, AO and lighting masks share the resulting coverage.
+Pixel filtering softens unresolved edges, and a small residual mix preserves
+thin sediment instead of discarding every minor material.
 Slope, incision, substrate hardness and convex ridges expose stone; sheltered
 hollows and deposited sediment retain cover. Broad, deterministic geology and
 smaller weathering patches vary those boundaries in world space, with no rock
 altitude cutoff, so high gentle benches can keep meadows and low cliffs can
 expose stone.
-Gravel fills the energetic, scoured drainage that cuts through those faces,
-so a gully reads as loose debris between intact rock walls. Ground093C sand
-follows the coast and slower depositional channels. Snow006 combines a broad
-altitude climate bias with world-anchored regional variation and local drifts,
+Gravel fills scoured drainage and concave footslopes where loose debris can
+remain. It sheds between roughly 34 and 46 degrees, exposing the bedrock on
+steep gully walls. Material slope and aspect use a fixed four-metre terrain
+sampling interval; distant mesh interpolation still limits their detail.
+Ground093C sand follows the coast and slower depositional channels. Snow006
+combines a broad altitude climate bias with world-anchored regional variation and local drifts,
 including on exposed rock, so slopes do not share a fixed snow contour.
 It settles like sediment: it holds deeper and reaches
 lower inside dry sheltered hollows, drains down inactive gullies as fingers
@@ -160,15 +166,20 @@ material-placement rules derived from the erosion
 results, not a climate or snowmelt simulation.
 
 World-anchored, warped fields vary patch size and density across broad regions;
-fine breakup filters away with distance. Grass shifts subtly between green and
-olive. Each material supplies matching colour, normal, roughness and optional
-ambient-occlusion maps. Texture cells use deterministic quarter turns and
-narrow edge blends; grass, soil, gravel and sand also use independent sample
-offsets to avoid repeating the same tufts and stones. All PBR channels share
-the mapping, including normal orientation. Damp ground darkens and becomes
-smoother, while snow retains its wind relief and glints. A camera-centred
-sea-level plane creates ocean and shorelines. The **Dirt/gravel variant scale**
-control affects scan variation within soil and gravel.
+fine breakup filters away with distance. Grass shifts between green and dry
+olive with moisture, exposure and alpine climate. Metre-scale rock relief,
+restrained tilted bedding and broad mineral variation keep exposed faces from going uniform when the scan detail mips out.
+Each material supplies matching colour, normal, roughness and optional
+ambient-occlusion maps. The scans retain 1024² texels per layer; albedo is resized
+and mip-filtered in linear light and decoded by the GPU's sRGB sampler, while
+AO, normals and roughness remain linear data. The two eight-layer arrays use
+about 85 MiB including mipmaps (64 MiB more than the former 512² arrays). Texture
+cells use deterministic quarter turns and narrow edge blends; grass, soil,
+gravel and sand also use independent sample offsets to avoid repeating the same tufts and stones. All PBR channels share
+the mapping, including normal orientation. Damp drainage and the shoreline
+darken and become smoother, while snow retains its wind relief and glints.
+A camera-centred sea-level plane creates ocean and shorelines. The
+**Dirt/gravel variant scale** control affects scan variation within soil and gravel.
 
 Ocean wave lighting is evaluated per pixel, so distant waves stay visible
 beyond the mesh's displacement fade and across the flat horizon skirt.

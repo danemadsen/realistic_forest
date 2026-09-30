@@ -1,9 +1,7 @@
 // G-buffer terrain shading — WGSL port of forest/assets/shaders/terrain.fs
-// (GLSL 330, raylib/GL 4.3 deferred renderer). 1:1 behavioral port: identical
-// math, identical constants, preserved comments. Function decomposition kept;
-// GLSL out/inout parameters became ptr<function> parameters; GLSL ternaries
-// became select() (false-value first — both arms evaluate, discarded arms are
-// side-effect free, see PORT NOTES).
+// (GLSL 330, raylib/GL 4.3 deferred renderer), extended with terrain-driven
+// PBR coverage, cavity-aware material contacts and filtered weathering relief.
+// The port notes below describe the original resource and sampling contracts.
 
 // PORT NOTES (deviations from a blind mechanical translation):
 // 1. textureGrad -> textureSampleGrad, NOT the spec table's textureSample.
@@ -36,7 +34,8 @@
 //    inversion (the vertex stage's inverse() is that file's business).
 // 6. Varying contract: @location(0..4) = fragPositionView, fragNormalView,
 //    fragWorldPosition, fragWorldNormal, fragErosionDelta — terrain.vs's
-//    `out` declaration order. The wgsl-check validator requires a vs_main
+//    `out` declaration order, plus location 5 for fixed-scale material slope.
+//    The wgsl-check validator requires a vs_main
 //    entry in every file it validates, so a never-bound dummy vs_main sits at
 //    the bottom of this fragment-only file.
 // 7. WGSL has no int uniforms here: everything else routes into the
@@ -46,7 +45,7 @@
 //    uCameraPosition, view = matView) or into StageUniforms (see its
 //    provenance comment and the STAGE UNIFORMS block at the file end).
 // 8. Material placement now uses world-anchored terrain exposure for an
-//    ordered grass -> soil -> rock transition. Snow combines regional climate
+//    overlapping ground cover and rock exposure. Snow combines regional climate
 //    variation with terrain retention instead of a fixed contour on rock.
 
 // Shared global uniforms — the spec preamble, verbatim.
@@ -130,8 +129,8 @@ struct StageUniforms {
 // PBR terrain texture atlases (see LoadTerrainTextures in main.cpp).
 // texture0 is the shared base-noise field for biome boundaries and surface detail.
 @group(1) @binding(0) var texture0: texture_2d<f32>;        // R32 base noise (also used by the vertex stage).
-@group(1) @binding(5) var albedo_ao: texture_2d_array<f32>;   // uAlbedoAO: 7 layers: rgb albedo (sRGB), a ambient occlusion.
-@group(1) @binding(6) var normal_rough: texture_2d_array<f32>; // uNormalRough: 7 layers: rgb tangent normal (OpenGL green-up), a roughness.
+@group(1) @binding(5) var albedo_ao: texture_2d_array<f32>;   // uAlbedoAO: 8 layers: rgb albedo (sRGB), a ambient occlusion.
+@group(1) @binding(6) var normal_rough: texture_2d_array<f32>; // uNormalRough: 8 layers: rgb tangent normal (OpenGL green-up), a roughness.
 
 @group(1) @binding(8) var texture0_sampler: sampler;
 @group(1) @binding(9) var texture1_sampler: sampler;
@@ -149,6 +148,7 @@ struct FsInput {
     @location(2) frag_world_position: vec3<f32>,  // fragWorldPosition
     @location(3) frag_world_normal: vec3<f32>,    // fragWorldNormal
     @location(4) frag_erosion_delta: f32,         // fragErosionDelta
+    @location(5) frag_material_normal: vec3<f32>, // fixed-scale world slope
 };
 
 // G-buffer outputs, locations preserved from the GLSL layout qualifiers.
@@ -337,7 +337,7 @@ fn materialDensity(material_index: i32) -> f32
     if (material_index == GRASS_BASE) { return 1.25 * 2.41421356; }
     // Soil stones belong at the same scale as the surrounding grass blades.
     if (material_index == DIRT_BASE || material_index == DIRT_BASE + 1) { return 2.0; }
-    // Rock shares the gravel-scale tile: the Rock016 scan's chip scars and
+    // Rock shares the gravel-scale tile: the Rock032 scan's chip scars and
     // crack stains span ~0.1-1.3 m inside one 6 m repeat, so a face reads as
     // weathered cliff detail at close and mid range without duplicating any
     // single feature across the whole mountainside.
@@ -346,7 +346,7 @@ fn materialDensity(material_index: i32) -> f32
 
 fn tileCoordContinuous(material_index: i32, worldXZ: vec2<f32>, octave: i32) -> vec2<f32>
 {
-    let scale_mul = select(2.41421356, 1.0, octave == 0);
+    let scale_mul = select(1.17, 1.0, octave == 0);
     let angle = uvAngle(material_index, octave);
     let base = vec2<f32>(fract(f32(material_index) * 0.37 + 0.13),
                          fract(f32(material_index) * 0.71 + 0.29));
@@ -361,7 +361,7 @@ fn tileCoordContinuous(material_index: i32, worldXZ: vec2<f32>, octave: i32) -> 
 // outside the weight-gated branches below, where dpdx would be undefined.
 fn gradContinuous(material_index: i32, octave: i32, d_plane: vec2<f32>) -> vec2<f32>
 {
-    let scale_mul = select(2.41421356, 1.0, octave == 0);
+    let scale_mul = select(1.17, 1.0, octave == 0);
     return rotateUV(d_plane * globals.settings_a.y * scale_mul * materialDensity(material_index),
                     uvAngle(material_index, octave));
 }
@@ -411,17 +411,43 @@ fn surfaceCellHash(cell: vec2<f32>, material_index: i32, octave: i32) -> u32
 // An unbounded world-space field for ground cover. Unlike the mirrored
 // noise texture, this has no short repeat period or reflected patch pairs.
 // Quintic interpolation keeps the warped patch boundaries smooth.
-fn groundNoise(p: vec2<f32>) -> f32
+// Value and analytic spatial derivatives. These derivatives describe the
+// world field, so relief remains stable when screen resolution/LOD changes.
+fn groundNoiseGradient(p: vec2<f32>) -> vec3<f32>
 {
     let cell = floor(p);
     let f = fract(p);
     let w = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    let dw = 30.0 * f * f * (f - 1.0) * (f - 1.0);
     let inv_hash_range = 1.0 / 16777215.0;
     let a = f32(surfaceCellHash(cell, 17, 0) & 0xffffffu) * inv_hash_range;
     let b = f32(surfaceCellHash(cell + vec2<f32>(1.0, 0.0), 17, 0) & 0xffffffu) * inv_hash_range;
     let c = f32(surfaceCellHash(cell + vec2<f32>(0.0, 1.0), 17, 0) & 0xffffffu) * inv_hash_range;
     let d = f32(surfaceCellHash(cell + vec2<f32>(1.0), 17, 0) & 0xffffffu) * inv_hash_range;
-    return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+    return vec3<f32>(mix(mix(a, b, w.x), mix(c, d, w.x), w.y),
+                     mix(b - a, d - c, w.y) * dw.x,
+                     mix(c - a, d - b, w.x) * dw.y);
+}
+
+fn groundNoise(p: vec2<f32>) -> f32
+{
+    return groundNoiseGradient(p).x;
+}
+
+// Metre-scale weathered relief bridges the gap between scanned grains and
+// the terrain mesh. Both octaves fade before becoming subpixel; explicit
+// footprint inputs keep this callable inside material branches.
+fn rockWeathering(p: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec3<f32>
+{
+    let pixel = max(length(dx), length(dy));
+    let broad = groundNoiseGradient(rotateUV(p * 0.11, 0.37) + vec2<f32>(13.7, -41.2));
+    let fine = groundNoiseGradient(rotateUV(p * 0.37, 1.19) + vec2<f32>(-31.6, 7.3));
+    let broadFade = 1.0 - smoothHermite(0.35, 1.1, pixel * 0.11);
+    let fineFade = 1.0 - smoothHermite(0.35, 1.1, pixel * 0.37);
+    let gradient = rotateUV(broad.yz, -0.37) * (0.32 * 0.11 * broadFade)
+                 + rotateUV(fine.yz, -1.19) * (0.07 * 0.37 * fineFade);
+    return vec3<f32>((broad.x - 0.5) * broadFade * 0.7
+                    + (fine.x - 0.5) * fineFade * 0.3, gradient);
 }
 
 // Only call before material branches. Derivatives include the domain warp;
@@ -489,7 +515,7 @@ fn sampleMaterial(material_index: i32, octave: i32, plane_coord: vec2<f32>,
                          + f32(turn) * 1.57079632679, N, &tangent, &bitangent);
             let tn = nr.rgb * 2.0 - 1.0;
             let detail = tangent * (tn.x * strength) + bitangent * (tn.y * strength) + N * tn.z;
-            (*albedo_ao_out) += weight * vec4<f32>(pow(colour.rgb, vec3<f32>(2.2)), colour.a);
+            (*albedo_ao_out) += weight * colour;
             (*detail_rough_out) += weight * vec4<f32>(detail, nr.a);
         }
     }
@@ -621,16 +647,8 @@ fn accumulateGroup(base: i32, group_weight: f32, plane_coord: vec2<f32>,
                          vec3<f32>(dot(sampled_albedo, vec3<f32>(0.299, 0.587, 0.114))), albedo_desat);
     if (base == ROCK_BASE)
     {
-        // Rock032 is a brighter, more contrasty scan than the Rock016 this
-        // stretch was first cut for (mean 0.099 vs 0.068 linear, native
-        // p1->p50 span already 40 sRGB levels vs Rock016's 27), so the
-        // slope eases 1.35 -> 1.20 around the new scan's measured mean.
-        // The darker rock tint below compresses the span back in sRGB, and
-        // 1.20 restores the same ~36-level rendered crack depth the Rock016
-        // round was tuned to, while the gentler slope holds the zero clamp
-        // at 0.5% of texels (1.35 would clamp 2.3% into pinprick black
-        // speckle). Clamped at zero because the deepest pores land
-        // fractionally negative after the stretch.
+        // A restrained contrast stretch keeps scanned recesses legible
+        // without clipping broad areas of the weathered face to black.
         sampled_albedo = max((sampled_albedo - vec3<f32>(0.099)) * 1.20 + vec3<f32>(0.099),
                              vec3<f32>(0.0));
     }
@@ -652,7 +670,8 @@ fn fs_main(input: FsInput) -> FsOutput
 
     var normalWorld = normalize(input.frag_world_normal);
     let height = frag_world_position.y;
-    let slope = 1.0 - clamp(normalWorld.y, 0.0, 1.0);
+    let materialNormal = normalize(input.frag_material_normal);
+    let slope = 1.0 - clamp(materialNormal.y, 0.0, 1.0);
     let worldXZ = frag_world_position.xz;
     // Evaluate derivatives before any material gates. Explicit gradients keep
     // the mirrored patch fields filtered without seams at their folds.
@@ -734,13 +753,13 @@ fn fs_main(input: FsInput) -> FsOutput
         rotateUV(groundDomain * 0.83, 2.04) + vec2<f32>(-41.6, -63.2));
     let soilPattern = mix(soilLarge, soilSmall, mix(0.18, 0.62, groundGrowth))
                     + (soilEdge - 0.5) * 0.16;
-    let soilThreshold = mix(0.66, 0.43, groundRegion);
-    let soilPatches = smoothHermite(soilThreshold, soilThreshold + 0.22, soilPattern);
+    let soilThreshold = mix(0.64, 0.42, groundRegion);
+    let soilPatches = smoothHermite(soilThreshold, soilThreshold + 0.18, soilPattern);
     // Fine sediment favours flats. Scouring can also expose soil on banks,
     // with retention fading as steep ground gives way to rock.
     let soilFlatness = 1.0 - smoothHermite(0.02, 0.25, slope);
     let soilRetention = 1.0 - smoothHermite(0.12, 0.48, slope);
-    let backgroundSoil = 0.015 + 0.18 * soilPatches * mix(0.55, 1.0, groundRegion);
+    let backgroundSoil = 0.015 + 0.52 * soilPatches * mix(0.45, 1.0, groundRegion);
     let depositedSoil = deposition * soilFlatness;
     let scouredSoil = incision * soilRetention;
     let channelSoil = channel * (1.0 - transport) * soilRetention;
@@ -764,19 +783,24 @@ fn fs_main(input: FsInput) -> FsOutput
                         + incision * mix(0.10, 0.24, resistantBed)
                         + ridge * 0.10 - hollow * 0.08
                         - deposition * soilRetention * (1.0 - transport) * 0.24;
-    // Both transitions share this field: grass has completely yielded to
-    // dirt before any rock appears, including at erosion-cut boundaries.
-    // This preserves a soil shoulder instead of blending grass into stone.
-    let exposedSoil = smoothHermite(0.085, 0.22, terrainExposure);
+    // Thin soils and protruding bedrock overlap: a meadow can meet an
+    // outcrop directly, while disturbance still opens soil around its roots.
+    // Local weathering breaks the boundary instead of drawing a dirt contour
+    // around every steep face.
+    let outcropBreakup = (soilSmall - 0.5) * 0.10 + (soilEdge - 0.5) * 0.055;
+    let exposedSoil = smoothHermite(0.12, 0.40, terrainExposure);
     let grassSoilBlend = 1.0 - (1.0 - backgroundSoil * soilFlatness)
-                               * (1.0 - disturbedSoil) * (1.0 - exposedSoil);
-    let fRock = smoothHermite(0.24, 0.52, terrainExposure);
-    // Gravel is the eroded mountain: energetic drainage cuts through the
-    // rock faces and leaves coarse debris along its gullies. Substrate
-    // hardness keeps the coarsest material on the hardest beds.
-    let scouredGravel = incision * mix(0.35, 1.0, transport)
-                      * mix(0.75, 1.0, clamp(surface.a / 0.56, 0.0, 1.0));
-    let fGravel = scouredGravel;
+                               * (1.0 - disturbedSoil) * (1.0 - exposedSoil * 0.82);
+    let fRock = smoothHermite(0.18, 0.40, terrainExposure + outcropBreakup);
+    // Loose debris accumulates in cuts and concave footslopes, then sheds
+    // above its angle of repose (~34-46 degrees). Incised walls expose their
+    // substrate rather than receiving the same gravel coat as the gully bed.
+    let debrisHold = 1.0 - smoothHermite(0.17, 0.31, slope);
+    let scouredGravel = incision * mix(0.28, 1.0, transport)
+                      * mix(0.65, 1.0, resistantBed);
+    let talus = hollow * smoothHermite(0.045, 0.19, slope)
+              * (0.35 * incision + 0.45 * deposition) * resistantBed;
+    let fGravel = clamp((scouredGravel + talus) * debrisHold, 0.0, 1.0);
     // Fine sediment bars occur where concentrated runoff slows and deposits
     // material. Shore sand remains the coastal base, including underwater.
     let sedimentSand = deposition * channel * (1.0 - transport) * soilFlatness;
@@ -804,7 +828,7 @@ fn fs_main(input: FsInput) -> FsOutput
     // while continuously running beds lose all of it.
     let flushSnow = smoothHermite(0.08, 0.30, dischargeAmount);
     let dryHollow = hollow * (1.0 - channel * mix(0.45, 1.0, flushSnow));
-    let sunExposure = max(dot(normalWorld, climateSun), 0.0);
+    let sunExposure = max(dot(materialNormal, climateSun), 0.0);
     // Height supplies a broad climate bias, not a shared material cutoff.
     // Curvature and solar aspect shift local retention by comparable amounts
     // to the drift fields. Aspect remains active beyond the erosion cache.
@@ -815,7 +839,7 @@ fn fs_main(input: FsInput) -> FsOutput
                             + dryHollow * 28.0 - ridge * 18.0
                             - (sunExposure - 0.65) * 22.0;
     let snowLine = smoothHermite(stage.sea_level + 92.0, stage.sea_level + 126.0, snowHeight);
-    let snowHold = smoothHermite(0.12, 0.72, normalWorld.y);
+    let snowHold = smoothHermite(0.12, 0.72, materialNormal.y);
     var fSnow = snowLine * snowHold;
 
     // Wind shapes the pack the way altitude noise alone cannot: prevailing
@@ -823,7 +847,7 @@ fn fs_main(input: FsInput) -> FsOutput
     // slopes hold their cover, so the snowline follows terrain aspect as well
     // as height. The aspect term is slope-gated so flat snowfields (degenerate
     // normalWorld.xz) are left alone.
-    let aspectN = normalize(normalWorld.xz + vec2<f32>(1e-4, 0.0));
+    let aspectN = normalize(materialNormal.xz + vec2<f32>(1e-4, 0.0));
     let windAlignment = dot(aspectN, normalize(vec2<f32>(0.70, 0.42)));
     let scour = smoothHermite(0.15, 0.60, -windAlignment)
               * smoothHermite(0.08, 0.30, slope);
@@ -892,14 +916,6 @@ fn fs_main(input: FsInput) -> FsOutput
     let wGravel = fGravel * (1.0 - fSnow);
     let wSnow = fSnow;
 
-    // Surface weights blend between biomes at shores, slopes and snowlines.
-    let gSnow = wSnow;
-    let gGrass = wGrass;
-    let gSand = wSand;
-    let gDirt = wDirt;
-    let gGravel = wGravel;
-    let gRock = wRock;
-
     // Ground103 leads the soil, with a little Ground106 variation.
     let nDirt = 0.25 * filteredGroundNoise(
         rotateUV(groundDomain * globals.settings_a.w * 8.0, 0.73) + vec2<f32>(19.4, 63.1));
@@ -912,8 +928,11 @@ fn fs_main(input: FsInput) -> FsOutput
     var grassDryness = smoothHermite(0.18, 0.84,
                                      groundRegion * 0.65 + groundGrowth * 0.35);
     grassDryness = clamp(grassDryness - dryHollow * 0.22
-                         - dischargeAmount * (1.0 - transport) * 0.12, 0.0, 1.0);
-    let grassTint = mix(vec3<f32>(0.22, 0.33, 0.24), vec3<f32>(0.28, 0.33, 0.20), grassDryness)
+                         - dischargeAmount * (1.0 - transport) * 0.12
+                         + ridge * 0.12
+                         + smoothHermite(stage.sea_level + 65.0, stage.sea_level + 150.0, height) * 0.22,
+                         0.0, 1.0);
+    let grassTint = mix(vec3<f32>(0.31, 0.39, 0.27), vec3<f32>(0.48, 0.40, 0.28), grassDryness)
                   * mix(0.94, 1.06, groundGrowth);
     // Neutralise the powder scan's blue cast while leaving headroom for its
     // grain and wind relief in sunlight. Shadow colour comes from sky lighting.
@@ -958,30 +977,21 @@ fn fs_main(input: FsInput) -> FsOutput
 
     var groupBases = array<i32, 6>(SNOW_BASE, GRASS_BASE, SAND_BASE,
                                    DIRT_BASE, GRAVEL_BASE, ROCK_BASE);
-    var groupWeights = array<f32, 6>(gSnow, gGrass, gSand,
-                                     gDirt, gGravel, gRock);
+    var groupWeights = array<f32, 6>(wSnow, wGrass, wSand,
+                                     wDirt, wGravel, wRock);
     var crossfades = array<f32, 6>(0.0, 0.0, 0.0,
                                    nDirt, nGravel, 0.0);
     var albedoTints = array<vec3<f32>, 6>(
         snowTint, grassTint,
         // Muted mineral sand suits a cold coastline; dampness still follows flow.
-        vec3<f32>(0.34, 0.36, 0.38),
-        vec3<f32>(0.24, 0.22, 0.18),
+        vec3<f32>(0.49, 0.46, 0.39),
+        vec3<f32>(0.40, 0.33, 0.25),
         // Weathered gravel should sit within the same exposure as the turf,
         // including the small patches newly exposed in drainage channels.
         vec3<f32>(0.52, 0.53, 0.50),
-        // Rock032 is a brighter scan than the Rock016 the committed rock round
-        // was measured on (mean 0.099 vs 0.068 linear, with a faint warm
-        // cast), so the tint re-solves to land the SAME rendered per-channel
-        // means that round calibrated: ~2/3 of gravel's effective brightness
-        // (Gravel040 at tint 0.52 lands ~0.066 linear; this lands ~0.045) with
-        // the same faint cool cast, so intact faces read darker than both the
-        // loose debris cutting them and the snowpack above the snowline —
-        // fresh scree's angular facets catching light against shaded bedrock
-        // — while the composite's ambient floor keeps the scan's darks well
-        // clear of silhouette. Without this re-anchor the brighter scan
-        // lands rock AT parity with the gravel beds, inverting the ordering.
-        vec3<f32>(0.449, 0.442, 0.482));
+        // Neutral weathered bedrock, with colour variation added below at
+        // geological scales after the scan detail has been resolved.
+        vec3<f32>(0.61, 0.59, 0.55));
     var albedoDesats = array<f32, 6>(0.0, 0.20, 0.28,
                                      0.12, 0.0, 0.0);
     var roughFloors = array<f32, 6>(0.72, 0.72, 0.70,
@@ -1001,52 +1011,86 @@ fn fs_main(input: FsInput) -> FsOutput
     var aoRetains = array<f32, 6>(0.75, 0.85, 1.0,
                                   0.90, 1.0, 1.0);
     var normalMuls = array<f32, 6>(1.0, 1.0, 1.0,
-                                   0.85, 1.0, 0.34);
-    // Rock032's normal map runs ~2.1x stronger than Rock016's (mean
-    // deviation from flat 0.156 vs 0.076), so the rock multiplier halves
-    // to 0.34 to hold the relief strength the committed round tuned.
-
-    // World-space detail accumulates across projections and biome groups and
-    // is normalised once at the end, so cliffs pick up side-projected texture
-    // with no vertical smear and the flat-to-cliff crossover stays continuous.
-    if (slopeWeights.y >= 0.02) {
-        for (var g: i32 = 0; g < 6; g++) {
-            accumulateGroup(groupBases[g], groupWeights[g] * slopeWeights.y, coordY,
-                            dYx, dYy, crossfades[g],
+                                   0.85, 1.0, 0.48);
+    // Resolve each material's three projections first, then blend whole
+    // surfaces. Scan cavities approximate local relief at the contact edge:
+    // exposed grains/tufts survive while the adjacent material fills gaps.
+    // This is a cavity proxy, not a displacement map. All PBR channels and
+    // the lighting masks use the resulting coverage, avoiding pale ghosted
+    // mixtures of snow, turf and stone across the full slope transition.
+    var surfaceAlbedo: array<vec3<f32>, 6>;
+    var surfaceDetail: array<vec3<f32>, 6>;
+    var surfaceRough: array<f32, 6>;
+    var surfaceAO: array<f32, 6>;
+    var scores: array<f32, 6>;
+    var edgeWidths: array<f32, 6>;
+    // Derivatives must run before the nonuniform texture-sampling branches.
+    for (var g = 0; g < 6; g++) {
+        edgeWidths[g] = min(fwidth(groupWeights[g]), 0.30);
+    }
+    let contactDetail = 1.0 - smoothHermite(0.08, 0.65, footprint);
+    var highestScore = -1.0;
+    for (var g = 0; g < 6; g++) {
+        scores[g] = -1.0;
+        if (groupWeights[g] <= 0.01) { continue; }
+        var colour = vec3<f32>(0.0);
+        var detail = vec3<f32>(0.0);
+        var roughness = 0.0;
+        var cavity = 0.0;
+        var projectionSum = 0.0;
+        if (slopeWeights.y >= 0.02) {
+            accumulateGroup(groupBases[g], slopeWeights.y, coordY, dYx, dYy, crossfades[g],
                             vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0),
                             normalWorld, globals.settings_b.x * scanDetailFade,
-                            albedoTints[g], albedoDesats[g], roughFloors[g],
-                            aoRetains[g], normalMuls[g],
-                            &albedo, &worldDetail, &rough, &ao, &weightSum);
+                            albedoTints[g], albedoDesats[g], roughFloors[g], aoRetains[g], normalMuls[g],
+                            &colour, &detail, &roughness, &cavity, &projectionSum);
         }
-    }
-    if (slopeWeights.x >= 0.02) {
-        for (var g: i32 = 0; g < 6; g++) {
-            accumulateGroup(groupBases[g], groupWeights[g] * slopeWeights.x, coordX,
-                            dXx, dXy, crossfades[g],
+        if (slopeWeights.x >= 0.02) {
+            accumulateGroup(groupBases[g], slopeWeights.x, coordX, dXx, dXy, crossfades[g],
                             vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0),
                             normalWorld, globals.settings_b.x * scanDetailFade,
-                            albedoTints[g], albedoDesats[g], roughFloors[g],
-                            aoRetains[g], normalMuls[g],
-                            &albedo, &worldDetail, &rough, &ao, &weightSum);
+                            albedoTints[g], albedoDesats[g], roughFloors[g], aoRetains[g], normalMuls[g],
+                            &colour, &detail, &roughness, &cavity, &projectionSum);
         }
-    }
-    if (slopeWeights.z >= 0.02) {
-        for (var g: i32 = 0; g < 6; g++) {
-            accumulateGroup(groupBases[g], groupWeights[g] * slopeWeights.z, coordZ,
-                            dZx, dZy, crossfades[g],
+        if (slopeWeights.z >= 0.02) {
+            accumulateGroup(groupBases[g], slopeWeights.z, coordZ, dZx, dZy, crossfades[g],
                             vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0),
                             normalWorld, globals.settings_b.x * scanDetailFade,
-                            albedoTints[g], albedoDesats[g], roughFloors[g],
-                            aoRetains[g], normalMuls[g],
-                            &albedo, &worldDetail, &rough, &ao, &weightSum);
+                            albedoTints[g], albedoDesats[g], roughFloors[g], aoRetains[g], normalMuls[g],
+                            &colour, &detail, &roughness, &cavity, &projectionSum);
         }
+        let invProjection = 1.0 / max(projectionSum, 0.0001);
+        surfaceAlbedo[g] = colour * invProjection;
+        surfaceDetail[g] = detail * invProjection;
+        surfaceRough[g] = roughness * invProjection;
+        surfaceAO[g] = cavity * invProjection;
+        let relief = (surfaceAO[g] - 0.65) * 0.22 * contactDetail;
+        scores[g] = groupWeights[g] + relief * 4.0 * groupWeights[g] * (1.0 - groupWeights[g]);
+        highestScore = max(highestScore, scores[g]);
     }
-
-    let denom = max(weightSum, 1e-4);
-    albedo = albedo / denom;
-    rough = rough / denom;
-    ao = ao / denom;
+    for (var g = 0; g < 6; g++) {
+        let width = 0.34 + edgeWidths[g];
+        let contact = smoothHermite(highestScore - width, highestScore, scores[g]);
+        // Keep a small mineral contribution below the contact threshold;
+        // thin silt and sparse grains should not vanish from distant turf.
+        let weight = select(0.0, groupWeights[g] * mix(0.08, 1.0, contact), scores[g] > -0.5);
+        groupWeights[g] = weight;
+        albedo += surfaceAlbedo[g] * weight;
+        worldDetail += surfaceDetail[g] * weight;
+        rough += surfaceRough[g] * weight;
+        ao += surfaceAO[g] * weight;
+        weightSum += weight;
+    }
+    let denom = max(weightSum, 0.0001);
+    albedo /= denom;
+    rough /= denom;
+    ao /= denom;
+    let gSnow = groupWeights[0] / denom;
+    let gGrass = groupWeights[1] / denom;
+    let gSand = groupWeights[2] / denom;
+    let gDirt = groupWeights[3] / denom;
+    let gGravel = groupWeights[4] / denom;
+    let gRock = groupWeights[5] / denom;
 
     // The blended world-space detail vector perturbs the geometric normal
     // before a single rotation into view space. Because every tangent frame is
@@ -1054,6 +1098,31 @@ fn fs_main(input: FsInput) -> FsOutput
     // normal detail stays pinned to the terrain as the camera moves instead of
     // swimming with the view, and it stays aligned with its own albedo.
     var perturbedWorld = normalize(worldDetail / max(weightSum, 1e-4));
+
+    // Mineral colour varies through the geological mass as well as across
+    // individual scan tiles. Restrained tilted bedding gives cliff faces a
+    // common structure without forcing every face into horizontal stripes.
+    let mineralMottle = (rockRegion - 0.5) * 0.24 + (soilLarge - 0.5) * 0.16;
+    albedo *= 1.0 + gGrass * ((groundGrowth - 0.5) * 0.22 + (soilLarge - 0.5) * 0.16)
+                  + (gDirt + gGravel + gSand) * (soilLarge - 0.5) * 0.22
+                  + gRock * mineralMottle;
+    if (gRock > 0.001) {
+        let wy = rockWeathering(coordY, dYx, dYy);
+        let wx = rockWeathering(coordX, dXx, dXy);
+        let wz = rockWeathering(coordZ, dZx, dZy);
+        let reliefGradient = vec3<f32>(wy.y, 0.0, wy.z) * slopeWeights.y
+                           + vec3<f32>(0.0, wx.z, wx.y) * slopeWeights.x
+                           + vec3<f32>(wz.y, wz.z, 0.0) * slopeWeights.z;
+        let tangentGradient = reliefGradient - normalWorld * dot(reliefGradient, normalWorld);
+        perturbedWorld = normalize(perturbedWorld - tangentGradient * gRock * globals.settings_b.x);
+        let weather = dot(vec3<f32>(wx.x, wy.x, wz.x), slopeWeights);
+        let bedCoordinate = height * 0.095 + dot(worldXZ, vec2<f32>(0.014, -0.009))
+                          + (rockRegion - 0.5) * 1.6;
+        let bedding = sin(bedCoordinate * 6.2831853)
+                    * (1.0 - smoothHermite(1.5, 6.0, footprint));
+        albedo *= 1.0 + gRock * (weather * 0.38 + bedding * 0.045);
+        rough = clamp(rough + gRock * weather * 0.10, 0.0, 1.0);
+    }
 
     // Gentle wind relief over the single powder scan, at ~22 m and ~8 m
     // wavelengths. This perturbs shading only, keeping soft sun/lee variation
@@ -1510,7 +1579,7 @@ fn fs_main(input: FsInput) -> FsOutput
         // straight through an olive half-mix; a real snowline melts through
         // dirty grey-brown snow. Desaturate the overlap band toward its own
         // luminance with a faintly earthen tint.
-        let fringe = clamp(min(gSnow, groundCover) * 1.8, 0.0, 1.0);
+        let fringe = clamp(min(gSnow, gGrass + gDirt) * 1.8, 0.0, 1.0);
         let fringeLum = dot(albedo, vec3<f32>(0.299, 0.587, 0.114));
         albedo = mix(albedo, vec3<f32>(fringeLum) * vec3<f32>(1.04, 0.99, 0.92), fringe * 0.5);
 
@@ -1548,16 +1617,19 @@ fn fs_main(input: FsInput) -> FsOutput
     }
     else
     {
-        let moisture = clamp(waterAmount * 0.52 + channel * 0.25, 0.0, 0.72)
+        let shoreWet = (1.0 - smoothHermite(stage.sea_level + 0.05,
+                         stage.sea_level + 1.15 + (soilLarge - 0.5) * 0.45, height))
+                       * (gSand + gGravel + gRock);
+        let moisture = clamp(waterAmount * 0.52 + channel * 0.25 + shoreWet * 0.65, 0.0, 0.72)
                      * (1.0 - gSnow);
-        let damp = albedo * vec3<f32>(0.56, 0.69, 0.63);
+        let damp = albedo * vec3<f32>(0.55, 0.57, 0.56);
         albedo = mix(albedo, damp, moisture);
         // Damp earth stays rough; only pooled water approaches a low
         // roughness. Write the final value used by the G-buffer (snow glints
         // have already modified outRough above).
         let wetness = moisture / 0.72;
         let wetRoughness = mix(0.70, 0.42, waterAmount);
-        outRough = mix(outRough, wetRoughness, wetness);
+        outRough = mix(outRough, min(outRough, wetRoughness), wetness);
     }
 
     // Diagnostic: replace the biome albedo with a false-colour of the blended

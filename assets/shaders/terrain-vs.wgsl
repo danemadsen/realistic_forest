@@ -373,6 +373,7 @@ struct VsOutput {
     @location(2) fragWorldPosition: vec3<f32>,  // fragWorldPosition
     @location(3) fragWorldNormal: vec3<f32>,    // fragWorldNormal
     @location(4) fragErosionDelta: f32,         // fragErosionDelta
+    @location(5) frag_material_normal: vec3<f32>, // Fixed-scale slope/aspect for material placement.
 };
 
 @vertex
@@ -411,6 +412,23 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput
                                           2.0*normalStep,
                                           heightBack - heightFront));
 
+    // Material retention follows the same four-metre terrain interval at
+    // every clipmap level. Using the lighting normal above for slope changes
+    // rock, soil and snow coverage whenever the camera changes the mesh LOD.
+    // terrainHeight includes the same erosion reveal and fade as the mesh.
+    // Reuse the lighting samples where that LOD already has this interval.
+    let materialStep = 4.0;
+    var materialNormal = localNormal;
+    if (abs(normalStep - materialStep) > 0.0001) {
+        let materialLeft = terrainHeight(worldXZ - vec2<f32>(materialStep, 0.0));
+        let materialRight = terrainHeight(worldXZ + vec2<f32>(materialStep, 0.0));
+        let materialBack = terrainHeight(worldXZ - vec2<f32>(0.0, materialStep));
+        let materialFront = terrainHeight(worldXZ + vec2<f32>(0.0, materialStep));
+        materialNormal = normalize(vec3<f32>(materialLeft - materialRight,
+                                             2.0*materialStep,
+                                             materialBack - materialFront));
+    }
+
     let worldPosition4 = stage.model*vec4<f32>(worldXZ.x, height, worldXZ.y, 1.0);
     // GLSL computed transpose(inverse(mat3(matModel))); stage.inverse_model is
     // inverse(matModel) supplied by the CPU because WGSL has no inverse().
@@ -425,6 +443,7 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput
     output.fragNormalView = viewNormal;
     output.fragWorldPosition = worldPosition4.xyz;
     output.fragWorldNormal = worldNormal;
+    output.frag_material_normal = normalize(normalModel*materialNormal);
 
     output.position = globals.projection*viewPosition4;
     return output;
@@ -484,4 +503,6 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput
 // @location(3) fragWorldNormal (world-space normal),
 // @location(4) fragErosionDelta (f32, blended erosion contribution for the
 // fragment-stage debug overlay).
+// @location(5) frag_material_normal (world-space normal over a fixed 4 m
+// interval for material slope/aspect, independent of the lighting LOD).
 // group 0 binding 0 = shared GlobalUniforms.
