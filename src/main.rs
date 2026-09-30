@@ -15,6 +15,7 @@ mod player;
 mod render;
 mod ui;
 mod water;
+mod weather;
 
 use crate::automation::AutomationSettings;
 use crate::constants::*;
@@ -172,6 +173,11 @@ fn main() {
             settings.volumetric_lighting = false;
             settings.water_reflections = false;
         }
+        settings.clouds_enabled = !automation.no_clouds && !automation.no_raymarch;
+        settings.cloud_coverage = automation.cloud_coverage;
+        settings.cloud_density = automation.cloud_density;
+        settings.cloud_base_height = automation.cloud_base_height;
+        settings.cloud_thickness = automation.cloud_thickness;
         settings.raymarch_quality = automation.raymarch_quality;
         settings
     };
@@ -258,6 +264,7 @@ fn main() {
             paused: automation.pause_time,
             day_length_minutes: automation.day_length_minutes,
         })
+        .init_resource::<weather::WeatherMotion>()
         .init_resource::<ErosionCache>()
         .insert_resource(ErosionSettings::default())
         .insert_resource(AppliedErosionSettings(ErosionSettings::default()))
@@ -291,6 +298,7 @@ fn main() {
             (
                 handle_global_keys,
                 day_night::advance_day_night,
+                weather::advance_weather,
                 ui::ui_wants_input_system,
                 // --measure-overlap replaces normal streaming with its own
                 // driver, mirroring the C++ short-circuit in main().

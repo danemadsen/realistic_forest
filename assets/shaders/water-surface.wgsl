@@ -32,8 +32,8 @@
 //   surf — which is exactly the mistake it made here. Foam is a property of the
 //   surface's own compression instead, and needs no depth at all.
 // - Visible terrain reflections are raymarched against the view-position
-//   buffer. Offscreen and disoccluded rays fade to the same analytic sky the
-//   composite draws. Scene taps are gamma-decoded and inverse-ACES transformed
+//   buffer. Offscreen and disoccluded rays fade to the shared sky plus a
+//   raymarched cloud probe. Scene taps are gamma-decoded and inverse-ACES transformed
 //   before mixing with linear radiance; clipped highlights cannot be recovered.
 //
 // WGSL CONSTRAINT: `textureSample` uses implicit derivatives and is illegal in
@@ -55,6 +55,9 @@ struct GlobalUniforms
     atmosphere: vec4<f32>,      // daylight, moon intensity, hours, volume strength
     raymarch: vec4<f32>,        // shadows, volumes, reflections, quality
     heightfield: vec4<f32>,     // world centre XZ, span, texel size
+    clouds: vec4<f32>,          // enabled, coverage, density, base altitude
+    cloud_layer: vec4<f32>,     // thickness, shape scale, shadow strength, quality
+    cloud_motion: vec4<f32>,    // wind offset XZ, detail strength, maximum distance
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
@@ -94,6 +97,10 @@ struct WaterStageUniforms
 @group(1) @binding(9) var gbuffer_sampler: sampler;
 @group(1) @binding(2) var terrain_heightfield: texture_2d<f32>;
 @group(1) @binding(10) var terrain_heightfield_sampler: sampler;
+// The sky probe is raymarched once per frame. Waves sample it in their
+// reflected direction, so the complete cloud sky remains visible offscreen.
+@group(3) @binding(2) var cloud_sky_probe: texture_2d<f32>;
+@group(3) @binding(3) var cloud_sky_sampler: sampler;
 
 const PI: f32 = 3.141592653589793;
 const PATH_LENGTH_MAX: f32 = 256.0;
@@ -288,6 +295,176 @@ fn skyAmbient(normal_world: vec3<f32>) -> vec3<f32> {
     return mix(night_fill, day_fill, daylight);
 }
 
+// BEGIN SHARED VOLUMETRIC CLOUDS
+// Periodic world-space noise keeps the volume stationary as the camera moves.
+// RG: smooth fractal / inverted Worley shape; B: fine detail; A: broad weather.
+@group(3) @binding(0) var cloud_noise: texture_3d<f32>;
+@group(3) @binding(1) var cloud_noise_sampler: sampler;
+const CLOUD_PI: f32 = 3.14159265;
+const CLOUD_EXTINCTION: f32 = 0.011;
+struct CloudResult {
+    scattering: vec3<f32>,
+    transmittance: f32,
+    distance: f32,
+};
+
+// Return a bounded interval even when the eye lies inside or above the layer.
+// A horizontal ray is valid only if its origin already lies in the volume.
+fn cloudInterval(origin: vec3<f32>, ray: vec3<f32>, maximum_distance: f32) -> vec2<f32> {
+    let bottom = globals.clouds.w;
+    let top = bottom + max(globals.cloud_layer.x, 50.0);
+    if (abs(ray.y) < 0.00001) {
+        if (origin.y <= bottom || origin.y >= top) { return vec2<f32>(0.0); }
+        return vec2<f32>(0.0, maximum_distance);
+    }
+    let a = (bottom - origin.y)/ray.y;
+    let b = (top - origin.y)/ray.y;
+    return vec2<f32>(max(min(a, b), 0.0), min(max(a, b), maximum_distance));
+}
+
+fn cloudDensity(world_position: vec3<f32>, use_detail: bool) -> f32 {
+    let height = (world_position.y - globals.clouds.w)/max(globals.cloud_layer.x, 50.0);
+    if (height <= 0.0 || height >= 1.0 || globals.clouds.y <= 0.001) { return 0.0; }
+    let scale = max(globals.cloud_layer.y, 100.0);
+    let wind_position = world_position - vec3<f32>(globals.cloud_motion.x, 0.0, globals.cloud_motion.y);
+    let weather_uv = vec3<f32>(wind_position.x, 0.37*scale, wind_position.z)/(scale*14.0);
+    let weather = textureSampleLevel(cloud_noise, cloud_noise_sampler, weather_uv, 0.0).a;
+    let local_coverage = clamp(globals.clouds.y + (weather - 0.5)*0.65, 0.0, 1.0);
+    // Broad clustered cumulus retain a low, fairly level base and rounded tops.
+    // Wind shear and a small vertical warp stop the cell pattern forming columns.
+    let uv = (wind_position + vec3<f32>(height*scale*0.22, 0.0, height*scale*0.09))/(scale*4.0);
+    let noise = textureSampleLevel(cloud_noise, cloud_noise_sampler, uv, 0.0);
+    let shape = noise.r*0.62 + noise.g*0.38;
+    let threshold = mix(0.70, 0.23, local_coverage) + height*height*height*0.14;
+    let height_profile = smoothstep(0.0, 0.09, height)*(1.0 - smoothstep(0.62, 1.0, height));
+    if (shape <= threshold) { return 0.0; }
+    let detail_strength = clamp(globals.cloud_motion.z, 0.0, 1.0);
+    // Erode the density field before the sharp remap: neighbouring Worley
+    // cells carve rounded lobes out of the silhouette instead of merely
+    // making a smooth blob more transparent. Two scales retain large billows
+    // and fine wisps. Light rays use the average erosion for the same footprint.
+    var erosion = detail_strength*0.20;
+    if (use_detail) {
+        let detail_a = textureSampleLevel(cloud_noise, cloud_noise_sampler,
+                                          uv*2.7 + vec3<f32>(0.17, 0.41, 0.29), 0.0);
+        let detail_b = textureSampleLevel(cloud_noise, cloud_noise_sampler,
+                                          uv*6.1 + vec3<f32>(0.53, 0.13, 0.71), 0.0);
+        let cellular_detail = detail_a.g*0.65 + detail_b.g*0.25 + detail_b.b*0.10;
+        let detail = clamp((cellular_detail - 0.30)*2.0, 0.0, 1.0);
+        erosion = (1.0 - detail)*detail_strength*0.42;
+    }
+    let density = clamp((shape - threshold - erosion)/0.075, 0.0, 1.0)*height_profile;
+    return density*max(globals.clouds.z, 0.0);
+}
+
+fn cloudLightDepth(world_position: vec3<f32>, to_light: vec3<f32>, quality: f32) -> f32 {
+    let interval = cloudInterval(world_position, to_light, 14000.0);
+    let length = max(interval.y, 0.0);
+    let count = 4u + u32(clamp(quality, 0.0, 2.0));
+    var optical_depth = 0.0;
+    // Quadratic spacing resolves the bright rim close to the sample and
+    // increasingly broad taps estimate the shadow through the cloud body.
+    for (var i = 0u; i < 6u; i += 1u) {
+        if (i >= count) { break; }
+        let a = f32(i)/f32(count);
+        let b = (f32(i) + 1.0)/f32(count);
+        let start = a*a*length;
+        let end = b*b*length;
+        let sample_position = world_position + to_light*((start + end)*0.5 + 4.0);
+        optical_depth += cloudDensity(sample_position, false)*(end - start)*CLOUD_EXTINCTION;
+    }
+    return optical_depth;
+}
+
+fn cloudPhase(mu: f32, g: f32) -> f32 {
+    return (1.0 - g*g)/pow(max(1.0 + g*g - 2.0*g*mu, 0.025), 1.5);
+}
+
+fn marchClouds(origin: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, quality: f32) -> CloudResult {
+    var result: CloudResult;
+    result.scattering = vec3<f32>(0.0);
+    result.transmittance = 1.0;
+    result.distance = maximum_distance;
+    if (globals.clouds.x < 0.5 || globals.clouds.y <= 0.001 || globals.clouds.z <= 0.001) { return result; }
+    let ray = normalize(direction);
+    let limit = min(maximum_distance, max(globals.cloud_motion.w, 1000.0));
+    let interval = cloudInterval(origin, ray, limit);
+    if (interval.y <= interval.x) { return result; }
+    let count = select(select(32u, 48u, quality >= 1.0), 72u, quality >= 2.0);
+    let step_length = (interval.y - interval.x)/f32(count);
+    let to_sun = -normalize(globals.sun_direction.xyz);
+    let to_moon = -normalize(globals.moon_direction.xyz);
+    let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    let sun_phase = mix(cloudPhase(dot(ray, to_sun), 0.58), cloudPhase(dot(ray, to_sun), -0.22), 0.20);
+    let moon_phase = mix(cloudPhase(dot(ray, to_moon), 0.48), 1.0, 0.28);
+    var weighted_distance = 0.0;
+    var distance_weight = 0.0;
+    for (var i = 0u; i < 72u; i += 1u) {
+        if (i >= count) { break; }
+        let distance = interval.x + (f32(i) + 0.5)*step_length;
+        let world_position = origin + ray*distance;
+        let density = cloudDensity(world_position, true)
+                      *(1.0 - smoothstep(limit*0.60, limit, distance));
+        if (density <= 0.001) { continue; }
+        let height = clamp((world_position.y - globals.clouds.w)/max(globals.cloud_layer.x, 50.0), 0.0, 1.0);
+        let step_transmittance = exp(-density*CLOUD_EXTINCTION*step_length);
+        let contribution = result.transmittance*(1.0 - step_transmittance);
+        let day_ambient = mix(vec3<f32>(0.065, 0.080, 0.105), vec3<f32>(0.26, 0.31, 0.38), height);
+        let night_ambient = mix(vec3<f32>(0.0015, 0.0025, 0.005), vec3<f32>(0.008, 0.012, 0.023), height);
+        var lighting = mix(night_ambient, day_ambient, daylight);
+        // Beer light transport gives dark rain-cloud cores; the two broader
+        // scattering lobes approximate energy scattered repeatedly inside.
+        // Strong forward scattering produces the silver lining toward the sun.
+        let powder = mix(0.72, 1.18, 1.0 - exp(-density*3.0));
+        if (globals.settings_a.x > 0.001) {
+            let depth = cloudLightDepth(world_position, to_sun, quality);
+            let transport = sun_phase*exp(-depth) + 0.28*exp(-depth*0.26) + 0.08*exp(-depth*0.055);
+            lighting += globals.sun_colour.rgb*globals.settings_a.x*0.18*transport*powder;
+        }
+        if (globals.atmosphere.y > 0.001) {
+            let depth = cloudLightDepth(world_position, to_moon, max(quality - 1.0, 0.0));
+            let transport = moon_phase*exp(-depth) + 0.32*exp(-depth*0.22);
+            lighting += vec3<f32>(0.52, 0.65, 1.0)*globals.atmosphere.y*0.22*transport;
+        }
+        result.scattering += contribution*lighting;
+        weighted_distance += distance*contribution;
+        distance_weight += contribution;
+        result.transmittance *= step_transmittance;
+        if (result.transmittance < 0.008) { break; }
+    }
+    if (distance_weight > 0.0001) { result.distance = weighted_distance/distance_weight; }
+    return result;
+}
+
+// The same density projects moving shadows onto land, water and atmospheric
+// samples. Coarse taps deliberately omit fine erosion for a soft solar shadow.
+fn cloudShadow(world_position: vec3<f32>, to_light: vec3<f32>) -> f32 {
+    if (globals.clouds.x < 0.5 || globals.clouds.y <= 0.001 || globals.clouds.z <= 0.001
+        || globals.cloud_layer.z <= 0.001 || to_light.y <= 0.0) { return 1.0; }
+    let interval = cloudInterval(world_position, to_light, 65000.0);
+    if (interval.y <= interval.x) { return 1.0; }
+    let count = 4u + u32(clamp(globals.cloud_layer.w, 0.0, 2.0));
+    let step_length = (interval.y - interval.x)/f32(count);
+    var optical_depth = 0.0;
+    for (var i = 0u; i < 6u; i += 1u) {
+        if (i >= count) { break; }
+        let distance = interval.x + (f32(i) + 0.5)*step_length;
+        optical_depth += cloudDensity(world_position + to_light*distance, false)*step_length*CLOUD_EXTINCTION;
+    }
+    return mix(1.0, exp(-optical_depth), clamp(globals.cloud_layer.z, 0.0, 1.0));
+}
+// END SHARED VOLUMETRIC CLOUDS
+
+fn cloudSkyRadiance(direction: vec3<f32>) -> vec3<f32> {
+    let ray = normalize(direction);
+    let clear_sky = skyRadiance(ray);
+    if (globals.clouds.x < 0.5) { return clear_sky; }
+    let uv = vec2<f32>(atan2(ray.z, ray.x)/(2.0*PI) + 0.5,
+                       0.5 - asin(clamp(ray.y, -1.0, 1.0))/PI);
+    let cloud = textureSampleLevel(cloud_sky_probe, cloud_sky_sampler, uv, 0.0);
+    return clear_sky*cloud.a + cloud.rgb;
+}
+
 // BEGIN SHARED TERRAIN SHADOWS
 // The map follows the camera, includes off-screen terrain, and contains the
 // same procedural + erosion height used by the terrain vertex shader.
@@ -394,9 +571,15 @@ fn integrateAtmosphere(ray: vec3<f32>, distance_to_surface: f32) -> FogResult {
         let step_transmittance = exp(-extinction*(end - start));
         var sunlight_visibility = 1.0;
         if (globals.settings_a.x > 0.01 && strength > 0.0) {
-            sunlight_visibility = volumeLightVisibility(world_position, to_sun);
+            sunlight_visibility = volumeLightVisibility(world_position, to_sun)
+                                *cloudShadow(world_position, to_sun);
         }
-        let lighting = ambient + (sun_scatter*sunlight_visibility + moon_scatter)*strength;
+        var moonlight_visibility = 1.0;
+        if (globals.atmosphere.y > 0.001 && strength > 0.0) {
+            moonlight_visibility = cloudShadow(world_position, to_moon);
+        }
+        let lighting = ambient + (sun_scatter*sunlight_visibility
+                                 + moon_scatter*moonlight_visibility)*strength;
         result.scattering += result.transmittance*(1.0 - step_transmittance)*lighting;
         result.transmittance *= step_transmittance;
         if (result.transmittance < 0.01) { break; }
@@ -731,13 +914,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     let transmittance = exp(-sigma_t*optical_path);
 
     let to_sun = normalize(-globals.sun_direction.xyz);
-    let sun_visibility = terrainShadow(in.world_position, normal, to_sun);
+    let sun_visibility = terrainShadow(in.world_position, normal, to_sun)
+                       *cloudShadow(in.world_position, to_sun);
     let sun_colour = globals.sun_colour.rgb*globals.settings_a.x*sun_visibility;
     let to_moon = normalize(-globals.moon_direction.xyz);
     var moon_visibility = 1.0;
     if (globals.atmosphere.y > 0.001)
     {
-        moon_visibility = terrainShadow(in.world_position, normal, to_moon);
+        moon_visibility = terrainShadow(in.world_position, normal, to_moon)
+                         *cloudShadow(in.world_position, to_moon);
     }
     let moon_colour = vec3<f32>(0.63, 0.74, 1.0)*globals.atmosphere.y*moon_visibility;
     let cos_theta = dot(to_view, -to_sun);
@@ -804,7 +989,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
 
     // --- Reflection ----------------------------------------------------------
     let reflection_direction = reflect(-to_view, normal);
-    let reflected_sky = skyRadiance(reflection_direction)*0.85;
+    let reflected_sky = cloudSkyRadiance(reflection_direction)*0.85;
 
     // Sun specular: GGX over the wave roughness, which is what produces a
     // glitter path rather than one broad highlight.

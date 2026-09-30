@@ -9,7 +9,9 @@
 //! Graph position: after `CompositePass`, before `FxaaPass`. The water shades
 //! using the composite as its refraction/reflection source, undoing gamma and
 //! ACES before optical composition. The G-buffer supplies raymarch depth and
-//! the terrain heightfield supplies sun occlusion. FXAA sees the result.
+//! the terrain heightfield and cloud volume supply sun occlusion. A shared
+//! cloud sky probe supplies offscreen reflections and Snell's window.
+//! FXAA sees the result.
 //!
 //! Neither pass has a depth attachment. The surface pass stands in for one by
 //! testing the G-buffer's view-space z against the water fragment's own (view
@@ -22,6 +24,7 @@
 //! "no ocean at all", which is what keeps tile seams measurable.
 
 use crate::constants::SEA_LEVEL;
+use crate::render::cloud_node::CloudRenderState;
 use crate::render::terrain_node::TerrainNodeState;
 use crate::render::{globals_layout, ExtractedForestView, ForestGlobals, ForestShaderHandles};
 use crate::water::rings::{self, Patch};
@@ -669,20 +672,34 @@ impl ViewNode for ForestWaterSurfaceNode {
         let Some(gbuffer) = gbuffer_guard.as_ref() else {
             return Ok(());
         };
-
-        // The composited frame's view alternates every frame, so both group-1
-        // bind groups are rebuilt from the source the ping-pong hands back —
-        // exactly how FXAA gets its own.
-        let post_process = view.post_process_write();
-        let destination: &wgpu::TextureView = post_process.destination;
-        let Some((pipeline_id, blit_id)) =
-            surface_pipelines(&mut inner, pipeline_cache, shaders, view.main_texture_format())
-        else {
+        let Some(cloud_state) = world.get_resource::<CloudRenderState>() else {
             return Ok(());
         };
-        let (Some(pipeline), Some(blit), Some(globals_group), Some(stage), Some(meshes), Some(group)) = (
+        let Some(clouds) = cloud_state.resources.as_ref() else {
+            return Ok(());
+        };
+
+        let Some((pipeline_id, blit_id)) = surface_pipelines(
+            &mut inner,
+            pipeline_cache,
+            shaders,
+            view.main_texture_format(),
+            &clouds.layout,
+        ) else {
+            return Ok(());
+        };
+        let (Some(pipeline), Some(blit)) = (
             pipeline_cache.get_render_pipeline(pipeline_id),
             pipeline_cache.get_render_pipeline(blit_id),
+        ) else {
+            return Ok(());
+        };
+        // Wait for both asynchronous pipelines before swapping the frame;
+        // otherwise a shader still compiling would leave an unwritten target.
+        // Rebuild group 1 from the source the ping-pong hands back each frame.
+        let post_process = view.post_process_write();
+        let destination: &wgpu::TextureView = post_process.destination;
+        let (Some(globals_group), Some(stage), Some(meshes), Some(group)) = (
             inner.globals_group.as_ref(),
             inner.surface_stage.as_ref(),
             inner.meshes.as_ref(),
@@ -729,6 +746,7 @@ impl ViewNode for ForestWaterSurfaceNode {
 
         render_pass.set_render_pipeline(pipeline);
         render_pass.set_bind_group(2, &stage.group, &[]);
+        render_pass.set_bind_group(3, &clouds.group, &[]);
         for patch in meshes.patches.iter() {
             if patch.instance_count == 0 {
                 continue;
@@ -749,12 +767,14 @@ fn surface_pipelines(
     pipeline_cache: &PipelineCache,
     shaders: &ForestShaderHandles,
     format: TextureFormat,
+    cloud_layout: &BindGroupLayout,
 ) -> Option<(CachedRenderPipelineId, CachedRenderPipelineId)> {
     let _ = pipeline_cache;
     let surface = match inner.surface_pipeline.get(&format).copied() {
         Some(id) => id,
         None => {
-            let layout = water_layouts(inner)?;
+            let mut layout = water_layouts(inner)?;
+            layout.push(cloud_layout.clone());
             let id = {
                 // `queue_render_pipeline` needs the cache; borrow it through the
                 // caller's reference.
@@ -897,6 +917,12 @@ impl ViewNode for ForestUnderwaterNode {
         let Some(gbuffer) = gbuffer_guard.as_ref() else {
             return Ok(());
         };
+        let Some(cloud_state) = world.get_resource::<CloudRenderState>() else {
+            return Ok(());
+        };
+        let Some(clouds) = cloud_state.resources.as_ref() else {
+            return Ok(());
+        };
 
         let format = view.main_texture_format();
         let pipeline_id = match inner.underwater_pipeline.get(&format).copied() {
@@ -913,7 +939,7 @@ impl ViewNode for ForestUnderwaterNode {
                 };
                 let descriptor = RenderPipelineDescriptor {
                     label: Some("forest_water_underwater_pipeline".into()),
-                    layout: vec![globals_group_layout, screen, stage],
+                    layout: vec![globals_group_layout, screen, stage, clouds.layout.clone()],
                     push_constant_ranges: Vec::new(),
                     vertex: VertexState {
                         shader: shaders.water_underwater.clone(),
@@ -942,10 +968,12 @@ impl ViewNode for ForestUnderwaterNode {
             }
         };
 
+        let Some(pipeline) = pipeline_cache.get_render_pipeline(pipeline_id) else {
+            return Ok(());
+        };
         let post_process = view.post_process_write();
         let destination: &wgpu::TextureView = post_process.destination;
-        let (Some(pipeline), Some(globals_group), Some(stage), Some(group)) = (
-            pipeline_cache.get_render_pipeline(pipeline_id),
+        let (Some(globals_group), Some(stage), Some(group)) = (
             inner.globals_group.as_ref(),
             inner.underwater_stage.as_ref(),
             underwater_group(device, &inner, &gbuffer.position_view, post_process.source),
@@ -977,6 +1005,7 @@ impl ViewNode for ForestUnderwaterNode {
         render_pass.set_bind_group(0, globals_group, &[]);
         render_pass.set_bind_group(1, &group, &[]);
         render_pass.set_bind_group(2, &stage.group, &[]);
+        render_pass.set_bind_group(3, &clouds.group, &[]);
         render_pass.draw(0..3, 0..1);
         Ok(())
     }

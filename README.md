@@ -9,9 +9,9 @@ domain: there is no world border.
 
 It is a port of the C++17/raylib/OpenGL project at `~/forest`, keeping the same
 math, constants and structure. The renderer is now wgpu through Bevy, the source
-noise comes from quick-noise, and the diagnostics panel is egui. Each shader in
-`assets/shaders` carries a `PORT NOTES` header naming the GLSL file it came from
-and recording every deliberate deviation.
+noise comes from quick-noise, and the diagnostics panel is egui. Ported shaders
+in `assets/shaders` carry `PORT NOTES` headers naming their GLSL sources and
+recording deliberate deviations; the atmospheric rendering extends that base.
 
 ## Build and run
 
@@ -54,6 +54,15 @@ full day in 24 real minutes. **Raymarched lighting** exposes terrain shadows,
 volumetric sunlight, water reflections, quality and light shaft strength;
 **Rendering** includes fog density, sun intensity and exposure.
 
+**Volumetric clouds** controls cloud coverage, density, base altitude, layer
+thickness, wind speed and direction, and shadow strength. **Cloud shape** expands
+formation scale and edge detail controls. Clouds start enabled with coverage
+`0.55`, density `1.0`, a base at `1300 m`, and a `1200 m` thick layer. The default
+wind is `18 m/s` toward `70°` (`0°` is world +X, `90°` is +Z), with shadow strength
+`0.65`, formation scale `1500 m`, and edge detail `0.35`. Wind accumulates in real
+time independently of the sun, so changing the hour or crossing midnight keeps
+cloud formations continuous. Set wind speed to zero to hold them in place.
+
 ## Command line
 
 | Flag | Effect |
@@ -70,14 +79,19 @@ volumetric sunlight, water reflections, quality and light shaft strength;
 | `--no-fog`, `--no-water` | Disable those stages |
 | `--time-of-day H` | Start at hour `H` in `[0, 24)`; default `10` |
 | `--day-length MIN` | Positive real minutes per complete day; default `24` |
-| `--pause-time` | Hold the selected time of day |
-| `--advance-time` | Allow the day/night cycle to advance during a screenshot run |
+| `--pause-time` | Hold the selected time of day and freeze cloud wind |
+| `--advance-time` | Allow the day/night cycle and cloud wind to advance during a screenshot run |
 | `--raymarch-quality low\|balanced\|high` | Choose the ray sampling budget; default `balanced` (also accepts `0`, `1`, `2`) |
-| `--no-raymarch` | Disable raymarched terrain shadows, volumetric integration and terrain reflections on water |
+| `--no-raymarch` | Disable raymarched terrain shadows, volumetric integration, clouds and terrain reflections on water |
+| `--no-clouds` | Disable cloud rendering and cloud shadows independently |
+| `--cloud-coverage N` | Coverage in `[0, 1]`; default `0.55` |
+| `--cloud-density N` | Density multiplier in `[0, 4]`; default `1` |
+| `--cloud-base M` | Cloud base altitude in `[100, 6000]` metres; default `1300` |
+| `--cloud-thickness M` | Layer thickness in `[100, 4000]` metres; default `1200` |
 
-Screenshot runs freeze the celestial clock automatically, so erosion warm-up
-does not change the selected lighting. Keep the same camera and `--wait` value
-when comparing settings. For example, these capture noon, dusk and night from
+Screenshot runs freeze the celestial clock and cloud wind automatically, so
+erosion warm-up does not change the selected weather or lighting. Keep the same
+camera and `--wait` value when comparing settings. For example, these capture noon, dusk and night from
 the same elevated position above spawn:
 
 ```sh
@@ -268,8 +282,8 @@ most recently completed tile.
 The atmosphere takes inspiration from the coordinated sky, fog and lighting
 approach presented in Rockstar's
 [Creating the Atmospheric World of Red Dead Redemption 2](https://advances.realtimerendering.com/s2019/index.htm)
-at SIGGRAPH 2019. This prototype implements a smaller set of those ideas; it
-does not reproduce RDR2's renderer, volumetric cloud system or full path tracing.
+at SIGGRAPH 2019. This prototype implements a smaller, independent version of
+those ideas with procedural volumetric clouds, fog and shared celestial lighting.
 
 The sun rises in the east at 06:00, reaches its highest point at noon, and sets
 in the west at 18:00. Its colour warms toward the horizon and its direct light
@@ -297,32 +311,52 @@ uniform fog approximation.
 Water integrates the same atmosphere up to its own surface with a smaller
 sample budget, so haze and shafts follow the shoreline rather than the seabed.
 
+Clouds occupy a world-space volume with a configurable base and thickness.
+Periodic 3D fractal and Worley noise build rounded cumulus formations with
+flatter bases, irregular coverage and eroded edges. View rays integrate density
+and transmittance through the volume; secondary rays toward the sun or moon
+produce shadowed interiors, warm sunset lighting and bright edges around the
+sun. Multiple scattering is approximated to retain light inside dense clouds.
+The same wind-driven density casts moving shadows over terrain, water and fog.
+Cloud rays stop at opaque geometry, and the volume remains visible when flying
+inside or above it. This is one procedural cloud layer, with a `40 km` maximum
+view-ray distance and a gradual fade near that limit.
+
 Water traces reflected rays against the terrain view-position buffer, refines
 depth crossings, and samples the lit scene at each valid hit. This adds visible
 coastlines and mountains to the wave-distorted reflections. Invalid hits and
-screen edges fade into the shared day/night sky. These screen-space reflections
+screen edges fade into the shared day/night sky with clouds. A separate
+`256×128` all-direction sky probe raymarches the same cloud volume each frame,
+so water can reflect clouds outside the camera view. Its angular resolution
+and camera-centred origin make cloud reflections an approximation, especially
+near or inside the cloud layer. These screen-space terrain reflections
 cannot recover terrain hidden behind other surfaces or outside the camera view;
 the world-heightfield shadows have different coverage from the reflections.
 
-| Quality | Cost and appearance |
-| --- | --- |
-| Low | Fewer shadow, fog and reflection samples; useful at high display resolutions or on slower GPUs |
-| Balanced | Default compromise between sampling detail and GPU cost |
-| High | More samples to resolve shadows, shafts and reflection intersections; higher GPU cost |
+| Quality | Cloud view steps | Cloud sunlight/shadow taps | Cost and appearance |
+| --- | --- | --- | --- |
+| Low | Up to 32 | 4 | Fewer shadow, fog and reflection samples; useful at high display resolutions or on slower GPUs |
+| Balanced | Up to 48 | 5 | Default compromise between sampling detail and GPU cost |
+| High | Up to 72 | 6 | More samples to resolve clouds, shadows, shafts and reflection intersections; higher GPU cost |
 
 All three presets keep the same effects enabled. The F1 switches can disable
-individual effects independently, and `--no-raymarch` disables all three traced
-effects together. The sampling budget and display resolution both affect cost;
-half-resolution fog reduces the number of rays without changing the scene's
-output resolution.
+individual effects independently, and `--no-raymarch` disables the traced
+effects together. Fog and clouds share a half-resolution integration target
+with a depth-aware upscale; the scene keeps its full output resolution. Cloud
+rays stop early once sufficiently opaque and skip lighting in empty regions.
+Clouds still add substantial GPU work, especially with high quality, large
+display resolutions or many partially transparent formations. Lower raymarch
+quality or disable clouds independently if the frame rate becomes too low.
 
 ## Render pipeline
 
 The renderer writes view position, view normal, and albedo to a three-target
 G-buffer. SSAO is evaluated at half resolution with a 24-sample rotated
 hemisphere kernel, followed by a depth/normal-aware bilateral blur. A separate
-half-resolution atmosphere pass supplies scattering and transmittance to the
-lighting composite, which also evaluates terrain shadows and the celestial sky.
+half-resolution atmosphere pass supplies combined fog/cloud scattering and
+transmittance to the lighting composite, which also evaluates terrain and cloud
+shadows and the celestial sky. A cloud sky probe supplies reflection directions
+outside the current view.
 The water surface then samples the opaque scene for refraction and raymarched
 reflections, followed by underwater effects where applicable. FXAA smooths the
 completed scene, and the diagnostics panel draws on top. The G-buffer, AO and

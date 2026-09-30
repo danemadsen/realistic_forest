@@ -50,6 +50,9 @@ struct GlobalUniforms {
     atmosphere: vec4<f32>,       // daylight, moon intensity, hours, volumetric strength
     raymarch: vec4<f32>,         // shadows, volumetrics, reflections, quality (0/1/2)
     heightfield: vec4<f32>,      // world centre XZ, world span, texel size in metres
+    clouds: vec4<f32>,          // enabled, coverage, density, base altitude
+    cloud_layer: vec4<f32>,     // thickness, shape scale, shadow strength, quality
+    cloud_motion: vec4<f32>,    // wind offset XZ, detail strength, maximum distance
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 

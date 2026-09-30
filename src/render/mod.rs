@@ -3,6 +3,7 @@
 //! render order 1:1 on wgpu.
 
 pub mod erosion_node;
+pub mod cloud_node;
 pub mod gpu_textures;
 pub mod post_nodes;
 pub mod terrain_node;
@@ -43,6 +44,7 @@ pub struct ExtractedForestView {
     pub physical_height: u32,
     pub settings: AppSettings,
     pub day_night: DayNightCycle,
+    pub weather_offset: [f32; 2],
     pub draw_ocean: bool,
     pub lookup_minimum: (i64, i64),
     pub frame: u64,
@@ -54,7 +56,7 @@ pub struct ExtractedForestView {
 // silently drift.
 // ---------------------------------------------------------------------------
 
-/// The shared `GlobalUniforms` preamble (group 0, binding 0), 304 bytes.
+/// The shared `GlobalUniforms` preamble (group 0, binding 0), 352 bytes.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GlobalUniformsGpu {
@@ -71,8 +73,11 @@ pub struct GlobalUniformsGpu {
     pub atmosphere: [f32; 4],
     pub raymarch: [f32; 4],
     pub heightfield: [f32; 4],
+    pub clouds: [f32; 4],
+    pub cloud_layer: [f32; 4],
+    pub cloud_motion: [f32; 4],
 }
-const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 304);
+const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 352);
 
 /// terrain-vs + terrain-fs share one canonical StageUniforms layout
 /// (272 bytes); the WGSL files are reconciled to this exact field order.
@@ -324,6 +329,7 @@ pub struct ForestShaderHandles {
     pub water_surface: Handle<Shader>,
     pub water_underwater: Handle<Shader>,
     pub water_blit: Handle<Shader>,
+    pub cloud_probe: Handle<Shader>,
 }
 
 pub struct ForestRenderPlugin {
@@ -364,6 +370,7 @@ impl Plugin for ForestRenderPlugin {
                 water_surface: asset_server.load::<Shader>("shaders/water-surface.wgsl"),
                 water_underwater: asset_server.load::<Shader>("shaders/water-underwater.wgsl"),
                 water_blit: asset_server.load::<Shader>("shaders/water-blit.wgsl"),
+                cloud_probe: asset_server.load::<Shader>("shaders/cloud-probe.wgsl"),
             }
         };
         // The main world's terrain layer images (and the erosion blend mask)
@@ -395,6 +402,7 @@ impl Plugin for ForestRenderPlugin {
         erosion_node::register_erosion_systems(render_app);
         terrain_node::register_terrain_systems(render_app);
         post_nodes::register_post_systems(render_app);
+        cloud_node::register_cloud_systems(render_app);
 
         render_app.add_systems(ExtractSchedule, extract_forest_view);
         render_app.add_systems(
@@ -429,6 +437,7 @@ fn build_forest_graph(render_app: &mut bevy::app::SubApp) -> RenderGraph {
     graph.add_node(terrain_node::NodeTerrain::TerrainPass, terrain_node::ForestTerrainNode);
     graph.add_node(post_nodes::NodeSsao::SsaoPass, post_nodes::ForestSsaoNode);
     graph.add_node(post_nodes::NodeSsao::BlurPass, post_nodes::ForestBlurNode);
+    graph.add_node(cloud_node::NodeClouds, cloud_node::CloudProbeNode);
     graph.add_node(
         post_nodes::NodeSsao::CompositePass,
         ViewNodeRunner::new(post_nodes::ForestCompositeNode, render_app.world_mut()),
@@ -454,7 +463,8 @@ fn build_forest_graph(render_app: &mut bevy::app::SubApp) -> RenderGraph {
     graph.add_node_edge(erosion_node::NodeErosion::ErosionSim, terrain_node::NodeTerrain::TerrainPass);
     graph.add_node_edge(terrain_node::NodeTerrain::TerrainPass, post_nodes::NodeSsao::SsaoPass);
     graph.add_node_edge(post_nodes::NodeSsao::SsaoPass, post_nodes::NodeSsao::BlurPass);
-    graph.add_node_edge(post_nodes::NodeSsao::BlurPass, post_nodes::NodeSsao::CompositePass);
+    graph.add_node_edge(post_nodes::NodeSsao::BlurPass, cloud_node::NodeClouds);
+    graph.add_node_edge(cloud_node::NodeClouds, post_nodes::NodeSsao::CompositePass);
     graph.add_node_edge(post_nodes::NodeSsao::CompositePass, water_node::NodeWater::SurfacePass);
     graph.add_node_edge(water_node::NodeWater::SurfacePass, water_node::NodeWater::UnderwaterPass);
     graph.add_node_edge(water_node::NodeWater::UnderwaterPass, post_nodes::NodeSsao::FxaaPass);
@@ -490,6 +500,7 @@ fn extract_forest_view(
 
     view.settings = *world.resource::<AppSettings>();
     view.day_night = *world.resource::<DayNightCycle>();
+    view.weather_offset = world.resource::<crate::weather::WeatherMotion>().offset;
     view.draw_ocean = world.resource::<WorldOptions>().draw_ocean;
     let cache = world.resource::<ErosionCache>();
     view.lookup_minimum = (cache.lookup_minimum.x, cache.lookup_minimum.z);
@@ -581,6 +592,22 @@ pub fn prepare_forest_globals(
             terrain_node::LIGHTING_HEIGHTFIELD_SPAN,
             heightfield_texel,
         ],
+        clouds: [
+            view.settings.clouds_enabled as u32 as f32,
+            view.settings.cloud_coverage,
+            view.settings.cloud_density,
+            view.settings.cloud_base_height,
+        ],
+        cloud_layer: [
+            view.settings.cloud_thickness,
+            view.settings.cloud_scale,
+            view.settings.cloud_shadow_strength,
+            view.settings.raymarch_quality.min(2) as f32,
+        ],
+        cloud_motion: [
+            view.weather_offset[0], view.weather_offset[1],
+            view.settings.cloud_detail_strength, 40000.0,
+        ],
     };
     if globals.buffer.is_none() {
         // Created straight off the wgpu device so the field can stay a raw
@@ -622,6 +649,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn visible_clouds_reflections_and_shadows_use_one_density_model() {
+        let common = include_str!("../../assets/shaders/cloud-functions.wgslinc").trim();
+        for source in [
+            include_str!("../../assets/shaders/composite.wgsl"),
+            include_str!("../../assets/shaders/cloud-probe.wgsl"),
+            include_str!("../../assets/shaders/water-surface.wgsl"),
+            include_str!("../../assets/shaders/water-underwater.wgsl"),
+        ] {
+            assert!(source.contains(common), "cloud shape or lighting differs between passes");
+        }
+    }
+
     /// A stale layout in even an unrelated pass can reinterpret daylight as
     /// a matrix or bind too small a uniform range. Check the actual WGSL ABI
     /// against Rust, including offsets, rather than just matching byte sizes.
@@ -641,6 +681,9 @@ mod tests {
             ("atmosphere", std::mem::offset_of!(GlobalUniformsGpu, atmosphere)),
             ("raymarch", std::mem::offset_of!(GlobalUniformsGpu, raymarch)),
             ("heightfield", std::mem::offset_of!(GlobalUniformsGpu, heightfield)),
+            ("clouds", std::mem::offset_of!(GlobalUniformsGpu, clouds)),
+            ("cloud_layer", std::mem::offset_of!(GlobalUniformsGpu, cloud_layer)),
+            ("cloud_motion", std::mem::offset_of!(GlobalUniformsGpu, cloud_motion)),
         ];
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
         let mut checked = 0;

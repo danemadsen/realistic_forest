@@ -268,6 +268,63 @@ fn draw_diagnostics_window(
                     .fixed_decimals(2),
             );
 
+            separator_text(ui, "Volumetric clouds");
+            ui.checkbox(&mut settings.clouds_enabled, "Clouds");
+            ui.add_enabled_ui(settings.clouds_enabled, |ui| {
+                ui.add(
+                    egui::Slider::new(&mut settings.cloud_coverage, 0.0..=1.0)
+                        .text("Coverage")
+                        .fixed_decimals(2),
+                );
+                ui.add(
+                    egui::Slider::new(&mut settings.cloud_density, 0.0..=4.0)
+                        .text("Density")
+                        .fixed_decimals(2),
+                );
+                ui.add(
+                    egui::Slider::new(&mut settings.cloud_base_height, 100.0..=6000.0)
+                        .text("Cloud base")
+                        .suffix(" m")
+                        .fixed_decimals(0),
+                );
+                ui.add(
+                    egui::Slider::new(&mut settings.cloud_thickness, 100.0..=4000.0)
+                        .text("Layer thickness")
+                        .suffix(" m")
+                        .fixed_decimals(0),
+                );
+                ui.add(
+                    egui::Slider::new(&mut settings.cloud_wind_speed, 0.0..=80.0)
+                        .text("Cloud wind speed")
+                        .suffix(" m/s")
+                        .fixed_decimals(1),
+                );
+                ui.add(
+                    egui::Slider::new(&mut settings.cloud_wind_direction_degrees, 0.0..=360.0)
+                        .text("Cloud wind direction")
+                        .suffix("°")
+                        .fixed_decimals(0),
+                );
+                ui.add(
+                    egui::Slider::new(&mut settings.cloud_shadow_strength, 0.0..=1.0)
+                        .text("Cloud shadows")
+                        .fixed_decimals(2),
+                );
+                ui.collapsing("Cloud shape", |ui| {
+                    ui.add(
+                        egui::Slider::new(&mut settings.cloud_scale, 300.0..=6000.0)
+                            .text("Formation scale")
+                            .suffix(" m")
+                            .fixed_decimals(0),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut settings.cloud_detail_strength, 0.0..=1.0)
+                            .text("Edge detail")
+                            .fixed_decimals(2),
+                    );
+                });
+            });
+
             separator_text(ui, "Rendering");
             ui.checkbox(&mut settings.ssao_enabled, "SSAO");
             ui.checkbox(&mut settings.flow_debug, "Flow visualization");

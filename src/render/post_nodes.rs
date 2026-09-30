@@ -700,6 +700,10 @@ impl ViewNode for ForestCompositeNode {
         let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
             return Ok(());
         };
+        let Some(clouds) = world.get_resource::<super::cloud_node::CloudRenderState>()
+            .and_then(|state| state.resources.as_ref()) else {
+            return Ok(());
+        };
         let Ok(mut inner) = state.inner.lock() else {
             return Ok(());
         };
@@ -718,7 +722,7 @@ impl ViewNode for ForestCompositeNode {
                 "forest_atmosphere_pipeline",
                 shaders.composite.clone(),
                 wgpu::TextureFormat::Rgba16Float,
-                vec![globals_layout, layouts.atmosphere.clone(), stage.layout.clone()],
+                vec![globals_layout, layouts.atmosphere.clone(), stage.layout.clone(), clouds.layout.clone()],
             );
             descriptor.fragment.as_mut().unwrap().entry_point = Some("fs_atmosphere".into());
             inner.atmosphere_pipeline = Some(pipeline_cache.queue_render_pipeline(descriptor));
@@ -737,7 +741,7 @@ impl ViewNode for ForestCompositeNode {
                     "forest_composite_pipeline",
                     shaders.composite.clone(),
                     format,
-                    vec![globals_group_layout, layouts.composite.clone(), stage.layout.clone()],
+                    vec![globals_group_layout, layouts.composite.clone(), stage.layout.clone(), clouds.layout.clone()],
                 );
                 let id = pipeline_cache.queue_render_pipeline(descriptor);
                 inner.composite_pipelines.insert(format, id);
@@ -780,7 +784,7 @@ impl ViewNode for ForestCompositeNode {
             draw_fullscreen(
                 &mut pass,
                 atmosphere_pipeline,
-                &[&half_globals.group, atmosphere_group, &stage.group],
+                &[&half_globals.group, atmosphere_group, &stage.group, &clouds.group],
                 targets.width as f32,
                 targets.height as f32,
             );
@@ -809,7 +813,7 @@ impl ViewNode for ForestCompositeNode {
         draw_fullscreen(
             &mut render_pass,
             pipeline,
-            &[globals_group, group, &stage.group],
+            &[globals_group, group, &stage.group, &clouds.group],
             width,
             height,
         );

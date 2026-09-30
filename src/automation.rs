@@ -4,9 +4,12 @@
 //! `--time-of-day H` selects a celestial pose; `--day-length MIN` sets real
 //! minutes per full day. `--pause-time` freezes it, and screenshot runs freeze
 //! it automatically unless `--advance-time` is supplied. `--no-raymarch` turns
-//! off terrain shadows, volume integration and water reflection tracing;
+//! off terrain shadows, volume integration, clouds and water reflection tracing;
 //! `--raymarch-quality low|balanced|high` selects their sampling budget.
+//! `--no-clouds` disables clouds independently; `--cloud-coverage`,
+//! `--cloud-density`, `--cloud-base` and `--cloud-thickness` set cloud weather.
 
+use crate::constants::AppSettings;
 use crate::erosion::TileKey;
 use bevy::prelude::Resource;
 
@@ -47,11 +50,17 @@ pub struct AutomationSettings {
     pub pause_time: bool,
     pub no_raymarch: bool,
     pub raymarch_quality: u32,
+    pub no_clouds: bool,
+    pub cloud_coverage: f32,
+    pub cloud_density: f32,
+    pub cloud_base_height: f32,
+    pub cloud_thickness: f32,
     pub overlap_tile: TileKey,
 }
 
 impl Default for AutomationSettings {
     fn default() -> Self {
+        let render_settings = AppSettings::default();
         Self {
             has_camera: false,
             position: [0.0, 0.0, 0.0],
@@ -73,6 +82,11 @@ impl Default for AutomationSettings {
             pause_time: false,
             no_raymarch: false,
             raymarch_quality: 1,
+            no_clouds: false,
+            cloud_coverage: render_settings.cloud_coverage,
+            cloud_density: render_settings.cloud_density,
+            cloud_base_height: render_settings.cloud_base_height,
+            cloud_thickness: render_settings.cloud_thickness,
             overlap_tile: TileKey { x: 0, z: 0 },
         }
     }
@@ -152,6 +166,35 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--pause-time" => automation.pause_time = true,
             "--advance-time" => advance_capture_time = true,
             "--no-raymarch" => automation.no_raymarch = true,
+            "--no-clouds" => automation.no_clouds = true,
+            "--cloud-coverage" | "--cloud-density" | "--cloud-base" | "--cloud-thickness" => {
+                let bounds = match flag {
+                    "--cloud-coverage" => 0.0..=1.0,
+                    "--cloud-density" => 0.0..=4.0,
+                    "--cloud-base" => 100.0..=6000.0,
+                    _ => 100.0..=4000.0,
+                };
+                let parsed = next
+                    .and_then(|value| value.parse::<f32>().ok())
+                    .filter(|value| value.is_finite() && bounds.contains(value));
+                if let Some(value) = parsed {
+                    match flag {
+                        "--cloud-coverage" => automation.cloud_coverage = value,
+                        "--cloud-density" => automation.cloud_density = value,
+                        "--cloud-base" => automation.cloud_base_height = value,
+                        _ => automation.cloud_thickness = value,
+                    }
+                    index += 1;
+                } else {
+                    eprintln!(
+                        "WARNING: {flag} expects a finite value in [{}, {}]; keeping the previous value",
+                        bounds.start(), bounds.end()
+                    );
+                    if next.is_some_and(|value| !value.starts_with("--")) {
+                        index += 1;
+                    }
+                }
+            }
             "--time-of-day" | "--day-length" => {
                 let parsed = next
                     .and_then(|value| value.parse::<f32>().ok())
@@ -247,8 +290,8 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
         }
         index += 1;
     }
-    // Screenshot warm-up duration depends on GPU speed. Hold the celestial
-    // pose fixed so the selected lighting is reproducible across machines.
+    // Screenshot warm-up duration depends on GPU speed. Hold celestial and
+    // weather motion fixed so lighting is reproducible across machines.
     if automation.shot_path.is_some() && !advance_capture_time {
         automation.pause_time = true;
     }
@@ -310,5 +353,57 @@ mod tests {
         assert!(parse(&["--shot", "test.png"]).pause_time);
         assert!(!parse(&["--shot", "test.png", "--advance-time"]).pause_time);
         assert!(parse(&["--shot", "test.png", "--advance-time", "--pause-time"]).pause_time);
+    }
+
+    #[test]
+    fn cloud_arguments_accept_extremes_and_overrides() {
+        let settings = parse(&[
+            "--no-clouds", "--cloud-coverage", "1", "--cloud-density", "4",
+            "--cloud-base", "6000", "--cloud-thickness", "4000",
+        ]);
+        assert!(settings.no_clouds);
+        assert_eq!(settings.cloud_coverage, 1.0);
+        assert_eq!(settings.cloud_density, 4.0);
+        assert_eq!(settings.cloud_base_height, 6000.0);
+        assert_eq!(settings.cloud_thickness, 4000.0);
+        let settings = parse(&[
+            "--cloud-coverage", "0", "--cloud-density", "0",
+            "--cloud-base", "100", "--cloud-thickness", "100",
+        ]);
+        assert_eq!(settings.cloud_coverage, 0.0);
+        assert_eq!(settings.cloud_density, 0.0);
+        assert_eq!(settings.cloud_base_height, 100.0);
+        assert_eq!(settings.cloud_thickness, 100.0);
+    }
+
+    #[test]
+    fn invalid_cloud_values_preserve_previous_value_and_following_flags() {
+        for (flag, valid, invalid) in [
+            ("--cloud-coverage", "0.7", "1.01"),
+            ("--cloud-density", "2", "4.01"),
+            ("--cloud-base", "1500", "6001"),
+            ("--cloud-thickness", "900", "4001"),
+        ] {
+            let expected = parse(&[flag, valid]);
+            for invalid in [invalid, "NaN", "inf", "-1", "bad", "--pause-time"] {
+                let settings = parse(&[flag, valid, flag, invalid, "--no-clouds"]);
+                assert_eq!(settings.cloud_coverage, expected.cloud_coverage);
+                assert_eq!(settings.cloud_density, expected.cloud_density);
+                assert_eq!(settings.cloud_base_height, expected.cloud_base_height);
+                assert_eq!(settings.cloud_thickness, expected.cloud_thickness);
+                assert!(settings.no_clouds);
+                if invalid == "--pause-time" {
+                    assert!(settings.pause_time);
+                }
+            }
+            let missing = parse(&[flag]);
+            let defaults = AutomationSettings::default();
+            assert_eq!(missing.cloud_coverage, defaults.cloud_coverage);
+            assert_eq!(missing.cloud_density, defaults.cloud_density);
+            assert_eq!(missing.cloud_base_height, defaults.cloud_base_height);
+            assert_eq!(missing.cloud_thickness, defaults.cloud_thickness);
+        }
+        assert_eq!(parse(&["--cloud-base", "99"]).cloud_base_height, 1300.0);
+        assert_eq!(parse(&["--cloud-thickness", "99"]).cloud_thickness, 1200.0);
     }
 }
