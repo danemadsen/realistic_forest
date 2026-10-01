@@ -20,17 +20,12 @@
 //   on the flat horizon skirt. Unresolved waves become specular roughness.
 //   Neither limit depends on the tile's LOD; `ranges` is uploaded for parity
 //   but not read.
-// - Aqua's shoaling reads a BedHeightMap texture. The optical path here comes
-//   from the G-buffer: the distance from the water surface to whatever the ray
-//   actually hits. That is the *real* path rather than a sampled approximation
-//   of it, so the body tint and the transmitted background are both driven by
-//   measured geometry. It cannot feed the vertex-stage shoaling term, which is
-//   the one aqua feature this port gives up.
-//   Foam deliberately does NOT use it. Depth arrives back out of the G-buffer
-//   stair-stepped, so a threshold on it draws straight, constant-profile
-//   boundaries through the water, and it cannot tell a calm shallow flat from
-//   surf — which is exactly the mistake it made here. Foam is a property of the
-//   surface's own compression instead, and needs no depth at all.
+// - A local metre-resolution seabed map samples the same procedural terrain
+//   and streamed erosion as the ground. Waves damp in shallow water and a
+//   depth-limited, shoreward travelling wave train supplies small breakers and
+//   receding foam. This is an analytic surf approximation, not a fluid solver.
+//   The G-buffer still supplies the measured optical path for transmission;
+//   it does not determine the surf band's width or direction.
 // - Visible terrain reflections are raymarched against the view-position
 //   buffer. Offscreen and disoccluded rays fade to the shared sky plus a
 //   raymarched cloud probe. Scene taps are gamma-decoded and inverse-ACES transformed
@@ -84,8 +79,9 @@ struct WaterStageUniforms
     scatter: vec4<f32>,       // rgb scatter tint, w asymmetry
     surface: vec4<f32>,       // x fresnel F0, y fresnel exponent, z sun roughness, w base scale
     sss_tint: vec4<f32>,      // rgb subsurface tint, w tile resolution
-    misc: vec4<f32>,          // x refraction scale, y foam scale, z max amplitude, w unused
+    misc: vec4<f32>,          // x refraction scale, y foam scale, z max amplitude, w significant wave height
     flags: vec4<f32>,         // x flat-surface debug, y sea state amplitude, z wind radians, w wave fade end
+    shore_map: vec4<f32>,     // world centre XZ, span, texel size
 };
 @group(2) @binding(0) var<uniform> stage: WaterStageUniforms;
 
@@ -97,6 +93,8 @@ struct WaterStageUniforms
 @group(1) @binding(9) var gbuffer_sampler: sampler;
 @group(1) @binding(2) var terrain_heightfield: texture_2d<f32>;
 @group(1) @binding(10) var terrain_heightfield_sampler: sampler;
+@group(1) @binding(3) var shoreline_heightfield: texture_2d<f32>;
+@group(1) @binding(11) var shoreline_sampler: sampler;
 // The sky probe is raymarched once per frame. Waves sample it in their
 // reflected direction, so the complete cloud sky remains visible offscreen.
 @group(3) @binding(2) var cloud_sky_probe: texture_2d<f32>;
@@ -122,6 +120,8 @@ struct SurfaceSample
     jacobian: f32,
     /// Mean squared slope of waves too small for the pixel to resolve.
     slope_variance: f32,
+    /// Breaking/wash coverage before the bubble texture is applied.
+    shore_foam: f32,
 };
 
 fn smoothstepf(edge0: f32, edge1: f32, x: f32) -> f32
@@ -156,13 +156,89 @@ fn sampleFootprint(distance: f32, pixel_angle: f32) -> f32
     return max(max(distance*pixel_angle, mesh_bound), 0.02);
 }
 
+// The local map is world anchored, including when the camera translates.
+// Fade the *effects*, not the sampled height, at its border so a moving map
+// never sweeps a fictitious shallow contour across deep water.
+struct ShoreSample {
+    depth: f32,
+    depth_gradient: vec2<f32>,
+    weight: f32,
+};
+
+fn sampleShore(world_xz: vec2<f32>) -> ShoreSample {
+    let uv = (world_xz - stage.shore_map.xy)/max(stage.shore_map.z, 1.0) + vec2<f32>(0.5);
+    let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
+    let weight = smoothstepf(0.025, 0.16, edge);
+    if (weight <= 0.0) { return ShoreSample(1000.0, vec2<f32>(0.0), 0.0); }
+    let step = stage.shore_map.w*2.0;
+    let du = vec2<f32>(step/stage.shore_map.z, 0.0);
+    let bed = textureSampleLevel(shoreline_heightfield, shoreline_sampler, uv, 0.0).r;
+    let left = textureSampleLevel(shoreline_heightfield, shoreline_sampler, uv - du, 0.0).r;
+    let right = textureSampleLevel(shoreline_heightfield, shoreline_sampler, uv + du, 0.0).r;
+    let back = textureSampleLevel(shoreline_heightfield, shoreline_sampler, uv - du.yx, 0.0).r;
+    let front = textureSampleLevel(shoreline_heightfield, shoreline_sampler, uv + du.yx, 0.0).r;
+    return ShoreSample(stage.params.z - bed,
+                       vec2<f32>(left - right, back - front)/(2.0*step), weight);
+}
+
+struct ShoreMotion {
+    height: f32,
+    slope: vec2<f32>,
+    foam: f32,
+};
+
+fn shoreMotion(world_xz: vec2<f32>, shore: ShoreSample, mesh_footprint: f32,
+               pixel_dx: vec2<f32>, pixel_dy: vec2<f32>) -> ShoreMotion {
+    let wave_height = stage.misc.w;
+    if (shore.weight <= 0.0 || wave_height < 0.001 || stage.flags.x > 0.5) {
+        return ShoreMotion(0.0, vec2<f32>(0.0), 0.0);
+    }
+    let depth = max(shore.depth, 0.0);
+    let slope = max(length(shore.depth_gradient), 0.035);
+    let offshore = shore.depth_gradient/slope;
+    let wind = vec2<f32>(cos(stage.flags.z), sin(stage.flags.z));
+    // Offshore wind still leaves small lapping waves; exposed shores break more.
+    let exposure = mix(0.28, 1.0, smoothstepf(-0.45, 0.65, dot(wind, -offshore)));
+    let breaker_depth = max(wave_height/0.78, 0.08);
+    let coast_distance = depth/slope;
+    let band = (1.0 - smoothstepf(breaker_depth*1.5, breaker_depth*4.0, depth))
+             * (1.0 - smoothstepf(5.0 + wave_height*8.0, 12.0 + wave_height*16.0, coast_distance))
+             * smoothstepf(0.008, 0.07, length(shore.depth_gradient))*shore.weight;
+    // Integration of c = sqrt(g*h) over a locally sloping bed gives arrival
+    // time. The positive time sign moves these crests toward decreasing depth.
+    // A small depth floor keeps the swash finite at the waterline.
+    let period = 2.4 + sqrt(wave_height)*1.1;
+    let omega = 2.0*PI/period;
+    let phase = omega*(stage.params.x + 2.0*(sqrt(depth + 0.08) - sqrt(0.08))/(sqrt(9.81)*slope))
+              + (valueNoise(world_xz*0.075) - 0.5)*1.4;
+    let phase_gradient = omega*offshore/sqrt(9.81*(depth + 0.08));
+    let phase_pixel = max(abs(dot(phase_gradient, pixel_dx)), abs(dot(phase_gradient, pixel_dy)));
+    let resolved = (1.0 - smoothstepf(0.7, PI, phase_pixel))
+                 * waveAttenuation(2.0*PI/max(length(phase_gradient), 0.01), mesh_footprint);
+    let wash = smoothstepf(-0.08, 0.04, shore.depth);
+    let amplitude = min(wave_height*0.24, depth*0.32 + wave_height*0.035)
+                  * band*exposure*wash*resolved;
+    let crest = cos(phase);
+    let height = amplitude*(crest + 0.18*cos(2.0*phase));
+    let gradient = -amplitude*(sin(phase) + 0.36*sin(2.0*phase))*phase_gradient;
+    let breaking = (1.0 - smoothstepf(breaker_depth*0.65, breaker_depth*2.4, depth));
+    let front = smoothstepf(0.25, 0.88, crest)*resolved;
+    // After the crest passes, a weaker patch remains and decays between waves.
+    let remnant = smoothstepf(-0.25, 0.85, cos(phase - 0.85))*resolved;
+    let contact = 1.0 - smoothstepf(0.025, 0.10 + wave_height*0.32, depth);
+    let foam = band*exposure*wash*breaking
+             * (front*0.82 + remnant*0.24 + contact*(0.10 + remnant*0.25));
+    return ShoreMotion(height, gradient, clamp(foam, 0.0, 1.0));
+}
+
 fn sampleSurface(world_xz: vec2<f32>, mesh_footprint: f32,
-                 pixel_dx: vec2<f32>, pixel_dy: vec2<f32>, wave_weight: f32) -> SurfaceSample
+                 pixel_dx: vec2<f32>, pixel_dy: vec2<f32>, wave_weight: f32,
+                 shore: ShoreSample) -> SurfaceSample
 {
     if (stage.flags.x > 0.5 || wave_weight <= 0.0)
     {
         return SurfaceSample(vec3<f32>(world_xz.x, 0.0, world_xz.y),
-                             vec3<f32>(0.0, 1.0, 0.0), 0.0, 1.0, 0.0);
+                             vec3<f32>(0.0, 1.0, 0.0), 0.0, 1.0, 0.0, 0.0);
     }
 
     let time = stage.params.x;
@@ -170,6 +246,9 @@ fn sampleSurface(world_xz: vec2<f32>, mesh_footprint: f32,
     var derivative_x = vec3<f32>(0.0);
     var derivative_z = vec3<f32>(0.0);
     var slope_variance = 0.0;
+    let depth = max(shore.depth, 0.0);
+    // Limit the entire train as the column becomes too thin to hold its waves.
+    let depth_limit = smoothstepf(0.0, max(stage.misc.w*1.5, 0.12), depth);
 
     // Skip unresolved components before evaluating trigonometry. Geometry
     // filters the shortest wavelengths first; pixels also account for each
@@ -185,10 +264,13 @@ fn sampleSurface(world_xz: vec2<f32>, mesh_footprint: f32,
                                    abs(dot(wave.direction, pixel_dy)))/wave.wavelength;
         // Full detail at eight pixels/cycle; gone before the Nyquist limit.
         let pixel_weight = 1.0 - smoothstepf(0.125, 0.5, cycles_per_pixel);
-        let slope = wave.amplitude*wave.wave_number;
+        let shallow = 1.0 - smoothstepf(0.0, 0.5, depth/wave.wavelength);
+        let shoal = (1.0 + 0.22*shallow)*depth_limit;
+        let bed_weight = mix(1.0, shoal, shore.weight);
+        let slope = wave.amplitude*wave.wave_number*bed_weight;
         slope_variance += 0.5*slope*slope*(1.0 - pixel_weight*pixel_weight);
         let attenuation = waveAttenuation(wave.wavelength, mesh_footprint)
-                        * wave_weight*pixel_weight;
+                        * wave_weight*pixel_weight*bed_weight;
         if (attenuation <= 0.0)
         {
             continue;
@@ -216,6 +298,10 @@ fn sampleSurface(world_xz: vec2<f32>, mesh_footprint: f32,
                                   chop*wave.direction.y*dphz*cos_phase);
     }
 
+    let surf = shoreMotion(world_xz, shore, mesh_footprint, pixel_dx, pixel_dy);
+    offset.y += surf.height*wave_weight;
+    derivative_x.y += surf.slope.x*wave_weight;
+    derivative_z.y += surf.slope.y*wave_weight;
     let tangent_x = vec3<f32>(1.0, 0.0, 0.0) + derivative_x;
     let tangent_z = vec3<f32>(0.0, 0.0, 1.0) + derivative_z;
     let normal = normalize(cross(tangent_z, tangent_x));
@@ -229,6 +315,7 @@ fn sampleSurface(world_xz: vec2<f32>, mesh_footprint: f32,
         offset.y,
         jacobian,
         slope_variance,
+        surf.foam,
     );
 }
 
@@ -828,7 +915,7 @@ fn vs_main(
     // The shared distance includes the ring centre's camera-snap allowance.
     let wave_weight = 1.0 - smoothstepf(stage.flags.w*0.75, stage.flags.w, distance);
     let surface = sampleSurface(world_xz, sampleFootprint(distance, pixel_angle),
-                                vec2<f32>(0.0), vec2<f32>(0.0), wave_weight);
+                                vec2<f32>(0.0), vec2<f32>(0.0), wave_weight, sampleShore(world_xz));
     let world_position = vec3<f32>(surface.displaced.x,
                                    stage.params.z + surface.displaced.y,
                                    surface.displaced.z);
@@ -858,7 +945,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     let pixel_dx = dpdx(in.wave_position);
     let pixel_dy = dpdy(in.wave_position);
     let pixel_footprint = max(length(pixel_dx), length(pixel_dy));
-    let surface = sampleSurface(in.wave_position, 0.0, pixel_dx, pixel_dy, 1.0);
+    let shore = sampleShore(in.wave_position);
+    let surface = sampleSurface(in.wave_position, 0.0, pixel_dx, pixel_dy, 1.0, shore);
 
     // View space looks down -Z, so a *greater* z is nearer. The water
     // surface's own view-space z, to compare against the G-buffer's.
@@ -956,29 +1044,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     let sss = pow(crest, 2.0)*stage.sss_tint.rgb*max(to_sun.y, 0.0);
     body += sss*sun_colour*0.35;
 
-    // --- Whitecaps -----------------------------------------------------------
-    // Foam is a wave breaking, so this is a local event on the surface rather
-    // than a property of the sea as a whole.
-    //
-    // There used to be a second, depth-driven term alongside it — a ramp on
-    // `water_depth` down to zero — and it was wrong twice over. It painted this
-    // coast's whole shelf, which is shallow pretty much everywhere, so a ramp
-    // meant to mark the waterline saturated across most of the visible ocean
-    // and turned the sea into a milky sheet. And because `water_depth` is read
-    // back out of the G-buffer it arrives stair-stepped, so a hard threshold on
-    // it drew a straight, constant-profile boundary that cut the water into two
-    // flat fields — dark on one side, milk on the other. Depth alone cannot
-    // tell a calm shallow flat from surf, and here it labelled the former as
-    // the latter. Foam now comes only from the surface itself, which needs no
-    // depth and has no edge to fall off.
-    //
-    // `1 - jacobian` is the surface compression, so the top few per cent of it
-    // is where the wave has actually pitched over. The threshold is set against
-    // the measured distribution of that pinch (median 0.014, 99th percentile
-    // 0.23), not against a guess.
+    // --- Whitecaps and shoreline wash ----------------------------------------
+    // Only an energetic, breaking wave generates foam. The local seabed
+    // confines the shore term to a narrow band; a calm shallow flat stays clear.
     let whitecap = smoothstepf(0.10, 0.30, crest);
-    let foam = clamp(whitecap*0.70*foamBreakup(in.wave_position, pixel_footprint)
-                     *stage.misc.y, 0.0, 1.0);
+    let drift = vec2<f32>(cos(stage.flags.z), sin(stage.flags.z))*stage.params.x*0.075;
+    let foam_uv = in.wave_position - drift;
+    let coarse = mix(valueNoise(foam_uv*1.3), 0.5,
+                     smoothstepf(0.25, 0.75, pixel_footprint*1.3));
+    let bubbles = mix(valueNoise(foam_uv*5.7 + vec2<f32>(23.4, 7.1)), 0.5,
+                      smoothstepf(0.25, 0.75, pixel_footprint*5.7));
+    let lace = smoothstepf(0.22, 0.72, coarse*0.68 + bubbles*0.32);
+    let shore_foam = surface.shore_foam*mix(0.22, 1.15, lace);
+    let caps = whitecap*0.70*foamBreakup(foam_uv, pixel_footprint);
+    // Bubbles sit on the upper surface. Avoid a bright foam sheet underwater.
+    let above_water = smoothstepf(-0.08, 0.12, camera_position.y - in.world_position.y);
+    let foam = clamp((1.0 - (1.0 - caps)*(1.0 - shore_foam))*stage.misc.y, 0.0, 1.0)
+             * above_water;
     // Foam is a bright diffuse surface, so its radiance sits a little above the
     // sky it is lit by — not the two-and-a-half times that `sun_colour*0.25`
     // produced, which clipped the shore break to flat white.
@@ -986,7 +1068,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
                     * ((sun_colour*max(dot(normal, to_sun), 0.0)
                         + moon_colour*max(dot(normal, to_moon), 0.0))*0.05
                        + skyAmbient(normal)*0.75);
-    body = mix(body, foam_colour, foam);
 
     // --- Reflection ----------------------------------------------------------
     //
@@ -1043,6 +1124,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     let fresnel = clamp(godotFresnel(clamp(dot(normal, to_view), 0.0, 1.0),
                                      stage.surface.x, stage.surface.y), 0.0, 1.0);
     var lit = mix(body, reflected, fresnel) + specular*sun_colour + moon_specular*moon_colour;
+
+    // Foam is a diffuse layer above the reflecting surface: it replaces both
+    // transmission and reflection, including at grazing view angles.
+    lit = mix(lit, foam_colour, foam);
+    // Resolve the last few centimetres into the actual bank instead of a hard
+    // cutout. The measured ray length makes this agree with visible geometry.
+    let contact_coverage = smoothstepf(0.0, 0.12, optical_path);
+    lit = mix(scene_linear, lit, contact_coverage);
 
     // Raymarch aerial scattering only up to this water surface. Height fog,
     // sunset shafts and the volumetric switch now agree with the terrain pass.

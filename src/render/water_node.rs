@@ -25,7 +25,7 @@
 
 use crate::constants::SEA_LEVEL;
 use crate::render::cloud_node::CloudRenderState;
-use crate::render::terrain_node::TerrainNodeState;
+use crate::render::terrain_node::{shore_heightfield_mapping, TerrainNodeState};
 use crate::render::{globals_layout, ExtractedForestView, ForestGlobals, ForestShaderHandles};
 use crate::water::rings::{self, Patch};
 use crate::water::{
@@ -194,7 +194,8 @@ struct WaterInner {
     globals_group: Option<BindGroup>,
     samplers: Option<WaterSamplers>,
     /// Group 1 for the surface and blit passes: the composited frame at 0/8,
-    /// the G-buffer position at 1/9 and terrain heightfield at 2/10.
+    /// the G-buffer position at 1/9, lighting heightfield at 2/10, and local
+    /// seabed heightfield at 3/11.
     surface_screen: Option<BindGroupLayoutDescriptor>,
     /// Group 1 for the underwater pass; the same shape, its own layout so the
     /// two can diverge.
@@ -436,11 +437,11 @@ fn prepare_water(
         inner.samplers = Some(create_samplers(&device));
     }
     if inner.surface_screen.is_none() {
-        // Group 1: composited frame and terrain heightfield (bilinear), and
-        // G-buffer position (point). Texture N pairs with sampler N + 8.
+        // Group 1: composited frame and the lighting/seabed maps (bilinear),
+        // plus G-buffer position (point). Texture N pairs with sampler N + 8.
         inner.surface_screen = Some(screen_layout(
             "forest_water_surface_layout",
-            &[true, false, true],
+            &[true, false, true, true],
         ));
     }
     if inner.underwater_screen.is_none() {
@@ -480,8 +481,8 @@ fn prepare_water(
         inner.surface_frame = block.params;
         inner.wave_key = Some(wave_key);
         if let Some(stage) = inner.surface_stage.as_ref() {
-            // The static half: everything outside `params`, which is the one
-            // field the clock rewrites every frame. `params` sits in the middle
+            // The static half: everything outside `params`. The clock and
+            // seabed-map transform are rewritten below. `params` sits in the middle
             // of the block, so this is two writes — the prefix before it and the
             // suffix after it. Writing only the prefix would leave extinction,
             // scatter, surface, sss_tint, misc and flags at their zeroed
@@ -499,14 +500,19 @@ fn prepare_water(
         }
     }
 
-    // The clock is the only part of the block that moves every frame; it is the
-    // first field of `params`, so a 16-byte write at that offset carries it.
+    // Keep the clock and the local seabed mapping current without uploading
+    // the whole wave spectrum. The terrain capture uses this same mapping.
     inner.surface_frame[0] = water.elapsed;
     if let Some(stage) = inner.surface_stage.as_ref() {
         queue.write_buffer(
             &stage.buffer,
             SURFACE_PARAMS_OFFSET,
             bytemuck::bytes_of(&inner.surface_frame),
+        );
+        queue.write_buffer(
+            &stage.buffer,
+            std::mem::offset_of!(WaterStageUniforms, shore_map) as u64,
+            bytemuck::bytes_of(&shore_heightfield_mapping(globals.globals.camera_position)),
         );
     }
 
@@ -602,7 +608,14 @@ fn build_stage_uniforms(
         REFRACTION_SCALE,
         FOAM_SCALE,
         displacement_bounds(spectrum, flat).max(1e-3),
-        0.0,
+        if flat {
+            0.0
+        } else {
+            let variance = 0.5 * spectrum.waves.iter()
+                .map(|wave| wave.amplitude * wave.amplitude)
+                .sum::<f32>();
+            4.0 * variance.sqrt()
+        },
     ];
     block.flags = [
         if flat { 1.0 } else { 0.0 },
@@ -676,6 +689,9 @@ pub fn forest_water_surface_pass(
     let Some(gbuffer) = gbuffer_guard.as_ref() else {
         return;
     };
+    if !gbuffer.shore_heightfield_ready {
+        return;
+    }
     let Some(cloud_state) = world.get_resource::<CloudRenderState>() else {
         return;
     };
@@ -713,6 +729,7 @@ pub fn forest_water_surface_pass(
             &inner,
             &gbuffer.position_view,
             &gbuffer.heightfield_view,
+            &gbuffer.shore_heightfield_view,
             post_process.source,
         ),
     ) else {
@@ -1019,13 +1036,15 @@ pub fn forest_underwater_pass(
 // ---------------------------------------------------------------------------
 
 /// The surface and blit passes' group-1 bind group: the composited frame at 0/8,
-/// the G-buffer position at 1/9 and terrain heightfield at 2/10.
+/// the G-buffer position at 1/9, lighting heightfield at 2/10 and local seabed
+/// heightfield at 3/11.
 fn surface_group(
     device: &RenderDevice,
     cache: &PipelineCache,
     inner: &WaterInner,
     gbuffer_position: &wgpu::TextureView,
     heightfield: &wgpu::TextureView,
+    shore_heightfield: &wgpu::TextureView,
     source: &wgpu::TextureView,
 ) -> Option<BindGroup> {
     screen_group(
@@ -1037,6 +1056,7 @@ fn surface_group(
         gbuffer_position,
         source,
         Some(heightfield),
+        Some(shore_heightfield),
     )
 }
 
@@ -1056,6 +1076,7 @@ fn underwater_group(
         gbuffer_position,
         source,
         None,
+        None,
     )
 }
 
@@ -1068,6 +1089,7 @@ fn screen_group(
     gbuffer_position: &wgpu::TextureView,
     source: &wgpu::TextureView,
     heightfield: Option<&wgpu::TextureView>,
+    shore_heightfield: Option<&wgpu::TextureView>,
 ) -> Option<BindGroup> {
     let mut entries = vec![
         BindGroupEntry {
@@ -1099,6 +1121,18 @@ fn screen_group(
             },
         ]);
     }
+    if let Some(shore_heightfield) = shore_heightfield {
+        entries.extend([
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::TextureView(shore_heightfield),
+            },
+            BindGroupEntry {
+                binding: 11,
+                resource: BindingResource::Sampler(&samplers.linear_clamp),
+            },
+        ]);
+    }
     Some(super::bind_group(device, cache, label, layout, &entries))
 }
 
@@ -1110,7 +1144,11 @@ fn screen_layout(label: &'static str, filterable: &[bool]) -> BindGroupLayoutDes
     for (index, filterable) in filterable.iter().enumerate() {
         entries.push(BindGroupLayoutEntry {
             binding: index as u32,
-            visibility: ShaderStages::FRAGMENT,
+            visibility: if index >= 2 {
+                ShaderStages::VERTEX_FRAGMENT
+            } else {
+                ShaderStages::FRAGMENT
+            },
             ty: BindingType::Texture {
                 sample_type: TextureSampleType::Float { filterable: *filterable },
                 view_dimension: TextureViewDimension::D2,
@@ -1122,7 +1160,11 @@ fn screen_layout(label: &'static str, filterable: &[bool]) -> BindGroupLayoutDes
     for (index, filterable) in filterable.iter().enumerate() {
         entries.push(BindGroupLayoutEntry {
             binding: index as u32 + 8,
-            visibility: ShaderStages::FRAGMENT,
+            visibility: if index >= 2 {
+                ShaderStages::VERTEX_FRAGMENT
+            } else {
+                ShaderStages::FRAGMENT
+            },
             ty: BindingType::Sampler(if *filterable {
                 SamplerBindingType::Filtering
             } else {

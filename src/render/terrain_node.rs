@@ -10,7 +10,7 @@
 use crate::constants::*;
 use crate::render::gpu_textures::{GpuWorldTextures, GpuWorldTexturesOption};
 use crate::render::{
-    ExtractedForestView, ForestGlobals, ForestShaderHandles,
+    ExtractedForestView, ForestGlobals, ForestShaderHandles, GlobalUniformsGpu,
     TerrainStageUniforms,
 };
 use bevy::asset::Handle;
@@ -64,6 +64,26 @@ const TERRAIN_VERTEX_STRIDE: u64 = 12;
 pub const LIGHTING_HEIGHTFIELD_SIZE: u32 = 1024;
 pub const LIGHTING_HEIGHTFIELD_SPAN: f32 = 12288.0;
 
+/// Near-shore bathymetry resolves one-metre terrain features independently of
+/// the much wider lighting map. Whole-texel snapping keeps the sampled bed
+/// fixed in world space as the camera moves.
+pub const SHORE_HEIGHTFIELD_SIZE: u32 = 512;
+pub const SHORE_HEIGHTFIELD_SPAN: f32 = 512.0;
+
+/// Shared by the terrain capture and water sampling; xy = centre, z = span,
+/// w = metres per texel. One source prevents the shoreline drifting between
+/// the vertex and fragment passes or when crossing a snap boundary.
+pub fn shore_heightfield_mapping(camera_position: [f32; 4]) -> [f32; 4] {
+    let texel = SHORE_HEIGHTFIELD_SPAN / SHORE_HEIGHTFIELD_SIZE as f32;
+    let snap = texel * 8.0;
+    [
+        (camera_position[0] / snap).floor() * snap,
+        (camera_position[2] / snap).floor() * snap,
+        SHORE_HEIGHTFIELD_SPAN,
+        texel,
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Public view/state types
 // ---------------------------------------------------------------------------
@@ -76,6 +96,10 @@ pub struct GbufferTargets {
     pub albedo_view: wgpu::TextureView,   // Rgba8Unorm
     pub depth_view: wgpu::TextureView,    // Depth32Float
     pub heightfield_view: wgpu::TextureView, // R32Float world-space terrain height
+    pub shore_heightfield_view: wgpu::TextureView, // R32Float local seabed elevation
+    /// False until this frame's capture is encoded, including after resize or
+    /// while its pipeline is compiling. Water must never sample an empty map.
+    pub shore_heightfield_ready: bool,
     pub width: u32,
     pub height: u32,
 }
@@ -154,6 +178,8 @@ struct TerrainResources {
     terrain_textures: BindGroup,
     terrain_pipeline: CachedRenderPipelineId,
     heightfield_pipeline: CachedRenderPipelineId,
+    /// The same terrain-height shader rendered through a local map transform.
+    shore_globals: StageUniform,
     center_mesh: GpuMesh,
     ring_mesh: GpuMesh,
     /// One stage block per clipmap level, matching `DrawClipmap`'s per-level
@@ -177,7 +203,7 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
     //
     // Lock order: gbuffer first, then resources. No other system ever
     // holds both, so this cannot deadlock.
-    let gbuffer_guard = state
+    let mut gbuffer_guard = state
         .gbuffer
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -185,17 +211,14 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         .resources
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let (Some(gbuffer), Some(resources)) = (gbuffer_guard.as_ref(), resources_guard.as_ref())
+    let (Some(gbuffer), Some(resources)) = (gbuffer_guard.as_mut(), resources_guard.as_ref())
     else {
         return;
     };
     let Some(view) = world.get_resource::<ExtractedForestView>() else {
         return;
     };
-    // The globals resource is not read here — the terrain's group-0 bind
-    // group already wraps its buffer — but the pass must not run before it
-    // exists, so the lookup stays as an ordering guard.
-    let Some(_globals) = world.get_resource::<ForestGlobals>() else {
+    let Some(globals) = world.get_resource::<ForestGlobals>() else {
         return;
     };
     let Some(queue) = world.get_resource::<RenderQueue>() else {
@@ -250,6 +273,43 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         pass.set_bind_group(1, &resources.terrain_textures, &[]);
         pass.set_bind_group(2, &resources.levels[0].bind_group, &[]);
         pass.draw(0..3, 0..1);
+    }
+
+    // A separate one-metre map gives the water a world-space seabed, including
+    // off-screen shores. It follows the exact same terrain/erosion function as
+    // the mesh, and remains available when raymarched shadows are disabled.
+    gbuffer.shore_heightfield_ready = false;
+    if world
+        .get_resource::<super::water_node::ExtractedWater>()
+        .is_some_and(|water| water.draw)
+        && let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.heightfield_pipeline)
+    {
+        let mut local_globals = globals.globals;
+        local_globals.heightfield = shore_heightfield_mapping(local_globals.camera_position);
+        queue.write_buffer(&resources.shore_globals.buffer, 0, bytemuck::bytes_of(&local_globals));
+        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+            label: Some("forest_shore_heightfield"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &gbuffer.shore_heightfield_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_render_pipeline(pipeline);
+        pass.set_bind_group(0, &resources.shore_globals.bind_group, &[]);
+        pass.set_bind_group(1, &resources.terrain_textures, &[]);
+        pass.set_bind_group(2, &resources.levels[0].bind_group, &[]);
+        pass.draw(0..3, 0..1);
+        drop(pass);
+        gbuffer.shore_heightfield_ready = true;
     }
 
     // One pass, three colour targets + depth, cleared exactly like the
@@ -904,7 +964,7 @@ fn prepare_terrain(
 
     let heightfield_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("forest_lighting_heightfield_pipeline".into()),
-        layout: vec![globals_layout, terrain_textures_layout, terrain_stage_layout.clone()],
+        layout: vec![globals_layout.clone(), terrain_textures_layout, terrain_stage_layout.clone()],
         immediate_size: 0,
         vertex: VertexState {
             shader: shaders.terrain_vs.clone(),
@@ -943,6 +1003,13 @@ fn prepare_terrain(
         terrain_textures,
         terrain_pipeline,
         heightfield_pipeline,
+        shore_globals: StageUniform::new(
+            device,
+            &pipeline_cache,
+            &globals_layout,
+            "forest_shore_globals_uniform",
+            std::mem::size_of::<GlobalUniformsGpu>() as u64,
+        ),
         center_mesh: build_clip_mesh(device, false),
         ring_mesh: build_clip_mesh(device, true),
         levels,
@@ -1044,6 +1111,21 @@ pub(crate) fn resize_gbuffer(
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             }).create_view(&wgpu::TextureViewDescriptor::default()),
+            shore_heightfield_view: device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("forest_shore_heightfield"),
+                size: wgpu::Extent3d {
+                    width: SHORE_HEIGHTFIELD_SIZE,
+                    height: SHORE_HEIGHTFIELD_SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }).create_view(&wgpu::TextureViewDescriptor::default()),
+            shore_heightfield_ready: false,
             width,
             height,
         });

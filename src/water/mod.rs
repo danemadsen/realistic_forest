@@ -131,14 +131,17 @@ pub struct WaterStageUniforms {
     pub surface: [f32; 4],                             // 1408
     /// rgb subsurface tint, w tile resolution.
     pub sss_tint: [f32; 4],                            // 1424
-    /// x refraction scale, y foam scale, z max wave amplitude, w reserved.
+    /// x refraction scale, y foam scale, z max wave amplitude,
+    /// w significant wave height (4 * sqrt(sum(amplitude²) / 2)), metres.
     pub misc: [f32; 4],                                // 1440
     /// x flat-surface debug, y sea state amplitude, z wind radians, w wave fade end.
     pub flags: [f32; 4],                               // 1456
+    /// xy local seabed-map centre, z world span, w metres per texel.
+    pub shore_map: [f32; 4],                           // 1472
 }
 
 const _: () = assert!(std::mem::size_of::<GpuWave>() == 32);
-const _: () = assert!(std::mem::size_of::<WaterStageUniforms>() == 1472);
+const _: () = assert!(std::mem::size_of::<WaterStageUniforms>() == 1488);
 
 /// The submerged-camera medium block, group 2 binding 0 of the underwater
 /// pass.
@@ -169,6 +172,7 @@ impl Default for WaterStageUniforms {
             sss_tint: [0.06, 0.55, 0.45, WATER_TILE_RESOLUTION as f32],
             misc: [0.5, 1.0, 1.0, 0.0],
             flags: [0.0, 1.0, 0.0, rings::horizon_wave_fade_end()],
+            shore_map: [0.0; 4],
         }
     }
 }
