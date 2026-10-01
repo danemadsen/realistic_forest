@@ -98,6 +98,7 @@ pub struct ExtractedForestView {
     pub settings: AppSettings,
     pub day_night: DayNightCycle,
     pub weather_offset: [f32; 2],
+    pub weather: crate::weather::WeatherState,
     pub draw_ocean: bool,
     pub lookup_minimum: (i64, i64),
     pub frame: u64,
@@ -109,7 +110,7 @@ pub struct ExtractedForestView {
 // silently drift.
 // ---------------------------------------------------------------------------
 
-/// The shared `GlobalUniforms` preamble (group 0, binding 0), 352 bytes.
+/// The shared `GlobalUniforms` preamble (group 0, binding 0), 368 bytes.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GlobalUniformsGpu {
@@ -129,8 +130,9 @@ pub struct GlobalUniformsGpu {
     pub clouds: [f32; 4],
     pub cloud_layer: [f32; 4],
     pub cloud_motion: [f32; 4],
+    pub weather: [f32; 4],
 }
-const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 352);
+const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 368);
 
 /// terrain-vs + terrain-fs share one canonical StageUniforms layout
 /// (272 bytes); the WGSL files are reconciled to this exact field order.
@@ -543,6 +545,7 @@ fn extract_forest_view(
     view.settings = *world.resource::<AppSettings>();
     view.day_night = *world.resource::<DayNightCycle>();
     view.weather_offset = world.resource::<crate::weather::WeatherMotion>().offset;
+    view.weather = *world.resource::<crate::weather::WeatherState>();
     view.draw_ocean = world.resource::<WorldOptions>().draw_ocean;
     let cache = world.resource::<ErosionCache>();
     view.lookup_minimum = (cache.lookup_minimum.x, cache.lookup_minimum.z);
@@ -583,6 +586,7 @@ pub fn prepare_forest_globals(
     let camera = PlayerCamera::from_player(&player);
     let view_matrix = crate::matrices::view_matrix(camera.position, camera.target, camera.up);
     let lighting = crate::day_night::sample(view.day_night.time_hours);
+    let weather = view.weather.conditions(&view.settings);
     let heightfield_texel = terrain_node::LIGHTING_HEIGHTFIELD_SPAN
         / terrain_node::LIGHTING_HEIGHTFIELD_SIZE as f32;
     // Move by whole texels so the world-space sampling lattice stays fixed
@@ -595,6 +599,7 @@ pub fn prepare_forest_globals(
         sun_direction: lighting.sun_direction,
         viewport: [width, height, 1.0 / width, 1.0 / height],
         params: [
+            // Fog extinction is sampled by world position in the shader.
             view.settings.fog_density,
             FAR_PLANE,
             view.settings.exposure,
@@ -619,7 +624,7 @@ pub fn prepare_forest_globals(
         atmosphere: [
             lighting.daylight,
             lighting.moon_intensity,
-            view.day_night.time_hours,
+            weather.sky_overcast,
             view.settings.volumetric_strength,
         ],
         raymarch: [
@@ -649,6 +654,11 @@ pub fn prepare_forest_globals(
         cloud_motion: [
             view.weather_offset[0], view.weather_offset[1],
             view.settings.cloud_detail_strength, 40000.0,
+        ],
+        weather: [
+            view.weather_offset[0], view.weather_offset[1],
+            view.weather.climate_bias,
+            view.weather.override_bits() as f32,
         ],
     };
     if globals.buffer.is_none() {
@@ -743,6 +753,7 @@ mod tests {
             ("clouds", std::mem::offset_of!(GlobalUniformsGpu, clouds)),
             ("cloud_layer", std::mem::offset_of!(GlobalUniformsGpu, cloud_layer)),
             ("cloud_motion", std::mem::offset_of!(GlobalUniformsGpu, cloud_motion)),
+            ("weather", std::mem::offset_of!(GlobalUniformsGpu, weather)),
         ];
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
         let mut checked = 0;

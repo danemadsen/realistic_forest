@@ -60,12 +60,13 @@ struct GlobalUniforms {
     settings_b: vec4<f32>,        // x normal_strength, y sparkle_strength, z flow_debug(1/0), w erosion_debug(1/0)
     sun_colour: vec4<f32>,       // RGB solar tint, w unattenuated sun intensity
     moon_direction: vec4<f32>,   // xyz direction moonlight travels
-    atmosphere: vec4<f32>,       // daylight, moon intensity, hours, volumetric strength
+    atmosphere: vec4<f32>,       // daylight, moon intensity, local sky cover, volumetric strength
     raymarch: vec4<f32>,         // shadows, volumetrics, reflections, quality (0/1/2)
     heightfield: vec4<f32>,      // world centre XZ, world span, texel size in metres
     clouds: vec4<f32>,          // enabled, coverage, density, base altitude
     cloud_layer: vec4<f32>,     // thickness, shape scale, shadow strength, quality
     cloud_motion: vec4<f32>,    // wind offset XZ, detail strength, maximum distance
+    weather: vec4<f32>, // front offset XZ, climate bias, explicit cloud overrides
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 

@@ -8,9 +8,12 @@
 //! `--raymarch-quality low|balanced|high` selects their sampling budget.
 //! `--no-clouds` disables clouds independently; `--cloud-coverage`,
 //! `--cloud-density`, `--cloud-base` and `--cloud-thickness` set cloud weather.
+//! `--weather` biases the spatial weather map and `--static-weather` freezes
+//! its moving fronts without removing variation between locations.
 
 use crate::constants::AppSettings;
 use crate::erosion::TileKey;
+use crate::weather::WeatherPreset;
 use bevy::prelude::Resource;
 
 /// `--camera x,y,z,yawDeg,pitchDeg` pins the player at a world pose (useful
@@ -51,10 +54,17 @@ pub struct AutomationSettings {
     pub no_raymarch: bool,
     pub raymarch_quality: u32,
     pub no_clouds: bool,
+    /// Initial weather condition. Live weather changes unless static_weather is set.
+    pub weather_preset: WeatherPreset,
+    pub static_weather: bool,
     pub cloud_coverage: f32,
+    pub cloud_coverage_override: bool,
     pub cloud_density: f32,
+    pub cloud_density_override: bool,
     pub cloud_base_height: f32,
+    pub cloud_base_override: bool,
     pub cloud_thickness: f32,
+    pub cloud_thickness_override: bool,
     pub overlap_tile: TileKey,
 }
 
@@ -83,10 +93,16 @@ impl Default for AutomationSettings {
             no_raymarch: false,
             raymarch_quality: 1,
             no_clouds: false,
+            weather_preset: WeatherPreset::Cloudy,
+            static_weather: false,
             cloud_coverage: render_settings.cloud_coverage,
+            cloud_coverage_override: false,
             cloud_density: render_settings.cloud_density,
+            cloud_density_override: false,
             cloud_base_height: render_settings.cloud_base_height,
+            cloud_base_override: false,
             cloud_thickness: render_settings.cloud_thickness,
+            cloud_thickness_override: false,
             overlap_tile: TileKey { x: 0, z: 0 },
         }
     }
@@ -167,6 +183,25 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--advance-time" => advance_capture_time = true,
             "--no-raymarch" => automation.no_raymarch = true,
             "--no-clouds" => automation.no_clouds = true,
+            "--static-weather" => automation.static_weather = true,
+            "--weather" => {
+                let preset = next.and_then(|value| match value.as_str() {
+                    "clear" => Some(WeatherPreset::Clear),
+                    "cloudy" => Some(WeatherPreset::Cloudy),
+                    "overcast" => Some(WeatherPreset::Overcast),
+                    "fog" | "whiteout" => Some(WeatherPreset::Fog),
+                    _ => None,
+                });
+                if let Some(preset) = preset {
+                    automation.weather_preset = preset;
+                    index += 1;
+                } else {
+                    eprintln!("WARNING: --weather expects clear, cloudy, overcast or fog");
+                    if next.is_some_and(|value| !value.starts_with("--")) {
+                        index += 1;
+                    }
+                }
+            }
             "--cloud-coverage" | "--cloud-density" | "--cloud-base" | "--cloud-thickness" => {
                 let bounds = match flag {
                     "--cloud-coverage" => 0.0..=1.0,
@@ -179,10 +214,22 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                     .filter(|value| value.is_finite() && bounds.contains(value));
                 if let Some(value) = parsed {
                     match flag {
-                        "--cloud-coverage" => automation.cloud_coverage = value,
-                        "--cloud-density" => automation.cloud_density = value,
-                        "--cloud-base" => automation.cloud_base_height = value,
-                        _ => automation.cloud_thickness = value,
+                        "--cloud-coverage" => {
+                            automation.cloud_coverage = value;
+                            automation.cloud_coverage_override = true;
+                        }
+                        "--cloud-density" => {
+                            automation.cloud_density = value;
+                            automation.cloud_density_override = true;
+                        }
+                        "--cloud-base" => {
+                            automation.cloud_base_height = value;
+                            automation.cloud_base_override = true;
+                        }
+                        _ => {
+                            automation.cloud_thickness = value;
+                            automation.cloud_thickness_override = true;
+                        }
                     }
                     index += 1;
                 } else {
@@ -353,6 +400,24 @@ mod tests {
         assert!(parse(&["--shot", "test.png"]).pause_time);
         assert!(!parse(&["--shot", "test.png", "--advance-time"]).pause_time);
         assert!(parse(&["--shot", "test.png", "--advance-time", "--pause-time"]).pause_time);
+    }
+
+    #[test]
+    fn weather_flags_select_starting_condition_and_preserve_following_flags() {
+        for (name, preset) in [
+            ("clear", WeatherPreset::Clear),
+            ("cloudy", WeatherPreset::Cloudy),
+            ("overcast", WeatherPreset::Overcast),
+            ("fog", WeatherPreset::Fog),
+            ("whiteout", WeatherPreset::Fog),
+        ] {
+            let settings = parse(&["--weather", name, "--static-weather"]);
+            assert_eq!(settings.weather_preset, preset);
+            assert!(settings.static_weather);
+        }
+        let settings = parse(&["--weather", "rain", "--no-clouds"]);
+        assert_eq!(settings.weather_preset, WeatherPreset::Cloudy);
+        assert!(settings.no_clouds);
     }
 
     #[test]

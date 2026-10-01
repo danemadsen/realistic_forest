@@ -6,6 +6,7 @@ struct GlobalUniforms {
     settings_a: vec4<f32>, settings_b: vec4<f32>, sun_colour: vec4<f32>,
     moon_direction: vec4<f32>, atmosphere: vec4<f32>, raymarch: vec4<f32>,
     heightfield: vec4<f32>, clouds: vec4<f32>, cloud_layer: vec4<f32>, cloud_motion: vec4<f32>,
+    weather: vec4<f32>, // front offset XZ, climate bias, explicit cloud overrides
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 struct GrassFrame {

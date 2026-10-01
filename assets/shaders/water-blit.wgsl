@@ -30,6 +30,7 @@ struct GlobalUniforms
     clouds: vec4<f32>,          // enabled, coverage, density, base altitude
     cloud_layer: vec4<f32>,     // thickness, shape scale, shadow strength, quality
     cloud_motion: vec4<f32>,    // wind offset XZ, detail strength, maximum distance
+    weather: vec4<f32>, // front offset XZ, climate bias, explicit cloud overrides
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 

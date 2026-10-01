@@ -1,7 +1,7 @@
 //! Periodic density noise and a raymarched, all-direction cloud reflection
 //! probe. The main atmosphere pass uses the same density and lighting model.
 
-use super::{globals_layout, ForestGlobals, ForestShaderHandles};
+use super::{ForestGlobals, ForestShaderHandles, globals_layout};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
     BindGroup, BindGroupLayoutDescriptor, CachedRenderPipelineId, FragmentState, PipelineCache,
@@ -10,6 +10,7 @@ use bevy::render::render_resource::{
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
 
 const NOISE_SIZE: u32 = 64;
+const NOISE_MIP_COUNT: u32 = 7;
 pub const PROBE_WIDTH: u32 = 256;
 pub const PROBE_HEIGHT: u32 = 128;
 
@@ -122,28 +123,42 @@ fn prepare_clouds(
                 height: NOISE_SIZE,
                 depth_or_array_layers: NOISE_SIZE,
             },
-            mip_level_count: 1,
+            mip_level_count: NOISE_MIP_COUNT,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &noise,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &build_noise(),
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(NOISE_SIZE * 4),
-            rows_per_image: Some(NOISE_SIZE),
-        },
-        noise.size(),
-    );
+    // Average each 3D octave into a mip chain. Long, near-horizontal rays
+    // otherwise alias the small Worley cells into visible depth slices.
+    let mut noise_data = build_noise();
+    let mut mip_size = NOISE_SIZE;
+    for mip_level in 0..NOISE_MIP_COUNT {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &noise,
+                mip_level,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &noise_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(mip_size * 4),
+                rows_per_image: Some(mip_size),
+            },
+            wgpu::Extent3d {
+                width: mip_size,
+                height: mip_size,
+                depth_or_array_layers: mip_size,
+            },
+        );
+        if mip_size > 1 {
+            noise_data = downsample_noise(&noise_data, mip_size);
+            mip_size /= 2;
+        }
+    }
     let noise_view = noise.create_view(&default());
     let repeat = device
         .wgpu_device()
@@ -154,6 +169,7 @@ fn prepare_clouds(
             address_mode_w: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..default()
         });
     let probe_texture = device
@@ -228,8 +244,13 @@ fn prepare_clouds(
             resource: wgpu::BindingResource::Sampler(&repeat),
         },
     ];
-    let noise_group =
-        super::bind_group(&device, &cache, "forest_cloud_noise", &noise_layout, &noise_bindings);
+    let noise_group = super::bind_group(
+        &device,
+        &cache,
+        "forest_cloud_noise",
+        &noise_layout,
+        &noise_bindings,
+    );
     let group = super::bind_group(
         &device,
         &cache,
@@ -257,8 +278,13 @@ fn prepare_clouds(
         &super::globals_bind_group_entries(globals_buffer),
     );
     let empty_layout = BindGroupLayoutDescriptor::new("forest_cloud_empty_layout", &[]);
-    let empty_group =
-        super::bind_group(&device, &cache, "forest_cloud_empty_group", &empty_layout, &[]);
+    let empty_group = super::bind_group(
+        &device,
+        &cache,
+        "forest_cloud_empty_group",
+        &empty_layout,
+        &[],
+    );
     let pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("forest_cloud_probe_pipeline".into()),
         layout: vec![
@@ -392,6 +418,33 @@ fn build_noise() -> Vec<u8> {
         }
     }
     data
+}
+
+fn downsample_noise(source: &[u8], size: u32) -> Vec<u8> {
+    let next = size / 2;
+    let mut result = vec![0; (next * next * next * 4) as usize];
+    for z in 0..next {
+        for y in 0..next {
+            for x in 0..next {
+                for channel in 0..4 {
+                    let mut sum = 0u32;
+                    for dz in 0..2 {
+                        for dy in 0..2 {
+                            for dx in 0..2 {
+                                let index =
+                                    ((((2 * z + dz) * size + 2 * y + dy) * size + 2 * x + dx) * 4
+                                        + channel) as usize;
+                                sum += source[index] as u32;
+                            }
+                        }
+                    }
+                    let index = (((z * next + y) * next + x) * 4 + channel) as usize;
+                    result[index] = ((sum + 4) / 8) as u8;
+                }
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]

@@ -1,21 +1,91 @@
 // Shared linear atmosphere model. Kept byte-for-byte in the composite and
 // water passes so reflected skies and the visible horizon agree.
+// Broad moving fronts vary the conditions with world position. The CPU uses
+// the same field for the player's local lighting and UI weather readout.
+fn weatherSeverity(world_xz: vec2<f32>) -> f32 {
+    let p = (world_xz - globals.weather.xy)/8000.0;
+    let score = clamp(0.523
+                      + 0.25*sin(0.83*p.x + 0.37*p.y)
+                      + 0.18*sin(-0.49*p.x + 0.91*p.y + 0.3)
+                      + 0.08*sin(1.73*p.x - 1.37*p.y - 1.2), 0.0, 1.0);
+    var base = 0.0;
+    if (score < 0.50) {
+        base = clamp((score - 0.20)/0.30, 0.0, 1.0);
+    } else if (score < 0.70) {
+        base = 1.0 + (score - 0.50)/0.20;
+    } else {
+        base = 2.0 + clamp((score - 0.70)/0.18, 0.0, 1.0);
+    }
+    return clamp(base + globals.weather.z, 0.0, 3.0);
+}
+
+fn weatherFogMultiplier(severity: f32) -> f32 {
+    if (severity < 1.0) { return mix(0.48, 1.0, severity); }
+    if (severity < 2.0) { return mix(1.0, 2.4, severity - 1.0); }
+    return mix(2.4, 250.0, severity - 2.0);
+}
+
+fn weatherSunMultiplier(severity: f32) -> f32 {
+    if (severity < 1.0) { return mix(1.08, 1.0, severity); }
+    if (severity < 2.0) { return mix(1.0, 0.38, severity - 1.0); }
+    return mix(0.38, 0.14, severity - 2.0);
+}
+
+fn weatherSkyCover(severity: f32) -> f32 {
+    if (severity <= 1.0) { return 0.0; }
+    if (severity <= 2.0) { return 0.8*(severity - 1.0); }
+    return mix(0.8, 1.0, severity - 2.0);
+}
+
+fn weatherFogAmbient(severity: f32, daylight: f32) -> vec3<f32> {
+    let sky_cover = weatherSkyCover(severity);
+    let overcast = smoothstep(0.05, 0.9, sky_cover);
+    let whiteout = smoothstep(0.78, 1.0, sky_cover);
+    let night_ambient = mix(vec3<f32>(0.012, 0.019, 0.037),
+                            vec3<f32>(0.021, 0.024, 0.028), overcast);
+    let day_ambient = mix(mix(vec3<f32>(0.32, 0.44, 0.59),
+                              vec3<f32>(0.40, 0.43, 0.43), overcast),
+                          vec3<f32>(0.67, 0.69, 0.68), whiteout);
+    return mix(night_ambient, day_ambient, clamp(daylight, 0.0, 1.0));
+}
+
 fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
     let ray = normalize(direction);
     let to_sun = -normalize(globals.sun_direction.xyz);
     let to_moon = -normalize(globals.moon_direction.xyz);
     let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    // Weather transitions continuously from the clear blue dome to a diffuse
+    // gray overcast, then to the nearly directionless sky of a whiteout.
+    // A grazing view looks across weather several kilometres away, while a
+    // steep view samples the front above the player. This lets blue gaps and
+    // gray clouded regions share the same sky without a camera-wide switch.
+    let cloud_distance = max((globals.clouds.w - globals.camera_position.y)
+                             /max(ray.y, 0.08), 0.0);
+    let horizon_distance = 12000.0*(1.0 - smoothstep(0.08, 0.8, ray.y));
+    let sky_xz = globals.camera_position.xz + ray.xz
+                 *clamp(max(cloud_distance, horizon_distance), 0.0, 16000.0);
+    let sky_cover = weatherSkyCover(weatherSeverity(sky_xz));
+    let overcast = smoothstep(0.05, 0.9, sky_cover);
+    let whiteout = smoothstep(0.78, 1.0, sky_cover);
     let elevation = smoothstep(0.0, 0.85, ray.y);
     let day_sky = mix(vec3<f32>(0.49, 0.64, 0.82),
                       vec3<f32>(0.045, 0.175, 0.43), elevation);
     let night_sky = mix(vec3<f32>(0.008, 0.013, 0.027),
                         vec3<f32>(0.0014, 0.0025, 0.008), elevation);
-    var sky = mix(night_sky, day_sky, daylight);
+    let clouded_day_sky = mix(vec3<f32>(0.40, 0.43, 0.43),
+                              vec3<f32>(0.28, 0.32, 0.34), elevation);
+    let clouded_night_sky = mix(vec3<f32>(0.018, 0.022, 0.028),
+                                vec3<f32>(0.009, 0.013, 0.021), elevation);
+    let weather_day_sky = mix(mix(day_sky, clouded_day_sky, overcast),
+                              vec3<f32>(0.64, 0.66, 0.65), whiteout);
+    let weather_night_sky = mix(night_sky, clouded_night_sky, overcast);
+    var sky = mix(weather_night_sky, weather_day_sky, daylight);
     let sunset = exp(-pow((to_sun.y + 0.025)/0.17, 2.0));
     let horizon = exp(-abs(ray.y)*6.0);
     let sunward = pow(max(dot(normalize(vec3<f32>(ray.x, 0.001, ray.z)),
                               normalize(vec3<f32>(to_sun.x, 0.001, to_sun.z))), 0.0), 5.0);
-    sky += vec3<f32>(0.65, 0.16, 0.025)*sunset*horizon*(0.15 + 0.85*sunward);
+    sky += vec3<f32>(0.65, 0.16, 0.025)*sunset*horizon*(0.15 + 0.85*sunward)
+           *(1.0 - overcast);
 
     let sun_mu = clamp(dot(ray, to_sun), -1.0, 1.0);
     let sun_visible = smoothstep(-0.018, 0.012, to_sun.y);
@@ -23,13 +93,13 @@ fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
     let sun_halo = exp(-(1.0 - sun_mu)*750.0)*0.10
                    + pow(max(sun_mu, 0.0), 24.0)*0.035;
     // Direct ground irradiance fades before the visible solar disc sets.
-    sky += globals.sun_colour.rgb*sun_visible
+    sky += globals.sun_colour.rgb*sun_visible*(1.0 - overcast)
            *(sun_disk*14.0*globals.sun_colour.w + sun_halo*globals.settings_a.x);
 
     let moon_mu = clamp(dot(ray, to_moon), -1.0, 1.0);
     let moon_disk = smoothstep(0.999978, 0.999986, moon_mu);
     let moon_visible = smoothstep(-0.02, 0.03, to_moon.y)*(1.0 - daylight*0.9);
-    sky += vec3<f32>(0.63, 0.74, 1.0)*moon_visible
+    sky += vec3<f32>(0.63, 0.74, 1.0)*moon_visible*(1.0 - overcast)
            *(moon_disk*1.6 + exp(-(1.0 - moon_mu)*500.0)*0.025);
 
     // Stars occupy a world-oriented angular grid and remain stationary when
@@ -41,18 +111,29 @@ fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
     let star_disc = 1.0 - smoothstep(0.035, 0.18, length(star_local));
     let star = step(0.997, star_hash)*star_disc*(0.25 + 0.75*star_hash);
     sky += vec3<f32>(0.6, 0.73, 1.0)*star*pow(1.0 - daylight, 4.0)
+           *(1.0 - overcast)
            *smoothstep(-0.03, 0.18, ray.y)*0.7;
     return max(sky, vec3<f32>(0.0));
 }
 
 // Hemisphere-integrated fill depends on the surface orientation and time of
 // day, never its screen row or camera pitch. Excludes the celestial discs.
-fn skyAmbient(normal_world: vec3<f32>) -> vec3<f32> {
+fn skyAmbient(normal_world: vec3<f32>, world_xz: vec2<f32>) -> vec3<f32> {
     let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    let sky_cover = weatherSkyCover(weatherSeverity(world_xz));
+    let overcast = smoothstep(0.05, 0.9, sky_cover);
+    let whiteout = smoothstep(0.78, 1.0, sky_cover);
     let upward = clamp(normal_world.y*0.5 + 0.5, 0.0, 1.0);
-    let day_fill = mix(vec3<f32>(0.13, 0.17, 0.22),
-                       vec3<f32>(0.32, 0.44, 0.62), upward);
-    let night_fill = mix(vec3<f32>(0.007, 0.011, 0.022),
-                         vec3<f32>(0.019, 0.029, 0.058), upward);
+    let clear_day_fill = mix(vec3<f32>(0.13, 0.17, 0.22),
+                             vec3<f32>(0.32, 0.44, 0.62), upward);
+    let clouded_day_fill = mix(vec3<f32>(0.17, 0.19, 0.19),
+                               vec3<f32>(0.30, 0.34, 0.35), upward);
+    let day_fill = mix(mix(clear_day_fill, clouded_day_fill, overcast),
+                       vec3<f32>(0.52, 0.55, 0.54), whiteout);
+    let clear_night_fill = mix(vec3<f32>(0.007, 0.011, 0.022),
+                               vec3<f32>(0.019, 0.029, 0.058), upward);
+    let clouded_night_fill = mix(vec3<f32>(0.008, 0.010, 0.014),
+                                 vec3<f32>(0.014, 0.018, 0.025), upward);
+    let night_fill = mix(clear_night_fill, clouded_night_fill, overcast);
     return mix(night_fill, day_fill, daylight);
 }

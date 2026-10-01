@@ -54,6 +54,15 @@ full day in 24 real minutes. **Raymarched lighting** exposes terrain shadows,
 volumetric sunlight, water reflections, quality and light shaft strength;
 **Rendering** includes fog density, sun intensity and exposure.
 
+**Weather** has moving fronts, so Clear, Cloudy, Overcast, and Fog / Whiteout
+can occur in different parts of the world at the same time. The starting area
+is Cloudy; local weather changes as fronts pass or the player travels. The F1
+condition selector biases the map toward a chosen condition while retaining
+local variation, and its transition control blends that bias over 75 seconds
+by default. Weather changes cloud amount and altitude, moving shadows, sun
+strength, sky color, and atmospheric visibility together. Fog / Whiteout
+produces short-range visibility and a diffuse, nearly colorless sky by day.
+
 **Volumetric clouds** controls cloud coverage, density, base altitude, layer
 thickness, wind speed and direction, and shadow strength. **Cloud shape** expands
 formation scale and edge detail controls. Clouds start enabled with coverage
@@ -79,8 +88,10 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--no-fog`, `--no-water` | Disable those stages |
 | `--time-of-day H` | Start at hour `H` in `[0, 24)`; default `10` |
 | `--day-length MIN` | Positive real minutes per complete day; default `24` |
-| `--pause-time` | Hold the selected time of day and freeze cloud wind |
-| `--advance-time` | Allow the day/night cycle and cloud wind to advance during a screenshot run |
+| `--pause-time` | Hold the selected time of day and freeze weather fronts and cloud wind |
+| `--advance-time` | Allow the day/night cycle, weather, and cloud wind to advance during a screenshot run |
+| `--weather clear\|cloudy\|overcast\|fog` | Bias the spatial weather map toward a chosen condition; default `cloudy` (`whiteout` also selects fog) |
+| `--static-weather` | Freeze weather fronts in place; conditions still vary by location |
 | `--raymarch-quality low\|balanced\|high` | Choose the ray sampling budget; default `balanced` (also accepts `0`, `1`, `2`) |
 | `--no-raymarch` | Disable raymarched terrain shadows, volumetric integration, clouds and terrain reflections on water |
 | `--no-clouds` | Disable cloud rendering and cloud shadows independently |
@@ -89,7 +100,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--cloud-base M` | Cloud base altitude in `[100, 6000]` metres; default `1300` |
 | `--cloud-thickness M` | Layer thickness in `[100, 4000]` metres; default `1200` |
 
-Screenshot runs freeze the celestial clock and cloud wind automatically, so
+Screenshot runs freeze the celestial clock, weather fronts, and cloud wind automatically, so
 erosion warm-up does not change the selected weather or lighting. Keep the same
 camera and `--wait` value when comparing settings. For example, these capture noon, dusk and night from
 the same elevated position above spawn:
@@ -363,10 +374,12 @@ uniform fog approximation.
 Water integrates the same atmosphere up to its own surface with a smaller
 sample budget, so haze and shafts follow the shoreline rather than the seabed.
 
-Clouds occupy a world-space volume with a configurable base and thickness.
-Periodic 3D fractal and Worley noise build rounded cumulus formations with
-flatter bases, irregular coverage and eroded edges. View rays integrate density
-and transmittance through the volume; secondary rays toward the sun or moon
+Clouds occupy a world-space volume whose base, thickness and coverage follow
+the local weather front. Periodic 3D fractal and Worley noise build rounded
+cumulus formations with irregular coverage, varied tops and eroded edges.
+Progressive view-ray steps resolve nearby cloud surfaces when flying through
+the layer, and filtered 3D noise limits distant sampling artifacts. View rays
+integrate density and transmittance through the volume; secondary rays toward the sun or moon
 produce shadowed interiors, warm sunset lighting and bright edges around the
 sun. Multiple scattering is approximated to retain light inside dense clouds.
 The same wind-driven density casts moving shadows over terrain, water and fog.

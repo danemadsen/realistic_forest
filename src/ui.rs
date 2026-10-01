@@ -44,6 +44,7 @@ use crate::noise::NoiseField;
 use crate::player::{Player, PlayerCamera, UiWantsInput};
 use crate::render::gpu_textures::GpuWorldTexturesOption;
 use crate::water::{WaterOptics, WaterSettings};
+use crate::weather::{WeatherPreset, WeatherState};
 use bevy::math::Vec3;
 use bevy::prelude::*;
 use bevy::render::render_phase::TrackedRenderPass;
@@ -83,6 +84,7 @@ pub fn draw_diagnostics_ui(
     mut erosion_settings: ResMut<ErosionSettings>,
     mut water_settings: ResMut<WaterSettings>,
     mut day_night: ResMut<DayNightCycle>,
+    mut weather: ResMut<WeatherState>,
     cache: Res<ErosionCache>,
     noise: Res<NoiseField>,
     players: Query<&Player>,
@@ -103,6 +105,7 @@ pub fn draw_diagnostics_ui(
             &mut erosion_settings,
             &mut water_settings,
             &mut day_night,
+            &mut weather,
             &cache,
             player,
             &mut rerun,
@@ -154,6 +157,7 @@ fn draw_diagnostics_window(
     erosion_settings: &mut ErosionSettings,
     water_settings: &mut WaterSettings,
     day_night: &mut DayNightCycle,
+    weather: &mut WeatherState,
     cache: &ErosionCache,
     player: &Player,
     rerun: &mut RerunErosion,
@@ -219,6 +223,41 @@ fn draw_diagnostics_window(
                 cache.stats.erosion_detail, cache.stats.flow_axis_bias
             ));
 
+            separator_text(ui, "Weather");
+            ui.checkbox(&mut weather.automatic, "Moving weather fronts");
+            egui::ComboBox::from_label("Weather trend")
+                .selected_text(weather.target.label())
+                .show_ui(ui, |ui| {
+                    for preset in WeatherPreset::ALL {
+                        if ui.selectable_label(weather.target == preset, preset.label()).clicked() {
+                            weather.set_target(preset);
+                        }
+                    }
+                });
+            if weather.is_transitioning() {
+                ui.label(format!("Changing to {}", weather.target.label()));
+            }
+            ui.small("Conditions vary by location; fronts move with the wind.");
+            let visibility = weather.visibility_metres(settings, player.position.y);
+            let visibility_label = if !visibility.is_finite() || visibility >= 40_000.0 {
+                ">40 km".to_owned()
+            } else if visibility >= 1000.0 {
+                format!("~{:.1} km", visibility / 1000.0)
+            } else {
+                format!("~{:.0} m", visibility)
+            };
+            ui.label(format!(
+                "Here: {} · visibility {}",
+                weather.local_condition().label(),
+                visibility_label,
+            ));
+            ui.add(
+                egui::Slider::new(&mut weather.transition_seconds, 10.0..=180.0)
+                    .text("Trend transition")
+                    .suffix(" s")
+                    .fixed_decimals(0),
+            );
+
             separator_text(ui, "Sun and time");
             ui.add(
                 egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99)
@@ -267,6 +306,7 @@ fn draw_diagnostics_window(
             );
 
             separator_text(ui, "Volumetric clouds");
+            ui.small("Cloud controls set the cloudy baseline; weather adjusts coverage, height, and density.");
             ui.checkbox(&mut settings.clouds_enabled, "Clouds");
             ui.add_enabled_ui(settings.clouds_enabled, |ui| {
                 ui.add(

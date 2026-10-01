@@ -264,6 +264,19 @@ fn main() {
             day_length_minutes: automation.day_length_minutes,
         })
         .init_resource::<weather::WeatherMotion>()
+        .insert_resource({
+            let mut weather = weather::WeatherState::from_preset(
+                automation.weather_preset,
+                !automation.static_weather,
+            );
+            weather.overrides = weather::WeatherOverrides {
+                coverage: automation.cloud_coverage_override,
+                density: automation.cloud_density_override,
+                base: automation.cloud_base_override,
+                thickness: automation.cloud_thickness_override,
+            };
+            weather
+        })
         .init_resource::<ErosionCache>()
         .insert_resource(ErosionSettings::default())
         .insert_resource(AppliedErosionSettings(ErosionSettings::default()))
