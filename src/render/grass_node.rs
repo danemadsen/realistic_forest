@@ -236,7 +236,13 @@ fn prepare_grass(
                     m.metallic_factor,
                     m.roughness_factor,
                 ],
-                shape: [model.height, model.radius, m.occlusion_strength, 0.0],
+                shape: [
+                    model.height,
+                    model.radius,
+                    m.occlusion_strength,
+                    m.base_color
+                        .visible_mean_luminance(m.base_color_factor, m.alpha_cutoff),
+                ],
             };
             let buffer = device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
                 label: Some("grass_material_uniform"),
@@ -453,7 +459,7 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
             },
             wgpu::BindGroupEntry {
                 binding: 3,
-                resource: wgpu::BindingResource::TextureView(&gbuffer.grass_ground_albedo_view),
+                resource: wgpu::BindingResource::TextureView(&gbuffer.grass_ground_average_view),
             },
         ],
     );

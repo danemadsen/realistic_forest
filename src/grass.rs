@@ -356,6 +356,33 @@ fn generate_tangents(
 }
 
 impl GrassTexture {
+    /// Average the visible blade texels in linear light. The render shader
+    /// uses this to keep a grayscale atlas's texture contrast while letting
+    /// the terrain, rather than atlas brightness, set each clump's mean color.
+    pub fn visible_mean_luminance(&self, factor: [f32; 4], alpha_cutoff: f32) -> f32 {
+        let mut weighted_luminance = 0.0;
+        let mut weight_sum = 0.0;
+        for pixel in self.rgba.chunks_exact(4) {
+            let alpha = pixel[3] as f32 / 255.0 * factor[3];
+            if alpha < alpha_cutoff {
+                continue;
+            }
+            let linear = [
+                srgb_to_linear(pixel[0] as f32 / 255.0) * factor[0],
+                srgb_to_linear(pixel[1] as f32 / 255.0) * factor[1],
+                srgb_to_linear(pixel[2] as f32 / 255.0) * factor[2],
+            ];
+            weighted_luminance +=
+                (linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722) * alpha;
+            weight_sum += alpha;
+        }
+        if weight_sum > 0.0 {
+            weighted_luminance / weight_sum
+        } else {
+            1.0
+        }
+    }
+
     /// Mips filter color in linear light and premultiply cutout alpha to avoid
     /// dark fringes. Coverage preservation keeps thin blades visible in mips.
     pub fn mip_chain(&self, srgb: bool, alpha_cutoff: Option<f32>) -> Vec<Self> {

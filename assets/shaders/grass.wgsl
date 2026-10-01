@@ -20,7 +20,7 @@ struct GrassFrame {
 struct GrassMaterial {
     colour: vec4<f32>,
     pbr: vec4<f32>, // alpha cutoff, normal strength, metal factor, rough factor
-    shape: vec4<f32>, // original height, root radius, AO strength, unused
+    shape: vec4<f32>, // original height, root radius, AO strength, visible atlas mean luminance
 };
 @group(2) @binding(0) var base_colour: texture_2d<f32>;
 @group(2) @binding(1) var normal_map: texture_2d<f32>;
@@ -35,7 +35,7 @@ struct GrassOut {
     @location(3) uv: vec2<f32>,
     @location(4) tint: f32,
     @location(5) blade_height: f32,
-    @location(6) ground_albedo: vec3<f32>,
+    @location(6) ground_average: vec3<f32>,
 };
 fn habitatUV(xz: vec2<f32>) -> vec2<f32> {
     return (xz - frame.mapping.xy) / frame.mapping.z + 0.5;
@@ -121,10 +121,9 @@ fn vs_main(
     out.uv = uv;
     out.tint = tint;
     out.blade_height = blade;
-    // One colour per rooted clump: use the same terrain material evaluation
-    // that supplied its habitat and height, before lighting or cloud shadow.
-    out.ground_albedo = textureSampleLevel(grass_ground_albedo, habitat_sampler,
-                                           habitatUV(root), 0.0).rgb;
+    // One averaged terrain colour per rooted clump, before lighting and shadow.
+    out.ground_average = textureSampleLevel(grass_ground_albedo, habitat_sampler,
+                                            habitatUV(root), 0.0).rgb;
     return out;
 }
 struct Gbuffer {
@@ -144,19 +143,24 @@ fn fs_main(input: GrassOut, @builtin(front_facing) front: bool) -> Gbuffer {
     var worldNormal = normalize(t * sampledNormal.x * material.pbr.y
                              + b * sampledNormal.y * material.pbr.y + n * sampledNormal.z);
     worldNormal = select(-worldNormal, worldNormal, front);
+    // A two-sided leaf still faces the sky on its back. Negating all three
+    // components would aim half the cards into the soil and shade them black.
+    worldNormal = normalize(vec3<f32>(worldNormal.x, abs(worldNormal.y), worldNormal.z));
     // The existing composite provides sunlight, sky, terrain/cloud shadows,
     // fog and grass transmission; foliage shares SSAO and water occlusion.
     let viewNormal = normalize((globals.view * vec4<f32>(worldNormal, 0.0)).xyz);
-    // The pack's blades supply fine light/dark detail, while the actual grass
-    // material below each root supplies the hue. Luminance-normalising the
-    // terrain colour keeps the blade's brightness and avoids a dark card over
-    // the already shaded ground. This all happens in linear light; both source
-    // textures have been sRGB-decoded before the G-buffer encoding below.
+    // The grayscale atlas supplies light/dark blade detail; the neighborhood
+    // averaged ground albedo supplies RGB tint and a brightness baseline. Normalise
+    // by the atlas's visible-texel average so a white atlas does not make the
+    // plants white. Both textures are linear before G-buffer encoding below.
     let luminance = vec3<f32>(0.2126, 0.7152, 0.0722);
     let blade_gray = dot(colour.rgb, luminance);
-    let ground_hue = input.ground_albedo / max(dot(input.ground_albedo, luminance), 0.01);
+    let blade_detail = clamp(blade_gray / max(material.shape.w, 0.05), 0.45, 1.4);
     let value_variation = mix(0.86, 1.12, clamp((input.tint - 0.88) / 0.20, 0.0, 1.0));
-    let albedo = blade_gray * ground_hue * value_variation;
+    // Upright leaf cards receive less diffuse/ambient light than the flat
+    // ground they cover. Lift reflectance while retaining the sampled RGB
+    // ratios, so a clump stays olive over olive turf rather than going black.
+    let albedo = input.ground_average * blade_detail * value_variation * 3.5;
     let rootAO = mix(0.64, 1.0, smoothstep(0.0, 0.65, input.blade_height));
     var out: Gbuffer;
     out.position = vec4<f32>(input.view_position, 1.0001);

@@ -215,10 +215,12 @@ water body; it does not remove otherwise healthy valley grass. Each
 clump checks its root footprint, rather than only its centre. The capture
 retains sub-metre root precision while covering the distant field.
 
-Pack 2's blade texture supplies grayscale light and dark detail. Each clump
-samples the rendered grass ground albedo at its root for hue, so its colour
-follows the same local green-to-dry-olive variation as the terrain beneath it.
-Small per-clump brightness variation keeps the carpet from looking uniform.
+Pack 2's grayscale blade texture supplies light and dark detail. Each frame the
+GPU averages nearby unlit terrain colours, and every clump samples that local
+average at its root for colour. The atlas's visible-pixel average normalises
+its grayscale detail; a canopy brightness factor compensates for the lower
+light received by upright cards. Small per-clump brightness variation keeps
+the carpet from looking uniform.
 
 The imported alpha-tested meshes join the terrain G-buffer before SSAO, so the
 lighting composite applies the same raymarched terrain and cloud shadows,

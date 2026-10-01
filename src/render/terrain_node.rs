@@ -74,6 +74,10 @@ pub const SHORE_HEIGHTFIELD_SPAN: f32 = 512.0;
 /// retain narrow bare patches; root-footprint tests dilate their exclusion.
 pub const GRASS_HABITAT_SIZE: u32 = 768;
 pub const GRASS_HABITAT_SPAN: f32 = 512.0;
+/// A two-by-two linear-light box average covers 1.33 m of terrain per texel.
+/// Bilinear sampling adds a smooth local footprint without repeated vertex
+/// fetches when the close grass density reaches dozens of clumps per m².
+const GRASS_GROUND_AVERAGE_SIZE: u32 = GRASS_HABITAT_SIZE / 2;
 
 pub fn grass_habitat_mapping(position: [f32; 3]) -> [f32; 4] {
     [
@@ -117,6 +121,9 @@ pub struct GbufferTargets {
     pub grass_habitat_view: wgpu::TextureView,
     /// Linear terrain albedo at the same world-space texels as grass_habitat_view.
     pub grass_ground_albedo_view: wgpu::TextureView,
+    /// Linear terrain albedo averaged over neighboring ground texels.
+    pub grass_ground_average_view: wgpu::TextureView,
+    grass_ground_average_bind_group: BindGroup,
     pub grass_habitat_ready: bool,
     pub width: u32,
     pub height: u32,
@@ -197,6 +204,7 @@ struct TerrainResources {
     terrain_pipeline: CachedRenderPipelineId,
     heightfield_pipeline: CachedRenderPipelineId,
     habitat_pipeline: CachedRenderPipelineId,
+    grass_ground_average_pipeline: CachedRenderPipelineId,
     habitat_globals: StageUniform,
     /// The same terrain-height shader rendered through a local map transform.
     shore_globals: StageUniform,
@@ -397,7 +405,36 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
             pass.draw_indexed(0..mesh.index_count, 0, 0..1);
         }
         drop(pass);
-        gbuffer.grass_habitat_ready = true;
+
+        // Four full-resolution ground samples become one filterable texel in
+        // linear RGB. This pass runs after the latest erosion/material capture
+        // and before any grass is drawn, so every clump reads this frame's
+        // local ground colour with a single vertex texture lookup.
+        if let Some(average_pipeline) = pipeline_cache
+            .get_render_pipeline(resources.grass_ground_average_pipeline)
+        {
+            let mut average_pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+                label: Some("forest_grass_ground_average"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &gbuffer.grass_ground_average_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            average_pass.set_render_pipeline(average_pipeline);
+            average_pass.set_bind_group(0, &gbuffer.grass_ground_average_bind_group, &[]);
+            average_pass.draw(0..3, 0..1);
+            drop(average_pass);
+            gbuffer.grass_habitat_ready = true;
+        }
     }
 
     // One pass, three colour targets + depth, cleared exactly like the
@@ -702,7 +739,24 @@ fn terrain_texture_layout() -> BindGroupLayoutDescriptor {
     )
 }
 
-/// The group(2) stage-uniform layout both pipelines share.
+/// Input to the local terrain-colour averaging pass.
+fn grass_ground_average_layout() -> BindGroupLayoutDescriptor {
+    BindGroupLayoutDescriptor::new(
+        "forest_grass_ground_average_layout",
+        &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    )
+}
+
+/// The group(2) stage-uniform layout shared by terrain pipelines.
 fn stage_uniform_layout(label: &'static str, size: u64) -> BindGroupLayoutDescriptor {
     BindGroupLayoutDescriptor::new(
         label,
@@ -1087,6 +1141,32 @@ fn prepare_terrain(
         zero_initialize_workgroup_memory: false,
     });
 
+    let grass_ground_average_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("forest_grass_ground_average_pipeline".into()),
+        layout: vec![grass_ground_average_layout()],
+        immediate_size: 0,
+        vertex: VertexState {
+            shader: shaders.grass_ground_average.clone(),
+            shader_defs: vec![],
+            entry_point: Some("vs_main".into()),
+            buffers: vec![],
+        },
+        primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(FragmentState {
+            shader: shaders.grass_ground_average.clone(),
+            shader_defs: vec![],
+            entry_point: Some("fs_main".into()),
+            targets: vec![Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba16Float,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        zero_initialize_workgroup_memory: false,
+    });
+
     let heightfield_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("forest_lighting_heightfield_pipeline".into()),
         layout: vec![globals_layout.clone(), terrain_textures_layout, terrain_stage_layout.clone()],
@@ -1129,6 +1209,7 @@ fn prepare_terrain(
         terrain_pipeline,
         heightfield_pipeline,
         habitat_pipeline,
+        grass_ground_average_pipeline,
         habitat_globals: StageUniform::new(
             device, &pipeline_cache, &globals_layout, "forest_habitat_globals",
             std::mem::size_of::<GlobalUniformsGpu>() as u64,
@@ -1157,6 +1238,7 @@ fn prepare_terrain(
 /// samplers the C++ sets on them.
 pub(crate) fn resize_gbuffer(
     device: Res<RenderDevice>,
+    pipeline_cache: Res<PipelineCache>,
     view: Res<ExtractedForestView>,
     state: Res<TerrainNodeState>,
 ) {
@@ -1222,6 +1304,42 @@ pub(crate) fn resize_gbuffer(
             view_formats: &[],
         });
 
+        let grass_ground_albedo_view = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("forest_grass_ground_albedo"),
+            size: wgpu::Extent3d {
+                width: GRASS_HABITAT_SIZE, height: GRASS_HABITAT_SIZE, depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }).create_view(&Default::default());
+        let grass_ground_average_bind_group = super::bind_group(
+            &device,
+            &pipeline_cache,
+            "forest_grass_ground_average_source",
+            &grass_ground_average_layout(),
+            &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&grass_ground_albedo_view),
+            }],
+        );
+        let grass_ground_average_view = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("forest_grass_ground_average"),
+            size: wgpu::Extent3d {
+                width: GRASS_GROUND_AVERAGE_SIZE, height: GRASS_GROUND_AVERAGE_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        }).create_view(&Default::default());
+
         *gbuffer = Some(GbufferTargets {
             position_view: position_texture.create_view(&wgpu::TextureViewDescriptor::default()),
             normal_view: normal_texture.create_view(&wgpu::TextureViewDescriptor::default()),
@@ -1267,18 +1385,9 @@ pub(crate) fn resize_gbuffer(
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             }).create_view(&Default::default()),
-            grass_ground_albedo_view: device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
-                label: Some("forest_grass_ground_albedo"),
-                size: wgpu::Extent3d {
-                    width: GRASS_HABITAT_SIZE, height: GRASS_HABITAT_SIZE, depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba16Float,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            }).create_view(&Default::default()),
+            grass_ground_albedo_view,
+            grass_ground_average_view,
+            grass_ground_average_bind_group,
             grass_habitat_ready: false,
             shore_heightfield_ready: false,
             width,
