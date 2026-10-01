@@ -516,7 +516,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let to_light = -normalize(stage.light_direction_view.xyz);
     let to_camera = normalize(-packed_position.xyz);
     let half_vector = normalize(to_light + to_camera);
-    let n_dot_l = max(dot(normal_view, to_light), 0.0);
+    let signed_n_dot_l = dot(normal_view, to_light);
+    let n_dot_l = max(signed_n_dot_l, 0.0);
     let n_dot_h = max(dot(normal_view, half_vector), 0.0);
     let n_dot_v = max(dot(normal_view, to_camera), 0.0);
     let v_dot_h = max(dot(to_camera, half_vector), 0.0);
@@ -531,7 +532,13 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let specular = D_GGX(n_dot_h, alpha)*V_SmithGGX(n_dot_l, n_dot_v, alpha)*fresnel
                    *mix(1.0, 0.10, grass_mask);
     let wrap = 0.22*snow_mask;
-    let wrapped_diffuse = clamp((n_dot_l + wrap)/(1.0 + wrap), 0.0, 1.0);
+    // Thin grass blades transmit some sunlight through their back faces.
+    // Their transmitted and direct light use the same raymarched terrain/cloud
+    // visibility above, so a tuft in mountain or cloud shadow still darkens.
+    let opaque_diffuse = clamp((n_dot_l + wrap)/(1.0 + wrap), 0.0, 1.0);
+    let blade_diffuse = clamp((signed_n_dot_l + 0.35)/1.35, 0.0, 1.0)
+                        + 0.28*max(-signed_n_dot_l, 0.0);
+    let wrapped_diffuse = mix(opaque_diffuse, blade_diffuse, grass_mask);
     var lit = ((albedo/PI)*wrapped_diffuse + specular*n_dot_l)*sun_colour;
     let hotspot = pow(max(dot(to_camera, to_light), 0.0), 3.0)
                   *0.048*smoothstep(15.0, 45.0, view_distance)*grass_mask;

@@ -187,6 +187,45 @@ Each wave filters against its projected pixel footprint; unresolved ripples
 broaden the sun reflection instead of shimmering. Crest compression drives
 whitecaps and subsurface light, with foam detail also filtered at distance.
 
+## Imported grass
+
+The nine separate grass pack 2 models live in `assets/models/`, with one
+shared material set in `assets/textures/grass/`. They retain their authored
+metre scale and individual shapes. The unused pack 1 models and textures are
+archived in `tmp/unused/`; its human reference and display stand were never
+extracted. `assets/models/grass-manifest.json` records each active source mesh
+and material; `assets/models/GRASS-ATTRIBUTION.md` preserves the original
+licence and author credit. Run
+`python3 scripts/extract_grass.py --validate` to verify the extracted assets.
+
+Grass is scattered deterministically in world cells, so camera movement and
+streaming do not reshuffle plants. Density and size vary in broad patches:
+the nearby carpet places up to 64 candidates per square metre, thinning to
+eight through 110 metres, then three through 170 metres, and finally a sparse
+field of larger clumps. Each tier fades over distance rather than ending at a
+hard ring. Grass fades beyond 213 metres and reaches its draw limit at 235 metres.
+Pack 2's medium and small clumps dominate the carpet. The GPU captures
+a 512-metre local map of terrain height, grass suitability and ground colour
+every frame, using the terrain's actual snow, sand, soil, rock, gravel and
+erosion material weights. Roots are admitted where grass dominates the visible
+blend, even if some dirt or sand shows through, above the ocean crest
+and away from snow, rock, gravel, and incised drainage furrows.
+The erosion solver's water is working runoff rather than a visible inland
+water body; it does not remove otherwise healthy valley grass. Each
+clump checks its root footprint, rather than only its centre. The capture
+retains sub-metre root precision while covering the distant field.
+
+Pack 2's blade texture supplies grayscale light and dark detail. Each clump
+samples the rendered grass ground albedo at its root for hue, so its colour
+follows the same local green-to-dry-olive variation as the terrain beneath it.
+Small per-clump brightness variation keeps the carpet from looking uniform.
+
+The imported alpha-tested meshes join the terrain G-buffer before SSAO, so the
+lighting composite applies the same raymarched terrain and cloud shadows,
+volumetric atmosphere, moonlight and fog to the grass. A small transmitted-light
+term keeps thin leaf cards readable when backlit while respecting those
+raymarched shadows. Wind bends the blade tips and leaves roots anchored.
+
 ## Fidelity of the noise substitution
 
 The C++ samples FastNoiseLite's OpenSimplex2S; the port samples quick-noise's

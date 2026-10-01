@@ -52,7 +52,7 @@
 struct GlobalUniforms {
     view: mat4x4<f32>,            // matView: column-major world->view
     projection: mat4x4<f32>,      // matProjection (standard GL shape, z converted to [0,1] NDC)
-    camera_position: vec4<f32>,   // xyz world-space eye; w unused
+    camera_position: vec4<f32>,   // xyz world-space eye; w habitat-only ocean crest clearance
     sun_direction: vec4<f32>,     // xyz direction sunlight travels, WORLD space
     viewport: vec4<f32>,          // xy = width, height in px; zw = 1/width, 1/height
     params: vec4<f32>,            // x fog_density, y z_far, z exposure, w ssao_enabled (1=on, 0=off)
@@ -156,6 +156,11 @@ struct FsOutput {
     @location(0) g_position: vec4<f32>,   // gPosition
     @location(1) g_normal: vec4<f32>,     // gNormal
     @location(2) g_albedo: vec4<f32>,     // gAlbedo
+};
+
+struct GrassHabitatOutput {
+    @location(0) habitat: vec4<f32>,
+    @location(1) ground_albedo: vec4<f32>,
 };
 
 fn smoothHermite(edge0: f32, edge1: f32, value: f32) -> f32
@@ -660,8 +665,11 @@ fn accumulateGroup(base: i32, group_weight: f32, plane_coord: vec2<f32>,
     (*weight_sum) += group_weight;
 }
 
-@fragment
-fn fs_main(input: FsInput) -> FsOutput
+// Both terrain shading and the vegetation habitat capture resolve precisely
+// the same biome/contact weights. A separate approximation for scatter would
+// drift from the visible snowline, soil patches and exposed erosion beds.
+fn shadeTerrain(input: FsInput, habitat: bool,
+                habitat_data: ptr<function, vec4<f32>>) -> FsOutput
 {
     var output: FsOutput;
 
@@ -1092,6 +1100,50 @@ fn fs_main(input: FsInput) -> FsOutput
     let gGravel = groupWeights[4] / denom;
     let gRock = groupWeights[5] / denom;
 
+    if (habitat)
+    {
+        // Dirt and sand may show between roots where this very same
+        // material blend still reads primarily as grass. Snow, rock and
+        // loose gravel do not hold these plants, even in a mixed pixel.
+        // Erode their suitability before the candidate's whole root
+        // footprint is tested in the grass vertex stage.
+        let grassDominance = smoothHermite(0.55, 0.82, gGrass);
+        let forbiddenCover = gSnow + gRock + gGravel;
+        let turf = grassDominance
+                 * (1.0 - smoothHermite(0.004, 0.028, forbiddenCover));
+
+        // The capture supplies the rendered ocean's maximum crest clearance
+        // in the otherwise unused camera_position.w. The extra dry fringe
+        // prevents wave wash and interpolation at the shoreline from planting
+        // roots underwater. Hydraulic flow.r is the *solver's* working water,
+        // which is not drawn as a lake or river in the current game; healthy
+        // valley turf can have a large temporary depth after erosion prewarm.
+        // Active drainage is excluded below using cuts, concentration and
+        // channel evidence rather than that unrendered simulation depth.
+        let dryShore = smoothHermite(stage.sea_level + max(globals.camera_position.w, 0.35),
+                                    stage.sea_level + max(globals.camera_position.w, 0.35) + 0.30,
+                                    height);
+
+        // A grassy valley can be concave and drain a large catchment. A true
+        // eroded furrow needs signed bed loss as well as focused concavity or
+        // discharge, so broad swales and simulated rain flow remain planted.
+        // The cut persists after runoff stops, keeping dry furrows clear.
+        let cutDepth = max(-surface.r, 0.0);
+        let incisedRoots = smoothHermite(0.030, 0.120, cutDepth);
+        let focusedCut = smoothHermite(0.06, 0.30, surface.g)
+                         * smoothHermite(0.012, 0.080, cutDepth);
+        let channelCut = smoothHermite(0.15, 0.80, surface.b)
+                         * smoothHermite(0.045, 0.25, surface.g)
+                         * smoothHermite(0.010, 0.060, cutDepth);
+        let furrow = max(incisedRoots, max(focusedCut, channelCut));
+        let intactRoots = 1.0 - smoothHermite(0.10, 0.50, furrow);
+        // Do not root upright clumps on cliff triangles even if a small
+        // interpolated material patch happens to meet the turf threshold.
+        let stableSlope = smoothHermite(0.70, 0.86, normalWorld.y);
+        let suitability = clamp(turf * dryShore * intactRoots * stableSlope, 0.0, 1.0);
+        (*habitat_data) = vec4<f32>(height, suitability, normalWorld.x, normalWorld.z);
+    }
+
     // The blended world-space detail vector perturbs the geometric normal
     // before a single rotation into view space. Because every tangent frame is
     // anchored in world space (and matched to its material's UV rotation), the
@@ -1132,7 +1184,9 @@ fn fs_main(input: FsInput) -> FsOutput
     // The macro gradient is also consumed by the mottle coupling in the
     // near-field detail block below, so it outlives this gate.
     var macroGradient = vec2<f32>(0.0);
-    if (gSnow > 0.02)
+    // Habitat colour is only consumed where snow coverage is effectively
+    // zero. Skip the costly snow relief on that offscreen capture.
+    if (!habitat && gSnow > 0.02)
     {
         let kMacroDriftFreq = 0.004;    // ~22 m wavelength
         let kMacroDriftHeight = 9.0;    // noise-height multiplier
@@ -1359,7 +1413,7 @@ fn fs_main(input: FsInput) -> FsOutput
     // octaves out by distance instead of dissolving in one uniform ring.
     var outNormalView = perturbedView;
     var outRough = rough;
-    if (globals.settings_b.y > 0.0 && gSnow > 0.02)
+    if (!habitat && globals.settings_b.y > 0.0 && gSnow > 0.02)
     {
         let up = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0),
                         abs(perturbedWorld.y) < 0.98);
@@ -1674,6 +1728,29 @@ fn fs_main(input: FsInput) -> FsOutput
     // 0-1 and stays linear.
     output.g_albedo = vec4<f32>(sqrt(max(albedo, vec3<f32>(0.0)) * 0.4), clamp(ao, 0.0, 1.0));
     return output;
+}
+
+@fragment
+fn fs_main(input: FsInput) -> FsOutput
+{
+    var unused_habitat = vec4<f32>(0.0);
+    return shadeTerrain(input, false, &unused_habitat);
+}
+
+// MRT capture: RGBA32F terrain world height, grass suitability and geometric
+// normal XZ; RGBA16F final terrain albedo in linear light. Both values come
+// from one evaluation of the same material blend as the visible G-buffer.
+// The consumer reconstructs upward normal Y. Capturing the actual terrain
+// meshes preserves their erosion, reveal and morph state.
+@fragment
+fn fs_grass_habitat(input: FsInput) -> GrassHabitatOutput
+{
+    var habitat_data = vec4<f32>(0.0);
+    let shaded = shadeTerrain(input, true, &habitat_data);
+    // g_albedo is sqrt-encoded into the Rgba8Unorm G-buffer with a 2.5
+    // headroom constant; invert that encoding before the linear 16-bit write.
+    let linear_albedo = shaded.g_albedo.rgb * shaded.g_albedo.rgb * 2.5;
+    return GrassHabitatOutput(habitat_data, vec4<f32>(linear_albedo, 1.0));
 }
 
 // Validator-only dummy: wgsl-check requires a vs_main entry in every file it

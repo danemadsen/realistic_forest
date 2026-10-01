@@ -70,6 +70,20 @@ pub const LIGHTING_HEIGHTFIELD_SPAN: f32 = 12288.0;
 pub const SHORE_HEIGHTFIELD_SIZE: u32 = 512;
 pub const SHORE_HEIGHTFIELD_SPAN: f32 = 512.0;
 
+/// Fixed world lattice shared with instanced vegetation. Sub-metre samples
+/// retain narrow bare patches; root-footprint tests dilate their exclusion.
+pub const GRASS_HABITAT_SIZE: u32 = 768;
+pub const GRASS_HABITAT_SPAN: f32 = 512.0;
+
+pub fn grass_habitat_mapping(position: [f32; 3]) -> [f32; 4] {
+    [
+        (position[0] / 8.0).floor() * 8.0,
+        (position[2] / 8.0).floor() * 8.0,
+        GRASS_HABITAT_SPAN,
+        GRASS_HABITAT_SPAN / GRASS_HABITAT_SIZE as f32,
+    ]
+}
+
 /// Shared by the terrain capture and water sampling; xy = centre, z = span,
 /// w = metres per texel. One source prevents the shoreline drifting between
 /// the vertex and fragment passes or when crossing a snap boundary.
@@ -100,6 +114,10 @@ pub struct GbufferTargets {
     /// False until this frame's capture is encoded, including after resize or
     /// while its pipeline is compiling. Water must never sample an empty map.
     pub shore_heightfield_ready: bool,
+    pub grass_habitat_view: wgpu::TextureView,
+    /// Linear terrain albedo at the same world-space texels as grass_habitat_view.
+    pub grass_ground_albedo_view: wgpu::TextureView,
+    pub grass_habitat_ready: bool,
     pub width: u32,
     pub height: u32,
 }
@@ -178,6 +196,8 @@ struct TerrainResources {
     terrain_textures: BindGroup,
     terrain_pipeline: CachedRenderPipelineId,
     heightfield_pipeline: CachedRenderPipelineId,
+    habitat_pipeline: CachedRenderPipelineId,
+    habitat_globals: StageUniform,
     /// The same terrain-height shader rendered through a local map transform.
     shore_globals: StageUniform,
     center_mesh: GpuMesh,
@@ -310,6 +330,74 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         pass.draw(0..3, 0..1);
         drop(pass);
         gbuffer.shore_heightfield_ready = true;
+    }
+
+    // Capture the *visible clipmap's* interpolated height and material contacts.
+    // Re-evaluate after erosion each frame, so reveals/regeneration cannot leave
+    // stale grass growing through newly exposed soil or an excavated channel.
+    gbuffer.grass_habitat_ready = false;
+    if let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.habitat_pipeline) {
+        let mapping = grass_habitat_mapping(view.player_position);
+        let mut habitat_globals = globals.globals;
+        habitat_globals.view = Mat4::IDENTITY.to_cols_array();
+        let scale = 2.0 / mapping[2];
+        habitat_globals.projection = [
+            scale, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+            0.0, -scale, 0.0, 0.0,
+            -mapping[0] * scale, mapping[1] * scale, 0.5, 1.0,
+        ];
+        // A crest bound protects roots even when the user increases the sea state.
+        if let Some(water) = world.get_resource::<super::water_node::ExtractedWater>() {
+            let spectrum = crate::water::waves::build(
+                water.settings.sea_state_amplitude,
+                water.settings.wind_direction_degrees.to_radians(),
+            );
+            habitat_globals.camera_position[3] =
+                crate::water::displacement_bounds(&spectrum, water.settings.flat_surface) + 0.10;
+        }
+        queue.write_buffer(&resources.habitat_globals.buffer, 0, bytemuck::bytes_of(&habitat_globals));
+        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+            label: Some("forest_grass_habitat"),
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &gbuffer.grass_habitat_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &gbuffer.grass_ground_albedo_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                }),
+            ],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_render_pipeline(pipeline);
+        pass.set_bind_group(0, &resources.habitat_globals.bind_group, &[]);
+        pass.set_bind_group(1, &resources.terrain_textures, &[]);
+        // Three levels cover the complete 512 m capture, even at the largest
+        // clipmap anchor offset. Their triangles exactly match the main pass.
+        for (level, stage) in resources.levels.iter().take(3).enumerate() {
+            let mesh = if level == 0 { &resources.center_mesh } else { &resources.ring_mesh };
+            pass.set_bind_group(2, &stage.bind_group, &[]);
+            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+        }
+        drop(pass);
+        gbuffer.grass_habitat_ready = true;
     }
 
     // One pass, three colour targets + depth, cleared exactly like the
@@ -962,6 +1050,43 @@ fn prepare_terrain(
         ],
     );
 
+    let habitat_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("forest_grass_habitat_pipeline".into()),
+        layout: vec![globals_layout.clone(), terrain_textures_layout.clone(), terrain_stage_layout.clone()],
+        immediate_size: 0,
+        vertex: VertexState {
+            shader: shaders.terrain_vs.clone(),
+            shader_defs: vec![],
+            entry_point: Some("vs_main".into()),
+            buffers: vec![VertexBufferLayout {
+                array_stride: TERRAIN_VERTEX_STRIDE,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: TERRAIN_VERTEX_ATTRIBUTES.to_vec(),
+            }],
+        },
+        primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(FragmentState {
+            shader: shaders.terrain_fs.clone(),
+            shader_defs: vec![],
+            entry_point: Some("fs_grass_habitat".into()),
+            targets: vec![
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba32Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+                Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ],
+        }),
+        zero_initialize_workgroup_memory: false,
+    });
+
     let heightfield_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("forest_lighting_heightfield_pipeline".into()),
         layout: vec![globals_layout.clone(), terrain_textures_layout, terrain_stage_layout.clone()],
@@ -1003,6 +1128,11 @@ fn prepare_terrain(
         terrain_textures,
         terrain_pipeline,
         heightfield_pipeline,
+        habitat_pipeline,
+        habitat_globals: StageUniform::new(
+            device, &pipeline_cache, &globals_layout, "forest_habitat_globals",
+            std::mem::size_of::<GlobalUniformsGpu>() as u64,
+        ),
         shore_globals: StageUniform::new(
             device,
             &pipeline_cache,
@@ -1125,6 +1255,31 @@ pub(crate) fn resize_gbuffer(
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             }).create_view(&wgpu::TextureViewDescriptor::default()),
+            grass_habitat_view: device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("forest_grass_habitat"),
+                size: wgpu::Extent3d {
+                    width: GRASS_HABITAT_SIZE, height: GRASS_HABITAT_SIZE, depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }).create_view(&Default::default()),
+            grass_ground_albedo_view: device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("forest_grass_ground_albedo"),
+                size: wgpu::Extent3d {
+                    width: GRASS_HABITAT_SIZE, height: GRASS_HABITAT_SIZE, depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            }).create_view(&Default::default()),
+            grass_habitat_ready: false,
             shore_heightfield_ready: false,
             width,
             height,

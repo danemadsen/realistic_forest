@@ -5189,6 +5189,7 @@ dependencies = [
  "bevy_egui",
  "bytemuck",
  "chrono",
+ "gltf",
  "image",
  "log",
  "naga",

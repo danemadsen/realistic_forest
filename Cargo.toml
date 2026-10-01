@@ -8,6 +8,7 @@ bevy = "0.19.1"
 bevy_egui = "0.42.0"
 quick-noise = "0.2.0"
 bytemuck = { version = "1", features = ["derive"] }
+gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
 
 wgpu = "29.0.3"
 naga = { version = "29.0.3", features = ["wgsl-in"] }

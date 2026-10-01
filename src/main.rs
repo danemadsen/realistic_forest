@@ -9,6 +9,7 @@ mod automation;
 mod constants;
 mod day_night;
 mod erosion;
+mod grass;
 mod matrices;
 mod noise;
 mod player;

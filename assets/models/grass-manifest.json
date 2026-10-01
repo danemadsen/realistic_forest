@@ -1,0 +1,246 @@
+{
+  "version": 1,
+  "coordinate_system": "right-handed, Y up; metres; root pivot at base Y=0",
+  "modifications": "Separate variants; bake orientation/scale; remove display translations; move mesh base to Y=0; share external textures; BLEND to MASK at 0.5.",
+  "materials": [
+    {
+      "name": "grass-pack-2",
+      "textures": {
+        "base-color": "textures/grass/grass-pack-2-base-color.png",
+        "orm": "textures/grass/grass-pack-2-orm.png",
+        "normal": "textures/grass/grass-pack-2-normal.png"
+      },
+      "normal_scale": 0.7212925562608193,
+      "alpha_cutoff": 0.5
+    }
+  ],
+  "models": [
+    {
+      "file": "models/grass-pack-2-large-1.glb",
+      "name": "grass-pack-2-large-1",
+      "source_pack": 2,
+      "source_mesh": 0,
+      "source_name": "Grass large 1",
+      "material": "grass-pack-2",
+      "vertices": 24,
+      "triangles": 12,
+      "bounds": {
+        "min": [
+          -0.384088,
+          0.0,
+          -0.3495029
+        ],
+        "max": [
+          0.400707,
+          0.3747614,
+          0.3779396
+        ]
+      },
+      "height": 0.3747614,
+      "radius": 0.4730669
+    },
+    {
+      "file": "models/grass-pack-2-large-2.glb",
+      "name": "grass-pack-2-large-2",
+      "source_pack": 2,
+      "source_mesh": 1,
+      "source_name": "Grass large 2",
+      "material": "grass-pack-2",
+      "vertices": 24,
+      "triangles": 12,
+      "bounds": {
+        "min": [
+          -0.3372331,
+          0.0,
+          -0.3280996
+        ],
+        "max": [
+          0.3765018,
+          0.3544378,
+          0.3659574
+        ]
+      },
+      "height": 0.3544378,
+      "radius": 0.4568918
+    },
+    {
+      "file": "models/grass-pack-2-large-3.glb",
+      "name": "grass-pack-2-large-3",
+      "source_pack": 2,
+      "source_mesh": 2,
+      "source_name": "Grass large 3",
+      "material": "grass-pack-2",
+      "vertices": 36,
+      "triangles": 18,
+      "bounds": {
+        "min": [
+          -0.3679126,
+          0.0,
+          -0.4752433
+        ],
+        "max": [
+          0.412424,
+          0.3953706,
+          0.4444991
+        ]
+      },
+      "height": 0.3953706,
+      "radius": 0.4752447
+    },
+    {
+      "file": "models/grass-pack-2-medium-1.glb",
+      "name": "grass-pack-2-medium-1",
+      "source_pack": 2,
+      "source_mesh": 3,
+      "source_name": "Grass medium 1",
+      "material": "grass-pack-2",
+      "vertices": 16,
+      "triangles": 8,
+      "bounds": {
+        "min": [
+          -0.1826607,
+          0.0,
+          -0.1993222
+        ],
+        "max": [
+          0.2049801,
+          0.2339274,
+          0.1663557
+        ]
+      },
+      "height": 0.2339274,
+      "radius": 0.2115609
+    },
+    {
+      "file": "models/grass-pack-2-medium-2.glb",
+      "name": "grass-pack-2-medium-2",
+      "source_pack": 2,
+      "source_mesh": 4,
+      "source_name": "Grass medium 2",
+      "material": "grass-pack-2",
+      "vertices": 20,
+      "triangles": 10,
+      "bounds": {
+        "min": [
+          -0.1939718,
+          0.0,
+          -0.1617075
+        ],
+        "max": [
+          0.1911252,
+          0.2156497,
+          0.1696291
+        ]
+      },
+      "height": 0.2156497,
+      "radius": 0.1949167
+    },
+    {
+      "file": "models/grass-pack-2-medium-3.glb",
+      "name": "grass-pack-2-medium-3",
+      "source_pack": 2,
+      "source_mesh": 5,
+      "source_name": "Grass medium 3",
+      "material": "grass-pack-2",
+      "vertices": 24,
+      "triangles": 12,
+      "bounds": {
+        "min": [
+          -0.1796292,
+          0.0,
+          -0.1835581
+        ],
+        "max": [
+          0.1710532,
+          0.2098607,
+          0.1916005
+        ]
+      },
+      "height": 0.2098607,
+      "radius": 0.198268
+    },
+    {
+      "file": "models/grass-pack-2-small-1.glb",
+      "name": "grass-pack-2-small-1",
+      "source_pack": 2,
+      "source_mesh": 6,
+      "source_name": "Grass small 1",
+      "material": "grass-pack-2",
+      "vertices": 12,
+      "triangles": 6,
+      "bounds": {
+        "min": [
+          -0.1519454,
+          0.0,
+          -0.1454239
+        ],
+        "max": [
+          0.099752,
+          0.188734,
+          0.1479683
+        ]
+      },
+      "height": 0.188734,
+      "radius": 0.1609067
+    },
+    {
+      "file": "models/grass-pack-2-small-2.glb",
+      "name": "grass-pack-2-small-2",
+      "source_pack": 2,
+      "source_mesh": 7,
+      "source_name": "Grass small 2",
+      "material": "grass-pack-2",
+      "vertices": 12,
+      "triangles": 6,
+      "bounds": {
+        "min": [
+          -0.1558935,
+          0.0,
+          -0.1581367
+        ],
+        "max": [
+          0.1288313,
+          0.204086,
+          0.0995082
+        ]
+      },
+      "height": 0.204086,
+      "radius": 0.1703013
+    },
+    {
+      "file": "models/grass-pack-2-small-3.glb",
+      "name": "grass-pack-2-small-3",
+      "source_pack": 2,
+      "source_mesh": 8,
+      "source_name": "Grass small 3",
+      "material": "grass-pack-2",
+      "vertices": 16,
+      "triangles": 8,
+      "bounds": {
+        "min": [
+          -0.149725,
+          0.0,
+          -0.1693473
+        ],
+        "max": [
+          0.1418351,
+          0.1990451,
+          0.1457066
+        ]
+      },
+      "height": 0.1990451,
+      "radius": 0.1900262
+    }
+  ],
+  "sources": [
+    {
+      "file": "grass-pack-2.glb",
+      "sha256": "c6e9c3dbb27ff632a6f2fb353faee482af035100eb084d3d2d1912c73a8b974e",
+      "author": "LOLIPOP (https://sketchfab.com/lolipop_1707)",
+      "license": "CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)",
+      "source": "https://sketchfab.com/3d-models/grass-pack-of-9-vars-lowpoly-game-ready-0561204a1fa14c17939300ee1108948b",
+      "title": "Grass (pack of 9 vars, lowpoly, game ready)",
+      "excluded_meshes": []
+    }
+  ]
+}

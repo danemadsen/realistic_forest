@@ -10,6 +10,7 @@
 pub mod erosion_node;
 pub mod cloud_node;
 pub mod gpu_textures;
+pub mod grass_node;
 pub mod post_nodes;
 pub mod terrain_node;
 pub mod water_node;
@@ -47,6 +48,7 @@ pub struct ForestRender;
 pub enum ForestRenderSystems {
     Erosion,
     Terrain,
+    Grass,
     Ssao,
     Blur,
     Clouds,
@@ -68,6 +70,7 @@ impl ForestRender {
             (
                 Erosion,
                 Terrain,
+                Grass,
                 Ssao,
                 Blur,
                 Clouds,
@@ -373,6 +376,7 @@ pub fn globals_layout() -> BindGroupLayoutDescriptor {
 pub struct ForestShaderHandles {
     pub terrain_vs: Handle<Shader>,
     pub terrain_fs: Handle<Shader>,
+    pub grass: Handle<Shader>,
     pub erosion_init: Handle<Shader>,
     pub erosion_flux: Handle<Shader>,
     pub erosion_water: Handle<Shader>,
@@ -414,6 +418,7 @@ impl Plugin for ForestRenderPlugin {
             ForestShaderHandles {
                 terrain_vs: asset_server.load::<Shader>("shaders/terrain-vs.wgsl"),
                 terrain_fs: asset_server.load::<Shader>("shaders/terrain-fs.wgsl"),
+                grass: asset_server.load::<Shader>("shaders/grass.wgsl"),
                 erosion_init: asset_server.load::<Shader>("shaders/erosion-init.wgsl"),
                 erosion_flux: asset_server.load::<Shader>("shaders/erosion-flux.wgsl"),
                 erosion_water: asset_server.load::<Shader>("shaders/erosion-water.wgsl"),
@@ -435,10 +440,19 @@ impl Plugin for ForestRenderPlugin {
         // borrowed below.
         water_node::register_water_main_world(app);
 
+        let grass_assets = crate::grass::GrassAssets::load("assets/models")
+            .map(|assets| crate::grass::SharedGrassAssets(std::sync::Arc::new(assets)));
+        if let Err(error) = &grass_assets {
+            error!("Grass assets could not be loaded: {error}");
+        }
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
 
+        if let Ok(assets) = grass_assets {
+            render_app.insert_resource(assets);
+        }
+        grass_node::register_grass_systems(render_app);
         render_app.insert_resource(bridge);
         render_app.insert_resource(self.noise_field.clone());
         render_app.insert_resource(handles);
@@ -476,6 +490,7 @@ impl Plugin for ForestRenderPlugin {
             (
                 erosion_node::forest_erosion_pass.in_set(ForestRenderSystems::Erosion),
                 terrain_node::forest_terrain_pass.in_set(ForestRenderSystems::Terrain),
+                grass_node::forest_grass_pass.in_set(ForestRenderSystems::Grass),
                 post_nodes::forest_ssao_pass.in_set(ForestRenderSystems::Ssao),
                 post_nodes::forest_blur_pass.in_set(ForestRenderSystems::Blur),
                 cloud_node::cloud_probe_pass.in_set(ForestRenderSystems::Clouds),
