@@ -299,14 +299,12 @@ whitecaps and subsurface light, with foam detail also filtered at distance.
 
 ## Imported grass
 
-The nine separate grass pack 2 models live in `assets/models/`, with one
-shared material set in `assets/textures/grass/`. They retain their authored
-metre scale and individual shapes. The unused pack 1 models and textures are
-archived in `tmp/unused/`; its human reference and display stand were never
-extracted. `assets/models/grass-manifest.json` records each active source mesh
-and material; `assets/models/GRASS-ATTRIBUTION.md` preserves the original
-licence and author credit. Run
-`python3 scripts/extract_grass.py --validate` to verify the extracted assets.
+The nine separate grass models (`grass-{large,medium,small}-{1,2,3}.glb`) live
+in `assets/models/`, with one shared material set in `assets/textures/grass/`.
+They retain their authored metre scale and individual shapes.
+`assets/models/grass-manifest.json` records each source mesh and material;
+`assets/models/GRASS-ATTRIBUTION.md` preserves the original licence and author
+credit.
 
 Grass is scattered deterministically in world cells, so camera movement and
 streaming do not reshuffle plants. Density and size vary in broad patches:
@@ -314,7 +312,7 @@ the nearby carpet places up to 64 candidates per square metre, thinning to
 eight through 110 metres, then three through 170 metres, and finally a sparse
 field of larger clumps. Each tier fades over distance rather than ending at a
 hard ring. Grass fades beyond 213 metres and reaches its draw limit at 235 metres.
-Pack 2's medium and small clumps dominate the carpet. The GPU captures
+The medium and small clumps dominate the carpet. The GPU captures
 a 512-metre local map of terrain height, grass suitability and ground colour
 every frame, using the terrain's actual snow, sand, soil, rock, gravel and
 erosion material weights. Roots are admitted where grass dominates the visible
@@ -325,7 +323,7 @@ water body; it does not remove otherwise healthy valley grass. Each
 clump checks its root footprint, rather than only its centre. The capture
 retains sub-metre root precision while covering the distant field.
 
-Pack 2's grayscale blade texture supplies light and dark detail. Each frame the
+The grass's grayscale blade texture supplies light and dark detail. Each frame the
 GPU averages nearby unlit terrain colours, and every clump samples that local
 average at its root for colour. The atlas's visible-pixel average normalises
 its grayscale detail; a canopy brightness factor compensates for the lower
