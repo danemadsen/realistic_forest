@@ -96,7 +96,7 @@ fn vs_main(
     // under a closed canopy keeps only a few, smaller clumps.
     let ground_colour = textureSampleLevel(grass_ground_albedo, habitat_sampler, habitatUV(root), 0.0);
     let sky = ground_colour.a;
-    let shade_survival = smoothstep(seed - 0.12, seed + 0.12, 1.15 * sky - 0.08);
+    let shade_survival = smoothstep(seed - 0.12, seed + 0.12, 1.25 * sky - 0.12);
     let potential = survival * fade * layer * shade_survival;
     if (potential < 0.02) { return out; }
     let ground = groundAt(root);

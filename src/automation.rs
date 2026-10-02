@@ -38,6 +38,9 @@ use bevy::prelude::Resource;
 /// `--measure-overlap [--overlap-tile x,z]` simulates one adjacent tile pair,
 /// prints the per-metre height disagreement across their shared overlap as
 /// CSV, and exits — the seam regression check for the erosion boundaries.
+/// `--no-vegetation` skips the plant library and scatter; `--vegetation-map
+/// path [--map-centre x,z] [--map-extent m]` renders the scatter from above,
+/// prints its statistics and exits.
 /// A discharge requested on the command line, see the module docs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ForcedLightning {

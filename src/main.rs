@@ -10,7 +10,6 @@ mod constants;
 mod day_night;
 mod erosion;
 mod grass;
-mod vegetation;
 mod lightning;
 mod matrices;
 mod noise;
@@ -18,6 +17,7 @@ mod player;
 mod render;
 mod thunder;
 mod ui;
+mod vegetation;
 mod water;
 mod weather;
 

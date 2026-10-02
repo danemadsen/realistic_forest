@@ -20,9 +20,11 @@ use bevy::render::renderer::RenderDevice;
 pub const SHADOW_CASCADES: usize = 4;
 /// Texels along each side of a cascade.
 pub const SHADOW_RESOLUTION: u32 = 2048;
-/// View-depth bounds of the cascades, metres: about 2.7 cm, 9 cm, 34 cm and
-/// 1.6 m per texel at the default field of view.
-pub const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.0, 20.0, 70.0, 250.0, 1200.0];
+/// View-depth bounds of the cascades, metres: about 2.7 cm, 9 cm, 38 cm and
+/// 2.7 m per texel at the default field of view. The last reaches as far as
+/// the trees are drawn, so no distant forest floor shows sunlit through the
+/// canopy.
+pub const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.0, 20.0, 70.0, 280.0, 2000.0];
 /// How far up-light of a cascade's slice a plant can stand and still be
 /// drawn into it: a 35 m pine's shadow under a sun 3 degrees up.
 pub const CASTER_REACH: f32 = 680.0;
