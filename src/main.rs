@@ -292,6 +292,7 @@ fn main() {
             draw_ocean: !automation.no_water,
         })
         .insert_resource(ErosionBridge::default())
+        .insert_resource(erosion::TilePreparation::new(std::sync::Arc::new(noise_field.clone())))
         .insert_resource(noise_field.clone())
         .insert_resource(automation.clone())
         // The render plugin lifts the shared noise field and erosion bridge
@@ -543,6 +544,8 @@ fn erosion_stream_system(
     mut applied: ResMut<AppliedErosionSettings>,
     mut rerun: ResMut<RerunErosion>,
     mut prewarm: ResMut<PrewarmRemaining>,
+    mut preparation: ResMut<erosion::TilePreparation>,
+    automation: Res<AutomationSettings>,
     player: Query<&Player>,
     time: Res<Time>,
 ) {
@@ -564,10 +567,15 @@ fn erosion_stream_system(
     // path uses the defaults (per-frame budget, animated reveal).
     let prewarming = prewarm.0 > 0;
     let budget = if prewarming { applied.0.iterations } else { EROSION_ITERATIONS_PER_FRAME };
+    // Interactive streaming builds each tile's inputs off the main thread.
+    // The prewarm and screenshot runs keep them inline, so a capture begins
+    // the same tiles on the same frames however busy the task pool is.
+    let background = !prewarming && automation.shot_path.is_none();
     let began = erosion::update_erosion_cache(
         &mut cache,
         &bridge,
         &noise,
+        background.then_some(&mut *preparation),
         &applied.0,
         position,
         budget,
@@ -673,6 +681,43 @@ fn measure_overlap_system(
     bridge.set_frame(commands, Some(erosion::erosion_lookup_records(&cache)));
 }
 
+/// Frame times a `--shot` run collects, split by whether erosion tiles were
+/// still streaming in that frame.
+#[derive(Default)]
+struct FrameTimes {
+    streaming: Vec<f32>,
+    settled: Vec<f32>,
+}
+
+impl FrameTimes {
+    fn record(&mut self, seconds: f32, streaming: bool) {
+        if streaming {
+            self.streaming.push(seconds);
+        } else {
+            self.settled.push(seconds);
+        }
+    }
+
+    fn log(&self) {
+        for (phase, samples) in [("streaming", &self.streaming), ("settled", &self.settled)] {
+            if samples.is_empty() {
+                continue;
+            }
+            let mut sorted = samples.clone();
+            sorted.sort_by(f32::total_cmp);
+            let average = sorted.iter().sum::<f32>() / sorted.len() as f32;
+            let p95 = sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)];
+            log::info!(
+                "FRAME: {phase} {:.1} ms average, {:.1} ms p95, {:.1} ms max over {} frames",
+                average * 1000.0,
+                p95 * 1000.0,
+                sorted[sorted.len() - 1] * 1000.0,
+                sorted.len()
+            );
+        }
+    }
+}
+
 /// Unattended capture: let the erosion cache stream in around the pinned
 /// camera for `--wait` frames, then save one screenshot and exit.
 fn shot_scheduling_system(
@@ -681,6 +726,8 @@ fn shot_scheduling_system(
     mut counter: ResMut<FrameCounter>,
     mut requested: ResMut<ShotRequested>,
     mut commands: Commands,
+    time: Res<Time<Real>>,
+    mut frame_times: Local<FrameTimes>,
 ) {
     let Some(shot_path) = automation.shot_path.clone() else {
         return;
@@ -704,11 +751,25 @@ fn shot_scheduling_system(
         return;
     }
     counter.0 += 1;
+    // Real frame times across the `--wait` window, reported before the
+    // capture so runs compare on cost as well as looks. Frames while erosion
+    // tiles still stream are kept apart from settled ones; the first 30
+    // counted frames (pipeline warm-up, the last prewarm uploads) are skipped.
+    if !requested.0 && counter.0 > 30 {
+        let streaming = cache.tiles.values().any(|tile| {
+            !matches!(
+                tile.state,
+                erosion::ErosionTileState::Ready | erosion::ErosionTileState::Failed
+            )
+        });
+        frame_times.record(time.delta_secs(), streaming);
+    }
     if requested.0 || counter.0 < automation.wait_frames as u64 {
         // A request already made and not yet captured; AppExit is written by
         // the capture observer once the image lands.
         return;
     }
+    frame_times.log();
     requested.0 = true;
     // The observer outlives this system, so it owns the path rather than
     // borrowing the resource.

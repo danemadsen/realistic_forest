@@ -805,7 +805,6 @@ mod tests {
         for source in [
             include_str!("../../assets/shaders/erosion-init.wgsl"),
             include_str!("../../assets/shaders/erosion-terrain.wgsl"),
-            include_str!("../../assets/shaders/erosion-thermal.wgsl"),
             include_str!("../../assets/shaders/terrain-fs.wgsl"),
         ] {
             assert!(source.contains(common), "erosion and material geology diverged");

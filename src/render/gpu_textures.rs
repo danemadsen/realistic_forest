@@ -349,6 +349,9 @@ pub struct GpuWorldTextures {
     pub sim_water: [wgpu::Texture; 2],
     pub sim_flux: [wgpu::Texture; 2],
     pub sim_drainage: [wgpu::Texture; 2],
+    /// Each cell's drainage-routing normaliser, written by the water pass for
+    /// the terrain pass of the same iteration (R; see erosion-water.wgsl).
+    pub sim_routing: wgpu::Texture,
     pub albedo_array_view: wgpu::TextureView,
     pub normal_rough_array_view: wgpu::TextureView,
     /// Rgba8Unorm 4x4 rotation noise (point, repeat).
@@ -676,6 +679,7 @@ pub fn prepare_gpu_textures(
         sim_texture(device, "sim_drainage_0"),
         sim_texture(device, "sim_drainage_1"),
     ];
+    let sim_routing = sim_texture(device, "sim_routing");
 
     // PBR texture arrays with CPU-built mip chains (wgpu cannot generate
     // array mips on the GPU), trilinear + repeat + max anisotropy.
@@ -801,6 +805,7 @@ pub fn prepare_gpu_textures(
         sim_water,
         sim_flux,
         sim_drainage,
+        sim_routing,
         albedo_array_view,
         normal_rough_array_view,
         ssao_noise_view,

@@ -128,7 +128,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | Flag | Effect |
 | --- | --- |
 | `--camera x,y,z,yawDeg,pitchDeg` | Pin the camera pose and fly, for reproducible shots; with `--shot`, mouse and keyboard input cannot move it |
-| `--shot path.png` | Render, save a screenshot, then exit |
+| `--shot path.png` | Render, save a screenshot, then exit; the log reports average, p95 and maximum frame time over the `--wait` window, split into frames while erosion tiles stream and settled frames |
 | `--wait n` | Frames to render before the screenshot, counted once the prewarmed erosion tiles are ready |
 | `--erosion-prewarm N` | Simulate the `N` nearest erosion tiles at full budget before streaming (default `4`, the quartet around the player); raise it so a capture shows erosion beyond the player's own lattice cell |
 | `--size W,H` | Window size in points (comma-separated, as the C++'s `sscanf`) |
@@ -279,8 +279,15 @@ AO, normals and roughness remain linear data. The two eight-layer arrays use
 about 85 MiB including mipmaps (64 MiB more than the former 512² arrays). Texture
 cells use deterministic quarter turns and narrow edge blends; grass, soil,
 gravel and sand also use independent sample offsets to avoid repeating the same tufts and stones. All PBR channels share
-the mapping, including normal orientation. Damp drainage and the shoreline
-darken and become smoother, while snow retains its wind relief and glints.
+the mapping, including normal orientation. Dry rock and gravel are matte: their
+scans' roughness is lifted toward fully rough while keeping its own variation,
+and runoff stains darken stone without polishing it. Damp drainage and the
+shoreline darken, but only wet ground at the waterline turns smoother, so
+channel gravel and rock never read as polished. Snow retains its wind relief and
+glints. The G-buffer position is rebuilt from each terrain fragment's world
+position: the interpolated view-space position arrives as zero in scattered
+fragments on Metal, which flashed white specks across the terrain and opened
+holes in the sea's hidden-surface test.
 A camera-centred sea-level plane creates ocean and shorelines. The
 **Dirt/gravel variant scale** control affects scan variation within soil and gravel.
 
@@ -379,9 +386,13 @@ target:
 
 1. Conservative pipe flux steered by a rotationally symmetric 3×3 gradient.
 2. Rain, evaporation, water transport, continuous-angle velocity, and discharge.
+   This pass also writes each cell's drainage-routing normaliser (the sum of
+   its squared downhill slopes) for the next pass, since no bed moves between
+   them.
 3. Inertial runoff sediment advection, erosion, settling and deposition,
    together with fluvial transport along routed drainage. This pass writes the
-   terrain and drainage states as two targets.
+   terrain and drainage states as two targets; drainage carries each cell's
+   bedrock resistance for the thermal pass.
 4. Thermal (talus) relaxation of over-steepened slopes.
 
 The runoff solver adapts the useful physics from the hydraulic erosion shader
@@ -400,7 +411,11 @@ supplies what it cannot. Contributing area is routed between bed cells with
 multiple-flow-direction shares proportional to the squared slope, so every
 channel knows its whole catchment within the tile's 1920-metre domain; the CPU
 routes the base surface before a tile starts, so this holds from the first
-iteration. A stream-power capacity proportional to √A·S then detaches bed where
+iteration. That routing releases each cell once every higher neighbour draining
+into it has passed its area on, which keeps it linear in the tile size, and in
+interactive play the base heights and routing are built on a background task so
+a starting tile never stalls a frame (prewarm and screenshot runs build them
+inline, keeping captures deterministic). A stream-power capacity proportional to √A·S then detaches bed where
 the routed sediment flux is below capacity and deposits where the flux exceeds
 it: steep, well-fed channels incise, slope breaks build fans, and valley floors
 and closed hollows fill with alluvium. Channels initiate above a few hundred

@@ -4,7 +4,8 @@
 // Hydraulic erosion pass 3: advect sediment, then erode or deposit terrain.
 // texture0:       terrain (bed height, sediment, immutable base height, loose cover)
 // uWaterState:    water (depth, velocity x, velocity z, accumulated discharge)
-// uDrainage:      drainage (contributing area in cells, routed sediment flux, 0, 0)
+// uDrainage:      drainage (contributing area in cells, routed sediment flux,
+//                 bedrock resistance for the thermal pass, 0)
 //
 // Two processes share the pass. The runoff solver below (the original
 // erosion_terrain.fs) carves the fine rills and gullies that the transient
@@ -117,13 +118,18 @@ struct StageUniforms {
 @group(1) @binding(0) var texture0: texture_2d<f32>;
 // uWaterState: water (depth, velocity x, velocity z, accumulated discharge)
 @group(1) @binding(1) var uWaterState: texture_2d<f32>;
-// uDrainage: drainage (contributing area in cells, routed sediment flux, 0, 0)
+// uDrainage: drainage (contributing area in cells, routed sediment flux,
+// bedrock resistance, 0)
 @group(1) @binding(2) var uDrainage: texture_2d<f32>;
+// uRouting: each cell's routing normaliser (R), written by this iteration's
+// water pass from the same beds this pass reads
+@group(1) @binding(3) var uRouting: texture_2d<f32>;
 
 // Samplers sit at GL unit + 8 per the spec; this pass only texel-fetches.
 @group(1) @binding(8) var tex0_sampler: sampler;
 @group(1) @binding(9) var uWaterState_sampler: sampler;
 @group(1) @binding(10) var uDrainage_sampler: sampler;
+@group(1) @binding(11) var uRouting_sampler: sampler;
 
 // ---------------------------------------------------------------------------
 // Fullscreen-triangle vertex shader (porting spec section 4)
@@ -317,10 +323,6 @@ struct FragmentOutput {
     @location(1) drainage: vec4<f32>,      // routed drainage state
 };
 
-// Routing treats cells beyond the grid as absent: they neither give nor
-// receive flow, which keeps the closed simulation wall closed.
-const ABSENT_BED: f32 = 3.0e38;
-
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
 {
@@ -356,20 +358,12 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
 
     // Drainage routing. Every bed cell passes its contributing area, and the
     // sediment flux it carries, to its lower neighbours in proportion to
-    // their squared slope. A 5x5 window holds each neighbour's own outflow
-    // shares, so the gather sees exactly what each donor gives away. Bed
+    // their squared slope. The water pass just before this one left each
+    // donor's own total of squared downhill slopes in uRouting, so the gather
+    // reads exactly what each donor gives away without re-deriving it. Bed
     // heights route the flow (not the transient water surface), which keeps
-    // the routing acyclic from one iteration to the next.
-    var beds: array<f32, 25>;
-    for (var row = 0; row < 5; row++)
-    {
-        for (var column = 0; column < 5; column++)
-        {
-            let sample_coord = coord + vec2<i32>(column - 2, row - 2);
-            let inside = all(sample_coord >= vec2<i32>(0)) && all(sample_coord < size);
-            beds[row * 5 + column] = select(ABSENT_BED, fetchTerrain(sample_coord).r, inside);
-        }
-    }
+    // the routing acyclic from one iteration to the next. Cells beyond the
+    // grid neither give nor receive flow, keeping the simulation wall closed.
     var drainage_area = 1.0;
     var sediment_in = 0.0;
     var steepest_descent = 0.0;
@@ -378,8 +372,9 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
     {
         if (donor == 4) { continue; }
         let donor_offset = vec2<i32>(donor % 3 - 1, donor / 3 - 1);
-        let donor_bed = beds[(donor_offset.y + 2) * 5 + donor_offset.x + 2];
-        if (donor_bed >= ABSENT_BED) { continue; }
+        let donor_coord = coord + donor_offset;
+        if (any(donor_coord < vec2<i32>(0)) || any(donor_coord >= size)) { continue; }
+        let donor_bed = fetchTerrain(donor_coord).r;
         let donor_distance = cell_size
             * select(1.0, 1.41421356, donor_offset.x != 0 && donor_offset.y != 0);
         let fall = (bed_height - donor_bed) / donor_distance;
@@ -388,19 +383,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
         // The same pair seen from the donor: its slope toward this cell.
         let rise = -fall;
         if (rise <= 0.0) { continue; }
-        var share_total = 0.0;
-        for (var receiver = 0; receiver < 9; receiver++)
-        {
-            if (receiver == 4) { continue; }
-            let step = vec2<i32>(receiver % 3 - 1, receiver / 3 - 1);
-            let receiver_offset = donor_offset + step;
-            let receiver_bed = beds[(receiver_offset.y + 2) * 5 + receiver_offset.x + 2];
-            let receiver_slope = (donor_bed - receiver_bed)
-                / (cell_size * select(1.0, 1.41421356, step.x != 0 && step.y != 0));
-            if (receiver_slope > 0.0) { share_total += receiver_slope * receiver_slope; }
-        }
-        let share = rise * rise / max(share_total, 1.0e-12);
-        let donor_drainage = fetchDrainage(coord + donor_offset);
+        let share = rise * rise / max(textureLoad(uRouting, donor_coord, 0).r, 1.0e-12);
+        let donor_drainage = fetchDrainage(donor_coord);
         drainage_area += max(donor_drainage.r, 0.0) * share;
         sediment_in += max(donor_drainage.g, 0.0) * share;
     }
@@ -690,8 +674,14 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
     sediment *= simulation_weight;
     sediment_out *= simulation_weight;
 
+    // The thermal pass reads every cell's bedrock resistance from drainage B
+    // rather than evaluating the geology for each of its steep neighbours:
+    // this is the same function of the same bedrock surface it writes here.
+    let bedrock_resistance = clamp(erosionHardness(world_position, bed_height - loose)
+                                   / GEOLOGY_HARDNESS_SCALE, 0.0, 1.0);
+
     return FragmentOutput(vec4<f32>(bed_height, max(sediment, 0.0), base_height, loose),
-                          vec4<f32>(drainage_area, sediment_out, 0.0, 0.0));
+                          vec4<f32>(drainage_area, sediment_out, bedrock_resistance, 0.0));
 }
 
 // STAGE UNIFORMS:
@@ -726,8 +716,10 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
 //     texture0    -> @group(1) @binding(0) texture_2d<f32>; sampler @binding(8) (unused)
 //     uWaterState -> @group(1) @binding(1) texture_2d<f32>; sampler @binding(9) (unused)
 //     uDrainage   -> @group(1) @binding(2) texture_2d<f32>; sampler @binding(10) (unused)
+//     uRouting    -> @group(1) @binding(3) texture_2d<f32>; sampler @binding(11) (unused)
 //   Outputs: @location(0) = updated terrain
 //     (bed height, sediment, immutable base height, loose cover);
-//     @location(1) = drainage (contributing area, sediment flux out, 0, 0).
+//     @location(1) = drainage (contributing area, sediment flux out,
+//     resistance of the bedrock under the updated cover, 0).
 //     Neither input may be an attachment fs_main renders to — ping-pong both
 //     states as in the GL FBO version.

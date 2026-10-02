@@ -10,8 +10,10 @@
 use crate::constants::*;
 use crate::noise::NoiseField;
 use bevy::ecs::prelude::Resource;
+use bevy::tasks::{block_on, poll_once, AsyncComputeTaskPool, Task};
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct TileKey {
@@ -506,48 +508,59 @@ pub fn reset_erosion_cache(cache: &mut ErosionCache) {
 /// iteration. Cells below sea level swallow what reaches them, flats and pits
 /// keep theirs, and the grid edge is a closed wall.
 pub fn route_base_drainage(heights: &[f32], resolution: usize, cell_size: f32) -> Vec<f32> {
-    const NEIGHBOURS: [(i64, i64); 8] =
-        [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
     let count = resolution * resolution;
     let mut area = vec![1.0f32; count.min(heights.len())];
     if area.len() != count {
         return area;
     }
-    // Highest first, so every donor has received all of its own area before
-    // it passes any on: the routing is acyclic because it only runs downhill.
-    let mut order: Vec<u32> = (0..count as u32).collect();
-    order.sort_unstable_by(|&a, &b| heights[b as usize].total_cmp(&heights[a as usize]));
+    // Every donor must hold all of its own area before it passes any on. The
+    // routing runs strictly downhill, so it is acyclic: a cell is ready once
+    // each higher neighbour draining into it has been routed. Counting those
+    // donors and releasing cells as their count reaches zero (Kahn's
+    // ordering) gives the same partial order as visiting cells highest first,
+    // without sorting the whole tile on the main thread as each one begins.
+    let mut waiting = vec![0u8; count];
+    for cell in 0..count {
+        let height = heights[cell];
+        if height < SEA_LEVEL {
+            continue;
+        }
+        for_each_neighbour(cell, resolution, |neighbour, _| {
+            if heights[neighbour] < height {
+                waiting[neighbour] += 1;
+            }
+        });
+    }
+    let mut ready: Vec<u32> = (0..count as u32)
+        .filter(|&cell| waiting[cell as usize] == 0)
+        .collect();
     let diagonal = cell_size * std::f32::consts::SQRT_2;
-    for &cell in &order {
+    while let Some(cell) = ready.pop() {
         let cell = cell as usize;
         let height = heights[cell];
         if height < SEA_LEVEL {
             continue;
         }
-        let x = (cell % resolution) as i64;
-        let z = (cell / resolution) as i64;
         let mut shares = [(0usize, 0.0f32); 8];
+        let mut receivers = 0;
         let mut share_total = 0.0f32;
-        for (slot, (dx, dz)) in NEIGHBOURS.iter().enumerate() {
-            let (nx, nz) = (x + dx, z + dz);
-            if nx < 0 || nz < 0 || nx >= resolution as i64 || nz >= resolution as i64 {
-                continue;
-            }
-            let neighbour = nz as usize * resolution + nx as usize;
-            let distance = if *dx != 0 && *dz != 0 { diagonal } else { cell_size };
+        for_each_neighbour(cell, resolution, |neighbour, diagonal_step| {
+            let distance = if diagonal_step { diagonal } else { cell_size };
             let slope = (height - heights[neighbour]) / distance;
             if slope > 0.0 {
-                shares[slot] = (neighbour, slope * slope);
+                shares[receivers] = (neighbour, slope * slope);
+                receivers += 1;
                 share_total += slope * slope;
             }
-        }
-        if share_total <= 0.0 {
-            continue;
-        }
+        });
         let passed = area[cell];
-        for (neighbour, share) in shares {
-            if share > 0.0 {
+        for &(neighbour, share) in &shares[..receivers] {
+            if share_total > 0.0 {
                 area[neighbour] += passed * share / share_total;
+            }
+            waiting[neighbour] -= 1;
+            if waiting[neighbour] == 0 {
+                ready.push(neighbour as u32);
             }
         }
     }
@@ -557,6 +570,86 @@ pub fn route_base_drainage(heights: &[f32], resolution: usize, cell_size: f32) -
         }
     }
     area
+}
+
+/// Calls `visit(neighbour, diagonal)` for each in-grid cell of the eight
+/// surrounding `cell`; the grid edge is a closed wall.
+fn for_each_neighbour(cell: usize, resolution: usize, mut visit: impl FnMut(usize, bool)) {
+    const NEIGHBOURS: [(i64, i64); 8] =
+        [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
+    let x = (cell % resolution) as i64;
+    let z = (cell / resolution) as i64;
+    for (dx, dz) in NEIGHBOURS {
+        let (nx, nz) = (x + dx, z + dz);
+        if nx < 0 || nz < 0 || nx >= resolution as i64 || nz >= resolution as i64 {
+            continue;
+        }
+        visit(nz as usize * resolution + nx as usize, dx != 0 && dz != 0);
+    }
+}
+
+/// A tile's CPU-built simulation inputs: its base heights and their routed
+/// drainage.
+pub struct PreparedTile {
+    pub key: TileKey,
+    pub base_height: Vec<f32>,
+    pub drainage_area: Vec<f32>,
+}
+
+pub fn prepare_tile(noise: &NoiseField, key: TileKey) -> PreparedTile {
+    let base_height = crate::noise::create_base_height_map(noise, key);
+    let drainage_area = route_base_drainage(&base_height, EROSION_RESOLUTION, EROSION_CELL_SIZE);
+    PreparedTile {
+        key,
+        base_height,
+        drainage_area,
+    }
+}
+
+/// Builds the next tile's inputs on the async compute pool. Base heights and
+/// their drainage routing take tens of milliseconds per tile, several times
+/// that in a debug build, and a tile begins every couple of dozen frames while
+/// the cache streams; done inline they stalled the frame each time. A tile
+/// starts a frame or two after it is chosen instead.
+#[derive(Resource)]
+pub struct TilePreparation {
+    noise: Arc<NoiseField>,
+    pending: Option<(TileKey, Task<PreparedTile>)>,
+}
+
+impl TilePreparation {
+    pub fn new(noise: Arc<NoiseField>) -> Self {
+        Self {
+            noise,
+            pending: None,
+        }
+    }
+
+    /// The prepared inputs of a tile still queued in `cache`, once they are
+    /// ready. Starts preparing `next` when nothing is in flight; work for a
+    /// tile that has meanwhile left the queue is dropped.
+    fn poll(&mut self, cache: &ErosionCache, next: TileKey) -> Option<PreparedTile> {
+        let still_queued = |key: &TileKey| {
+            cache
+                .tiles
+                .get(key)
+                .is_some_and(|tile| tile.state == ErosionTileState::Queued)
+        };
+        if self.pending.as_ref().is_some_and(|(key, _)| !still_queued(key)) {
+            self.pending = None;
+        }
+        let Some((key, mut task)) = self.pending.take() else {
+            let noise = self.noise.clone();
+            let task = AsyncComputeTaskPool::get().spawn(async move { prepare_tile(&noise, next) });
+            self.pending = Some((next, task));
+            return None;
+        };
+        let prepared = block_on(poll_once(&mut task));
+        if prepared.is_none() {
+            self.pending = Some((key, task));
+        }
+        prepared
+    }
 }
 
 /// `BeginErosionTile`: stage one tile's base height map for GPU initialization
@@ -572,13 +665,25 @@ pub fn begin_tile(
     if !cache.tiles.contains_key(&key) {
         return;
     }
-    let base_height = crate::noise::create_base_height_map(noise, key);
-    let drainage_area = route_base_drainage(&base_height, EROSION_RESOLUTION, EROSION_CELL_SIZE);
+    begin_prepared_tile(cache, commands, prepare_tile(noise, key));
+}
+
+/// [`begin_tile`] with inputs already built, synchronously or by
+/// [`TilePreparation`].
+pub fn begin_prepared_tile(
+    cache: &mut ErosionCache,
+    commands: &mut ErosionFrameCommands,
+    prepared: PreparedTile,
+) {
+    let key = prepared.key;
+    if !cache.tiles.contains_key(&key) {
+        return;
+    }
     commands.sim_min = tile_simulation_minimum(key);
     commands.init = Some(InitTileCommand {
         key,
-        base_height,
-        drainage_area,
+        base_height: prepared.base_height,
+        drainage_area: prepared.drainage_area,
     });
     if let Some(existing) = cache.tiles.get_mut(&key) {
         existing.state = ErosionTileState::Simulating;
@@ -645,11 +750,14 @@ pub fn advance_active_tile(
 ///
 /// Returns whether a tile was begun this frame: the C++ prewarm loop runs one
 /// full-budget pass per tile, so the caller counts down its four passes here.
+/// With `preparation`, the next tile's inputs are built off the main thread
+/// and it begins once they are ready; without, it begins in this frame.
 #[allow(clippy::too_many_arguments)]
 pub fn update_erosion_cache(
     cache: &mut ErosionCache,
     bridge: &ErosionBridge,
     noise: &NoiseField,
+    preparation: Option<&mut TilePreparation>,
     settings: &ErosionSettings,
     player_position: [f32; 3],
     iteration_budget: usize,
@@ -684,8 +792,18 @@ pub fn update_erosion_cache(
     let mut began_tile = false;
     if !cache.has_active_tile {
         if let Some(next) = choose_next_erosion_tile(cache, player_tile, player_minimum) {
-            begin_tile(cache, &mut commands, noise, next);
-            began_tile = true;
+            match preparation {
+                Some(preparation) => {
+                    if let Some(prepared) = preparation.poll(cache, next) {
+                        begin_prepared_tile(cache, &mut commands, prepared);
+                        began_tile = true;
+                    }
+                }
+                None => {
+                    begin_tile(cache, &mut commands, noise, next);
+                    began_tile = true;
+                }
+            }
         }
     }
     advance_active_tile(cache, &mut commands, settings, iteration_budget, reveal_immediately);
@@ -928,6 +1046,65 @@ mod tests {
         let thalweg = area[(resolution - 3) * resolution + 4];
         assert!(thalweg > area[(resolution - 3) * resolution + 2] * 3.0, "{thalweg}");
         assert!(area[(resolution - 1) * resolution + 4] == 0.0);
+    }
+
+    /// The donor-count ordering routes exactly what visiting cells highest
+    /// first did, on rough ground with flats, pits, plateaus and a sea.
+    #[test]
+    fn base_drainage_matches_highest_first_routing() {
+        let resolution = 96;
+        let mut seed = 0x2545_f491u32;
+        let heights: Vec<f32> = (0..resolution * resolution)
+            .map(|cell| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                let x = (cell % resolution) as f32;
+                let z = (cell / resolution) as f32;
+                let relief = 30.0 * (x * 0.11).sin() * (z * 0.07).cos() + 0.4 * z - 12.0;
+                // Quantised noise leaves exact ties (flats) between neighbours.
+                ((relief + (seed % 3) as f32 * 0.1) * 4.0).round() * 0.25
+            })
+            .collect();
+        let routed = route_base_drainage(&heights, resolution, 4.0);
+        let reference = highest_first_drainage(&heights, resolution, 4.0);
+        for (cell, (a, b)) in routed.iter().zip(&reference).enumerate() {
+            assert!((a - b).abs() <= 1e-3 * b.max(1.0), "cell {cell}: {a} vs {b}");
+        }
+        assert!(reference.iter().any(|area| *area > 100.0));
+        assert!(heights.iter().any(|height| *height < SEA_LEVEL));
+    }
+
+    fn highest_first_drainage(heights: &[f32], resolution: usize, cell_size: f32) -> Vec<f32> {
+        let count = resolution * resolution;
+        let mut area = vec![1.0f32; count];
+        let mut order: Vec<usize> = (0..count).collect();
+        order.sort_unstable_by(|&a, &b| heights[b].total_cmp(&heights[a]));
+        for cell in order {
+            let height = heights[cell];
+            if height < SEA_LEVEL {
+                continue;
+            }
+            let mut shares = Vec::new();
+            for_each_neighbour(cell, resolution, |neighbour, diagonal| {
+                let distance = if diagonal { cell_size * std::f32::consts::SQRT_2 } else { cell_size };
+                let slope = (height - heights[neighbour]) / distance;
+                if slope > 0.0 {
+                    shares.push((neighbour, slope * slope));
+                }
+            });
+            let total: f32 = shares.iter().map(|share| share.1).sum();
+            let passed = area[cell];
+            for (neighbour, share) in shares {
+                area[neighbour] += passed * share / total;
+            }
+        }
+        for (cell, height) in heights.iter().enumerate() {
+            if *height < SEA_LEVEL {
+                area[cell] = 0.0;
+            }
+        }
+        area
     }
 
     /// The ordinary path: a frame that is consumed leaves nothing behind.

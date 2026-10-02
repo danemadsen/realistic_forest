@@ -10,8 +10,9 @@
 //!    ping-pong indices to zero;
 //! 2. `RunErosionIterations` runs flux -> water -> terrain -> thermal into the
 //!    opposite targets in that order, so every pass reads the state its
-//!    predecessor wrote in the same iteration. The terrain pass writes the
-//!    terrain and drainage states together (two colour targets);
+//!    predecessor wrote in the same iteration. The water pass also writes each
+//!    cell's drainage-routing normaliser, and the terrain pass writes the
+//!    terrain and drainage states together (two colour targets each);
 //! 3. a finalize frame copies terrain, water and drainage back to the CPU,
 //!    which crops the retained footprint, derives the two atlas patches and
 //!    publishes `ErosionEvent::TileFinalized`.
@@ -347,7 +348,7 @@ struct ErosionSim {
     flux_inputs: [[[BindGroup; 2]; 2]; 2],
     water_inputs: [[[BindGroup; 2]; 2]; 2],
     terrain_inputs: [[[BindGroup; 2]; 2]; 2],
-    thermal_inputs: [BindGroup; 2],
+    thermal_inputs: [[BindGroup; 2]; 2],
 
     /// The short-lived base height map the init passes sample, one Rgba32Float
     /// 480x480 texture reused for every tile (the C++'s `base` Texture2D).
@@ -357,6 +358,9 @@ struct ErosionSim {
     water_views: [wgpu::TextureView; 2],
     flux_views: [wgpu::TextureView; 2],
     drainage_views: [wgpu::TextureView; 2],
+    /// Written by every water pass and read by the terrain pass right after,
+    /// so it needs no ping-pong partner.
+    routing_view: wgpu::TextureView,
 
     /// `terrainIndex`, `waterIndex`, `fluxIndex`, plus the drainage state.
     terrain_index: usize,
@@ -416,8 +420,8 @@ impl ErosionSim {
         let init_inputs_layout = sim_inputs_layout(1);
         let flux_inputs_layout = sim_inputs_layout(3);
         let water_inputs_layout = sim_inputs_layout(3);
-        let terrain_inputs_layout = sim_inputs_layout(3);
-        let thermal_inputs_layout = sim_inputs_layout(1);
+        let terrain_inputs_layout = sim_inputs_layout(4);
+        let thermal_inputs_layout = sim_inputs_layout(2);
 
         // The C++ sets TEXTURE_FILTER_POINT on the base map and keeps every
         // simulation texture point-sampled; the sim shaders only ever
@@ -441,6 +445,7 @@ impl ErosionSim {
             textures.sim_drainage[0].create_view(&Default::default()),
             textures.sim_drainage[1].create_view(&Default::default()),
         ];
+        let routing_view = textures.sim_routing.create_view(&Default::default());
 
         let base_texture = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
             label: Some("erosion_base_height"),
@@ -469,7 +474,8 @@ impl ErosionSim {
         // `RunErosionIterations` feeds each pass the state it must read: flux
         // takes (flux, terrain, water), water takes (water, flux, terrain) —
         // after the flux flip — terrain takes (terrain, water, drainage) and
-        // thermal takes the terrain the terrain pass just wrote.
+        // thermal takes the terrain and drainage the terrain pass just wrote
+        // (drainage B carries each cell's bedrock resistance).
         let flux_inputs = std::array::from_fn(|flux_index| {
             std::array::from_fn(|terrain_index| {
                 std::array::from_fn(|water_index| {
@@ -518,6 +524,7 @@ impl ErosionSim {
                             &terrain_views[terrain_index],
                             &water_views[water_index],
                             &drainage_views[drainage_index],
+                            &routing_view,
                         ],
                         &sampler,
                     )
@@ -525,14 +532,16 @@ impl ErosionSim {
             })
         });
         let thermal_inputs = std::array::from_fn(|terrain_index| {
-            target_bind_group(
-                device,
-                pipeline_cache,
-                "erosion_thermal_inputs",
-                &thermal_inputs_layout,
-                &[&terrain_views[terrain_index]],
-                &sampler,
-            )
+            std::array::from_fn(|drainage_index| {
+                target_bind_group(
+                    device,
+                    pipeline_cache,
+                    "erosion_thermal_inputs",
+                    &thermal_inputs_layout,
+                    &[&terrain_views[terrain_index], &drainage_views[drainage_index]],
+                    &sampler,
+                )
+            })
         });
 
         // One init uniform per mode: `queue.write_buffer` is ordered before
@@ -615,12 +624,13 @@ impl ErosionSim {
             vec![globals_layout.clone(), flux_inputs_layout, stage_layout.clone()],
             1,
         );
+        // Water and the routing normaliser.
         let water_pipeline = queue_erosion_pipeline(
             pipeline_cache,
             "erosion_water_pipeline",
             handles.erosion_water.clone(),
             vec![globals_layout.clone(), water_inputs_layout, stage_layout.clone()],
-            1,
+            2,
         );
         // Terrain and drainage states.
         let terrain_pipeline = queue_erosion_pipeline(
@@ -665,6 +675,7 @@ impl ErosionSim {
             water_views,
             flux_views,
             drainage_views,
+            routing_view,
             terrain_index: 0,
             water_index: 0,
             flux_index: 0,
@@ -885,13 +896,13 @@ impl ErosionSim {
             self.flux_index = next_flux;
 
             let next_water = 1 - self.water_index;
-            record_erosion_pass(
+            record_erosion_pass_targets(
                 context,
                 pipelines.water,
                 &self.globals,
                 &self.water_inputs[self.water_index][self.flux_index][self.terrain_index],
                 &self.water_stage_group,
-                &self.water_views[next_water],
+                &[&self.water_views[next_water], &self.routing_view],
             );
             self.water_index = next_water;
 
@@ -913,7 +924,7 @@ impl ErosionSim {
                 context,
                 pipelines.thermal,
                 &self.globals,
-                &self.thermal_inputs[self.terrain_index],
+                &self.thermal_inputs[self.terrain_index][self.drainage_index],
                 &self.thermal_stage_group,
                 &self.terrain_views[next_terrain],
             );

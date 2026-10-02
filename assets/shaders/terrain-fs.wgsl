@@ -550,6 +550,15 @@ fn rockJoints(p: vec2<f32>, seed: i32) -> vec4<f32>
     return vec4<f32>(second - nearest, facet, shade);
 }
 
+// A block's facet tilt eases to nothing at its joints, so neighbouring
+// blocks meet on a shared normal and round into the joint instead of
+// stepping there; a one-pixel normal step along every joint sparkles as the
+// view moves.
+fn facetTaper(gap: f32) -> f32
+{
+    return smoothHermite(0.0, 0.2, gap);
+}
+
 // Metre-scale weathered relief bridges the gap between scanned grains and
 // the terrain mesh. Both octaves fade before becoming subpixel; explicit
 // footprint inputs keep this callable inside material branches.
@@ -736,7 +745,7 @@ fn accumulateGroup(base: i32, group_weight: f32, plane_coord: vec2<f32>,
                    d_plane_x: vec2<f32>, d_plane_y: vec2<f32>, crossfade: f32,
                    eP: vec3<f32>, eQ: vec3<f32>, axis: vec3<f32>, N: vec3<f32>, strength: f32,
                    albedo_tint: vec3<f32>, albedo_desat: f32, rough_floor: f32,
-                   ao_retain: f32, normal_mul: f32,
+                   rough_lift: f32, ao_retain: f32, normal_mul: f32,
                    albedo: ptr<function, vec3<f32>>, world_detail: ptr<function, vec3<f32>>,
                    rough: ptr<function, f32>, ao: ptr<function, f32>, weight_sum: ptr<function, f32>)
 {
@@ -771,7 +780,9 @@ fn accumulateGroup(base: i32, group_weight: f32, plane_coord: vec2<f32>,
     (*albedo) += group_weight * sampled_albedo * albedo_tint;
     // AO retention scales cavity contrast, with zero giving an unoccluded surface.
     (*ao) += group_weight * (1.0 - (1.0 - albedo_ao_sample.a) * ao_retain);
-    (*rough) += group_weight * max(detail_rough_sample.a, rough_floor);
+    // A lift remaps the scan's roughness into [lift, 1] before the floor,
+    // keeping its relative variation; zero leaves the scan as it is.
+    (*rough) += group_weight * max(mix(rough_lift, 1.0, detail_rough_sample.a), rough_floor);
     (*world_detail) += group_weight * detail_rough_sample.xyz;
     (*weight_sum) += group_weight;
 }
@@ -784,8 +795,16 @@ fn shadeTerrain(input: FsInput, habitat: bool,
 {
     var output: FsOutput;
 
-    let frag_position_view = input.frag_position_view;
     let frag_world_position = input.frag_world_position;
+    // The G-buffer position is rebuilt from the world-space varying instead
+    // of read from fragPositionView. On Metal that interpolant arrives as
+    // zero in scattered fragments (1 px runs along ridges and silhouettes,
+    // thousands per frame) while the world position beside it is intact. A
+    // zero position hands the composite a degenerate view vector - Fresnel
+    // at 1, no fog - so the pixel flashes white, and the water's
+    // hidden-surface test discards over it, showing the seabed through the
+    // sea. Grass-damped specular used to hide most of them.
+    let frag_position_view = (globals.view * vec4<f32>(frag_world_position, 1.0)).xyz;
 
     var normalWorld = normalize(input.frag_world_normal);
     let height = frag_world_position.y;
@@ -1189,11 +1208,14 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                                      0.0, 0.0);
     var roughFloors = array<f32, 6>(0.72, 0.72, 0.70,
                                     0.88, 0.80, 0.65);
-    // Rock's own roughness map (Rock032) runs mean 0.70 with p5 0.57, so
-    // its floor sits below the map's mean instead of at it: clamping at
-    // 0.70 would cut away half the map and erase the scar pockets that
-    // catch the light. 0.65 preserves the same below-mean share (~21%)
-    // the Rock016 round kept with its 0.70 floor.
+    // Dry stone is among the roughest ground there is, but the scans are
+    // smooth: Rock032 runs 0.58-0.78 (mean 0.70) and both gravels 0.47-0.66,
+    // so gravel sat flat on its floor and rock read polished, sheening at
+    // every grazing sun angle. Lifting each map into [lift, 1] keeps its
+    // pockets and scars while placing rock at ~0.89-0.94 and gravel at
+    // ~0.89-0.93, alongside the soil's 0.88.
+    var roughLifts = array<f32, 6>(0.0, 0.0, 0.0,
+                                   0.0, 0.80, 0.73);
     // aoRetain (cavity contrast, see accumulateGroup): the AO map's darks
     // are what make scanned surfaces read as relief — blade gaps, thatch
     // shadows, snow pore shadows. Flattening them past ~25% turns a meadow
@@ -1236,21 +1258,24 @@ fn shadeTerrain(input: FsInput, habitat: bool,
             accumulateGroup(groupBases[g], slopeWeights.y, coordY, dYx, dYy, crossfades[g],
                             vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0),
                             normalWorld, globals.settings_b.x * scanDetailFade,
-                            albedoTints[g], albedoDesats[g], roughFloors[g], aoRetains[g], normalMuls[g],
+                            albedoTints[g], albedoDesats[g], roughFloors[g], roughLifts[g],
+                            aoRetains[g], normalMuls[g],
                             &colour, &detail, &roughness, &cavity, &projectionSum);
         }
         if (slopeWeights.x >= 0.02) {
             accumulateGroup(groupBases[g], slopeWeights.x, coordX, dXx, dXy, crossfades[g],
                             vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0),
                             normalWorld, globals.settings_b.x * scanDetailFade,
-                            albedoTints[g], albedoDesats[g], roughFloors[g], aoRetains[g], normalMuls[g],
+                            albedoTints[g], albedoDesats[g], roughFloors[g], roughLifts[g],
+                            aoRetains[g], normalMuls[g],
                             &colour, &detail, &roughness, &cavity, &projectionSum);
         }
         if (slopeWeights.z >= 0.02) {
             accumulateGroup(groupBases[g], slopeWeights.z, coordZ, dZx, dZy, crossfades[g],
                             vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 0.0, 1.0),
                             normalWorld, globals.settings_b.x * scanDetailFade,
-                            albedoTints[g], albedoDesats[g], roughFloors[g], aoRetains[g], normalMuls[g],
+                            albedoTints[g], albedoDesats[g], roughFloors[g], roughLifts[g],
+                            aoRetains[g], normalMuls[g],
                             &colour, &detail, &roughness, &cavity, &projectionSum);
         }
         let invProjection = 1.0 / max(projectionSum, 0.0001);
@@ -1375,52 +1400,79 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         // blocks. On the side projections the blocks are flattened into slabs
         // (bedding planes crossed by vertical joints); seen from above they
         // are equant. Facets fade before a block is a few pixels across, and
-        // the joints, being narrow, earlier still.
+        // the joints, being narrow, earlier still: the ~20 cm coarse joints
+        // by ~3 px, the ~5 cm fine ones by ~2 px. Blocks under a few percent
+        // of the cover cannot be seen, and, as with the scans, only the
+        // projections carrying at least 2% of the slope weight are searched,
+        // so a face pays for one or two Voronoi pairs rather than three.
         let coarseFade = 1.0 - smoothHermite(0.16, 0.40, footprint);
         let fineFade = 1.0 - smoothHermite(0.06, 0.16, footprint);
-        let jointFade = 1.0 - smoothHermite(0.03, 0.09, footprint);
-        if (coarseFade > 0.001)
+        let jointFade = 1.0 - smoothHermite(0.025, 0.07, footprint);
+        let fineJointFade = 1.0 - smoothHermite(0.012, 0.03, footprint);
+        if (coarseFade > 0.001 && gRock > 0.04)
         {
-            let topCoarse = rockJoints(coordY / 2.8, 31);
-            let sideXCoarse = rockJoints(coordX / vec2<f32>(3.2, 1.7), 37);
-            let sideZCoarse = rockJoints(coordZ / vec2<f32>(3.2, 1.7), 41);
-            let topFine = rockJoints(coordY / 0.95, 43);
-            let sideXFine = rockJoints(coordX / vec2<f32>(1.1, 0.6), 47);
-            let sideZFine = rockJoints(coordZ / vec2<f32>(1.1, 0.6), 53);
             // Facet tilts enter world space through each projection's axes,
             // as the weathering relief does.
-            let tiltCoarse = vec3<f32>(topCoarse.y, 0.0, topCoarse.z) * slopeWeights.y
-                           + vec3<f32>(0.0, sideXCoarse.z, sideXCoarse.y) * slopeWeights.x
-                           + vec3<f32>(sideZCoarse.y, sideZCoarse.z, 0.0) * slopeWeights.z;
-            let tiltFine = vec3<f32>(topFine.y, 0.0, topFine.z) * slopeWeights.y
-                         + vec3<f32>(0.0, sideXFine.z, sideXFine.y) * slopeWeights.x
-                         + vec3<f32>(sideZFine.y, sideZFine.z, 0.0) * slopeWeights.z;
+            var tiltCoarse = vec3<f32>(0.0);
+            var tiltFine = vec3<f32>(0.0);
+            var border = 0.0;
+            var fineBorder = 0.0;
+            var blockShade = 0.0;
+            var jointWeight = 0.0;
+            if (slopeWeights.y >= 0.02)
+            {
+                let coarse = rockJoints(coordY / 2.8, 31);
+                let fine = rockJoints(coordY / 0.95, 43);
+                tiltCoarse += vec3<f32>(coarse.y, 0.0, coarse.z) * (slopeWeights.y * facetTaper(coarse.x));
+                tiltFine += vec3<f32>(fine.y, 0.0, fine.z) * (slopeWeights.y * facetTaper(fine.x));
+                border += coarse.x * slopeWeights.y;
+                fineBorder += fine.x * slopeWeights.y;
+                blockShade += coarse.w * slopeWeights.y;
+                jointWeight += slopeWeights.y;
+            }
+            if (slopeWeights.x >= 0.02)
+            {
+                let coarse = rockJoints(coordX / vec2<f32>(3.2, 1.7), 37);
+                let fine = rockJoints(coordX / vec2<f32>(1.1, 0.6), 47);
+                tiltCoarse += vec3<f32>(0.0, coarse.z, coarse.y) * (slopeWeights.x * facetTaper(coarse.x));
+                tiltFine += vec3<f32>(0.0, fine.z, fine.y) * (slopeWeights.x * facetTaper(fine.x));
+                border += coarse.x * slopeWeights.x;
+                fineBorder += fine.x * slopeWeights.x;
+                blockShade += coarse.w * slopeWeights.x;
+                jointWeight += slopeWeights.x;
+            }
+            if (slopeWeights.z >= 0.02)
+            {
+                let coarse = rockJoints(coordZ / vec2<f32>(3.2, 1.7), 41);
+                let fine = rockJoints(coordZ / vec2<f32>(1.1, 0.6), 53);
+                tiltCoarse += vec3<f32>(coarse.y, coarse.z, 0.0) * (slopeWeights.z * facetTaper(coarse.x));
+                tiltFine += vec3<f32>(fine.y, fine.z, 0.0) * (slopeWeights.z * facetTaper(fine.x));
+                border += coarse.x * slopeWeights.z;
+                fineBorder += fine.x * slopeWeights.z;
+                blockShade += coarse.w * slopeWeights.z;
+                jointWeight += slopeWeights.z;
+            }
+            let projectionScale = 1.0 / max(jointWeight, 0.0001);
             let facetTilt = tiltCoarse * (0.22 * coarseFade) + tiltFine * (0.10 * fineFade);
             let facetTangent = facetTilt - normalWorld * dot(facetTilt, normalWorld);
             perturbedWorld = normalize(perturbedWorld
                                      - facetTangent * gRock * globals.settings_b.x);
-            let border = vec3<f32>(topCoarse.x, sideXCoarse.x, sideZCoarse.x);
-            let fineBorder = vec3<f32>(topFine.x, sideXFine.x, sideZFine.x);
-            let blockShade = dot(vec3<f32>(topCoarse.w, sideXCoarse.w, sideZCoarse.w),
-                                 vec3<f32>(slopeWeights.y, slopeWeights.x, slopeWeights.z));
-            let jointCoarse = 1.0 - smoothHermite(0.0, 0.07,
-                dot(border, vec3<f32>(slopeWeights.y, slopeWeights.x, slopeWeights.z)));
-            let jointFine = 1.0 - smoothHermite(0.0, 0.05,
-                dot(fineBorder, vec3<f32>(slopeWeights.y, slopeWeights.x, slopeWeights.z)));
-            albedo *= 1.0 + gRock * ((blockShade - 0.5) * 0.16 * coarseFade
+            let jointCoarse = 1.0 - smoothHermite(0.0, 0.07, border * projectionScale);
+            let jointFine = 1.0 - smoothHermite(0.0, 0.05, fineBorder * projectionScale);
+            albedo *= 1.0 + gRock * ((blockShade * projectionScale - 0.5) * 0.16 * coarseFade
                                      - jointCoarse * 0.42 * jointFade
-                                     - jointFine * 0.22 * jointFade * fineFade);
+                                     - jointFine * 0.22 * fineJointFade * fineFade);
             ao = mix(ao, ao * (1.0 - 0.45 * jointCoarse), gRock * jointFade);
         }
 
         // Runoff stains: water routed over steep rock gathers along the
         // simulated rills and leaves dark streaks down the face, lined up with
         // the gullies the same drainage cut below. They fade with the erosion
-        // cache like the rest of the flow evidence.
+        // cache like the rest of the flow evidence. A stain is a dry film of
+        // oxide and algae, so it darkens the stone without polishing it.
         let runoffStain = smoothHermite(2.5, 6.5, catchment)
                         * smoothHermite(0.45, 0.90, steepness);
         albedo *= 1.0 - gRock * runoffStain * 0.32;
-        rough = mix(rough, rough * 0.85, gRock * runoffStain);
         // Lichen: grey-green crusts on shaded, damp faces, ochre on sunny
         // ones, in patches that thin toward the summits.
         let lichen = smoothHermite(0.55, 0.80, soilSmall * 0.6 + soilEdge * 0.4)
@@ -1435,31 +1487,40 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // small debris flows leave long streaks of coarser and finer, lighter and
     // darker scree running straight downslope, which keeps a smooth repose
     // slope from reading as one uniform sheet. The frame follows the 4 m
-    // aspect, so streaks bend with the apron; they fade once a streak is
-    // narrower than a few pixels.
-    if (gGravel > 0.01)
+    // aspect, so streaks bend with the apron. Each octave fades out while
+    // its period still spans four or more pixels: closer to a pixel, the
+    // noise aliases into light and dark specks that crawl as the view moves.
+    let screeStreaks = gGravel * smoothHermite(0.40, 0.65, steepness);
+    let broadStreakFade = 1.0 - smoothHermite(0.42, 0.83, footprint);   // 3.3 m across
+    let fineStreakFade = 1.0 - smoothHermite(0.13, 0.26, footprint);    // 1.05 m across
+    if (screeStreaks > 0.01 && broadStreakFade > 0.001)
     {
-        let fallLine = normalize(materialNormal.xz + vec2<f32>(1e-4, 0.0));
+        let aspect = materialNormal.xz;
+        let aspectLength = dot(aspect, aspect);
+        let fallLine = select(vec2<f32>(1.0, 0.0), aspect * inverseSqrt(aspectLength),
+                              aspectLength > 1e-8);
         let across = dot(worldXZ, vec2<f32>(-fallLine.y, fallLine.x));
         let along = dot(worldXZ, fallLine);
-        let streakFade = 1.0 - smoothHermite(0.6, 2.5, footprint * 0.30);
-        let streak = groundNoise(vec2<f32>(across * 0.30, along * 0.035) + vec2<f32>(11.3, -7.7))
-                   * 0.7
-                   + groundNoise(vec2<f32>(across * 0.95, along * 0.11) + vec2<f32>(-23.1, 5.9))
-                   * 0.3;
-        let screeFace = smoothHermite(0.40, 0.65, steepness);
-        albedo *= 1.0 + gGravel * screeFace * (streak - 0.5) * 0.45 * streakFade;
+        let streak = (groundNoise(vec2<f32>(across * 0.30, along * 0.035) + vec2<f32>(11.3, -7.7))
+                      - 0.5) * 0.7 * broadStreakFade
+                   + (groundNoise(vec2<f32>(across * 0.95, along * 0.11) + vec2<f32>(-23.1, 5.9))
+                      - 0.5) * 0.3 * fineStreakFade;
+        albedo *= 1.0 + screeStreaks * streak * 0.45;
+    }
 
-        // Block-scale rubble. The gravel scans resolve pebbles, which are
-        // sub-pixel beyond a few tens of metres, while a real talus slope
-        // stays lumpy with metre and half-metre blocks: lit block tops,
-        // shaded gaps. Two relief octaves tilt the normal and shade the
-        // albedo, each fading out before its blocks shrink below a pixel.
+    // Block-scale rubble. The gravel scans resolve pebbles, which are
+    // sub-pixel beyond a few tens of metres, while a real talus slope stays
+    // lumpy with metre and half-metre blocks: lit block tops, shaded gaps.
+    // Two relief octaves tilt the normal and shade the albedo, each fading
+    // out while its period still spans four or more pixels, before its
+    // normals can alias into sparkle.
+    let rubbleWeight = gGravel * smoothHermite(0.30, 0.60, steepness);
+    let blockFade = 1.0 - smoothHermite(0.16, 0.31, footprint);   // 1.25 m blocks
+    let chipFade = 1.0 - smoothHermite(0.054, 0.109, footprint);  // 0.43 m chips
+    if (rubbleWeight > 0.01 && blockFade > 0.001)
+    {
         let blocks = groundNoiseGradient(worldXZ * 0.8 + vec2<f32>(3.7, -9.2));
         let chips = groundNoiseGradient(worldXZ * 2.3 + vec2<f32>(-14.1, 6.6));
-        let blockFade = 1.0 - smoothHermite(0.35, 1.1, footprint * 0.8);
-        let chipFade = 1.0 - smoothHermite(0.35, 1.1, footprint * 2.3);
-        let rubbleWeight = gGravel * smoothHermite(0.30, 0.60, steepness);
         albedo *= 1.0 + rubbleWeight * ((blocks.x - 0.5) * 0.34 * blockFade
                                         + (chips.x - 0.5) * 0.20 * chipFade);
         // Block heights ~0.35 m and chip heights ~0.12 m, as world slopes.
@@ -1966,19 +2027,25 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     }
     else
     {
-        let shoreWet = (1.0 - smoothHermite(stage.sea_level + 0.05,
-                         stage.sea_level + 1.15 + (soilLarge - 0.5) * 0.45, height))
-                       * (gSand + gGravel + gRock);
+        let waterline = 1.0 - smoothHermite(stage.sea_level + 0.05,
+                                            stage.sea_level + 1.15 + (soilLarge - 0.5) * 0.45,
+                                            height);
+        let shoreWet = waterline * (gSand + gGravel + gRock);
         let moisture = clamp(waterAmount * 0.52 + channel * 0.25 + shoreWet * 0.65, 0.0, 0.72)
                      * (1.0 - gSnow);
         let damp = albedo * vec3<f32>(0.55, 0.57, 0.56);
         albedo = mix(albedo, damp, moisture);
         // Damp earth stays rough; only pooled water approaches a low
         // roughness. Write the final value used by the G-buffer (snow glints
-        // have already modified outRough above).
+        // have already modified outRough above). Stone darkens when damp but
+        // glazes only at the waterline: the solver's working water in the
+        // channels is never drawn, so a wet sheen on channel gravel and rock
+        // reads as polish rather than as water.
         let wetness = moisture / 0.72;
+        let stony = clamp(gGravel + gRock, 0.0, 1.0);
+        let glaze = wetness * mix(1.0, waterline, stony);
         let wetRoughness = mix(0.70, 0.42, waterAmount);
-        outRough = mix(outRough, min(outRough, wetRoughness), wetness);
+        outRough = mix(outRough, min(outRough, wetRoughness), glaze);
     }
 
     // Diagnostic: replace the biome albedo with a false-colour of the blended

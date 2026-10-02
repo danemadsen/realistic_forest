@@ -170,8 +170,13 @@ fn vs_main(@builtin(vertex_index) vertex: u32) -> VsOutput {
     return output;
 }
 
+struct FragmentOutput {
+    @location(0) water: vec4<f32>,     // finalColor: water state
+    @location(1) routing: vec4<f32>,   // drainage-routing normaliser (R)
+};
+
 @fragment
-fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput {
     let coord = fragmentCoord(position.xy);
     let size = gridSize();
 
@@ -255,7 +260,27 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         velocity = vec2<f32>(0.0);
     }
 
-    return vec4<f32>(depth, velocity, accumulated_discharge);  // finalColor
+    // Drainage-routing normaliser for the terrain pass that follows: the sum
+    // of this cell's squared downhill bed slopes to its in-grid neighbours,
+    // the total each of its receivers divides its own share by. No pass
+    // between this one and the terrain pass moves a bed, so this is the very
+    // total that pass used to rebuild from a 5x5 window at every receiver;
+    // the arithmetic and its order are unchanged.
+    let routing_bed = fetchTerrain(coord).r;
+    var share_total = 0.0;
+    for (var receiver = 0; receiver < 9; receiver++)
+    {
+        if (receiver == 4) { continue; }
+        let step = vec2<i32>(receiver % 3 - 1, receiver / 3 - 1);
+        let receiver_coord = coord + step;
+        if (any(receiver_coord < vec2<i32>(0)) || any(receiver_coord >= size)) { continue; }
+        let receiver_slope = (routing_bed - fetchTerrain(receiver_coord).r)
+            / (cell_size * select(1.0, 1.41421356, step.x != 0 && step.y != 0));
+        if (receiver_slope > 0.0) { share_total += receiver_slope * receiver_slope; }
+    }
+
+    return FragmentOutput(vec4<f32>(depth, velocity, accumulated_discharge),
+                          vec4<f32>(share_total, 0.0, 0.0, 0.0));
 }
 
 // STAGE UNIFORMS:
