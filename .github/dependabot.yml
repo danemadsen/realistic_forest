@@ -1,0 +1,32 @@
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # One PR per week instead of one per crate, since each PR runs the
+    # three-platform build.
+    groups:
+      cargo-dependencies:
+        patterns: ["*"]
+    # These move in lockstep with Bevy (bevy_egui 0.42 targets Bevy 0.19, and
+    # wgpu and naga must match the versions Bevy resolves), so only patch
+    # releases are automatic. A Bevy upgrade is a manual, coordinated change.
+    ignore:
+      - dependency-name: bevy
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: bevy_egui
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: wgpu
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: naga
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]

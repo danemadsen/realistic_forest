@@ -1,0 +1,34 @@
+name: security
+
+on:
+  push:
+    branches: [master]
+    paths: [Cargo.toml, Cargo.lock, .github/workflows/security.yml]
+  pull_request:
+    paths: [Cargo.toml, Cargo.lock, .github/workflows/security.yml]
+  # Advisories land independently of commits, so re-check on a schedule.
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      # cargo audit only reads the lockfile, so skip the ~550 MB of assets.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            /Cargo.toml
+            /Cargo.lock
+          sparse-checkout-cone-mode: false
+
+      # Vulnerabilities fail the run. Unmaintained-crate notices, which a Bevy
+      # tree usually has a few of, are reported without failing it.
+      - uses: actions-rust-lang/audit@v1
+        with:
+          createIssues: false

@@ -1,0 +1,118 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+    paths-ignore: ["**/*.md"]
+  pull_request:
+    paths-ignore: ["**/*.md"]
+  workflow_dispatch:
+    inputs:
+      bundle_assets:
+        description: Include the assets directory in the archives (about 550 MB each)
+        type: boolean
+        default: false
+  # Called by release.yml, which always bundles the assets.
+  workflow_call:
+    inputs:
+      bundle_assets:
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: build (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ubuntu-latest sets the glibc floor for the Linux binary (2.39).
+          - platform: linux-x86_64
+            runner: ubuntu-latest
+            exe_suffix: ""
+            archive_ext: tar.gz
+          # macos-latest is Apple silicon. Intel would be `macos-15-intel`.
+          - platform: macos-arm64
+            runner: macos-latest
+            exe_suffix: ""
+            archive_ext: tar.gz
+          - platform: windows-x86_64
+            runner: windows-latest
+            exe_suffix: ".exe"
+            archive_ext: zip
+    steps:
+      # A full checkout: the build embeds assets/shaders with include_str!.
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Keep in sync with the same step in ci.yml.
+      - name: Install system libraries
+        if: ${{ runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev libx11-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: build-${{ matrix.platform }}
+          save-if: ${{ github.ref == 'refs/heads/master' }}
+
+      # Only the game: the other bins in src/bin are developer tools.
+      - name: Build
+        run: cargo build --release --locked --bin realistic_forest
+
+      # The binary finds its shaders and textures in an `assets` folder next to
+      # it (or in the working directory), so a runnable archive carries both.
+      # Push and PR builds skip the assets to stay quick; release.yml bundles them.
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          BUNDLE_ASSETS: ${{ inputs.bundle_assets }}
+          PLATFORM: ${{ matrix.platform }}
+          EXE_SUFFIX: ${{ matrix.exe_suffix }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          name="realistic-forest-${version}-${PLATFORM}"
+
+          mkdir -p "dist/${name}"
+          cp "target/release/realistic_forest${EXE_SUFFIX}" "dist/${name}/"
+          cp README.md "dist/${name}/"
+          if [ "${BUNDLE_ASSETS}" = "true" ]; then
+            cp -R assets "dist/${name}/assets"
+          fi
+
+          cd dist
+          if [ "${ARCHIVE_EXT}" = "zip" ]; then
+            7z a -tzip -mx=1 "${name}.zip" "${name}" > /dev/null
+          else
+            COPYFILE_DISABLE=1 tar -czf "${name}.tar.gz" "${name}"
+          fi
+          ls -lh "${name}.${ARCHIVE_EXT}"
+          echo "archive=dist/${name}.${ARCHIVE_EXT}" >> "${GITHUB_OUTPUT}"
+
+      # One archive per platform. It is already compressed, and building the
+      # archive ourselves keeps the executable bit that artifact zips drop.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: realistic-forest-${{ matrix.platform }}
+          path: ${{ steps.package.outputs.archive }}
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error
