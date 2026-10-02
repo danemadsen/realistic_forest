@@ -63,14 +63,6 @@ pub const LEVEL_TREES: u8 = 0;
 pub const LEVEL_SHRUBS: u8 = 1;
 pub const LEVEL_GROUND: u8 = 2;
 
-pub fn level_layers(level: u8) -> &'static [Layer] {
-    match level {
-        LEVEL_TREES => &[Layer::Canopy, Layer::Regeneration],
-        LEVEL_SHRUBS => &[Layer::Shrub],
-        _ => &[Layer::Herb, Layer::Lavender],
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Catalogue
 // ---------------------------------------------------------------------------

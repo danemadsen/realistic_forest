@@ -61,7 +61,9 @@ fn species_colour(species: Species) -> [u8; 3] {
     }
 }
 
-/// Counts and spatial statistics of a scatter, printed as a report.
+/// Counts and spatial statistics of a scatter, printed as a report. The map
+/// prints `lines`; the tests hold the statistics to the brief.
+#[cfg_attr(not(test), allow(dead_code))]
 pub struct Report {
     pub lines: Vec<String>,
     pub species_counts: std::collections::BTreeMap<Species, usize>,

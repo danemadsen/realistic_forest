@@ -15,6 +15,8 @@ pub mod post_nodes;
 pub mod lightning_node;
 pub mod precipitation_node;
 pub mod terrain_node;
+pub mod vegetation_node;
+pub mod vegetation_shadows;
 pub mod water_node;
 
 use crate::constants::*;
@@ -45,11 +47,14 @@ pub struct ForestRender;
 
 /// The ordered stages of the forest pipeline. Mirrors the render order the
 /// port's render graph used to encode with node edges: erosion -> terrain ->
-/// SSAO -> blur -> clouds -> composite -> water -> FXAA -> egui -> upscale.
+/// SSAO -> blur -> clouds -> composite -> water -> FXAA -> egui -> upscale,
+/// with the scattered vegetation and then the grass joining the terrain
+/// G-buffer before SSAO.
 #[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone)]
 pub enum ForestRenderSystems {
     Erosion,
     Terrain,
+    Vegetation,
     Grass,
     Ssao,
     Blur,
@@ -74,6 +79,7 @@ impl ForestRender {
             (
                 Erosion,
                 Terrain,
+                Vegetation,
                 Grass,
                 Ssao,
                 Blur,
@@ -416,6 +422,8 @@ pub struct ForestShaderHandles {
     pub terrain_fs: Handle<Shader>,
     pub grass: Handle<Shader>,
     pub grass_ground_average: Handle<Shader>,
+    pub vegetation: Handle<Shader>,
+    pub vegetation_cull: Handle<Shader>,
     pub erosion_init: Handle<Shader>,
     pub erosion_flux: Handle<Shader>,
     pub erosion_water: Handle<Shader>,
@@ -462,6 +470,8 @@ impl Plugin for ForestRenderPlugin {
                 terrain_fs: asset_server.load::<Shader>("shaders/terrain-fs.wgsl"),
                 grass: asset_server.load::<Shader>("shaders/grass.wgsl"),
                 grass_ground_average: asset_server.load::<Shader>("shaders/grass-ground-average.wgsl"),
+                vegetation: asset_server.load::<Shader>("shaders/vegetation.wgsl"),
+                vegetation_cull: asset_server.load::<Shader>("shaders/vegetation-cull.wgsl"),
                 erosion_init: asset_server.load::<Shader>("shaders/erosion-init.wgsl"),
                 erosion_flux: asset_server.load::<Shader>("shaders/erosion-flux.wgsl"),
                 erosion_water: asset_server.load::<Shader>("shaders/erosion-water.wgsl"),
@@ -499,6 +509,7 @@ impl Plugin for ForestRenderPlugin {
             render_app.insert_resource(assets);
         }
         grass_node::register_grass_systems(render_app);
+        vegetation_node::register_vegetation_systems(render_app);
         render_app.insert_resource(bridge);
         render_app.insert_resource(self.noise_field.clone());
         render_app.insert_resource(handles);
@@ -538,6 +549,7 @@ impl Plugin for ForestRenderPlugin {
             (
                 erosion_node::forest_erosion_pass.in_set(ForestRenderSystems::Erosion),
                 terrain_node::forest_terrain_pass.in_set(ForestRenderSystems::Terrain),
+                vegetation_node::forest_vegetation_pass.in_set(ForestRenderSystems::Vegetation),
                 grass_node::forest_grass_pass.in_set(ForestRenderSystems::Grass),
                 post_nodes::forest_ssao_pass.in_set(ForestRenderSystems::Ssao),
                 post_nodes::forest_blur_pass.in_set(ForestRenderSystems::Blur),

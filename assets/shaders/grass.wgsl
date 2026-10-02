@@ -91,7 +91,13 @@ fn vs_main(
                               select(near_medium, carpet, scatter_data.y > 2.5),
                               scatter_data.y > 1.5),
                        scatter_data.y > 0.5);
-    let potential = survival * fade * layer;
+    // The ground-colour texture's alpha is the share of open sky the tree
+    // crowns leave over the root (vegetation.wgsl's canopy pass): deep shade
+    // under a closed canopy keeps only a few, smaller clumps.
+    let ground_colour = textureSampleLevel(grass_ground_albedo, habitat_sampler, habitatUV(root), 0.0);
+    let sky = ground_colour.a;
+    let shade_survival = smoothstep(seed - 0.12, seed + 0.12, 1.15 * sky - 0.08);
+    let potential = survival * fade * layer * shade_survival;
     if (potential < 0.02) { return out; }
     let ground = groundAt(root);
     let radius = max(0.12, material.shape.y * scale);
@@ -101,7 +107,7 @@ fn vs_main(
     suitability = min(suitability, allowedAt(root - vec2<f32>(radius, 0.0)));
     suitability = min(suitability, allowedAt(root + vec2<f32>(0.0, radius)));
     suitability = min(suitability, allowedAt(root - vec2<f32>(0.0, radius)));
-    let growth = suitability * potential;
+    let growth = suitability * potential * mix(0.6, 1.0, sky);
     if (growth < 0.02) { return out; }
     let up = normalize(vec3<f32>(ground.b, sqrt(max(0.01, 1.0 - dot(ground.ba, ground.ba))), ground.a));
     let c = cos(rotation); let s = sin(rotation);
@@ -126,8 +132,7 @@ fn vs_main(
     out.tint = tint;
     out.blade_height = blade;
     // One averaged terrain colour per rooted clump, before lighting and shadow.
-    out.ground_average = textureSampleLevel(grass_ground_albedo, habitat_sampler,
-                                            habitatUV(root), 0.0).rgb;
+    out.ground_average = ground_colour.rgb;
     return out;
 }
 struct Gbuffer {

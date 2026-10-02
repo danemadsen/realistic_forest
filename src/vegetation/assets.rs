@@ -137,14 +137,7 @@ pub struct PlantLod {
     /// Into [`VegetationAssets::vertices`]; the primitives' indices are
     /// relative to it.
     pub base_vertex: u32,
-    pub vertex_count: u32,
     pub primitives: Vec<PlantPrimitive>,
-}
-
-impl PlantLod {
-    pub fn triangles(&self) -> u32 {
-        self.primitives.iter().map(|p| p.index_count / 3).sum()
-    }
 }
 
 pub struct PlantModel {
@@ -152,7 +145,6 @@ pub struct PlantModel {
     pub species: Species,
     /// `small`, `large`, `sapling`, ... or empty for a family with one form.
     pub form: String,
-    pub variant: u32,
     pub lods: Vec<PlantLod>,
     /// Top of the LOD-0 mesh above its trunk-base pivot, metres.
     pub height: f32,
@@ -174,10 +166,6 @@ pub struct VegetationAssets {
 }
 
 impl VegetationAssets {
-    pub fn model_index(&self, name: &str) -> Option<usize> {
-        self.models.iter().position(|model| model.name == name)
-    }
-
     pub fn texture_bytes(&self) -> usize {
         self.textures.iter().map(PreparedTexture::byte_size).sum()
     }
@@ -605,7 +593,6 @@ impl VegetationAssets {
                 }
                 lods.push(PlantLod {
                     base_vertex,
-                    vertex_count: local_vertex,
                     primitives: lod_primitives,
                 });
             }
@@ -614,7 +601,6 @@ impl VegetationAssets {
                 name: model_name,
                 species: name.species,
                 form: name.form.clone(),
-                variant: name.variant,
                 lods,
                 height: top.max(0.05),
                 crown_radius,
@@ -1141,7 +1127,11 @@ mod tests {
                 model.height,
                 model.crown_radius,
                 model.crown_base,
-                model.lods.iter().map(PlantLod::triangles).collect::<Vec<_>>()
+                model
+                    .lods
+                    .iter()
+                    .map(|lod| lod.primitives.iter().map(|p| p.index_count / 3).sum::<u32>())
+                    .collect::<Vec<_>>()
             );
         }
     }

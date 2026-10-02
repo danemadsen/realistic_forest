@@ -14,6 +14,7 @@ use crate::render::{
     globals_layout, BlurStageUniforms, CompositeStageUniforms, ExtractedForestView,
     ForestGlobals, ForestShaderHandles, GlobalUniformsGpu, SsaoStageUniforms,
 };
+use super::vegetation_shadows::{ShadowUniform, VegetationShadowMaps};
 use bevy::app::SubApp;
 use bevy::asset::Handle;
 use bevy::ecs::schedule::IntoScheduleConfigs;
@@ -183,6 +184,7 @@ fn prepare_post_pipelines(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
+    vegetation_shadows: Res<VegetationShadowMaps>,
 ) {
     let Ok(mut inner) = state.inner.lock() else {
         return;
@@ -264,6 +266,9 @@ fn prepare_post_pipelines(
     let Some(world_textures) = world_textures.0.as_ref() else {
         return;
     };
+    let Some(shadows) = vegetation_shadows.targets.as_ref() else {
+        return;
+    };
 
     if inner.samplers.is_none() {
         let wgpu_device = device.wgpu_device();
@@ -313,10 +318,10 @@ fn prepare_post_pipelines(
             // blur: raw SSAO (bilinear), position, normal.
             blur: screen_group_layout("forest_blur_group_layout", &[true, false, false]),
             // composite: position, normal, albedo, blurred SSAO.
-            composite: screen_group_layout(
+            composite: with_vegetation_shadows(screen_group_layout(
                 "forest_composite_group_layout",
                 &[false, false, true, true, true, true],
-            ),
+            )),
             atmosphere: screen_group_layout(
                 "forest_atmosphere_group_layout",
                 &[false, false, true, true, true],
@@ -384,12 +389,18 @@ fn prepare_post_pipelines(
                 texture_entry(3, blurred),
                 texture_entry(4, &gbuffer.heightfield_view),
                 texture_entry(5, &targets.atmosphere_view),
+                texture_entry(6, &shadows.array_view),
+                BindGroupEntry {
+                    binding: 7,
+                    resource: shadows.uniform.as_entire_binding(),
+                },
                 sampler_entry(8, &samplers.point_clamp),
                 sampler_entry(9, &samplers.point_clamp),
                 sampler_entry(10, &samplers.linear_clamp),
                 sampler_entry(11, &samplers.linear_clamp),
                 sampler_entry(12, &samplers.linear_clamp),
                 sampler_entry(13, &samplers.linear_clamp),
+                sampler_entry(14, &shadows.sampler),
             ],
         );
 
@@ -545,7 +556,8 @@ pub fn register_post_systems(render_app: &mut SubApp) {
             resize_ssao_targets,
             prepare_post_pipelines
                 .after(crate::render::prepare_forest_globals)
-                .after(crate::render::terrain_node::resize_gbuffer),
+                .after(crate::render::terrain_node::resize_gbuffer)
+                .after(crate::render::vegetation_shadows::prepare_vegetation_shadow_maps),
         )
             .chain()
             .in_set(RenderSystems::Prepare),
@@ -998,6 +1010,40 @@ fn screen_group_layout(
         });
     }
     BindGroupLayoutDescriptor::new(label, &entries)
+}
+
+/// Adds the plants' shadow cascades to the composite's group: the depth
+/// array at binding 6, its uniform at 7 and the comparison sampler at 14.
+fn with_vegetation_shadows(mut layout: BindGroupLayoutDescriptor) -> BindGroupLayoutDescriptor {
+    layout.entries.extend([
+        wgpu::BindGroupLayoutEntry {
+            binding: 6,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Depth,
+                view_dimension: wgpu::TextureViewDimension::D2Array,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 7,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<ShadowUniform>() as u64),
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 14,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+            count: None,
+        },
+    ]);
+    layout
 }
 
 /// Binds a sampled texture at `binding`.

@@ -1,0 +1,258 @@
+// BEGIN SHARED TERRAIN HEIGHT
+// The streamed landform: base noise relief plus the four-pass erosion delta,
+// faded with distance from the player. terrain-vs.wgsl draws the clipmap and
+// the lighting heightfield from it, and vegetation-cull.wgsl seats every
+// plant's root on it; a test keeps the pasted copies identical, so a trunk
+// stands exactly on the ground the terrain pass draws. Requires StageUniforms
+// as `stage` and the base noise, surface atlas, tile lookup and blend mask as
+// tex0, tex1, tex3 and tex4 with their samplers.
+fn smoothHermite(edge0: f32, edge1: f32, value: f32) -> f32
+{
+    let t = clamp((value - edge0)/max(edge1 - edge0, 0.0001), 0.0, 1.0);
+    return t*t*(3.0 - 2.0*t);
+}
+
+// This is deliberately a single, simple sampling rule so the CPU erosion
+// initialisation can reproduce it with a bilinear texture lookup. The R32
+// field is NOT periodic (it is one FastNoiseLite patch, not a wrapped one),
+// so the phase is mirror-folded back over the texture instead of wrapped:
+// a plain fract() repeat would tear between unrelated edge texels at every
+// period seam, leaving cliff lines through the landform. The first half of
+// each period samples exactly as before; the second half reads the first
+// half reversed, so the fold is continuous at every crease.
+//
+// The fold valley must not reach uv = 0: that is the field's wrap edge, where
+// bilinear filtering blends the unrelated first and last texels of the
+// non-periodic patch, and the blend steps against the local trend along the
+// fold line. The valley is clamped to the first texel centre instead, so the
+// fold runs along the edge texel without ever blending across it. The
+// reverse fold at uv = 0.5 lands on a genuine interior texel pair and needs
+// no clamp.
+fn signedNoise(p: vec2<f32>) -> f32
+{
+    let phase = fract(p/max(stage.noise_period, 0.0001) + vec2<f32>(0.5));
+    let uv = vec2<f32>(0.5) - abs(phase - vec2<f32>(0.5));
+    let halfTexel = 0.5/vec2<f32>(textureDimensions(tex0, 0));
+    return textureSampleLevel(tex0, tex0_sampler, max(uv, halfTexel), 0.0).r*2.0 - 1.0;
+}
+
+fn rotateA(p: vec2<f32>) -> vec2<f32>
+{
+    return vec2<f32>(0.8*p.x - 0.6*p.y, 0.6*p.x + 0.8*p.y);
+}
+
+fn rotateB(p: vec2<f32>) -> vec2<f32>
+{
+    return vec2<f32>(0.6*p.x + 0.8*p.y, -0.8*p.x + 0.6*p.y);
+}
+
+// Bounded-exponential altitude profile around sea level, mirrored exactly by
+// ShapeElevation in main.cpp (the constants arrive as uniforms). Convex on
+// both sides of the waterline: the shore keeps gentle slopes for wide plains
+// and a littoral shelf, and the gradient accelerates with elevation into
+// steep mountain crowns and a progressively deepening seabed.
+// (GLSL named the parameter `macro`; that word is reserved in WGSL.)
+fn shapeElevation(macroIn: f32) -> f32
+{
+    var macroValue = macroIn;
+    if (macroValue >= 0.0)
+    {
+        // tanh is saturated to +/-1 at |x| = 10 in f32. Bound its input to
+        // avoid overflowing the GPU backend's exponential implementation.
+        macroValue += stage.waterline_clearance * tanh(clamp(
+                         macroValue/stage.waterline_clearance_scale, -10.0, 10.0))
+                    * exp(-(macroValue*macroValue)
+                          / (stage.waterline_clearance_decay*stage.waterline_clearance_decay));
+        let t = macroValue/max(stage.land_profile_reference, 0.0001);
+        return stage.land_profile_peak*(exp(stage.land_profile_curve*t) - 1.0)
+             / (exp(stage.land_profile_curve) - 1.0);
+    }
+    // Clamped at the reference: the deepest basins flatten into an abyssal
+    // plain at the depth constant instead of diving without bound.
+    let t = min(macroValue/min(stage.ocean_profile_reference, -0.0001), 1.0);
+    return stage.ocean_profile_depth*(exp(stage.ocean_profile_curve*t) - 1.0)
+         / (exp(stage.ocean_profile_curve) - 1.0);
+}
+
+// Push a finished height away from the waterline, preserving its sign.
+// Mirrored exactly by `push_from_waterline` in src/noise.rs, which is what the
+// player's walking collision samples — the two must stay identical or the
+// player floats over or sinks into the rendered ground.
+//
+// shapeElevation shapes only the macro landform, and the fine detail octaves
+// are added after it, so the surface can land anywhere within about +-2 m of
+// sea level across the whole coastal plain. Terrain in that band is
+// indistinguishable from the water surface to the depth buffer, and once the
+// sea has waves it is indistinguishable to the eye as well, because every
+// trough exposes it again. This is the dead-zone removal that makes the
+// coastline decisive: monotone, exactly zero at sea level so the shoreline
+// does not move, and steepening the approach to it by 1 + push/scale.
+fn pushFromWaterline(height: f32) -> f32
+{
+    let scale = max(stage.waterline_push_scale, 0.0001);
+    let push = select(stage.waterline_push_sea, stage.waterline_push_land,
+                      height >= 0.0);
+    // Unbounded tanh overflows on Metal at mountain elevations, producing
+    // NaN heights and normals. Saturation preserves the CPU profile while
+    // keeping the shader finite on summits and in deep ocean basins.
+    return height + push*tanh(clamp(height/scale, -10.0, 10.0));
+}
+
+fn baseHeight(p: vec2<f32>) -> f32
+{
+    // Compress only the macro domain. The final detail octaves still use
+    // physical coordinates, retaining nearby surface definition even though
+    // ranges, plains, islands, and bays are much broader.
+    let detailA = rotateA(p);
+    let detailB = rotateB(p);
+    let macroP = p/max(stage.landform_horizontal_scale, 0.0001);
+    let sourceA = rotateA(macroP);
+    let sourceB = rotateB(macroP);
+    let warp = vec2<f32>(
+        signedNoise(sourceA*0.74 + vec2<f32>(1129.0, -587.0)),
+        signedNoise(sourceB*0.69 + vec2<f32>(-977.0, 1231.0)));
+    let warped = macroP + warp*210.0;
+    let a = rotateA(warped);
+    let b = rotateB(warped);
+
+    let continent = signedNoise(warped*0.38 + vec2<f32>(137.0, -311.0));
+    let coastDetail = signedNoise(a*0.83 + vec2<f32>(-743.0, 521.0));
+    let plains = signedNoise(b*2.20 + vec2<f32>(193.0, -97.0));
+    let mountainField = signedNoise(a*0.63 + vec2<f32>(887.0, 653.0));
+    let ridgeNoiseA = signedNoise(b*2.15 + vec2<f32>(-419.0, -811.0));
+    let ridgeNoiseB = signedNoise(a*3.35 + vec2<f32>(1601.0, -1297.0));
+    let ridgeA = smoothHermite(0.0, 1.0, 1.0 - abs(ridgeNoiseA));
+    let ridgeB = smoothHermite(0.0, 1.0, 1.0 - abs(ridgeNoiseB));
+    let ridge = ridgeA*0.72 + ridgeB*0.28;
+    let detail = signedNoise(detailA*8.60 + vec2<f32>(47.0, 101.0));
+    let microDetail = signedNoise(detailB*31.0 + vec2<f32>(-211.0, 379.0));
+
+    let continental = continent*0.70 + coastDetail*0.30;
+    let mountainMask = smoothHermite(-0.02, 0.62,
+                                     mountainField + continent*0.38);
+
+    var macroHeight = stage.sea_level - 5.0;
+    macroHeight += continental*32.0;
+    macroHeight += plains*6.0;
+    macroHeight += mountainMask*(20.0 + 68.0*ridge);
+    let fineHeight = detail*(1.4 + 2.8*mountainMask)
+                   + microDetail*(0.55 + 0.55*mountainMask);
+    // The macro landform goes through the exponential altitude profile; fine
+    // detail octaves are added after it so plains keep their rolling surface
+    // and the steep crowns do not shimmer.
+    let verticalScale = max(stage.landform_vertical_scale, 0.0001);
+    let height = stage.sea_level
+        + shapeElevation((macroHeight - stage.sea_level)*verticalScale)
+        + fineHeight*verticalScale;
+
+    // Only a small patch at spawn is stabilised for the first player frame;
+    // every landscape-scale feature comes from the warped noise field.
+    let distanceFromSpawn = length(p);
+    let safeHeight = stage.sea_level + 14.0 + plains*1.8 + detail*0.35;
+    let spawnBlend = smoothHermite(22.0, 90.0, distanceFromSpawn);
+    // The push goes on last, after the spawn blend, so the stabilised patch and
+    // the open landscape are shaped by the same function and no artificial
+    // ring appears at the blend's edge.
+    return pushFromWaterline(mix(safeHeight, height, spawnBlend));
+}
+
+fn lookupErosionTile(tileCoordinate: vec2<f32>, record: ptr<function, vec4<f32>>) -> bool
+{
+    let relativeTile = tileCoordinate - stage.erosion_lookup_min_tile;
+    let lookupSize = max(stage.erosion_lookup_size, 1.0);
+    if (any(relativeTile < vec2<f32>(0.0)) ||
+        any(relativeTile >= vec2<f32>(lookupSize)))
+    {
+        *record = vec4<f32>(0.0);
+        return false;
+    }
+
+    *record = textureLoad(tex3, vec2<i32>(relativeTile), 0);
+    return (*record).a > 0.0;
+}
+
+fn erosionSupportUV(worldXZ: vec2<f32>, tileCoordinate: vec2<f32>) -> vec2<f32>
+{
+    let stride = max(stage.erosion_tile_stride, 0.0001);
+    let footprint = max(stage.erosion_footprint_size, 0.0001);
+    let supportMinimum = tileCoordinate*stride - vec2<f32>(0.5*footprint);
+    return (worldXZ - supportMinimum)/footprint;
+}
+
+fn erosionTileMask(worldXZ: vec2<f32>, tileCoordinate: vec2<f32>) -> f32
+{
+    let tileUV = erosionSupportUV(worldXZ, tileCoordinate);
+    if (any(tileUV < vec2<f32>(0.0)) ||
+        any(tileUV > vec2<f32>(1.0))) { return 0.0; }
+    return max(textureSampleLevel(tex4, tex4_sampler, tileUV, 0.0).r, 0.0);
+}
+
+fn erosionAtlasUV(worldXZ: vec2<f32>, tileCoordinate: vec2<f32>, atlasSlot: vec2<f32>) -> vec2<f32>
+{
+    let outputResolution = max(stage.erosion_output_resolution, 1.0);
+    let tileUV = clamp(erosionSupportUV(worldXZ, tileCoordinate),
+                       vec2<f32>(0.0), vec2<f32>(1.0));
+    let atlasPixel = atlasSlot*max(stage.erosion_atlas_pitch, outputResolution)
+                   + vec2<f32>(max(stage.erosion_atlas_gutter, 0.0))
+                   + tileUV*outputResolution;
+    return atlasPixel/max(stage.erosion_atlas_size, 1.0);
+}
+
+fn accumulateErosionTile(worldXZ: vec2<f32>, tileCoordinate: vec2<f32>, spatialWeight: f32,
+                         weightedDelta: ptr<function, f32>)
+{
+    if (spatialWeight <= 0.0) { return; }
+
+    var record = vec4<f32>(0.0);
+    if (!lookupErosionTile(tileCoordinate, &record)) { return; }
+    let reveal = clamp(record.z*record.a, 0.0, 1.0);
+    let heightDelta = textureSampleLevel(tex1, tex1_sampler,
+        erosionAtlasUV(worldXZ, tileCoordinate, record.xy), 0.0).r;
+    *weightedDelta += spatialWeight*reveal*heightDelta;
+}
+
+fn erosionDelta(worldXZ: vec2<f32>) -> f32
+{
+    // Pass centres lie on a half-footprint lattice. Between two adjacent
+    // centres, the raylib-derived Hermite tents are complementary; their
+    // separable products therefore form one smooth four-pass partition.
+    let stride = max(stage.erosion_tile_stride, 0.0001);
+    let minimumTile = floor(worldXZ/stride);
+    let tile00 = minimumTile;
+    let tile10 = minimumTile + vec2<f32>(1.0, 0.0);
+    let tile01 = minimumTile + vec2<f32>(0.0, 1.0);
+    let tile11 = minimumTile + vec2<f32>(1.0, 1.0);
+
+    var spatialWeights = vec4<f32>(erosionTileMask(worldXZ, tile00),
+                                   erosionTileMask(worldXZ, tile10),
+                                   erosionTileMask(worldXZ, tile01),
+                                   erosionTileMask(worldXZ, tile11));
+    let geometricSum = dot(spatialWeights, vec4<f32>(1.0));
+    if (geometricSum <= 0.000001) { return 0.0; }
+    spatialWeights /= geometricSum;
+
+    // Only this fixed geometric partition is normalized. Readiness never
+    // changes its denominator: a missing pass contributes zero erosion (the
+    // base surface) and its reveal brings it in without amplifying neighbours.
+    var weightedDelta = 0.0;
+    accumulateErosionTile(worldXZ, tile00, spatialWeights.x, &weightedDelta);
+    accumulateErosionTile(worldXZ, tile10, spatialWeights.y, &weightedDelta);
+    accumulateErosionTile(worldXZ, tile01, spatialWeights.z, &weightedDelta);
+    accumulateErosionTile(worldXZ, tile11, spatialWeights.w, &weightedDelta);
+    return weightedDelta;
+}
+
+fn erosionVisibility(worldXZ: vec2<f32>) -> f32
+{
+    return 1.0 - smoothHermite(stage.erosion_visibility_full_radius,
+                               stage.erosion_visibility_zero_radius,
+                               length(worldXZ - stage.erosion_visibility_center));
+}
+
+fn terrainHeight(worldXZ: vec2<f32>) -> f32
+{
+    // The four-pass result is already spatially normalized. The radial fade
+    // stays well inside the region where every required lookup record exists.
+    return baseHeight(worldXZ) + erosionDelta(worldXZ)*erosionVisibility(worldXZ);
+}
+// END SHARED TERRAIN HEIGHT

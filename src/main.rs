@@ -299,6 +299,10 @@ fn main() {
         })
         .insert_resource(ErosionBridge::default())
         .insert_resource(erosion::TilePreparation::new(std::sync::Arc::new(noise_field.clone())))
+        .insert_resource(vegetation::VegetationField::new(
+            std::sync::Arc::new(noise_field.clone()),
+            !automation.no_vegetation,
+        ))
         .insert_resource(noise_field.clone())
         .insert_resource(automation.clone())
         // The render plugin lifts the shared noise field and erosion bridge
@@ -329,6 +333,7 @@ fn main() {
                 erosion_stream_system.run_if(not_in_measure_mode),
                 player::update_player_system,
                 player::sync_player_camera_transform,
+                vegetation::stream_vegetation,
                 measure_overlap_system.run_if(in_measure_mode),
                 shot_scheduling_system,
             )
@@ -729,6 +734,7 @@ impl FrameTimes {
 fn shot_scheduling_system(
     automation: Res<AutomationSettings>,
     cache: Res<ErosionCache>,
+    vegetation: Res<vegetation::VegetationField>,
     mut counter: ResMut<FrameCounter>,
     mut requested: ResMut<ShotRequested>,
     mut commands: Commands,
@@ -754,6 +760,11 @@ fn shot_scheduling_system(
         })
         .count();
     if settled_tiles < automation.erosion_prewarm as usize {
+        return;
+    }
+    // Likewise the plants: the library loaded, every chunk around the pinned
+    // camera scattered, and the latest snapshot on the GPU.
+    if !vegetation.ready() {
         return;
     }
     counter.0 += 1;
