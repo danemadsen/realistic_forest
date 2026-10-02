@@ -1,0 +1,61 @@
+// BEGIN SHARED SPATIAL PRECIPITATION
+// This field is mirrored by weather.rs. Broad sky fronts and narrower storm
+// cells share one advected world-space offset, so showers move with the wind.
+fn weatherStormScore(world_xz: vec2<f32>) -> f32 {
+    let p = (world_xz - globals.weather.xy)/5400.0;
+    return clamp(0.5
+        + 0.28*sin(1.07*p.x + 0.31*p.y + 0.53)
+        + 0.16*sin(-0.61*p.x + 1.27*p.y - 1.1)
+        + 0.11*sin(2.15*p.x - 1.41*p.y + 0.8), 0.0, 1.0);
+}
+
+fn weatherPrecipitationSeverity(world_xz: vec2<f32>) -> f32 {
+    let p = (world_xz - globals.weather.xy)/8000.0;
+    let score = clamp(0.523
+        + 0.25*sin(0.83*p.x + 0.37*p.y)
+        + 0.18*sin(-0.49*p.x + 0.91*p.y + 0.3)
+        + 0.08*sin(1.73*p.x - 1.37*p.y - 1.2), 0.0, 1.0);
+    var base = 0.0;
+    if (score < 0.5) {
+        base = clamp((score - 0.2)/0.3, 0.0, 1.0);
+    } else if (score < 0.7) {
+        base = 1.0 + (score - 0.5)/0.2;
+    } else {
+        base = 2.0 + clamp((score - 0.7)/0.18, 0.0, 1.0);
+    }
+    return clamp(base + globals.weather.z, 0.0, 3.0);
+}
+
+// Return rain, snow, thunderstorm, gust, each in [0, 1]. The altitude
+// transition follows the terrain material's low mountain snowline. Explicit
+// Snow/Rain/Thunderstorm trends select phase while retaining spatial cells.
+fn weatherPrecipitation(world_position: vec3<f32>) -> vec4<f32> {
+    let score = weatherStormScore(world_position.xz);
+    let severity = weatherPrecipitationSeverity(world_position.xz);
+    let wet_gate = smoothstep(1.25, 2.0, severity);
+    let base_offset = -300.0*clamp(severity - 1.0, 0.0, 1.0)
+                        -150.0*clamp(severity - 2.0, 0.0, 1.0);
+    let base_override = (u32(globals.weather.w) & 4u) != 0u;
+    let cloud_base = max(globals.clouds.w
+                         + select(base_offset, 0.0, base_override), 100.0);
+    // Hydrometeors leave the lower cloud and fall toward the ground. Fade
+    // them through its base so flying above a storm is dry.
+    let below_cloud = 1.0 - smoothstep(cloud_base + 100.0,
+                                       cloud_base + 600.0, world_position.y);
+    let precipitation = smoothstep(0.74, 0.90, score + globals.storm.x)
+                        *wet_gate*below_cloud;
+    let cold_altitude = world_position.y
+        + 70.0*sin((world_position.x - globals.weather.x)/18000.0
+                   + (world_position.z - globals.weather.y)/27000.0 + 0.7);
+    var snow_fraction = smoothstep(80.0, 260.0, cold_altitude);
+    let override_kind = u32(globals.storm.y + 0.5);
+    if (override_kind == 1u || override_kind == 3u) { snow_fraction = 0.0; }
+    if (override_kind == 2u) { snow_fraction = 1.0; }
+    let rain = precipitation*(1.0 - snow_fraction);
+    let snow = precipitation*snow_fraction;
+    let convective_bias = select(0.0, globals.storm.x, override_kind == 3u);
+    let thunderstorm = rain*smoothstep(0.91, 0.98, score + convective_bias);
+    let gust = clamp(0.18*precipitation + 0.75*thunderstorm, 0.0, 1.0);
+    return vec4<f32>(rain, snow, thunderstorm, gust);
+}
+// END SHARED SPATIAL PRECIPITATION

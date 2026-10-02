@@ -12,10 +12,17 @@ pub enum WeatherPreset {
     Cloudy,
     Overcast,
     Fog,
+    Rain,
+    Snow,
+    Thunderstorm,
 }
 
 impl WeatherPreset {
-    pub const ALL: [Self; 4] = [Self::Clear, Self::Cloudy, Self::Overcast, Self::Fog];
+    pub const ALL: [Self; 7] = [
+        Self::Clear, Self::Cloudy, Self::Overcast, Self::Fog,
+        Self::Rain, Self::Snow, Self::Thunderstorm,
+    ];
+    pub const BASE: [Self; 4] = [Self::Clear, Self::Cloudy, Self::Overcast, Self::Fog];
 
     pub const fn label(self) -> &'static str {
         match self {
@@ -23,6 +30,9 @@ impl WeatherPreset {
             Self::Cloudy => "Cloudy",
             Self::Overcast => "Overcast",
             Self::Fog => "Fog / whiteout",
+            Self::Rain => "Rain",
+            Self::Snow => "Snow",
+            Self::Thunderstorm => "Thunderstorm",
         }
     }
 
@@ -32,6 +42,27 @@ impl WeatherPreset {
             Self::Cloudy => 0.0,
             Self::Overcast => 1.0,
             Self::Fog => 2.0,
+            Self::Rain | Self::Snow => 1.0,
+            Self::Thunderstorm => 1.3,
+        }
+    }
+
+    pub const fn precipitation_bias(self) -> f32 {
+        match self {
+            Self::Rain | Self::Snow => 0.25,
+            Self::Thunderstorm => 0.37,
+            _ => 0.0,
+        }
+    }
+
+    /// 0 is temperature-driven phase; positive values force a demonstration
+    /// trend while the precipitation amount remains spatial.
+    pub const fn precipitation_override(self) -> u32 {
+        match self {
+            Self::Rain => 1,
+            Self::Snow => 2,
+            Self::Thunderstorm => 3,
+            _ => 0,
         }
     }
 }
@@ -79,7 +110,7 @@ impl WeatherProfile {
                 wind_multiplier: 1.0,
                 shadow_multiplier: 1.0,
             },
-            WeatherPreset::Overcast => Self {
+            WeatherPreset::Overcast | WeatherPreset::Rain | WeatherPreset::Snow | WeatherPreset::Thunderstorm => Self {
                 coverage_delta: 0.40,
                 density_multiplier: 1.5,
                 base_offset: -300.0,
@@ -126,8 +157,8 @@ impl WeatherProfile {
         let severity = severity.clamp(0.0, 3.0);
         let lower = severity.floor() as usize;
         let upper = (lower + 1).min(3);
-        Self::for_preset(WeatherPreset::ALL[lower]).lerp(
-            Self::for_preset(WeatherPreset::ALL[upper]),
+        Self::for_preset(WeatherPreset::BASE[lower]).lerp(
+            Self::for_preset(WeatherPreset::BASE[upper]),
             severity - lower as f32,
         )
     }
@@ -154,6 +185,74 @@ pub fn front_severity(world_xz: [f32; 2], offset: [f32; 2], climate_bias: f32) -
     (base + climate_bias).clamp(0.0, 3.0)
 }
 
+pub fn storm_score(world_xz: [f32; 2], offset: [f32; 2]) -> f32 {
+    let x = (world_xz[0] - offset[0]) / 5400.0;
+    let z = (world_xz[1] - offset[1]) / 5400.0;
+    (0.5
+        + 0.28 * (1.07 * x + 0.31 * z + 0.53).sin()
+        + 0.16 * (-0.61 * x + 1.27 * z - 1.1).sin()
+        + 0.11 * (2.15 * x - 1.41 * z + 0.8).sin())
+        .clamp(0.0, 1.0)
+}
+
+fn smoothstep(low: f32, high: f32, value: f32) -> f32 {
+    let t = ((value - low) / (high - low)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PrecipitationSample {
+    pub rain: f32,
+    pub snow: f32,
+    pub thunderstorm: f32,
+    pub gust: f32,
+}
+
+impl PrecipitationSample {
+    pub fn intensity(self) -> f32 {
+        self.rain + self.snow
+    }
+}
+
+/// Matches weatherPrecipitation in precipitation-functions.wgslinc. Broad
+/// overcast gates a narrower moving storm field; snow follows the low mountain
+/// snowline unless a named showcase trend explicitly selects the phase.
+pub fn sample_precipitation(
+    world_xz: [f32; 2],
+    altitude: f32,
+    offset: [f32; 2],
+    climate_bias: f32,
+    precipitation_bias: f32,
+    override_kind: u32,
+    cloud_base_height: f32,
+    cloud_base_override: bool,
+) -> PrecipitationSample {
+    let score = storm_score(world_xz, offset);
+    let severity = front_severity(world_xz, offset, climate_bias);
+    let wet_gate = smoothstep(1.25, 2.0, severity);
+    let base_offset = -300.0 * (severity - 1.0).clamp(0.0, 1.0)
+        - 150.0 * (severity - 2.0).clamp(0.0, 1.0);
+    let cloud_base = (cloud_base_height + if cloud_base_override { 0.0 } else { base_offset })
+        .max(100.0);
+    let below_cloud = 1.0 - smoothstep(cloud_base + 100.0, cloud_base + 600.0, altitude);
+    let precipitation = smoothstep(0.74, 0.90, score + precipitation_bias)
+        * wet_gate * below_cloud;
+    let cold_altitude = altitude
+        + 70.0 * ((world_xz[0] - offset[0]) / 18000.0
+            + (world_xz[1] - offset[1]) / 27000.0 + 0.7).sin();
+    let snow_fraction = match override_kind {
+        1 | 3 => 0.0,
+        2 => 1.0,
+        _ => smoothstep(80.0, 260.0, cold_altitude),
+    };
+    let rain = precipitation * (1.0 - snow_fraction);
+    let snow = precipitation * snow_fraction;
+    let convective_bias = if override_kind == 3 { precipitation_bias } else { 0.0 };
+    let thunderstorm = rain * smoothstep(0.91, 0.98, score + convective_bias);
+    let gust = (0.18 * precipitation + 0.75 * thunderstorm).clamp(0.0, 1.0);
+    PrecipitationSample { rain, snow, thunderstorm, gust }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WeatherOverrides {
     pub coverage: bool,
@@ -173,6 +272,35 @@ pub struct WeatherConditions {
     pub sun_intensity: f32,
     pub sky_overcast: f32,
     pub wind_speed: f32,
+    pub rain_intensity: f32,
+    pub snow_intensity: f32,
+    pub thunder_intensity: f32,
+    pub gust_strength: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct LightningEvent {
+    /// Bolt's contact point, resolved to eroded terrain or sea level on spawn.
+    pub position: [f32; 3],
+    /// Linear HDR radiance. A short sequence of flashes peaks near 12.
+    pub flash: f32,
+    pub seed: f32,
+    pub age_seconds: f32,
+    pub top_height: f32,
+    peak_flash: f32,
+}
+
+impl Default for LightningEvent {
+    fn default() -> Self {
+        Self {
+            position: [0.0; 3],
+            flash: 0.0,
+            seed: 0.0,
+            age_seconds: 1000.0,
+            top_height: 0.0,
+            peak_flash: 0.0,
+        }
+    }
 }
 
 /// A spatial weather map sampled near the player for local sun/sky controls.
@@ -188,10 +316,20 @@ pub struct WeatherState {
     pub transition_seconds: f32,
     pub overrides: WeatherOverrides,
     pub climate_bias: f32,
+    pub precipitation_bias: f32,
     pub local_severity: f32,
+    pub local_precipitation: PrecipitationSample,
+    pub elapsed_seconds: f32,
+    pub lightning: LightningEvent,
+    /// Set for one update after a strike is scheduled, so terrain height can
+    /// be resolved with the erosion cache outside this resource's pure model.
+    pub new_strike: bool,
     source_bias: f32,
+    source_precipitation_bias: f32,
     transition_elapsed: f32,
     in_transition: bool,
+    lightning_wait: f32,
+    random_state: u64,
 }
 
 impl Default for WeatherState {
@@ -203,6 +341,11 @@ impl Default for WeatherState {
 impl WeatherState {
     pub fn from_preset(preset: WeatherPreset, automatic: bool) -> Self {
         let profile = WeatherProfile::for_preset(preset);
+        let local_precipitation = sample_precipitation(
+            [0.0, 0.0], 0.0, [0.0, 0.0], preset.climate_bias(),
+            preset.precipitation_bias(), preset.precipitation_override(),
+            AppSettings::default().cloud_base_height, false,
+        );
         Self {
             automatic,
             target: preset,
@@ -210,10 +353,18 @@ impl WeatherState {
             transition_seconds: 75.0,
             overrides: WeatherOverrides::default(),
             climate_bias: preset.climate_bias(),
+            precipitation_bias: preset.precipitation_bias(),
             local_severity: preset as usize as f32,
+            local_precipitation,
+            elapsed_seconds: 0.0,
+            lightning: LightningEvent::default(),
+            new_strike: false,
             source_bias: preset.climate_bias(),
+            source_precipitation_bias: preset.precipitation_bias(),
             transition_elapsed: 0.0,
             in_transition: false,
+            lightning_wait: 4.0,
+            random_state: 0xD6B5_EA92_5C31_0847,
         }
     }
 
@@ -222,6 +373,7 @@ impl WeatherState {
             return;
         }
         self.source_bias = self.climate_bias;
+        self.source_precipitation_bias = self.precipitation_bias;
         self.target = target;
         self.transition_elapsed = 0.0;
         self.in_transition = true;
@@ -231,7 +383,13 @@ impl WeatherState {
         self.in_transition
     }
 
-    pub fn advance(&mut self, delta_seconds: f32, world_xz: [f32; 2], offset: [f32; 2]) {
+    pub fn advance(
+        &mut self,
+        delta_seconds: f32,
+        world_position: [f32; 3],
+        offset: [f32; 2],
+        settings: &AppSettings,
+    ) {
         if delta_seconds.is_finite() && delta_seconds > 0.0 && self.in_transition {
             let duration = self.transition_seconds.max(0.01);
             self.transition_elapsed = (self.transition_elapsed + delta_seconds).min(duration);
@@ -239,13 +397,28 @@ impl WeatherState {
             let eased = fraction * fraction * (3.0 - 2.0 * fraction);
             self.climate_bias =
                 self.source_bias + (self.target.climate_bias() - self.source_bias) * eased;
+            self.precipitation_bias = self.source_precipitation_bias
+                + (self.target.precipitation_bias() - self.source_precipitation_bias) * eased;
             if self.transition_elapsed >= duration {
                 self.climate_bias = self.target.climate_bias();
+                self.precipitation_bias = self.target.precipitation_bias();
                 self.in_transition = false;
             }
         }
+        let world_xz = [world_position[0], world_position[2]];
         self.local_severity = front_severity(world_xz, offset, self.climate_bias);
         self.current = WeatherProfile::from_severity(self.local_severity);
+        self.local_precipitation = sample_precipitation(
+            world_xz, world_position[1], offset, self.climate_bias,
+            self.precipitation_bias, self.target.precipitation_override(),
+            settings.cloud_base_height, self.overrides.base,
+        );
+        if delta_seconds.is_finite() && delta_seconds > 0.0 {
+            self.elapsed_seconds += delta_seconds;
+            self.advance_lightning(delta_seconds, world_position, offset, settings);
+        } else {
+            self.new_strike = false;
+        }
     }
 
     pub fn override_bits(&self) -> u32 {
@@ -256,8 +429,17 @@ impl WeatherState {
     }
 
     pub fn local_condition(&self) -> WeatherPreset {
+        if self.local_precipitation.thunderstorm > 0.25 {
+            return WeatherPreset::Thunderstorm;
+        }
+        if self.local_precipitation.snow > 0.35 {
+            return WeatherPreset::Snow;
+        }
+        if self.local_precipitation.rain > 0.35 {
+            return WeatherPreset::Rain;
+        }
         let index = (self.local_severity + 0.5).floor().clamp(0.0, 3.0) as usize;
-        WeatherPreset::ALL[index]
+        WeatherPreset::BASE[index]
     }
 
     /// Approximate 5% contrast range through the current local air. The
@@ -265,11 +447,13 @@ impl WeatherState {
     /// nearby readout rather than a guarantee of a distant sightline.
     pub fn visibility_metres(&self, settings: &AppSettings, altitude: f32) -> f32 {
         let base_density = self.conditions(settings).fog_density;
-        if base_density <= 0.0 {
+        let precipitation = self.local_precipitation;
+        if base_density <= 0.0 && precipitation.intensity() <= 0.0 {
             return f32::INFINITY;
         }
         let height_density = (-(altitude - 20.0).max(0.0) / 450.0).exp();
-        let extinction = base_density * (0.16 + 0.84 * height_density);
+        let extinction = base_density * (0.16 + 0.84 * height_density)
+            + precipitation.rain * 0.00085 + precipitation.snow * 0.0013;
         2.995_732_3 / extinction
     }
 
@@ -308,7 +492,69 @@ impl WeatherState {
             sun_intensity: settings.sun_intensity.max(0.0) * profile.sun_multiplier,
             sky_overcast: profile.sky_overcast,
             wind_speed: settings.cloud_wind_speed.max(0.0) * profile.wind_multiplier,
+            rain_intensity: self.local_precipitation.rain,
+            snow_intensity: self.local_precipitation.snow,
+            thunder_intensity: self.local_precipitation.thunderstorm,
+            gust_strength: self.local_precipitation.gust,
         }
+    }
+
+    fn random(&mut self) -> f32 {
+        // A local, reproducible stream keeps strikes independent of frame rate
+        // and avoids adding a global random resource to the render schedule.
+        self.random_state ^= self.random_state << 13;
+        self.random_state ^= self.random_state >> 7;
+        self.random_state ^= self.random_state << 17;
+        (self.random_state as u32) as f32 / u32::MAX as f32
+    }
+
+    fn advance_lightning(&mut self, delta: f32, player: [f32; 3], offset: [f32; 2], settings: &AppSettings) {
+        self.new_strike = false;
+        self.lightning.age_seconds += delta;
+        let age = self.lightning.age_seconds;
+        // The principal return stroke and two faint after-strokes are brief.
+        // The cloud and water shaders receive this same radiance each frame.
+        let pulse = (-(age - 0.045).powi(2) / 0.0012).exp()
+            + 0.33 * (-(age - 0.155).powi(2) / 0.00045).exp()
+            + 0.14 * (-(age - 0.255).powi(2) / 0.0007).exp();
+        self.lightning.flash = self.lightning.peak_flash * pulse;
+        self.lightning_wait -= delta;
+        if self.lightning_wait > 0.0 { return; }
+
+        let local = self.local_precipitation.thunderstorm;
+        if local < 0.12 {
+            self.lightning_wait = 2.0;
+            return;
+        }
+        // Storm cells determine where a bolt may appear. Scan several nearby
+        // candidates so lightning stays under rain-bearing cloud, while the
+        // local hazard controls how frequently a player experiences it.
+        for _ in 0..10 {
+            let angle = self.random() * std::f32::consts::TAU;
+            let radius = 250.0 + self.random().sqrt() * 2500.0;
+            let x = player[0] + radius * angle.cos();
+            let z = player[2] + radius * angle.sin();
+            let cell = sample_precipitation(
+                [x, z], player[1], offset, self.climate_bias,
+                self.precipitation_bias, self.target.precipitation_override(),
+                settings.cloud_base_height, self.overrides.base,
+            );
+            if cell.thunderstorm < 0.18 { continue; }
+            let seed = self.random();
+            self.lightning = LightningEvent {
+                position: [x, 0.0, z],
+                flash: 0.0,
+                seed,
+                age_seconds: 0.0,
+                top_height: 1650.0 + self.random() * 800.0,
+                peak_flash: 7.0 + self.random() * 7.0,
+            };
+            self.new_strike = true;
+            break;
+        }
+        // A few seconds between discharges in a strong cell; longer in a
+        // weaker one. Weather outside the cell produces no strikes nearby.
+        self.lightning_wait = (5.0 + 18.0 * (1.0 - local) + 11.0 * self.random()).max(4.0);
     }
 }
 
@@ -348,6 +594,8 @@ pub fn advance_weather(
     mut motion: ResMut<WeatherMotion>,
     mut weather: ResMut<WeatherState>,
     players: Query<&Player>,
+    erosion: Option<Res<crate::erosion::ErosionCache>>,
+    noise: Option<Res<crate::noise::NoiseField>>,
 ) {
     // Automated captures freeze both weather and the celestial clock unless
     // --advance-time was requested. Live changes to time of day affect only
@@ -364,10 +612,20 @@ pub fn advance_weather(
             settings.cloud_wind_direction_degrees,
         );
     }
-    let world_xz = players
-        .single()
-        .map_or([0.0, 0.0], |player| [player.position.x, player.position.z]);
-    weather.advance(delta, world_xz, motion.offset);
+    let world_position = players.single().map_or([0.0; 3], |player| {
+        [player.position.x, player.position.y, player.position.z]
+    });
+    weather.advance(delta, world_position, motion.offset, &settings);
+    if weather.new_strike {
+        let [x, _, z] = weather.lightning.position;
+        let terrain = if let (Some(cache), Some(field)) = (erosion, noise) {
+            crate::erosion::sample_eroded_height(
+                &cache, &field, x, z, [world_position[0], world_position[2]],
+            )
+        } else { crate::constants::SEA_LEVEL };
+        weather.lightning.position[1] = terrain.max(crate::constants::SEA_LEVEL);
+        weather.lightning.top_height += weather.lightning.position[1].max(0.0);
+    }
 }
 
 #[cfg(test)]
@@ -408,13 +666,13 @@ mod tests {
         let mut weather = WeatherState::from_preset(WeatherPreset::Cloudy, false);
         weather.transition_seconds = 10.0;
         weather.set_target(WeatherPreset::Overcast);
-        weather.advance(5.0, [0.0, 0.0], [0.0, 0.0]);
+        weather.advance(5.0, [0.0, 0.0, 0.0], [0.0, 0.0], &AppSettings::default());
         assert!(weather.is_transitioning());
         assert!((weather.climate_bias - 0.5).abs() < 1e-5);
         let before_retarget = weather.climate_bias;
         weather.set_target(WeatherPreset::Clear);
         assert_eq!(weather.climate_bias, before_retarget);
-        weather.advance(10.0, [0.0, 0.0], [0.0, 0.0]);
+        weather.advance(10.0, [0.0, 0.0, 0.0], [0.0, 0.0], &AppSettings::default());
         assert_eq!(weather.climate_bias, WeatherPreset::Clear.climate_bias());
         assert_eq!(
             weather.current,
@@ -461,11 +719,11 @@ mod tests {
         }
         assert!(minimum < 0.4 && maximum > 2.8);
         let location = [3000.0, -1200.0];
-        weather.advance(0.0, location, [0.0, 0.0]);
+        weather.advance(0.0, [location[0], 0.0, location[1]], [0.0, 0.0], &AppSettings::default());
         let first = weather.local_severity;
-        weather.advance(1.0, location, [1500.0, 0.0]);
+        weather.advance(1.0, [location[0], 0.0, location[1]], [1500.0, 0.0], &AppSettings::default());
         assert_ne!(first, weather.local_severity);
-        weather.advance(1.0, [location[0] + 0.1, location[1]], [1500.0, 0.0]);
+        weather.advance(1.0, [location[0] + 0.1, 0.0, location[1]], [1500.0, 0.0], &AppSettings::default());
         assert!(
             (weather.local_severity - front_severity(location, [1500.0, 0.0], 0.0)).abs() < 0.001
         );
@@ -539,5 +797,49 @@ mod tests {
                 front_severity([0.0, 0.0], offset, state.climate_bias)
             );
         }
+    }
+
+    #[test]
+    fn ordinary_weather_dominates_spatial_storm_cells() {
+        let mut weather = WeatherState::default();
+        let mut sea_level = [0usize; 7];
+        let mut highland = [0usize; 7];
+        for z in -30..=30 {
+            for x in -30..=30 {
+                let position = [x as f32 * 3000.0, 0.0, z as f32 * 3000.0];
+                weather.advance(0.0, position, [0.0, 0.0], &AppSettings::default());
+                sea_level[weather.local_condition() as usize] += 1;
+                weather.advance(0.0, [position[0], 500.0, position[2]], [0.0, 0.0], &AppSettings::default());
+                highland[weather.local_condition() as usize] += 1;
+            }
+        }
+        let count = |preset: WeatherPreset, values: [usize; 7]| values[preset as usize];
+        for common in [WeatherPreset::Clear, WeatherPreset::Cloudy, WeatherPreset::Overcast] {
+            assert!(count(common, sea_level) > count(WeatherPreset::Fog, sea_level));
+        }
+        assert!(count(WeatherPreset::Fog, sea_level) > count(WeatherPreset::Rain, sea_level));
+        assert!(count(WeatherPreset::Fog, highland) > count(WeatherPreset::Snow, highland));
+        assert!(count(WeatherPreset::Rain, sea_level)
+                > count(WeatherPreset::Thunderstorm, sea_level));
+        assert_eq!(count(WeatherPreset::Snow, sea_level), 0);
+    }
+
+    #[test]
+    fn lightning_requires_a_convective_cell_and_has_short_pulses() {
+        let mut clear = WeatherState::from_preset(WeatherPreset::Clear, false);
+        clear.advance(60.0, [0.0; 3], [0.0; 2], &AppSettings::default());
+        assert!(!clear.new_strike);
+        assert_eq!(clear.lightning.flash, 0.0);
+
+        let mut storm = WeatherState::from_preset(WeatherPreset::Thunderstorm, false);
+        storm.advance(5.0, [0.0; 3], [0.0; 2], &AppSettings::default());
+        assert!(storm.local_precipitation.thunderstorm > 0.12);
+        assert!(storm.new_strike);
+        let strike = storm.lightning.position;
+        assert!(strike[0].hypot(strike[2]) >= 250.0);
+        storm.advance(0.045, [0.0; 3], [0.0; 2], &AppSettings::default());
+        assert!(storm.lightning.flash > 5.0);
+        storm.advance(0.4, [0.0; 3], [0.0; 2], &AppSettings::default());
+        assert!(storm.lightning.flash < 0.001);
     }
 }

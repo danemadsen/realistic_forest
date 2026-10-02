@@ -25,23 +25,23 @@
 
 use crate::constants::SEA_LEVEL;
 use crate::render::cloud_node::CloudRenderState;
-use crate::render::terrain_node::{shore_heightfield_mapping, TerrainNodeState};
-use crate::render::{globals_layout, ExtractedForestView, ForestGlobals, ForestShaderHandles};
+use crate::render::terrain_node::{TerrainNodeState, shore_heightfield_mapping};
+use crate::render::{ExtractedForestView, ForestGlobals, ForestShaderHandles, globals_layout};
 use crate::water::rings::{self, Patch};
 use crate::water::{
-    displacement_bounds, waves, GpuWave, UnderwaterUniforms, WaterSettings, WaterStageUniforms,
-    FRESNEL_EXPONENT, WATER_LOD_COUNT, WATER_SNAP,
+    FRESNEL_EXPONENT, GpuWave, UnderwaterUniforms, WATER_LOD_COUNT, WATER_SNAP, WaterSettings,
+    WaterStageUniforms, displacement_bounds, waves,
 };
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::mesh::VertexBufferLayout;
 use bevy::prelude::{Res, ResMut, Resource, World};
 use bevy::render::render_resource::{
     BindGroup, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingResource,
-    BindingType, Buffer, BufferDescriptor, BufferSize, BufferUsages,
-    CachedRenderPipelineId, ColorTargetState, ColorWrites, FragmentState, IndexFormat,
-    MultisampleState, PipelineCache, PrimitiveState, RenderPipelineDescriptor, SamplerBindingType,
-    ShaderStages, TextureFormat, TextureSampleType, TextureViewDimension, VertexAttribute,
-    VertexFormat, VertexState, VertexStepMode,
+    BindingType, Buffer, BufferDescriptor, BufferSize, BufferUsages, CachedRenderPipelineId,
+    ColorTargetState, ColorWrites, FragmentState, IndexFormat, MultisampleState, PipelineCache,
+    PrimitiveState, RenderPipelineDescriptor, SamplerBindingType, ShaderStages, TextureFormat,
+    TextureSampleType, TextureViewDimension, VertexAttribute, VertexFormat, VertexState,
+    VertexStepMode,
 };
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue, ViewQuery};
 use bevy::render::view::ViewTarget;
@@ -70,8 +70,8 @@ const MEDIUM_SUN_GAIN: f32 = 15.0;
 /// Byte offset of `WaterStageUniforms::params` — 40 waves at 32 bytes plus five
 /// LOD ranges at 16. The clock is rewritten here every frame, so the block's
 /// static half is uploaded once per sea-state edit.
-const SURFACE_PARAMS_OFFSET: u64 = 40 * std::mem::size_of::<GpuWave>() as u64
-    + WATER_LOD_COUNT as u64 * 16;
+const SURFACE_PARAMS_OFFSET: u64 =
+    40 * std::mem::size_of::<GpuWave>() as u64 + WATER_LOD_COUNT as u64 * 16;
 
 // ---------------------------------------------------------------------------
 // Extraction
@@ -90,6 +90,9 @@ pub struct ExtractedWater {
     pub camera_height: f32,
     /// `--no-water` combined with `settings.enabled`.
     pub draw: bool,
+    /// Baseline wind response. Local storm gusts are sampled per water point
+    /// in the shader, while this authored wind change eases over time.
+    pub weather_wave_target: f32,
 }
 
 impl Default for ExtractedWater {
@@ -99,6 +102,7 @@ impl Default for ExtractedWater {
             elapsed: 0.0,
             camera_height: 0.0,
             draw: true,
+            weather_wave_target: 1.0,
         }
     }
 }
@@ -137,6 +141,24 @@ fn extract_water(
     extracted.elapsed = elapsed;
     extracted.camera_height = camera_height;
     extracted.draw = draw_ocean && settings.enabled;
+    extracted.weather_wave_target = world
+        .get_resource::<crate::constants::AppSettings>()
+        .map_or(1.0, |app| weather_wave_target(app.cloud_wind_speed));
+}
+
+/// The square-root wind response gives calm water residual wave energy and
+/// prevents strong authored wind from amplifying the spectrum excessively.
+fn weather_wave_target(wind_metres_per_second: f32) -> f32 {
+    let wind = (wind_metres_per_second.max(0.0) / 18.0).sqrt();
+    (0.58 + 0.42 * wind).clamp(0.55, 1.55)
+}
+
+/// Wind changes do not instantly rebuild developed waves. The existing
+/// spectrum keeps its phase while its gain eases toward the authored wind.
+fn settle_wave_gain(current: f32, target: f32, delta_seconds: f32) -> f32 {
+    let seconds = if target > current { 18.0 } else { 40.0 };
+    let blend = 1.0 - (-delta_seconds.max(0.0) / seconds).exp();
+    current + (target - current) * blend
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +238,9 @@ struct WaterInner {
     /// The per-frame half of the surface uniform: the clock and the sea state
     /// scalars. Rewritten every frame at `SURFACE_PARAMS_OFFSET`.
     surface_frame: [f32; 4],
+    /// (previous real time, settled weather gain). The authored wave spectrum
+    /// changes only when the user's WaterSettings change.
+    weather_response: Option<(f32, f32)>,
     /// Submerged-camera admission, from the eye height: 0 fully above the
     /// surface, 1 fully below. Zero skips the pass.
     underwater_fade: f32,
@@ -247,6 +272,7 @@ impl Default for WaterNodeState {
                 snapped_centre: None,
                 wave_key: None,
                 surface_frame: [0.0; 4],
+                weather_response: None,
                 underwater_fade: 0.0,
             }),
         }
@@ -474,7 +500,11 @@ fn prepare_water(
         settings.wind_direction_degrees.to_bits(),
         flat,
     );
-    let amplitude = if flat { 0.0 } else { settings.sea_state_amplitude };
+    let amplitude = if flat {
+        0.0
+    } else {
+        settings.sea_state_amplitude
+    };
     if inner.wave_key != Some(wave_key) {
         let spectrum = waves::build(amplitude, settings.wind_direction_degrees.to_radians());
         let block = build_stage_uniforms(&settings, &spectrum, amplitude, flat);
@@ -491,11 +521,7 @@ fn prepare_water(
             // and no foam, subsurface or refraction.
             let bytes = bytemuck::bytes_of(&block);
             let params_end = SURFACE_PARAMS_OFFSET as usize + std::mem::size_of::<[f32; 4]>();
-            queue.write_buffer(
-                &stage.buffer,
-                0,
-                &bytes[..SURFACE_PARAMS_OFFSET as usize],
-            );
+            queue.write_buffer(&stage.buffer, 0, &bytes[..SURFACE_PARAMS_OFFSET as usize]);
             queue.write_buffer(&stage.buffer, params_end as u64, &bytes[params_end..]);
         }
     }
@@ -503,6 +529,13 @@ fn prepare_water(
     // Keep the clock and the local seabed mapping current without uploading
     // the whole wave spectrum. The terrain capture uses this same mapping.
     inner.surface_frame[0] = water.elapsed;
+    let (last_time, previous_gain) = inner
+        .weather_response
+        .unwrap_or((water.elapsed, water.weather_wave_target));
+    let delta = (water.elapsed - last_time).clamp(0.0, 0.25);
+    let weather_gain = settle_wave_gain(previous_gain, water.weather_wave_target, delta);
+    inner.weather_response = Some((water.elapsed, weather_gain));
+    inner.surface_frame[3] = weather_gain;
     if let Some(stage) = inner.surface_stage.as_ref() {
         queue.write_buffer(
             &stage.buffer,
@@ -611,9 +644,12 @@ fn build_stage_uniforms(
         if flat {
             0.0
         } else {
-            let variance = 0.5 * spectrum.waves.iter()
-                .map(|wave| wave.amplitude * wave.amplitude)
-                .sum::<f32>();
+            let variance = 0.5
+                * spectrum
+                    .waves
+                    .iter()
+                    .map(|wave| wave.amplitude * wave.amplitude)
+                    .sum::<f32>();
             4.0 * variance.sqrt()
         },
     ];
@@ -888,11 +924,7 @@ fn water_layouts(inner: &WaterInner) -> Option<Vec<BindGroupLayoutDescriptor>> {
 
 /// The submerged-camera medium, applied to the whole composited frame once the
 /// eye crosses the surface.
-pub fn forest_underwater_pass(
-    view: ViewQuery<&ViewTarget>,
-    world: &World,
-    mut ctx: RenderContext,
-) {
+pub fn forest_underwater_pass(view: ViewQuery<&ViewTarget>, world: &World, mut ctx: RenderContext) {
     let view = view.into_inner();
     let Some(state) = world.get_resource::<WaterNodeState>() else {
         return;
@@ -1150,7 +1182,9 @@ fn screen_layout(label: &'static str, filterable: &[bool]) -> BindGroupLayoutDes
                 ShaderStages::FRAGMENT
             },
             ty: BindingType::Texture {
-                sample_type: TextureSampleType::Float { filterable: *filterable },
+                sample_type: TextureSampleType::Float {
+                    filterable: *filterable,
+                },
                 view_dimension: TextureViewDimension::D2,
                 multisampled: false,
             },
@@ -1241,7 +1275,11 @@ fn create_stage(
             resource: buffer.as_entire_binding(),
         }],
     );
-    WaterStage { layout, buffer, group }
+    WaterStage {
+        layout,
+        buffer,
+        group,
+    }
 }
 
 /// Inserts the main-world half of the water setup. Called before

@@ -54,6 +54,9 @@ struct GlobalUniforms
     cloud_layer: vec4<f32>,     // thickness, shape scale, shadow strength, quality
     cloud_motion: vec4<f32>,    // wind offset XZ, detail strength, maximum distance
     weather: vec4<f32>, // front offset XZ, climate bias, explicit cloud overrides
+    storm: vec4<f32>, // precipitation bias, phase override, weather clock, local gust
+    lightning: vec4<f32>, // xyz terrain strike, w HDR flash radiance
+    lightning_meta: vec4<f32>, // seed, age, bolt top altitude, local thunder
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
@@ -75,7 +78,7 @@ struct WaterStageUniforms
 {
     waves: array<GpuWave, WAVE_SLOTS>,
     ranges: array<vec4<u32>, LOD_COUNT>,   // per-LOD bands; see the note above
-    params: vec4<f32>,        // x time, y amplitude multiplier, z sea level, w chop scale
+    params: vec4<f32>,        // x time, y authored amplitude, z sea level, w settled weather wave gain
     extinction: vec4<f32>,    // rgb extinction /m, w scatter scale
     scatter: vec4<f32>,       // rgb scatter tint, w asymmetry
     surface: vec4<f32>,       // x fresnel F0, y fresnel exponent, z sun roughness, w base scale
@@ -189,8 +192,8 @@ struct ShoreMotion {
 };
 
 fn shoreMotion(world_xz: vec2<f32>, shore: ShoreSample, mesh_footprint: f32,
-               pixel_dx: vec2<f32>, pixel_dy: vec2<f32>) -> ShoreMotion {
-    let wave_height = stage.misc.w;
+               pixel_dx: vec2<f32>, pixel_dy: vec2<f32>, local_gain: f32) -> ShoreMotion {
+    let wave_height = stage.misc.w*local_gain;
     if (shore.weight <= 0.0 || wave_height < 0.001 || stage.flags.x > 0.5) {
         return ShoreMotion(0.0, vec2<f32>(0.0), 0.0);
     }
@@ -243,13 +246,18 @@ fn sampleSurface(world_xz: vec2<f32>, mesh_footprint: f32,
     }
 
     let time = stage.params.x;
+    // Storm gusts roughen each water region under its own moving cell. The
+    // authored spectrum and wave phase remain continuous across the map.
+    let local_gust = weatherPrecipitation(vec3<f32>(world_xz.x, stage.params.z,
+                                                   world_xz.y)).w;
+    let local_gain = stage.params.w*(1.0 + 0.14*local_gust);
     var offset = vec3<f32>(0.0);
     var derivative_x = vec3<f32>(0.0);
     var derivative_z = vec3<f32>(0.0);
     var slope_variance = 0.0;
     let depth = max(shore.depth, 0.0);
     // Limit the entire train as the column becomes too thin to hold its waves.
-    let depth_limit = smoothstepf(0.0, max(stage.misc.w*1.5, 0.12), depth);
+    let depth_limit = smoothstepf(0.0, max(stage.misc.w*local_gain*1.5, 0.12), depth);
 
     // Skip unresolved components before evaluating trigonometry. Geometry
     // filters the shortest wavelengths first; pixels also account for each
@@ -268,7 +276,7 @@ fn sampleSurface(world_xz: vec2<f32>, mesh_footprint: f32,
         let shallow = 1.0 - smoothstepf(0.0, 0.5, depth/wave.wavelength);
         let shoal = (1.0 + 0.22*shallow)*depth_limit;
         let bed_weight = mix(1.0, shoal, shore.weight);
-        let slope = wave.amplitude*wave.wave_number*bed_weight;
+        let slope = wave.amplitude*local_gain*wave.wave_number*bed_weight;
         slope_variance += 0.5*slope*slope*(1.0 - pixel_weight*pixel_weight);
         let attenuation = waveAttenuation(wave.wavelength, mesh_footprint)
                         * wave_weight*pixel_weight*bed_weight;
@@ -276,8 +284,8 @@ fn sampleSurface(world_xz: vec2<f32>, mesh_footprint: f32,
         {
             continue;
         }
-        let amplitude = wave.amplitude*attenuation;
-        let chop = wave.chop_amplitude*attenuation;
+        let amplitude = wave.amplitude*local_gain*attenuation;
+        let chop = wave.chop_amplitude*local_gain*attenuation;
         let phase = wave.wave_number*dot(wave.direction, world_xz)
                   + wave.phase - wave.angular_frequency*time;
         let sin_phase = sin(phase);
@@ -299,7 +307,8 @@ fn sampleSurface(world_xz: vec2<f32>, mesh_footprint: f32,
                                   chop*wave.direction.y*dphz*cos_phase);
     }
 
-    let surf = shoreMotion(world_xz, shore, mesh_footprint, pixel_dx, pixel_dy);
+    let surf = shoreMotion(world_xz, shore, mesh_footprint, pixel_dx, pixel_dy,
+                           local_gain);
     offset.y += surf.height*wave_weight;
     derivative_x.y += surf.slope.x*wave_weight;
     derivative_z.y += surf.slope.y*wave_weight;
@@ -319,6 +328,68 @@ fn sampleSurface(world_xz: vec2<f32>, mesh_footprint: f32,
         surf.foam,
     );
 }
+
+// BEGIN SHARED SPATIAL PRECIPITATION
+// This field is mirrored by weather.rs. Broad sky fronts and narrower storm
+// cells share one advected world-space offset, so showers move with the wind.
+fn weatherStormScore(world_xz: vec2<f32>) -> f32 {
+    let p = (world_xz - globals.weather.xy)/5400.0;
+    return clamp(0.5
+        + 0.28*sin(1.07*p.x + 0.31*p.y + 0.53)
+        + 0.16*sin(-0.61*p.x + 1.27*p.y - 1.1)
+        + 0.11*sin(2.15*p.x - 1.41*p.y + 0.8), 0.0, 1.0);
+}
+
+fn weatherPrecipitationSeverity(world_xz: vec2<f32>) -> f32 {
+    let p = (world_xz - globals.weather.xy)/8000.0;
+    let score = clamp(0.523
+        + 0.25*sin(0.83*p.x + 0.37*p.y)
+        + 0.18*sin(-0.49*p.x + 0.91*p.y + 0.3)
+        + 0.08*sin(1.73*p.x - 1.37*p.y - 1.2), 0.0, 1.0);
+    var base = 0.0;
+    if (score < 0.5) {
+        base = clamp((score - 0.2)/0.3, 0.0, 1.0);
+    } else if (score < 0.7) {
+        base = 1.0 + (score - 0.5)/0.2;
+    } else {
+        base = 2.0 + clamp((score - 0.7)/0.18, 0.0, 1.0);
+    }
+    return clamp(base + globals.weather.z, 0.0, 3.0);
+}
+
+// Return rain, snow, thunderstorm, gust, each in [0, 1]. The altitude
+// transition follows the terrain material's low mountain snowline. Explicit
+// Snow/Rain/Thunderstorm trends select phase while retaining spatial cells.
+fn weatherPrecipitation(world_position: vec3<f32>) -> vec4<f32> {
+    let score = weatherStormScore(world_position.xz);
+    let severity = weatherPrecipitationSeverity(world_position.xz);
+    let wet_gate = smoothstep(1.25, 2.0, severity);
+    let base_offset = -300.0*clamp(severity - 1.0, 0.0, 1.0)
+                        -150.0*clamp(severity - 2.0, 0.0, 1.0);
+    let base_override = (u32(globals.weather.w) & 4u) != 0u;
+    let cloud_base = max(globals.clouds.w
+                         + select(base_offset, 0.0, base_override), 100.0);
+    // Hydrometeors leave the lower cloud and fall toward the ground. Fade
+    // them through its base so flying above a storm is dry.
+    let below_cloud = 1.0 - smoothstep(cloud_base + 100.0,
+                                       cloud_base + 600.0, world_position.y);
+    let precipitation = smoothstep(0.74, 0.90, score + globals.storm.x)
+                        *wet_gate*below_cloud;
+    let cold_altitude = world_position.y
+        + 70.0*sin((world_position.x - globals.weather.x)/18000.0
+                   + (world_position.z - globals.weather.y)/27000.0 + 0.7);
+    var snow_fraction = smoothstep(80.0, 260.0, cold_altitude);
+    let override_kind = u32(globals.storm.y + 0.5);
+    if (override_kind == 1u || override_kind == 3u) { snow_fraction = 0.0; }
+    if (override_kind == 2u) { snow_fraction = 1.0; }
+    let rain = precipitation*(1.0 - snow_fraction);
+    let snow = precipitation*snow_fraction;
+    let convective_bias = select(0.0, globals.storm.x, override_kind == 3u);
+    let thunderstorm = rain*smoothstep(0.91, 0.98, score + convective_bias);
+    let gust = clamp(0.18*precipitation + 0.75*thunderstorm, 0.0, 1.0);
+    return vec4<f32>(rain, snow, thunderstorm, gust);
+}
+// END SHARED SPATIAL PRECIPITATION
 
 // ---------------------------------------------------------------------------
 // Sky and tone, matching composite.wgsl so water and terrain share one haze
@@ -710,6 +781,15 @@ fn marchClouds(origin: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, q
             lighting += vec3<f32>(0.52, 0.65, 1.0)*globals.atmosphere.y
                         *cloudSunMultiplier(local_severity)*0.22*transport;
         }
+        if (globals.lightning.w > 0.001) {
+            let source = vec3<f32>(globals.lightning.x,
+                                   mix(globals.lightning.y, globals.lightning_meta.z, 0.65),
+                                   globals.lightning.z);
+            let range = length(world_position - source);
+            let reach = 1.0/(1.0 + pow(range/1900.0, 2.0));
+            lighting += vec3<f32>(0.72, 0.84, 1.0)*globals.lightning.w
+                        *reach*0.55;
+        }
         result.scattering += contribution*lighting;
         weighted_distance += distance*contribution;
         distance_weight += contribution;
@@ -1081,6 +1161,74 @@ fn foamBreakup(world_xz: vec2<f32>, footprint: f32) -> f32
     return clamp(mix(0.55, 1.35, a*0.65 + b*0.35), 0.0, 1.4);
 }
 
+// Rain impacts are analytic, short-lived circular capillary waves in world
+// space. Cell seeds and phase never depend on the camera or the front value,
+// so a moving rain band smoothly reveals impacts already in progress. At a
+// large pixel footprint, the rings fade into a small slope variance instead
+// of becoming flashing subpixel dots. Snow melts on this unfrozen surface:
+// it leaves only a few soft, brief flecks, without rain-like rings.
+struct WaterImpacts {
+    slope: vec2<f32>,
+    splash: f32,
+    snow_fleck: f32,
+    slope_variance: f32,
+};
+
+fn waterImpacts(world_xz: vec2<f32>, time: f32, footprint: f32,
+                view_distance: f32, rain: f32, snow: f32, gust: f32) -> WaterImpacts {
+    var result = WaterImpacts(vec2<f32>(0.0), 0.0, 0.0,
+                              rain*0.0025 + snow*0.00025 + gust*0.0008);
+    if (stage.flags.x > 0.5 || max(rain, snow) < 0.005) { return result; }
+    let visibility = 1.0 - smoothstepf(25.0, 115.0, view_distance);
+    let resolved = 1.0 - smoothstepf(0.055, 0.24, footprint);
+    if (visibility*resolved < 0.001) { return result; }
+
+    let spacing = 0.78;
+    let coordinate = world_xz/spacing;
+    let base = floor(coordinate - vec2<f32>(0.5));
+    for (var z = 0i; z < 2i; z += 1i) {
+        for (var x = 0i; x < 2i; x += 1i) {
+            let cell = base + vec2<f32>(f32(x), f32(z));
+            let seed = hash21(cell + vec2<f32>(7.13, 41.9));
+            let jitter = vec2<f32>(hash21(cell + vec2<f32>(23.7, 18.2)),
+                                    hash21(cell + vec2<f32>(49.1, 71.4)));
+            let centre = (cell + vec2<f32>(0.5) + (jitter - vec2<f32>(0.5))*0.25)*spacing;
+            let delta = world_xz - centre;
+            let distance_to_drop = length(delta);
+
+            let rain_active = smoothstepf(seed - 0.10, seed + 0.10, rain);
+            if (rain_active > 0.001) {
+                let age = fract(time*1.15 + hash21(cell + vec2<f32>(92.3, 12.7)));
+                let life = 1.0 - smoothstepf(0.45, 0.80, age);
+                let radius = 0.025 + age*0.36;
+                let width = max(0.025, footprint*0.50);
+                let ring_distance = (distance_to_drop - radius)/width;
+                let ring = exp(-1.25*ring_distance*ring_distance)*life;
+                let height = 0.0045*rain_active*rain;
+                let gradient = ring*(-2.5*ring_distance/width)*height;
+                result.slope += delta/max(distance_to_drop, 0.001)*gradient;
+                let first_splash = 1.0 - smoothstepf(0.015, 0.12, age);
+                let core = 1.0 - smoothstepf(0.01, 0.065 + footprint*0.4,
+                                             distance_to_drop);
+                result.splash += first_splash*core*rain_active*rain;
+            }
+
+            let snow_active = smoothstepf(seed - 0.05, seed + 0.28, snow*0.38);
+            if (snow_active > 0.001) {
+                let age = fract(time*0.62 + hash21(cell + vec2<f32>(39.1, 63.7)));
+                let brief = 1.0 - smoothstepf(0.03, 0.23, age);
+                let soft_core = 1.0 - smoothstepf(0.015, 0.085 + footprint*0.5,
+                                                  distance_to_drop);
+                result.snow_fleck += brief*soft_core*snow_active;
+            }
+        }
+    }
+    result.slope *= visibility*resolved;
+    result.splash *= visibility*resolved;
+    result.snow_fleck *= visibility*resolved;
+    return result;
+}
+
 // ---------------------------------------------------------------------------
 // Vertex stage
 // ---------------------------------------------------------------------------
@@ -1153,6 +1301,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     let pixel_footprint = max(length(pixel_dx), length(pixel_dy));
     let shore = sampleShore(in.wave_position);
     let surface = sampleSurface(in.wave_position, 0.0, pixel_dx, pixel_dy, 1.0, shore);
+    let precipitation = weatherPrecipitation(vec3<f32>(in.world_position.x,
+                                                       stage.params.z,
+                                                       in.world_position.z));
+    let impacts = waterImpacts(in.world_position.xz, globals.storm.z, pixel_footprint,
+                               view_distance, precipitation.x, precipitation.y,
+                               precipitation.w);
 
     // View space looks down -Z, so a *greater* z is nearer. The water
     // surface's own view-space z, to compare against the G-buffer's.
@@ -1163,6 +1317,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     // from the other side, so the geometric normal is flipped toward the eye
     // rather than the pass culling backfaces.
     var normal = surface.normal;
+    if (camera_position.y >= in.world_position.y) {
+        normal = normalize(normal + vec3<f32>(-impacts.slope.x, 0.0, -impacts.slope.y));
+    }
     if (dot(normal, to_view) < 0.0)
     {
         normal = -normal;
@@ -1269,7 +1426,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     let caps = whitecap*0.70*foamBreakup(foam_uv, pixel_footprint);
     // Bubbles sit on the upper surface. Avoid a bright foam sheet underwater.
     let above_water = smoothstepf(-0.08, 0.12, camera_position.y - in.world_position.y);
-    let foam = clamp((1.0 - (1.0 - caps)*(1.0 - shore_foam))*stage.misc.y, 0.0, 1.0)
+    let foam = clamp((1.0 - (1.0 - caps)*(1.0 - shore_foam))*stage.misc.y
+                     + impacts.splash*0.22 + impacts.snow_fleck*0.06, 0.0, 1.0)
              * above_water;
     // Foam is a bright diffuse surface, so its radiance sits a little above the
     // sky it is lit by — not the two-and-a-half times that `sun_colour*0.25`
@@ -1320,7 +1478,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     }
     // Filtered-out slopes broaden the glitter instead of leaving a perfectly
     // smooth mirror or aliasing into isolated bright pixels at the horizon.
-    let alpha = clamp(sqrt(pow(roughness, 4.0) + surface.slope_variance), 1e-3, 1.0);
+    let alpha = clamp(sqrt(pow(roughness, 4.0) + surface.slope_variance
+                           + impacts.slope_variance), 1e-3, 1.0);
     let specular = dGGX(n_dot_h, alpha)*vSmithGGX(n_dot_l, n_dot_v, alpha)*n_dot_l*0.35;
     let moon_half = (to_moon + to_view)/max(length(to_moon + to_view), 1e-4);
     let moon_dot_l = max(dot(normal, to_moon), 0.0);
@@ -1330,10 +1489,52 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
                                                    reflection_direction, alpha);
     let reflected = mix(reflected_sky, terrain_reflection.rgb, terrain_reflection.a);
 
+    // A lightning strike is a short-lived local source. Its cool reflection
+    // follows the wave normal, while a narrow corridor approximates the image
+    // of the bright vertical bolt in the water. Both fade with strike range;
+    // the ordinary sky flash still comes from the shared atmosphere model.
+    var flash_specular = vec3<f32>(0.0);
+    var bolt_reflection = vec3<f32>(0.0);
+    if (globals.lightning.w > 0.001 && above_water > 0.0) {
+        let strike_base = globals.lightning.xyz;
+        let strike_top = vec3<f32>(strike_base.x,
+                                  max(globals.lightning_meta.z, strike_base.y + 20.0),
+                                  strike_base.z);
+        let source = (strike_base + strike_top)*0.5;
+        let source_vector = source - in.world_position;
+        let source_range = max(length(source_vector), 1.0);
+        let flash_direction = source_vector/source_range;
+        let range_fade = 1.0/(1.0 + pow(source_range/3000.0, 2.0));
+        let flash_colour = vec3<f32>(0.73, 0.84, 1.0)
+                           *globals.lightning.w*range_fade;
+        let flash_n_dot_l = max(dot(normal, flash_direction), 0.0);
+        let flash_half = normalize(flash_direction + to_view);
+        let flash_alpha = max(alpha, 0.045);
+        let flash_lobe = dGGX(max(dot(normal, flash_half), 0.0), flash_alpha)
+                          *vSmithGGX(flash_n_dot_l, n_dot_v, flash_alpha)
+                          *flash_n_dot_l*0.35;
+        flash_specular = flash_colour*flash_lobe;
+
+        let horizontal_ray = reflection_direction.xz;
+        let ray_span = max(dot(horizontal_ray, horizontal_ray), 0.005);
+        let along_ray = max(dot(strike_base.xz - in.world_position.xz,
+                                horizontal_ray)/ray_span, 0.0);
+        let reflected_point = in.world_position + reflection_direction*along_ray;
+        let nearest_bolt = vec3<f32>(strike_base.x,
+                                     clamp(reflected_point.y, strike_base.y, strike_top.y),
+                                     strike_base.z);
+        let miss = distance(reflected_point, nearest_bolt);
+        let glint_width = 2.5 + along_ray*(0.0025 + 0.012*flash_alpha);
+        let glint = exp(-pow(miss/max(glint_width, 0.1), 2.0))
+                    *smoothstepf(0.0, 50.0, along_ray);
+        bolt_reflection = flash_colour*glint*0.65;
+    }
+
     // --- Fresnel composition -------------------------------------------------
     let fresnel = clamp(godotFresnel(clamp(dot(normal, to_view), 0.0, 1.0),
                                      stage.surface.x, stage.surface.y), 0.0, 1.0);
-    var lit = mix(body, reflected, fresnel) + specular*sun_colour + moon_specular*moon_colour;
+    var lit = mix(body, reflected, fresnel) + specular*sun_colour + moon_specular*moon_colour
+              + flash_specular + bolt_reflection*fresnel;
 
     // Foam is a diffuse layer above the reflecting surface: it replaces both
     // transmission and reflection, including at grazing view angles.

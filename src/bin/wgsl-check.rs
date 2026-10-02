@@ -56,7 +56,16 @@ fn main() {
     for path in paths {
         // Fullscreen passes (SSAO/blur/composite/fxaa) use `vs_main` +
         // `fs_main`; clipmap/geometry passes name their vs entry `vs_main` too.
-        let entry_points = [EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_main".into() }];
+        let entry_points = if path.file_name().is_some_and(|name| name == "precipitation.wgsl") {
+            vec![
+                EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_blit".into() },
+                EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_blit".into() },
+                EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_particle".into() },
+                EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_particle".into() },
+            ]
+        } else {
+            vec![EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_main".into() }]
+        };
         match validate_file(&path, &entry_points) {
             Ok(()) => {}
             Err(error) => {

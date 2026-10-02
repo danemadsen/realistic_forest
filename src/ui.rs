@@ -251,6 +251,16 @@ fn draw_diagnostics_window(
                 weather.local_condition().label(),
                 visibility_label,
             ));
+            let local_precipitation = weather.conditions(settings);
+            if local_precipitation.rain_intensity + local_precipitation.snow_intensity > 0.02 {
+                ui.small(format!(
+                    "Rain {:.0}% · snow {:.0}% · thunder {:.0}% · gust {:.0}%",
+                    local_precipitation.rain_intensity * 100.0,
+                    local_precipitation.snow_intensity * 100.0,
+                    local_precipitation.thunder_intensity * 100.0,
+                    local_precipitation.gust_strength * 100.0,
+                ));
+            }
             ui.add(
                 egui::Slider::new(&mut weather.transition_seconds, 10.0..=180.0)
                     .text("Trend transition")

@@ -12,6 +12,7 @@ pub mod cloud_node;
 pub mod gpu_textures;
 pub mod grass_node;
 pub mod post_nodes;
+pub mod precipitation_node;
 pub mod terrain_node;
 pub mod water_node;
 
@@ -55,6 +56,7 @@ pub enum ForestRenderSystems {
     Composite,
     WaterSurface,
     WaterUnderwater,
+    Precipitation,
     Fxaa,
     Egui,
     Upscale,
@@ -77,6 +79,7 @@ impl ForestRender {
                 Composite,
                 WaterSurface,
                 WaterUnderwater,
+                Precipitation,
                 Fxaa,
                 Egui,
                 Upscale,
@@ -110,7 +113,7 @@ pub struct ExtractedForestView {
 // silently drift.
 // ---------------------------------------------------------------------------
 
-/// The shared `GlobalUniforms` preamble (group 0, binding 0), 368 bytes.
+/// The shared `GlobalUniforms` preamble (group 0, binding 0), 416 bytes.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GlobalUniformsGpu {
@@ -131,8 +134,11 @@ pub struct GlobalUniformsGpu {
     pub cloud_layer: [f32; 4],
     pub cloud_motion: [f32; 4],
     pub weather: [f32; 4],
+    pub storm: [f32; 4],
+    pub lightning: [f32; 4],
+    pub lightning_meta: [f32; 4],
 }
-const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 368);
+const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 416);
 
 /// terrain-vs + terrain-fs share one canonical StageUniforms layout
 /// (272 bytes); the WGSL files are reconciled to this exact field order.
@@ -391,6 +397,7 @@ pub struct ForestShaderHandles {
     pub water_surface: Handle<Shader>,
     pub water_underwater: Handle<Shader>,
     pub water_blit: Handle<Shader>,
+    pub precipitation: Handle<Shader>,
     pub cloud_probe: Handle<Shader>,
 }
 
@@ -434,6 +441,7 @@ impl Plugin for ForestRenderPlugin {
                 water_surface: asset_server.load::<Shader>("shaders/water-surface.wgsl"),
                 water_underwater: asset_server.load::<Shader>("shaders/water-underwater.wgsl"),
                 water_blit: asset_server.load::<Shader>("shaders/water-blit.wgsl"),
+                precipitation: asset_server.load::<Shader>("shaders/precipitation.wgsl"),
                 cloud_probe: asset_server.load::<Shader>("shaders/cloud-probe.wgsl"),
             }
         };
@@ -476,6 +484,7 @@ impl Plugin for ForestRenderPlugin {
         terrain_node::register_terrain_systems(render_app);
         post_nodes::register_post_systems(render_app);
         cloud_node::register_cloud_systems(render_app);
+        precipitation_node::register_precipitation_systems(render_app);
 
         render_app.add_systems(ExtractSchedule, extract_forest_view);
         render_app.add_systems(
@@ -501,6 +510,7 @@ impl Plugin for ForestRenderPlugin {
                 post_nodes::forest_composite_pass.in_set(ForestRenderSystems::Composite),
                 water_node::forest_water_surface_pass.in_set(ForestRenderSystems::WaterSurface),
                 water_node::forest_underwater_pass.in_set(ForestRenderSystems::WaterUnderwater),
+                precipitation_node::forest_precipitation_pass.in_set(ForestRenderSystems::Precipitation),
                 post_nodes::forest_fxaa_pass.in_set(ForestRenderSystems::Fxaa),
                 // bevy_egui draws through `egui_pass`, with `prepare_egui_pass`
                 // immediately before it to resolve paint callbacks. bevy_egui
@@ -660,6 +670,24 @@ pub fn prepare_forest_globals(
             view.weather.climate_bias,
             view.weather.override_bits() as f32,
         ],
+        storm: [
+            view.weather.precipitation_bias,
+            view.weather.target.precipitation_override() as f32,
+            view.weather.elapsed_seconds,
+            view.weather.local_precipitation.gust,
+        ],
+        lightning: [
+            view.weather.lightning.position[0],
+            view.weather.lightning.position[1],
+            view.weather.lightning.position[2],
+            view.weather.lightning.flash,
+        ],
+        lightning_meta: [
+            view.weather.lightning.seed,
+            view.weather.lightning.age_seconds,
+            view.weather.lightning.top_height,
+            view.weather.local_precipitation.thunderstorm,
+        ],
     };
     if globals.buffer.is_none() {
         // Created straight off the wgpu device so the field can stay a raw
@@ -731,6 +759,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn rain_snow_and_water_share_one_spatial_storm_field() {
+        let common = include_str!("../../assets/shaders/precipitation-functions.wgslinc").trim();
+        for source in [
+            include_str!("../../assets/shaders/composite.wgsl"),
+            include_str!("../../assets/shaders/water-surface.wgsl"),
+            include_str!("../../assets/shaders/precipitation.wgsl"),
+        ] {
+            assert!(source.contains(common), "precipitation field differs between passes");
+        }
+    }
+
     /// A stale layout in even an unrelated pass can reinterpret daylight as
     /// a matrix or bind too small a uniform range. Check the actual WGSL ABI
     /// against Rust, including offsets, rather than just matching byte sizes.
@@ -754,6 +794,9 @@ mod tests {
             ("cloud_layer", std::mem::offset_of!(GlobalUniformsGpu, cloud_layer)),
             ("cloud_motion", std::mem::offset_of!(GlobalUniformsGpu, cloud_motion)),
             ("weather", std::mem::offset_of!(GlobalUniformsGpu, weather)),
+            ("storm", std::mem::offset_of!(GlobalUniformsGpu, storm)),
+            ("lightning", std::mem::offset_of!(GlobalUniformsGpu, lightning)),
+            ("lightning_meta", std::mem::offset_of!(GlobalUniformsGpu, lightning_meta)),
         ];
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
         let mut checked = 0;

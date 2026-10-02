@@ -190,13 +190,16 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                     "cloudy" => Some(WeatherPreset::Cloudy),
                     "overcast" => Some(WeatherPreset::Overcast),
                     "fog" | "whiteout" => Some(WeatherPreset::Fog),
+                    "rain" => Some(WeatherPreset::Rain),
+                    "snow" => Some(WeatherPreset::Snow),
+                    "thunderstorm" | "storm" => Some(WeatherPreset::Thunderstorm),
                     _ => None,
                 });
                 if let Some(preset) = preset {
                     automation.weather_preset = preset;
                     index += 1;
                 } else {
-                    eprintln!("WARNING: --weather expects clear, cloudy, overcast or fog");
+                    eprintln!("WARNING: --weather expects clear, cloudy, overcast, fog, rain, snow or thunderstorm");
                     if next.is_some_and(|value| !value.starts_with("--")) {
                         index += 1;
                     }
@@ -410,12 +413,16 @@ mod tests {
             ("overcast", WeatherPreset::Overcast),
             ("fog", WeatherPreset::Fog),
             ("whiteout", WeatherPreset::Fog),
+            ("rain", WeatherPreset::Rain),
+            ("snow", WeatherPreset::Snow),
+            ("thunderstorm", WeatherPreset::Thunderstorm),
+            ("storm", WeatherPreset::Thunderstorm),
         ] {
             let settings = parse(&["--weather", name, "--static-weather"]);
             assert_eq!(settings.weather_preset, preset);
             assert!(settings.static_weather);
         }
-        let settings = parse(&["--weather", "rain", "--no-clouds"]);
+        let settings = parse(&["--weather", "invalid", "--no-clouds"]);
         assert_eq!(settings.weather_preset, WeatherPreset::Cloudy);
         assert!(settings.no_clouds);
     }

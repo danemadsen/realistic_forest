@@ -34,6 +34,9 @@ struct GlobalUniforms
     cloud_layer: vec4<f32>,     // thickness, shape scale, shadow strength, quality
     cloud_motion: vec4<f32>,    // wind offset XZ, detail strength, maximum distance
     weather: vec4<f32>, // front offset XZ, climate bias, explicit cloud overrides
+    storm: vec4<f32>, // precipitation bias, type override, elapsed time, local gust
+    lightning: vec4<f32>, // strike world xyz, HDR flash
+    lightning_meta: vec4<f32>, // seed, age, bolt top, local thunder
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
@@ -450,6 +453,15 @@ fn marchClouds(origin: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, q
             let transport = moon_phase*exp(-depth) + 0.32*exp(-depth*0.22);
             lighting += vec3<f32>(0.52, 0.65, 1.0)*globals.atmosphere.y
                         *cloudSunMultiplier(local_severity)*0.22*transport;
+        }
+        if (globals.lightning.w > 0.001) {
+            let source = vec3<f32>(globals.lightning.x,
+                                   mix(globals.lightning.y, globals.lightning_meta.z, 0.65),
+                                   globals.lightning.z);
+            let range = length(world_position - source);
+            let reach = 1.0/(1.0 + pow(range/1900.0, 2.0));
+            lighting += vec3<f32>(0.72, 0.84, 1.0)*globals.lightning.w
+                        *reach*0.55;
         }
         result.scattering += contribution*lighting;
         weighted_distance += distance*contribution;

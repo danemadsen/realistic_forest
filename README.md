@@ -54,14 +54,27 @@ full day in 24 real minutes. **Raymarched lighting** exposes terrain shadows,
 volumetric sunlight, water reflections, quality and light shaft strength;
 **Rendering** includes fog density, sun intensity and exposure.
 
-**Weather** has moving fronts, so Clear, Cloudy, Overcast, and Fog / Whiteout
-can occur in different parts of the world at the same time. The starting area
-is Cloudy; local weather changes as fronts pass or the player travels. The F1
-condition selector biases the map toward a chosen condition while retaining
-local variation, and its transition control blends that bias over 75 seconds
-by default. Weather changes cloud amount and altitude, moving shadows, sun
-strength, sky color, and atmospheric visibility together. Fog / Whiteout
-produces short-range visibility and a diffuse, nearly colorless sky by day.
+**Weather** has moving fronts and smaller storm cells, so Clear, Cloudy,
+Overcast, Fog / Whiteout, Rain, Snow, and Thunderstorm can occur in different
+parts of the world at the same time. Clear, Cloudy, and Overcast cover most of
+the map. Fog is less common; rain and snow occupy smaller areas; thunderstorms
+are the rarest. The starting area is Cloudy. The F1 condition selector biases
+the map toward a chosen condition while retaining local variation, and its
+transition control blends that bias over 75 seconds by default. Weather
+changes cloud amount and altitude, moving shadows, sun strength, sky color,
+and atmospheric visibility together. Fog / Whiteout produces short-range
+visibility and a diffuse, nearly colorless sky by day.
+
+Rain falls as wind-leaning, depth-tested streaks; snow falls more slowly as
+flakes. The terrain darkens and grows glossier under rain, while snowfall gives
+upward surfaces a light dusting. Precipitation adds distance haze, and the F1
+panel reports the local intensity and visibility. Rain makes short-lived
+ripples and small splashes on the water; snowflakes briefly fleck its surface.
+Local storm gusts roughen the existing wave spectrum without resetting it.
+Thunderstorm cells produce short lightning flashes and jagged bolts that can
+strike terrain or water. The flashes light nearby ground, clouds, fog, and
+water reflections. Snow phase normally follows altitude and the mountain
+snowline; selecting Rain, Snow, or Thunderstorm forces that phase for previews.
 
 **Volumetric clouds** controls cloud coverage, density, base altitude, layer
 thickness, wind speed and direction, and shadow strength. **Cloud shape** expands
@@ -90,7 +103,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--day-length MIN` | Positive real minutes per complete day; default `24` |
 | `--pause-time` | Hold the selected time of day and freeze weather fronts and cloud wind |
 | `--advance-time` | Allow the day/night cycle, weather, and cloud wind to advance during a screenshot run |
-| `--weather clear\|cloudy\|overcast\|fog` | Bias the spatial weather map toward a chosen condition; default `cloudy` (`whiteout` also selects fog) |
+| `--weather clear\|cloudy\|overcast\|fog\|rain\|snow\|thunderstorm` | Bias the spatial weather map toward a chosen condition; default `cloudy` (`whiteout` and `storm` are aliases) |
 | `--static-weather` | Freeze weather fronts in place; conditions still vary by location |
 | `--raymarch-quality low\|balanced\|high` | Choose the ray sampling budget; default `balanced` (also accepts `0`, `1`, `2`) |
 | `--no-raymarch` | Disable raymarched terrain shadows, volumetric integration, clouds and terrain reflections on water |

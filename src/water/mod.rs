@@ -119,25 +119,27 @@ pub struct GpuWave {
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WaterStageUniforms {
-    pub waves: [GpuWave; waves::WAVE_SLOTS],           // 0    1280
-    pub ranges: [[u32; 4]; WATER_LOD_COUNT],           // 1280 80
-    /// x elapsed seconds, y amplitude multiplier, z sea level, w chop scale.
-    pub params: [f32; 4],                              // 1360
+    pub waves: [GpuWave; waves::WAVE_SLOTS], // 0    1280
+    pub ranges: [[u32; 4]; WATER_LOD_COUNT], // 1280 80
+    /// x elapsed seconds, y authored amplitude, z sea level, w slowly varying
+    /// weather wave gain. Wave components stay fixed while fronts pass, so
+    /// their phases remain continuous.
+    pub params: [f32; 4], // 1360
     /// rgb extinction per metre, w scatter scale.
-    pub extinction: [f32; 4],                          // 1376
+    pub extinction: [f32; 4], // 1376
     /// rgb scatter tint, w Henyey-Greenstein asymmetry.
-    pub scatter: [f32; 4],                             // 1392
+    pub scatter: [f32; 4], // 1392
     /// x Fresnel F0, y Fresnel exponent, z sun roughness, w base scale.
-    pub surface: [f32; 4],                             // 1408
+    pub surface: [f32; 4], // 1408
     /// rgb subsurface tint, w tile resolution.
-    pub sss_tint: [f32; 4],                            // 1424
+    pub sss_tint: [f32; 4], // 1424
     /// x refraction scale, y foam scale, z max wave amplitude,
     /// w significant wave height (4 * sqrt(sum(amplitude²) / 2)), metres.
-    pub misc: [f32; 4],                                // 1440
+    pub misc: [f32; 4], // 1440
     /// x flat-surface debug, y sea state amplitude, z wind radians, w wave fade end.
-    pub flags: [f32; 4],                               // 1456
+    pub flags: [f32; 4], // 1456
     /// xy local seabed-map centre, z world span, w metres per texel.
-    pub shore_map: [f32; 4],                           // 1472
+    pub shore_map: [f32; 4], // 1472
 }
 
 const _: () = assert!(std::mem::size_of::<GpuWave>() == 32);
@@ -194,9 +196,5 @@ pub fn displacement_bounds(spectrum: &waves::WaveSpectrum, flat: bool) -> f32 {
     if flat {
         return 0.0;
     }
-    spectrum
-        .waves
-        .iter()
-        .map(|wave| wave.amplitude.abs())
-        .sum()
+    spectrum.waves.iter().map(|wave| wave.amplitude.abs()).sum()
 }
