@@ -15,7 +15,9 @@ use bevy::render::view::ViewTarget;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-const RAIN_PARTICLES: u32 = 32 * 32 * 16;
+// The smaller cells give heavy rain enough density while the shader culls
+// particles before rasterization outside the local, depth-tested volume.
+const RAIN_PARTICLES: u32 = 40 * 40 * 16;
 const SNOW_PARTICLES: u32 = 24 * 24 * 12;
 
 #[derive(Default)]
@@ -171,6 +173,30 @@ pub fn forest_precipitation_pass(
     if ocean_visible && extracted.player_position[1] <= SEA_LEVEL + 0.2 {
         return;
     }
+    // Rain bands can cross the near-camera particle volume before reaching
+    // the player. Sample its corners as well as the local reading so their
+    // leading edge remains visible and moves across the landscape smoothly.
+    let nearby_precipitation = extracted.weather.local_precipitation.intensity() > 0.001
+        || [-24.0, 0.0, 24.0].into_iter().any(|dx| {
+            [-24.0, 0.0, 24.0].into_iter().any(|dz| {
+                crate::weather::sample_precipitation(
+                    [extracted.player_position[0] + dx, extracted.player_position[2] + dz],
+                    extracted.player_position[1] - 8.0,
+                    extracted.weather_offset,
+                    extracted.weather.climate_bias,
+                    extracted.weather.precipitation_bias,
+                    extracted.weather.precipitation_override(),
+                    extracted.settings.cloud_base_height,
+                    extracted.weather.overrides.base,
+                    extracted.settings.cloud_wind_direction_degrees.to_radians(),
+                )
+                .intensity()
+                    > 0.001
+            })
+        });
+    if !nearby_precipitation {
+        return;
+    }
     let Ok(mut inner) = state.inner.lock() else {
         return;
     };
@@ -194,6 +220,7 @@ pub fn forest_precipitation_pass(
             "vs_blit",
             "fs_blit",
             None,
+            wgpu::PrimitiveTopology::TriangleList,
         ));
         let particles = cache.queue_render_pipeline(pipeline_descriptor(
             "forest_precipitation_particle_pipeline",
@@ -203,6 +230,7 @@ pub fn forest_precipitation_pass(
             "vs_particle",
             "fs_particle",
             Some(wgpu::BlendState::ALPHA_BLENDING),
+            wgpu::PrimitiveTopology::TriangleStrip,
         ));
         inner.pipelines.insert(format, (blit, particles));
         (blit, particles)
@@ -216,15 +244,6 @@ pub fn forest_precipitation_pass(
     ) else {
         return;
     };
-
-    // This volume extends only 24 m laterally from the camera. The storm
-    // field varies over kilometres, so a dry camera means there are no nearby
-    // particles to draw, even if clouds are raining in the distance.
-    if extracted.weather.local_precipitation.rain + extracted.weather.local_precipitation.snow
-        <= 0.001
-    {
-        return;
-    }
 
     let Ok(gbuffer_guard) = terrain.gbuffer.lock() else {
         return;
@@ -279,7 +298,7 @@ pub fn forest_precipitation_pass(
     pass.set_render_pipeline(blit);
     pass.draw(0..3, 0..1);
     pass.set_render_pipeline(particles);
-    pass.draw(0..6, 0..RAIN_PARTICLES + SNOW_PARTICLES);
+    pass.draw(0..4, 0..RAIN_PARTICLES + SNOW_PARTICLES);
 }
 
 fn pipeline_descriptor(
@@ -290,6 +309,7 @@ fn pipeline_descriptor(
     vertex_entry: &'static str,
     fragment_entry: &'static str,
     blend: Option<wgpu::BlendState>,
+    topology: wgpu::PrimitiveTopology,
 ) -> RenderPipelineDescriptor {
     RenderPipelineDescriptor {
         label: Some(label.into()),
@@ -301,7 +321,10 @@ fn pipeline_descriptor(
             entry_point: Some(vertex_entry.into()),
             buffers: vec![],
         },
-        primitive: wgpu::PrimitiveState::default(),
+        primitive: wgpu::PrimitiveState {
+            topology,
+            ..Default::default()
+        },
         depth_stencil: None,
         multisample: wgpu::MultisampleState::default(),
         fragment: Some(bevy::render::render_resource::FragmentState {

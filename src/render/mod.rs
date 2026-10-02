@@ -674,7 +674,7 @@ pub fn prepare_forest_globals(
             view.weather.precipitation_bias,
             view.weather.precipitation_override() as f32,
             view.weather.elapsed_seconds,
-            view.weather.local_precipitation.gust,
+            view.settings.cloud_wind_direction_degrees.to_radians(),
         ],
         lightning: [
             view.weather.lightning.position[0],
@@ -686,7 +686,7 @@ pub fn prepare_forest_globals(
             view.weather.lightning.seed,
             view.weather.lightning.age_seconds,
             view.weather.lightning.top_height,
-            view.weather.local_precipitation.thunderstorm,
+            if view.weather.automatic { view.settings.cloud_wind_speed } else { 0.0 },
         ],
     };
     if globals.buffer.is_none() {
@@ -766,6 +766,8 @@ mod tests {
             include_str!("../../assets/shaders/composite.wgsl"),
             include_str!("../../assets/shaders/water-surface.wgsl"),
             include_str!("../../assets/shaders/precipitation.wgsl"),
+            include_str!("../../assets/shaders/cloud-probe.wgsl"),
+            include_str!("../../assets/shaders/water-underwater.wgsl"),
         ] {
             assert!(source.contains(common), "precipitation field differs between passes");
         }

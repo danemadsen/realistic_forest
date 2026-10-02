@@ -74,16 +74,24 @@ changes cloud amount and altitude, moving shadows, sun strength, sky color,
 and atmospheric visibility together. Fog / Whiteout produces short-range
 visibility and a diffuse, nearly colorless sky by day.
 
-Rain falls as wind-leaning, depth-tested streaks; snow falls more slowly as
-flakes. The terrain darkens and grows glossier under rain, while snowfall gives
-upward surfaces a light dusting. Precipitation adds distance haze, and the F1
-panel reports the local intensity and visibility. Rain makes short-lived
-ripples and small splashes on the water; snowflakes briefly fleck its surface.
-Local storm gusts roughen the existing wave spectrum without resetting it.
-Thunderstorm cells produce short lightning flashes and jagged bolts that can
-strike terrain or water. The flashes light nearby ground, clouds, fog, and
-water reflections. Snow phase normally follows altitude and the mountain
-snowline; selecting Rain, Snow, or Thunderstorm forces that phase for previews.
+Rain travels in wind-driven sheets inside the larger moving storm cells. Broad
+and fine bands bend across the landscape, so heavy rain alternates with lighter
+intervals at a fixed location. The raymarched atmosphere integrates rain, snow,
+and fog density along each view ray, making distant precipitation curtains and
+whiteout visible through the landscape. Near the camera, depth-tested rain
+drops vary in length and speed, subtly refract
+the scene, and occasionally catch sunlight or lightning; snow falls more slowly
+as flakes. The terrain darkens and grows glossier under rain and stays damp
+between passing sheets, while snowfall gives upward surfaces a light dusting.
+The F1 panel reports local intensity and
+visibility. Rain makes short-lived ripples and splashes on the water; snowflakes
+briefly fleck its surface. Local storm gusts roughen the existing wave spectrum
+without resetting it. Thunderheads dim the sky, clouds, terrain, and fog even
+between heavy rain sheets. Thunderstorm cells produce both cloud-contained
+flashes and jagged ground bolts that can strike terrain or water. The flashes
+light nearby ground, clouds, fog, rain, and water reflections. Snow phase
+normally follows altitude and the mountain snowline; selecting Rain, Snow, or
+Thunderstorm forces that phase for previews.
 
 **Volumetric clouds** controls cloud coverage, density, base altitude, layer
 thickness, wind speed and direction, and shadow strength. **Cloud shape** expands

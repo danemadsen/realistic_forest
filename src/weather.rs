@@ -200,6 +200,28 @@ fn smoothstep(low: f32, high: f32, value: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// The same bent, wind-aligned precipitation sheets as weatherRainBand in
+/// precipitation-functions.wgslinc. Each sheet moves with WeatherMotion, so
+/// heavy and light rain pass through a fixed location without following the
+/// camera. Large storm cells continue to decide where rain is possible.
+pub fn rain_band_multiplier(
+    world_xz: [f32; 2],
+    offset: [f32; 2],
+    wind_direction_radians: f32,
+) -> f32 {
+    let (sin, cos) = wind_direction_radians.sin_cos();
+    let p = [world_xz[0] - offset[0], world_xz[1] - offset[1]];
+    let along = p[0] * cos + p[1] * sin;
+    let across = -p[0] * sin + p[1] * cos;
+    let bent = along
+        + 135.0 * (across / 340.0 + along / 1450.0).sin()
+        + 80.0 * (across / 125.0 - along / 870.0).sin();
+    let broad = 0.5 + 0.5 * (bent / 150.0 + 1.2).sin();
+    let fine = 0.5 + 0.5 * (bent / 51.0 + across / 190.0 + 0.6).sin();
+    let sheet = smoothstep(0.28, 0.82, broad * 0.72 + fine * 0.28);
+    0.18 + (1.16 - 0.18) * sheet
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PrecipitationSample {
     pub rain: f32,
@@ -226,6 +248,7 @@ pub fn sample_precipitation(
     override_kind: u32,
     cloud_base_height: f32,
     cloud_base_override: bool,
+    wind_direction_radians: f32,
 ) -> PrecipitationSample {
     let score = storm_score(world_xz, offset);
     let severity = front_severity(world_xz, offset, climate_bias);
@@ -235,8 +258,11 @@ pub fn sample_precipitation(
     let cloud_base = (cloud_base_height + if cloud_base_override { 0.0 } else { base_offset })
         .max(100.0);
     let below_cloud = 1.0 - smoothstep(cloud_base + 100.0, cloud_base + 600.0, altitude);
-    let precipitation = smoothstep(0.74, 0.90, score + precipitation_bias)
+    let storm_precipitation = smoothstep(0.74, 0.90, score + precipitation_bias)
         * wet_gate * below_cloud;
+    let precipitation = (storm_precipitation
+        * rain_band_multiplier(world_xz, offset, wind_direction_radians))
+    .min(1.0);
     let cold_altitude = altitude
         + 70.0 * ((world_xz[0] - offset[0]) / 18000.0
             + (world_xz[1] - offset[1]) / 27000.0 + 0.7).sin();
@@ -251,7 +277,8 @@ pub fn sample_precipitation(
     let thunderstorm = if override_kind == 4 {
         0.0
     } else {
-        rain * smoothstep(0.91, 0.98, score + convective_bias)
+        storm_precipitation * (1.0 - snow_fraction)
+            * smoothstep(0.91, 0.98, score + convective_bias)
     };
     let gust = (0.18 * precipitation + 0.75 * thunderstorm).clamp(0.0, 1.0);
     PrecipitationSample { rain, snow, thunderstorm, gust }
@@ -288,6 +315,7 @@ pub struct LightningEvent {
     pub position: [f32; 3],
     /// Linear HDR radiance. A short sequence of flashes peaks near 12.
     pub flash: f32,
+    /// Negative seeds denote a cloud-contained flash without a ground bolt.
     pub seed: f32,
     pub age_seconds: f32,
     pub top_height: f32,
@@ -347,10 +375,12 @@ impl Default for WeatherState {
 impl WeatherState {
     pub fn from_preset(preset: WeatherPreset, automatic: bool) -> Self {
         let profile = WeatherProfile::for_preset(preset);
+        let settings = AppSettings::default();
         let local_precipitation = sample_precipitation(
             [0.0, 0.0], 0.0, [0.0, 0.0], preset.climate_bias(),
             preset.precipitation_bias(), preset.precipitation_override(),
-            AppSettings::default().cloud_base_height, false,
+            settings.cloud_base_height, false,
+            settings.cloud_wind_direction_degrees.to_radians(),
         );
         Self {
             automatic,
@@ -501,6 +531,7 @@ impl WeatherState {
             self.precipitation_override(),
             settings.cloud_base_height,
             self.overrides.base,
+            settings.cloud_wind_direction_degrees.to_radians(),
         );
     }
 
@@ -539,7 +570,8 @@ impl WeatherState {
         }
         let height_density = (-(altitude - 20.0).max(0.0) / 450.0).exp();
         let extinction = base_density * (0.16 + 0.84 * height_density)
-            + precipitation.rain * 0.00085 + precipitation.snow * 0.0013;
+            + precipitation.rain * 0.00085 + precipitation.snow * 0.0013
+            + precipitation.thunderstorm * 0.00035;
         2.995_732_3 / extinction
     }
 
@@ -624,16 +656,25 @@ impl WeatherState {
                 [x, z], player[1], offset, self.climate_bias,
                 self.precipitation_bias, self.precipitation_override(),
                 settings.cloud_base_height, self.overrides.base,
+                settings.cloud_wind_direction_degrees.to_radians(),
             );
             if cell.thunderstorm < 0.18 { continue; }
-            let seed = self.random();
+            // Many discharges stay inside the cloud. They brighten the cloud
+            // volume and haze without painting a ground-contact bolt.
+            let cloud_flash = self.random() < 0.4;
+            let seed = self.random().max(0.0001)
+                * if cloud_flash { -1.0 } else { 1.0 };
             self.lightning = LightningEvent {
                 position: [x, 0.0, z],
                 flash: 0.0,
                 seed,
                 age_seconds: 0.0,
                 top_height: 1650.0 + self.random() * 800.0,
-                peak_flash: 7.0 + self.random() * 7.0,
+                peak_flash: if cloud_flash {
+                    4.0 + self.random() * 6.0
+                } else {
+                    7.0 + self.random() * 7.0
+                },
             };
             self.new_strike = true;
             break;
@@ -826,16 +867,16 @@ mod tests {
                         assert_eq!(precipitation.intensity(), 0.0);
                     }
                     WeatherPreset::Rain => {
-                        assert!(precipitation.rain > 0.9);
+                        assert!(precipitation.rain > 0.17);
                         assert_eq!(precipitation.snow, 0.0);
                         assert_eq!(precipitation.thunderstorm, 0.0);
                     }
                     WeatherPreset::Snow => {
-                        assert!(precipitation.snow > 0.9);
+                        assert!(precipitation.snow > 0.17);
                         assert_eq!(precipitation.rain, 0.0);
                     }
                     WeatherPreset::Thunderstorm => {
-                        assert!(precipitation.rain > 0.9);
+                        assert!(precipitation.rain > 0.17);
                         assert!(precipitation.thunderstorm > 0.9);
                     }
                 }
@@ -1019,6 +1060,36 @@ mod tests {
     }
 
     #[test]
+    fn wind_advects_heavy_and_light_rain_sheets_through_a_fixed_location() {
+        let angle = 70.0_f32.to_radians();
+        let direction = [angle.cos(), angle.sin()];
+        let location = [3200.0, -1700.0];
+        let displacement = [direction[0] * 800.0, direction[1] * 800.0];
+        let first = rain_band_multiplier(location, [0.0, 0.0], angle);
+        let shifted = rain_band_multiplier(
+            [location[0] + displacement[0], location[1] + displacement[1]],
+            displacement,
+            angle,
+        );
+        assert!((first - shifted).abs() < 0.0001);
+
+        let mut minimum = 1.0_f32;
+        let mut maximum = 0.0_f32;
+        for second in 0..=120 {
+            let offset = [direction[0] * second as f32 * 18.0,
+                          direction[1] * second as f32 * 18.0];
+            let rain = sample_precipitation(
+                location, 0.0, offset, 2.0, 1.0, 4, 1300.0,
+                false, angle,
+            ).rain;
+            minimum = minimum.min(rain);
+            maximum = maximum.max(rain);
+        }
+        assert!(minimum < 0.30, "rain lull should be visible: {minimum}");
+        assert!(maximum > 0.95, "heavy sheet should follow: {maximum}");
+    }
+
+    #[test]
     fn lightning_requires_a_convective_cell_and_has_short_pulses() {
         let mut clear = WeatherState::from_preset(WeatherPreset::Clear, false);
         clear.advance(60.0, [0.0; 3], [0.0; 2], &AppSettings::default());
@@ -1035,5 +1106,23 @@ mod tests {
         assert!(storm.lightning.flash > 5.0);
         storm.advance(0.4, [0.0; 3], [0.0; 2], &AppSettings::default());
         assert!(storm.lightning.flash < 0.001);
+    }
+
+    #[test]
+    fn thunderstorms_produce_both_cloud_flashes_and_ground_bolts() {
+        let mut storm = WeatherState::from_preset(WeatherPreset::Thunderstorm, false);
+        let settings = AppSettings::default();
+        let mut cloud_flashes = 0;
+        let mut ground_bolts = 0;
+        for _ in 0..24 {
+            storm.advance(40.0, [0.0; 3], [0.0; 2], &settings);
+            assert!(storm.new_strike);
+            if storm.lightning.seed < 0.0 {
+                cloud_flashes += 1;
+            } else {
+                ground_bolts += 1;
+            }
+        }
+        assert!(cloud_flashes > 0 && ground_bolts > 0);
     }
 }

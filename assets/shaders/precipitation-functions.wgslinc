@@ -26,10 +26,25 @@ fn weatherPrecipitationSeverity(world_xz: vec2<f32>) -> f32 {
     return clamp(base + globals.weather.z, 0.0, 3.0);
 }
 
-// Return rain, snow, thunderstorm, gust, each in [0, 1]. The altitude
-// transition follows the terrain material's low mountain snowline. Explicit
-// Snow/Rain/Thunderstorm trends select phase while retaining spatial cells.
-fn weatherPrecipitation(world_position: vec3<f32>) -> vec4<f32> {
+// Wind-carried rain curtains ride inside each broad storm cell. The two
+// wavelengths and bent crosswind coordinate keep the passing sheets irregular
+// while preserving a stationary world-space pattern as the camera moves.
+fn weatherRainBand(world_xz: vec2<f32>) -> f32 {
+    let p = world_xz - globals.weather.xy;
+    let wind = vec2<f32>(cos(globals.storm.w), sin(globals.storm.w));
+    let along = dot(p, wind);
+    let across = dot(p, vec2<f32>(-wind.y, wind.x));
+    let bent = along + 135.0*sin(across/340.0 + along/1450.0)
+                      + 80.0*sin(across/125.0 - along/870.0);
+    let broad = 0.5 + 0.5*sin(bent/150.0 + 1.2);
+    let fine = 0.5 + 0.5*sin(bent/51.0 + across/190.0 + 0.6);
+    let sheet = smoothstep(0.28, 0.82, broad*0.72 + fine*0.28);
+    return mix(0.18, 1.16, sheet);
+}
+
+// A cheap core query for clouds and sky shading: avoid evaluating the finer
+// moving rain sheets for every raymarch step through a thunderhead.
+fn weatherStormBase(world_position: vec3<f32>) -> vec3<f32> {
     let score = weatherStormScore(world_position.xz);
     let severity = weatherPrecipitationSeverity(world_position.xz);
     let wet_gate = smoothstep(1.25, 2.0, severity);
@@ -42,8 +57,9 @@ fn weatherPrecipitation(world_position: vec3<f32>) -> vec4<f32> {
     // them through its base so flying above a storm is dry.
     let below_cloud = 1.0 - smoothstep(cloud_base + 100.0,
                                        cloud_base + 600.0, world_position.y);
-    let precipitation = smoothstep(0.74, 0.90, score + globals.storm.x)
+    let storm_precipitation = smoothstep(0.74, 0.90, score + globals.storm.x)
                         *wet_gate*below_cloud;
+    if (storm_precipitation <= 0.0) { return vec3<f32>(0.0); }
     let cold_altitude = world_position.y
         + 70.0*sin((world_position.x - globals.weather.x)/18000.0
                    + (world_position.z - globals.weather.y)/27000.0 + 0.7);
@@ -51,12 +67,28 @@ fn weatherPrecipitation(world_position: vec3<f32>) -> vec4<f32> {
     let override_kind = u32(globals.storm.y + 0.5);
     if (override_kind == 1u || override_kind == 3u || override_kind == 4u) { snow_fraction = 0.0; }
     if (override_kind == 2u) { snow_fraction = 1.0; }
-    let rain = precipitation*(1.0 - snow_fraction);
-    let snow = precipitation*snow_fraction;
     let convective_bias = select(0.0, globals.storm.x, override_kind == 3u);
-    let thunderstorm = select(rain*smoothstep(0.91, 0.98, score + convective_bias),
+    // A lull in a rain sheet does not instantly clear the thunderhead.
+    let thunderstorm = select(storm_precipitation*(1.0 - snow_fraction)
+                              *smoothstep(0.91, 0.98, score + convective_bias),
                               0.0, override_kind == 4u);
-    let gust = clamp(0.18*precipitation + 0.75*thunderstorm, 0.0, 1.0);
-    return vec4<f32>(rain, snow, thunderstorm, gust);
+    return vec3<f32>(storm_precipitation, snow_fraction, thunderstorm);
+}
+
+fn weatherConvectiveCore(world_position: vec3<f32>) -> f32 {
+    return weatherStormBase(world_position).z;
+}
+
+// Return rain, snow, thunderstorm, gust, each in [0, 1]. The altitude
+// transition follows the terrain material's low mountain snowline. Explicit
+// Snow/Rain/Thunderstorm trends select phase while retaining spatial cells.
+fn weatherPrecipitation(world_position: vec3<f32>) -> vec4<f32> {
+    let base = weatherStormBase(world_position);
+    if (base.x <= 0.0) { return vec4<f32>(0.0); }
+    let precipitation = min(base.x*weatherRainBand(world_position.xz), 1.0);
+    let rain = precipitation*(1.0 - base.y);
+    let snow = precipitation*base.y;
+    let gust = clamp(0.18*precipitation + 0.75*base.z, 0.0, 1.0);
+    return vec4<f32>(rain, snow, base.z, gust);
 }
 // END SHARED SPATIAL PRECIPITATION

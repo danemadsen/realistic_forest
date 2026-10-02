@@ -21,9 +21,9 @@ struct GlobalUniforms {
     cloud_layer: vec4<f32>,     // thickness, shape scale, shadow strength, quality
     cloud_motion: vec4<f32>,    // wind offset XZ, detail strength, maximum distance
     weather: vec4<f32>, // front offset XZ, climate bias, explicit cloud overrides
-    storm: vec4<f32>, // precipitation bias, phase override, elapsed seconds, local gust
+    storm: vec4<f32>, // precipitation bias, phase override, elapsed seconds, wind direction radians
     lightning: vec4<f32>, // strike world position xyz, flash radiance
-    lightning_meta: vec4<f32>, // seed, strike age, bolt top altitude, local thunder
+    lightning_meta: vec4<f32>, // seed, strike age, bolt top altitude, front speed
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
@@ -89,6 +89,29 @@ fn cloudFrontSeverity(world_xz: vec2<f32>) -> f32 {
         severity = 2.0 + clamp((score - 0.7)/0.18, 0.0, 1.0);
     }
     return clamp(severity + globals.weather.z, 0.0, 3.0);
+}
+
+// The cloud deck remains storm-dark through lulls between rain sheets.
+// Sample below its base so an observer flying over the clouds can still see
+// their dark upper billows while the open sky above stays bright.
+fn stormCoreStrength(world_xz: vec2<f32>) -> f32 {
+    let altitude = min(max(globals.camera_position.y, 0.0),
+                       max(globals.clouds.w - 400.0, 0.0));
+    return weatherConvectiveCore(vec3<f32>(world_xz.x, altitude, world_xz.y));
+}
+
+fn stormLightAt(world_position: vec3<f32>) -> f32 {
+    let layer = cloudLocalLayer(cloudFrontSeverity(world_position.xz));
+    let cloud_top = layer.x + layer.y;
+    let below_deck = 1.0 - smoothstep(cloud_top - 150.0,
+                                      cloud_top + 350.0, world_position.y);
+    if (below_deck <= 0.0) { return 0.0; }
+    return stormCoreStrength(world_position.xz)*below_deck;
+}
+
+fn stormVisualStrength(world_xz: vec2<f32>) -> f32 {
+    return stormLightAt(vec3<f32>(world_xz.x, globals.camera_position.y,
+                                  world_xz.y));
 }
 
 // x coverage offset, y extinction multiplier, z base offset in metres,
@@ -274,6 +297,7 @@ fn marchClouds(origin: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, q
                       *(1.0 - smoothstep(cloud_range*0.60, cloud_range, distance));
         if (density <= 0.001) { continue; }
         let local_severity = cloudFrontSeverity(world_position.xz);
+        let storm = stormCoreStrength(world_position.xz);
         let local_layer = cloudLocalLayer(local_severity);
         let height = clamp((world_position.y - local_layer.x)/local_layer.y, 0.0, 1.0);
         let step_transmittance = exp(-density*CLOUD_EXTINCTION*step_length);
@@ -282,10 +306,12 @@ fn marchClouds(origin: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, q
                                 vec3<f32>(0.26, 0.31, 0.38), height);
         let overcast_ambient = mix(vec3<f32>(0.085, 0.095, 0.10),
                                    vec3<f32>(0.22, 0.24, 0.25), height);
-        let day_ambient = mix(mix(clear_ambient, overcast_ambient,
-                                  smoothstep(1.0, 2.0, local_severity)),
-                              vec3<f32>(0.31, 0.33, 0.33),
-                              smoothstep(2.0, 3.0, local_severity));
+        let day_ambient = mix(mix(mix(clear_ambient, overcast_ambient,
+                                      smoothstep(1.0, 2.0, local_severity)),
+                                  vec3<f32>(0.31, 0.33, 0.33),
+                                  smoothstep(2.0, 3.0, local_severity)),
+                              mix(vec3<f32>(0.027, 0.035, 0.044),
+                                  vec3<f32>(0.13, 0.15, 0.17), height), storm);
         let night_ambient = mix(vec3<f32>(0.0015, 0.0025, 0.005), vec3<f32>(0.008, 0.012, 0.023), height);
         var lighting = mix(night_ambient, day_ambient, daylight);
         // Beer light transport gives dark rain-cloud cores; the two broader
@@ -296,13 +322,15 @@ fn marchClouds(origin: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, q
             let depth = cloudLightDepth(world_position, to_sun, quality);
             let transport = sun_phase*exp(-depth) + 0.28*exp(-depth*0.26) + 0.08*exp(-depth*0.055);
             lighting += globals.sun_colour.rgb*globals.settings_a.x
-                        *cloudSunMultiplier(local_severity)*0.18*transport*powder;
+                        *cloudSunMultiplier(local_severity)*mix(1.0, 0.11, storm)
+                        *0.18*transport*powder;
         }
         if (globals.atmosphere.y > 0.001) {
             let depth = cloudLightDepth(world_position, to_moon, max(quality - 1.0, 0.0));
             let transport = moon_phase*exp(-depth) + 0.32*exp(-depth*0.22);
             lighting += vec3<f32>(0.52, 0.65, 1.0)*globals.atmosphere.y
-                        *cloudSunMultiplier(local_severity)*0.22*transport;
+                        *cloudSunMultiplier(local_severity)*mix(1.0, 0.42, storm)
+                        *0.22*transport;
         }
         if (globals.lightning.w > 0.001) {
             let source = vec3<f32>(globals.lightning.x,
@@ -383,10 +411,25 @@ fn weatherPrecipitationSeverity(world_xz: vec2<f32>) -> f32 {
     return clamp(base + globals.weather.z, 0.0, 3.0);
 }
 
-// Return rain, snow, thunderstorm, gust, each in [0, 1]. The altitude
-// transition follows the terrain material's low mountain snowline. Explicit
-// Snow/Rain/Thunderstorm trends select phase while retaining spatial cells.
-fn weatherPrecipitation(world_position: vec3<f32>) -> vec4<f32> {
+// Wind-carried rain curtains ride inside each broad storm cell. The two
+// wavelengths and bent crosswind coordinate keep the passing sheets irregular
+// while preserving a stationary world-space pattern as the camera moves.
+fn weatherRainBand(world_xz: vec2<f32>) -> f32 {
+    let p = world_xz - globals.weather.xy;
+    let wind = vec2<f32>(cos(globals.storm.w), sin(globals.storm.w));
+    let along = dot(p, wind);
+    let across = dot(p, vec2<f32>(-wind.y, wind.x));
+    let bent = along + 135.0*sin(across/340.0 + along/1450.0)
+                      + 80.0*sin(across/125.0 - along/870.0);
+    let broad = 0.5 + 0.5*sin(bent/150.0 + 1.2);
+    let fine = 0.5 + 0.5*sin(bent/51.0 + across/190.0 + 0.6);
+    let sheet = smoothstep(0.28, 0.82, broad*0.72 + fine*0.28);
+    return mix(0.18, 1.16, sheet);
+}
+
+// A cheap core query for clouds and sky shading: avoid evaluating the finer
+// moving rain sheets for every raymarch step through a thunderhead.
+fn weatherStormBase(world_position: vec3<f32>) -> vec3<f32> {
     let score = weatherStormScore(world_position.xz);
     let severity = weatherPrecipitationSeverity(world_position.xz);
     let wet_gate = smoothstep(1.25, 2.0, severity);
@@ -399,8 +442,9 @@ fn weatherPrecipitation(world_position: vec3<f32>) -> vec4<f32> {
     // them through its base so flying above a storm is dry.
     let below_cloud = 1.0 - smoothstep(cloud_base + 100.0,
                                        cloud_base + 600.0, world_position.y);
-    let precipitation = smoothstep(0.74, 0.90, score + globals.storm.x)
+    let storm_precipitation = smoothstep(0.74, 0.90, score + globals.storm.x)
                         *wet_gate*below_cloud;
+    if (storm_precipitation <= 0.0) { return vec3<f32>(0.0); }
     let cold_altitude = world_position.y
         + 70.0*sin((world_position.x - globals.weather.x)/18000.0
                    + (world_position.z - globals.weather.y)/27000.0 + 0.7);
@@ -408,13 +452,29 @@ fn weatherPrecipitation(world_position: vec3<f32>) -> vec4<f32> {
     let override_kind = u32(globals.storm.y + 0.5);
     if (override_kind == 1u || override_kind == 3u || override_kind == 4u) { snow_fraction = 0.0; }
     if (override_kind == 2u) { snow_fraction = 1.0; }
-    let rain = precipitation*(1.0 - snow_fraction);
-    let snow = precipitation*snow_fraction;
     let convective_bias = select(0.0, globals.storm.x, override_kind == 3u);
-    let thunderstorm = select(rain*smoothstep(0.91, 0.98, score + convective_bias),
+    // A lull in a rain sheet does not instantly clear the thunderhead.
+    let thunderstorm = select(storm_precipitation*(1.0 - snow_fraction)
+                              *smoothstep(0.91, 0.98, score + convective_bias),
                               0.0, override_kind == 4u);
-    let gust = clamp(0.18*precipitation + 0.75*thunderstorm, 0.0, 1.0);
-    return vec4<f32>(rain, snow, thunderstorm, gust);
+    return vec3<f32>(storm_precipitation, snow_fraction, thunderstorm);
+}
+
+fn weatherConvectiveCore(world_position: vec3<f32>) -> f32 {
+    return weatherStormBase(world_position).z;
+}
+
+// Return rain, snow, thunderstorm, gust, each in [0, 1]. The altitude
+// transition follows the terrain material's low mountain snowline. Explicit
+// Snow/Rain/Thunderstorm trends select phase while retaining spatial cells.
+fn weatherPrecipitation(world_position: vec3<f32>) -> vec4<f32> {
+    let base = weatherStormBase(world_position);
+    if (base.x <= 0.0) { return vec4<f32>(0.0); }
+    let precipitation = min(base.x*weatherRainBand(world_position.xz), 1.0);
+    let rain = precipitation*(1.0 - base.y);
+    let snow = precipitation*base.y;
+    let gust = clamp(0.18*precipitation + 0.75*base.z, 0.0, 1.0);
+    return vec4<f32>(rain, snow, base.z, gust);
 }
 // END SHARED SPATIAL PRECIPITATION
 
@@ -457,16 +517,19 @@ fn weatherSkyCover(severity: f32) -> f32 {
     return mix(0.8, 1.0, severity - 2.0);
 }
 
-fn weatherFogAmbient(severity: f32, daylight: f32) -> vec3<f32> {
+fn weatherFogAmbient(severity: f32, daylight: f32, thunder: f32) -> vec3<f32> {
     let sky_cover = weatherSkyCover(severity);
     let overcast = smoothstep(0.05, 0.9, sky_cover);
     let whiteout = smoothstep(0.78, 1.0, sky_cover);
+    let storm = thunder;
     let night_ambient = mix(vec3<f32>(0.012, 0.019, 0.037),
                             vec3<f32>(0.021, 0.024, 0.028), overcast);
     let day_ambient = mix(mix(vec3<f32>(0.32, 0.44, 0.59),
                               vec3<f32>(0.40, 0.43, 0.43), overcast),
                           vec3<f32>(0.67, 0.69, 0.68), whiteout);
-    return mix(night_ambient, day_ambient, clamp(daylight, 0.0, 1.0));
+    let dark_night = mix(night_ambient, vec3<f32>(0.007, 0.010, 0.017), storm);
+    let dark_day = mix(day_ambient, vec3<f32>(0.10, 0.125, 0.14), storm);
+    return mix(dark_night, dark_day, clamp(daylight, 0.0, 1.0));
 }
 
 fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
@@ -484,6 +547,7 @@ fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
     let horizon_distance = 12000.0*(1.0 - smoothstep(0.08, 0.8, ray.y));
     let sky_xz = globals.camera_position.xz + ray.xz
                  *clamp(max(cloud_distance, horizon_distance), 0.0, 16000.0);
+    let storm = stormVisualStrength(sky_xz);
     let sky_cover = weatherSkyCover(weatherSeverity(sky_xz));
     let overcast = smoothstep(0.05, 0.9, sky_cover);
     let whiteout = smoothstep(0.78, 1.0, sky_cover);
@@ -499,13 +563,17 @@ fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
     let weather_day_sky = mix(mix(day_sky, clouded_day_sky, overcast),
                               vec3<f32>(0.64, 0.66, 0.65), whiteout);
     let weather_night_sky = mix(night_sky, clouded_night_sky, overcast);
-    var sky = mix(weather_night_sky, weather_day_sky, daylight);
+    let storm_day_sky = mix(vec3<f32>(0.15, 0.17, 0.18),
+                            vec3<f32>(0.06, 0.075, 0.09), elevation);
+    let storm_night_sky = vec3<f32>(0.006, 0.009, 0.016);
+    var sky = mix(mix(weather_night_sky, storm_night_sky, storm),
+                  mix(weather_day_sky, storm_day_sky, storm), daylight);
     let sunset = exp(-pow((to_sun.y + 0.025)/0.17, 2.0));
     let horizon = exp(-abs(ray.y)*6.0);
     let sunward = pow(max(dot(normalize(vec3<f32>(ray.x, 0.001, ray.z)),
                               normalize(vec3<f32>(to_sun.x, 0.001, to_sun.z))), 0.0), 5.0);
     sky += vec3<f32>(0.65, 0.16, 0.025)*sunset*horizon*(0.15 + 0.85*sunward)
-           *(1.0 - overcast);
+           *(1.0 - overcast)*(1.0 - storm);
 
     let sun_mu = clamp(dot(ray, to_sun), -1.0, 1.0);
     let sun_visible = smoothstep(-0.018, 0.012, to_sun.y);
@@ -513,13 +581,13 @@ fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
     let sun_halo = exp(-(1.0 - sun_mu)*750.0)*0.10
                    + pow(max(sun_mu, 0.0), 24.0)*0.035;
     // Direct ground irradiance fades before the visible solar disc sets.
-    sky += globals.sun_colour.rgb*sun_visible*(1.0 - overcast)
+    sky += globals.sun_colour.rgb*sun_visible*(1.0 - overcast)*(1.0 - storm)
            *(sun_disk*14.0*globals.sun_colour.w + sun_halo*globals.settings_a.x);
 
     let moon_mu = clamp(dot(ray, to_moon), -1.0, 1.0);
     let moon_disk = smoothstep(0.999978, 0.999986, moon_mu);
     let moon_visible = smoothstep(-0.02, 0.03, to_moon.y)*(1.0 - daylight*0.9);
-    sky += vec3<f32>(0.63, 0.74, 1.0)*moon_visible*(1.0 - overcast)
+    sky += vec3<f32>(0.63, 0.74, 1.0)*moon_visible*(1.0 - overcast)*(1.0 - storm)
            *(moon_disk*1.6 + exp(-(1.0 - moon_mu)*500.0)*0.025);
 
     // Stars occupy a world-oriented angular grid and remain stationary when
@@ -531,16 +599,17 @@ fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
     let star_disc = 1.0 - smoothstep(0.035, 0.18, length(star_local));
     let star = step(0.997, star_hash)*star_disc*(0.25 + 0.75*star_hash);
     sky += vec3<f32>(0.6, 0.73, 1.0)*star*pow(1.0 - daylight, 4.0)
-           *(1.0 - overcast)
+           *(1.0 - overcast)*(1.0 - storm)
            *smoothstep(-0.03, 0.18, ray.y)*0.7;
     return max(sky, vec3<f32>(0.0));
 }
 
 // Hemisphere-integrated fill depends on the surface orientation and time of
 // day, never its screen row or camera pitch. Excludes the celestial discs.
-fn skyAmbient(normal_world: vec3<f32>, world_xz: vec2<f32>) -> vec3<f32> {
+fn skyAmbient(normal_world: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
     let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
-    let sky_cover = weatherSkyCover(weatherSeverity(world_xz));
+    let storm = stormLightAt(world_position);
+    let sky_cover = weatherSkyCover(weatherSeverity(world_position.xz));
     let overcast = smoothstep(0.05, 0.9, sky_cover);
     let whiteout = smoothstep(0.78, 1.0, sky_cover);
     let upward = clamp(normal_world.y*0.5 + 0.5, 0.0, 1.0);
@@ -548,13 +617,16 @@ fn skyAmbient(normal_world: vec3<f32>, world_xz: vec2<f32>) -> vec3<f32> {
                              vec3<f32>(0.32, 0.44, 0.62), upward);
     let clouded_day_fill = mix(vec3<f32>(0.17, 0.19, 0.19),
                                vec3<f32>(0.30, 0.34, 0.35), upward);
-    let day_fill = mix(mix(clear_day_fill, clouded_day_fill, overcast),
-                       vec3<f32>(0.52, 0.55, 0.54), whiteout);
+    let day_fill = mix(mix(mix(clear_day_fill, clouded_day_fill, overcast),
+                           vec3<f32>(0.52, 0.55, 0.54), whiteout),
+                       mix(vec3<f32>(0.075, 0.095, 0.11),
+                           vec3<f32>(0.19, 0.21, 0.22), upward), storm);
     let clear_night_fill = mix(vec3<f32>(0.007, 0.011, 0.022),
                                vec3<f32>(0.019, 0.029, 0.058), upward);
     let clouded_night_fill = mix(vec3<f32>(0.008, 0.010, 0.014),
                                  vec3<f32>(0.014, 0.018, 0.025), upward);
-    let night_fill = mix(clear_night_fill, clouded_night_fill, overcast);
+    let night_fill = mix(mix(clear_night_fill, clouded_night_fill, overcast),
+                         vec3<f32>(0.006, 0.009, 0.016), storm);
     return mix(night_fill, day_fill, daylight);
 }
 
@@ -626,6 +698,12 @@ fn henyeyGreenstein(cos_angle: f32, anisotropy: f32) -> f32 {
     return (1.0 - g2)/(4.0*PI*pow(max(1.0 + g2 - 2.0*anisotropy*cos_angle, 0.01), 1.5));
 }
 struct FogResult { scattering: vec3<f32>, transmittance: f32 };
+fn precipitationExtinction(precipitation: vec4<f32>) -> f32 {
+    // Rain bands visibly sweep through the view, while a convective core
+    // retains a dim humid veil in the gaps between heavy sheets.
+    return precipitation.x*0.00085 + precipitation.y*0.0013
+           + precipitation.z*0.00035;
+}
 fn integrateAtmosphereSegment(ray: vec3<f32>, start_distance: f32, end_distance: f32) -> FogResult {
     var result: FogResult;
     result.scattering = vec3<f32>(0.0);
@@ -640,9 +718,10 @@ fn integrateAtmosphereSegment(ray: vec3<f32>, start_distance: f32, end_distance:
         let severity = weatherSeverity(world_position.xz);
         let precipitation = weatherPrecipitation(world_position);
         let density = base_density*weatherFogMultiplier(severity)
-                      + precipitation.x*0.00085 + precipitation.y*0.0013;
+                      + precipitationExtinction(precipitation);
         result.transmittance = exp(-density*ray_length);
-        var ambient = weatherFogAmbient(severity, globals.atmosphere.x);
+        var ambient = weatherFogAmbient(severity, globals.atmosphere.x,
+                                        precipitation.z);
         if (globals.lightning.w > 0.001) {
             let source = vec3<f32>(globals.lightning.x,
                                    mix(globals.lightning.y, globals.lightning_meta.z, 0.60),
@@ -676,7 +755,8 @@ fn integrateAtmosphereSegment(ray: vec3<f32>, start_distance: f32, end_distance:
         let severity = weatherSeverity(world_position.xz);
         let precipitation = weatherPrecipitation(world_position);
         let sky_cover = weatherSkyCover(severity);
-        var ambient = weatherFogAmbient(severity, globals.atmosphere.x);
+        var ambient = weatherFogAmbient(severity, globals.atmosphere.x,
+                                        precipitation.z);
         if (globals.lightning.w > 0.001) {
             let source = vec3<f32>(globals.lightning.x,
                                    mix(globals.lightning.y, globals.lightning_meta.z, 0.60),
@@ -688,7 +768,7 @@ fn integrateAtmosphereSegment(ray: vec3<f32>, start_distance: f32, end_distance:
         let height_density = exp(-max(world_position.y - 20.0, 0.0)/450.0);
         let extinction = base_density*weatherFogMultiplier(severity)
                          *(0.16 + 0.84*height_density)
-                         + precipitation.x*0.00085 + precipitation.y*0.0013;
+                         + precipitationExtinction(precipitation);
         let step_transmittance = exp(-extinction*(end - start));
         var sunlight_visibility = 1.0;
         if (globals.settings_a.x > 0.01 && strength > 0.0) {
@@ -700,8 +780,11 @@ fn integrateAtmosphereSegment(ray: vec3<f32>, start_distance: f32, end_distance:
             moonlight_visibility = cloudShadow(world_position, to_moon);
         }
         let lighting = ambient + (sun_scatter*weatherSunMultiplier(severity)
-                                  *(1.0 - sky_cover*0.85)*sunlight_visibility
+                                  *(1.0 - sky_cover*0.85)
+                                  *mix(1.0, 0.10, precipitation.z)
+                                  *sunlight_visibility
                                   + moon_scatter*weatherSunMultiplier(severity)
+                                  *mix(1.0, 0.42, precipitation.z)
                                   *moonlight_visibility)*strength;
         result.scattering += result.transmittance*(1.0 - step_transmittance)*lighting;
         result.transmittance *= step_transmittance;
@@ -725,7 +808,10 @@ fn boltPoint(fraction: f32) -> vec3<f32> {
 // Project each jagged world-space segment onto the camera ray. The depth
 // test prevents a bolt behind a ridge from shining through that ridge.
 fn lightningBolt(ray: vec3<f32>, maximum_distance: f32) -> vec3<f32> {
-    if (globals.lightning.w <= 0.001 || globals.lightning_meta.y > 0.34) {
+    // Negative seeds mark intracloud flashes: light the deck and fog without
+    // inventing a visible ground contact for a bolt inside the cloud.
+    if (globals.lightning.w <= 0.001 || globals.lightning_meta.y > 0.34
+        || globals.lightning_meta.x < 0.0) {
         return vec3<f32>(0.0);
     }
     let eye = globals.camera_position.xyz;
@@ -764,7 +850,7 @@ fn lightningBolt(ray: vec3<f32>, maximum_distance: f32) -> vec3<f32> {
     let precipitation = weatherPrecipitation(point);
     let severity = weatherSeverity(point.xz);
     let extinction = max(globals.params.x, 0.0)*weatherFogMultiplier(severity)
-                     + precipitation.x*0.00085 + precipitation.y*0.0013;
+                     + precipitationExtinction(precipitation);
     let transmission = exp(-extinction*closest);
     let cloud_transmission = marchClouds(eye, ray, closest, 0.0).transmittance;
     return vec3<f32>(0.73, 0.85, 1.0)*globals.lightning.w
@@ -851,10 +937,11 @@ fn upsampleAtmosphere(uv: vec2<f32>, packed_position: vec4<f32>) -> vec4<f32> {
     let severity = weatherSeverity(fallback_midpoint.xz);
     let precipitation = weatherPrecipitation(fallback_midpoint);
     let extinction = max(globals.params.x, 0.0)*weatherFogMultiplier(severity)
-                       + precipitation.x*0.00085 + precipitation.y*0.0013;
+                       + precipitationExtinction(precipitation);
     let transmission = exp(-extinction
                              *min(distance_to_surface, 10000.0));
-    let ambient = weatherFogAmbient(severity, globals.atmosphere.x);
+    let ambient = weatherFogAmbient(severity, globals.atmosphere.x,
+                                    precipitation.z);
     return vec4<f32>(ambient*(1.0 - transmission), transmission);
 }
 
@@ -882,7 +969,21 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let world_position = globals.camera_position.xyz + viewToWorld(packed_position.xyz);
     let local_precipitation = weatherPrecipitation(world_position);
     let upward = smoothstep(0.15, 0.75, normal_world.y);
-    let wetness = local_precipitation.x*upward*mix(1.0, 0.32, grass_mask);
+    // Fronts translate with the wind. Looking upwind samples the rain that
+    // crossed this ground during the previous minute, so soil and rock stay
+    // damp between rain sheets and dry gradually behind a departing cell.
+    var lingering_rain = 0.0;
+    if (globals.lightning_meta.w > 0.05) {
+        let wind_direction = vec2<f32>(cos(globals.storm.w), sin(globals.storm.w));
+        let previous_offset = wind_direction*globals.lightning_meta.w*70.0;
+        let earlier_ground = vec3<f32>(world_position.x + previous_offset.x,
+                                       world_position.y,
+                                       world_position.z + previous_offset.y);
+        let earlier_storm = weatherStormBase(earlier_ground);
+        lingering_rain = earlier_storm.x*(1.0 - earlier_storm.y)*0.62;
+    }
+    let wetness = max(local_precipitation.x, lingering_rain)
+                  *upward*mix(1.0, 0.32, grass_mask);
     let falling_snow = local_precipitation.y*upward*mix(1.0, 0.25, grass_mask)
                        *(1.0 - snow_mask);
     let roughness = mix(clamp(normal_sample.a, 0.06, 1.0), 0.22,
@@ -907,7 +1008,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     }
     let local_weather = weatherSeverity(world_position.xz);
     let sun_colour = globals.sun_colour.rgb*globals.settings_a.x
-                     *weatherSunMultiplier(local_weather)*sun_visibility;
+                     *weatherSunMultiplier(local_weather)
+                     *mix(1.0, 0.11, local_precipitation.z)*sun_visibility;
     let alpha = roughness*roughness;
     let fresnel = vec3<f32>(0.04) + vec3<f32>(0.96)*pow(1.0 - v_dot_h, 5.0);
     let specular = D_GGX(n_dot_h, alpha)*V_SmithGGX(n_dot_l, n_dot_v, alpha)*fresnel
@@ -934,8 +1036,9 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     }
     lit += albedo/PI*vec3<f32>(0.52, 0.65, 1.0)*globals.atmosphere.y
            *weatherSunMultiplier(local_weather)
+           *mix(1.0, 0.42, local_precipitation.z)
            *max(dot(normal_world, to_moon), 0.0)*moon_visibility*ao_factor;
-    let ambient = skyAmbient(normal_world, world_position.xz);
+    let ambient = skyAmbient(normal_world, world_position);
     let ambient_colour = mix(ambient*vec3<f32>(0.80, 1.00, 0.68),
                              ambient*vec3<f32>(0.865, 0.955, 1.189), snow_mask);
     lit += albedo*ambient_colour*mix(0.22, 0.42, snow_mask)*ao_factor;
