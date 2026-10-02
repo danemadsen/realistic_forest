@@ -370,7 +370,7 @@ fn weatherRainBand(world_xz: vec2<f32>) -> f32 {
     let broad = 0.5 + 0.5*sin(bent/150.0 + 1.2);
     let fine = 0.5 + 0.5*sin(bent/51.0 + across/190.0 + 0.6);
     let sheet = smoothstep(0.28, 0.82, broad*0.72 + fine*0.28);
-    return mix(0.18, 1.16, sheet);
+    return mix(0.45, 1.16, sheet);
 }
 
 // A cheap core query for clouds and sky shading: avoid evaluating the finer
@@ -974,7 +974,7 @@ fn volumeLightVisibility(world_position: vec3<f32>, to_light: vec3<f32>) -> f32 
 
 struct FogResult { scattering: vec3<f32>, transmittance: f32 };
 fn precipitationExtinction(precipitation: vec4<f32>) -> f32 {
-    return precipitation.x*0.00085 + precipitation.y*0.0013
+    return precipitation.x*0.0021 + precipitation.y*0.0013
            + precipitation.z*0.00035;
 }
 fn integrateAtmosphere(ray: vec3<f32>, distance_to_surface: f32) -> FogResult {
@@ -1668,7 +1668,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
             let glint_width = 2.5 + along_ray*(0.0025 + 0.012*flash_alpha);
             let glint = exp(-pow(miss/max(glint_width, 0.1), 2.0))
                         *smoothstepf(0.0, 50.0, along_ray);
-            bolt_reflection = flash_colour*glint*0.65;
+            // The channel itself is far brighter than the light it sheds.
+            bolt_reflection = flash_colour*glint*6.5;
         }
     }
 

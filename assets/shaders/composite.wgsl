@@ -424,7 +424,7 @@ fn weatherRainBand(world_xz: vec2<f32>) -> f32 {
     let broad = 0.5 + 0.5*sin(bent/150.0 + 1.2);
     let fine = 0.5 + 0.5*sin(bent/51.0 + across/190.0 + 0.6);
     let sheet = smoothstep(0.28, 0.82, broad*0.72 + fine*0.28);
-    return mix(0.18, 1.16, sheet);
+    return mix(0.45, 1.16, sheet);
 }
 
 // A cheap core query for clouds and sky shading: avoid evaluating the finer
@@ -701,7 +701,7 @@ struct FogResult { scattering: vec3<f32>, transmittance: f32 };
 fn precipitationExtinction(precipitation: vec4<f32>) -> f32 {
     // Rain bands visibly sweep through the view, while a convective core
     // retains a dim humid veil in the gaps between heavy sheets.
-    return precipitation.x*0.00085 + precipitation.y*0.0013
+    return precipitation.x*0.0021 + precipitation.y*0.0013
            + precipitation.z*0.00035;
 }
 fn integrateAtmosphereSegment(ray: vec3<f32>, start_distance: f32, end_distance: f32) -> FogResult {
@@ -793,70 +793,6 @@ fn integrateAtmosphereSegment(ray: vec3<f32>, start_distance: f32, end_distance:
     return result;
 }
 
-fn boltPoint(fraction: f32) -> vec3<f32> {
-    let base = globals.lightning.xyz;
-    let top = max(globals.lightning_meta.z, base.y + 100.0);
-    let seed = globals.lightning_meta.x;
-    let envelope = sin(fraction*PI);
-    let bend_x = fract(sin(fraction*117.3 + seed*613.7)*43758.5453)*2.0 - 1.0;
-    let bend_z = fract(sin(fraction*173.9 + seed*411.1)*32943.2135)*2.0 - 1.0;
-    return vec3<f32>(base.x + bend_x*envelope*95.0,
-                     mix(base.y, top, fraction),
-                     base.z + bend_z*envelope*95.0);
-}
-
-// Project each jagged world-space segment onto the camera ray. The depth
-// test prevents a bolt behind a ridge from shining through that ridge.
-fn lightningBolt(ray: vec3<f32>, maximum_distance: f32) -> vec3<f32> {
-    // Negative seeds mark intracloud flashes: light the deck and fog without
-    // inventing a visible ground contact for a bolt inside the cloud.
-    if (globals.lightning.w <= 0.001 || globals.lightning_meta.y > 0.34
-        || globals.lightning_meta.x < 0.0) {
-        return vec3<f32>(0.0);
-    }
-    let eye = globals.camera_position.xyz;
-    var core = 0.0;
-    var halo = 0.0;
-    var closest = maximum_distance;
-    var best = 0.0;
-    for (var i = 0u; i < 12u; i += 1u) {
-        let a = boltPoint(f32(i)/12.0);
-        let b = boltPoint(f32(i + 1u)/12.0);
-        let segment = b - a;
-        let from_eye = a - eye;
-        let along_segment = dot(ray, segment);
-        let denominator = max(dot(segment, segment) - along_segment*along_segment, 0.001);
-        let fraction = clamp((along_segment*dot(ray, from_eye)
-                              - dot(segment, from_eye))/denominator, 0.0, 1.0);
-        let point = a + segment*fraction;
-        let along_ray = dot(point - eye, ray);
-        if (along_ray <= 0.0 || along_ray >= maximum_distance) { continue; }
-        let miss = length(eye + ray*along_ray - point);
-        let footprint = along_ray/max(globals.viewport.y, 1.0);
-        let core_radius = max(1.4, footprint*1.8);
-        let halo_radius = max(22.0, footprint*18.0);
-        let segment_core = exp(-pow(miss/core_radius, 2.0)*1.7);
-        let segment_halo = exp(-pow(miss/halo_radius, 2.0)*1.4);
-        core = max(core, segment_core);
-        halo = max(halo, segment_halo);
-        let prominence = segment_core + segment_halo*0.04;
-        if (prominence > best) {
-            best = prominence;
-            closest = along_ray;
-        }
-    }
-    if (best < 0.0001) { return vec3<f32>(0.0); }
-    let point = eye + ray*closest;
-    let precipitation = weatherPrecipitation(point);
-    let severity = weatherSeverity(point.xz);
-    let extinction = max(globals.params.x, 0.0)*weatherFogMultiplier(severity)
-                     + precipitationExtinction(precipitation);
-    let transmission = exp(-extinction*closest);
-    let cloud_transmission = marchClouds(eye, ray, closest, 0.0).transmittance;
-    return vec3<f32>(0.73, 0.85, 1.0)*globals.lightning.w
-           *(core*3.8 + halo*0.16)*transmission*cloud_transmission;
-}
-
 fn D_GGX(n_dot_h: f32, alpha: f32) -> f32 {
     let a2 = alpha*alpha;
     let d = n_dot_h*n_dot_h*(a2 - 1.0) + 1.0;
@@ -875,6 +811,49 @@ fn acesFilm(x: vec3<f32>) -> vec3<f32> {
 fn encodeOutput(radiance: vec3<f32>) -> vec4<f32> {
     return vec4<f32>(pow(acesFilm(max(radiance, vec3<f32>(0.0))*globals.params.z),
                               vec3<f32>(1.0/2.2)), 1.0);
+}
+
+fn groundHash(cell: vec2<i32>) -> f32 {
+    var value = bitcast<u32>(cell.x)*0x8da6b343u ^ bitcast<u32>(cell.y)*0xd8163841u;
+    value ^= value >> 16u;
+    value *= 0x7feb352du;
+    value ^= value >> 15u;
+    value *= 0x846ca68bu;
+    value ^= value >> 16u;
+    return f32(value & 0x00ffffffu)/16777215.0;
+}
+
+fn groundNoise(p: vec2<f32>) -> f32 {
+    let cell = vec2<i32>(floor(p));
+    let f = fract(p);
+    let u = f*f*(3.0 - 2.0*f);
+    return mix(mix(groundHash(cell), groundHash(cell + vec2<i32>(1, 0)), u.x),
+               mix(groundHash(cell + vec2<i32>(0, 1)), groundHash(cell + vec2<i32>(1, 1)), u.x),
+               u.y);
+}
+
+// Rings spreading from raindrops that land in a puddle tilt its surface.
+// Each 35 cm cell holds one impact repeating at a rate set by the rain.
+fn puddleRipples(world_xz: vec2<f32>, rain: f32) -> vec2<f32> {
+    let spacing = 0.35;
+    let base = floor(world_xz/spacing - vec2<f32>(0.5));
+    let period = mix(1.4, 0.45, rain);
+    var tilt = vec2<f32>(0.0);
+    for (var z = 0i; z < 2i; z += 1i) {
+        for (var x = 0i; x < 2i; x += 1i) {
+            let cell = base + vec2<f32>(f32(x), f32(z));
+            let id = vec2<i32>(cell);
+            if (groundHash(id + vec2<i32>(53, 7)) > rain + 0.15) { continue; }
+            let centre = (cell + vec2<f32>(0.2 + 0.6*groundHash(id + vec2<i32>(91, 17)),
+                                           0.2 + 0.6*groundHash(id + vec2<i32>(13, 71))))*spacing;
+            let age = fract(globals.storm.z/period + groundHash(id));
+            let offset = world_xz - centre;
+            let distance = max(length(offset), 0.001);
+            let ring = exp(-pow((distance - age*0.3)/0.03, 2.0))*(1.0 - age);
+            tilt += offset/distance*sin((distance - age*0.3)*80.0)*ring;
+        }
+    }
+    return tilt*0.3;
 }
 
 // Runs at half resolution before the composite. This entry point intentionally
@@ -957,9 +936,10 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let is_sky = packed_position.a < 0.5;
     let view_distance = select(length(packed_position.xyz), globals.params.y, is_sky);
     let fog = upsampleAtmosphere(uv, packed_position);
-    let bolt = lightningBolt(world_ray, view_distance);
+    // The lightning pass draws the channel itself; this pass lights the
+    // scene, clouds and air with its flash.
     if (is_sky) {
-        return encodeOutput(skyRadiance(world_ray)*fog.a + fog.rgb + bolt);
+        return encodeOutput(skyRadiance(world_ray)*fog.a + fog.rgb);
     }
     // G-buffer alpha stores snow to hundredths and grass in the residue.
     let snow_mask = clamp(floor((packed_position.a - 1.0)*100.0 + 0.5)*0.01, 0.0, 1.0);
@@ -982,14 +962,33 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         let earlier_storm = weatherStormBase(earlier_ground);
         lingering_rain = earlier_storm.x*(1.0 - earlier_storm.y)*0.62;
     }
-    let wetness = max(local_precipitation.x, lingering_rain)
-                  *upward*mix(1.0, 0.32, grass_mask);
+    let soak = max(local_precipitation.x, lingering_rain);
+    let wetness = soak*upward*mix(1.0, 0.32, grass_mask);
     let falling_snow = local_precipitation.y*upward*mix(1.0, 0.25, grass_mask)
                        *(1.0 - snow_mask);
-    let roughness = mix(clamp(normal_sample.a, 0.06, 1.0), 0.22,
-                        wetness*0.55);
+    // Rain pools on level ground outside the grass: a broad pattern of
+    // hollows fills as the ground stays wet, so puddles spread through a
+    // downpour and shrink again once the cell has passed. Water ignores the
+    // small bumps of the surface texture, so levelness comes from the terrain
+    // heightfield's slope rather than the shading normal.
+    let texel = globals.heightfield.w;
+    let slope = vec2<f32>(
+        terrainHeightAt(world_position.xz + vec2<f32>(texel, 0.0))
+            - terrainHeightAt(world_position.xz - vec2<f32>(texel, 0.0)),
+        terrainHeightAt(world_position.xz + vec2<f32>(0.0, texel))
+            - terrainHeightAt(world_position.xz - vec2<f32>(0.0, texel)))/(2.0*texel);
+    let level = (1.0 - smoothstep(0.03, 0.09, length(slope)))
+                *smoothstep(0.55, 0.8, normal_world.y)*terrainMapWeight(world_position.xz);
+    let hollows = groundNoise(world_position.xz/4.5)*0.7
+                  + groundNoise(world_position.xz/1.6 + vec2<f32>(17.0, 5.0))*0.3;
+    let puddle = smoothstep(0.66 - 0.14*soak, 0.72 - 0.14*soak, hollows)
+                 *level*smoothstep(0.25, 0.6, soak)
+                 *(1.0 - grass_mask)*(1.0 - snow_mask)
+                 *smoothstep(0.2, 0.6, world_position.y);
+    let roughness = mix(mix(clamp(normal_sample.a, 0.06, 1.0), 0.22, wetness*0.55),
+                        0.02, puddle);
     var albedo = albedo_sample.rgb*albedo_sample.rgb*2.5;
-    albedo *= 1.0 - wetness*0.22;
+    albedo *= mix(1.0 - wetness*0.35, 0.3, puddle);
     albedo = mix(albedo, vec3<f32>(0.48, 0.53, 0.58), falling_snow*0.18);
     let ao_factor = mix(1.0, ssao, clamp(stage.ao_strength, 0.0, 1.0))
                     *mix(1.0, albedo_sample.a, clamp(globals.settings_a.z, 0.0, 1.0));
@@ -1053,10 +1052,31 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         let flash_colour = vec3<f32>(0.73, 0.85, 1.0)
                            *globals.lightning.w*attenuation;
         let incidence = max(dot(normal_world, direction), 0.0);
+        let water = max(wetness, puddle);
         let wet_glint = pow(max(dot(reflect(-direction, normal_world), -world_ray), 0.0),
-                            mix(28.0, 90.0, wetness));
+                            mix(28.0, 120.0, water));
         lit += flash_colour*((albedo/PI)*incidence*ao_factor
-                             + wet_glint*wetness*0.16);
+                             + wet_glint*water*1.6);
     }
-    return encodeOutput(lit*fog.a + fog.rgb + bolt);
+    // Wet films and puddles mirror the sky. Ripples from falling drops break
+    // up the image in a puddle; a film on rough ground only adds a sheen.
+    let sheen = max(wetness*0.3, puddle);
+    if (sheen > 0.01) {
+        var mirror_normal = normalize(mix(normal_world, vec3<f32>(0.0, 1.0, 0.0), puddle));
+        if (puddle > 0.01 && view_distance < 40.0 && local_precipitation.x > 0.01) {
+            let tilt = puddleRipples(world_position.xz, local_precipitation.x)
+                       *(1.0 - smoothstep(15.0, 40.0, view_distance));
+            mirror_normal = normalize(mirror_normal + vec3<f32>(tilt.x, 0.0, tilt.y)*puddle);
+        }
+        var mirror_direction = reflect(world_ray, mirror_normal);
+        mirror_direction = normalize(vec3<f32>(mirror_direction.x, max(mirror_direction.y, 0.01),
+                                               mirror_direction.z));
+        let facing = clamp(dot(mirror_normal, -world_ray), 0.0, 1.0);
+        // A rough film loses most of the grazing-angle boost a mirror gets.
+        let grazing = max(1.0 - roughness, 0.02);
+        let mirror_fresnel = 0.02 + (grazing - 0.02)*pow(1.0 - facing, 5.0);
+        let reflected_sky = skyRadiance(mirror_direction)*mix(1.0, ao_factor, 0.6);
+        lit = mix(lit, reflected_sky, mirror_fresnel*sheen);
+    }
+    return encodeOutput(lit*fog.a + fog.rgb);
 }

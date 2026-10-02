@@ -180,6 +180,8 @@ pub struct AppSettings {
     pub variant_scale: f32,
     pub sparkle_strength: f32,
     pub exposure: f32,
+    /// Loudness of thunder, 0 silent to 1 full.
+    pub thunder_volume: f32,
 }
 
 impl Default for AppSettings {
@@ -223,6 +225,7 @@ impl Default for AppSettings {
             // Linear scale before the ACES tonemap; the shoulder, not this,
             // protects highlights.
             exposure: 1.0,
+            thunder_volume: 0.8,
         }
     }
 }

@@ -12,6 +12,7 @@ pub mod cloud_node;
 pub mod gpu_textures;
 pub mod grass_node;
 pub mod post_nodes;
+pub mod lightning_node;
 pub mod precipitation_node;
 pub mod terrain_node;
 pub mod water_node;
@@ -56,6 +57,7 @@ pub enum ForestRenderSystems {
     Composite,
     WaterSurface,
     WaterUnderwater,
+    Lightning,
     Precipitation,
     Fxaa,
     Egui,
@@ -79,6 +81,7 @@ impl ForestRender {
                 Composite,
                 WaterSurface,
                 WaterUnderwater,
+                Lightning,
                 Precipitation,
                 Fxaa,
                 Egui,
@@ -102,6 +105,8 @@ pub struct ExtractedForestView {
     pub day_night: DayNightCycle,
     pub weather_offset: [f32; 2],
     pub weather: crate::weather::WeatherState,
+    /// The latest discharge's channel, copied when its generation changes.
+    pub bolt: crate::lightning::ActiveBolt,
     pub draw_ocean: bool,
     pub lookup_minimum: (i64, i64),
     pub frame: u64,
@@ -398,6 +403,7 @@ pub struct ForestShaderHandles {
     pub water_underwater: Handle<Shader>,
     pub water_blit: Handle<Shader>,
     pub precipitation: Handle<Shader>,
+    pub lightning: Handle<Shader>,
     pub cloud_probe: Handle<Shader>,
 }
 
@@ -442,6 +448,7 @@ impl Plugin for ForestRenderPlugin {
                 water_underwater: asset_server.load::<Shader>("shaders/water-underwater.wgsl"),
                 water_blit: asset_server.load::<Shader>("shaders/water-blit.wgsl"),
                 precipitation: asset_server.load::<Shader>("shaders/precipitation.wgsl"),
+                lightning: asset_server.load::<Shader>("shaders/lightning.wgsl"),
                 cloud_probe: asset_server.load::<Shader>("shaders/cloud-probe.wgsl"),
             }
         };
@@ -484,6 +491,7 @@ impl Plugin for ForestRenderPlugin {
         terrain_node::register_terrain_systems(render_app);
         post_nodes::register_post_systems(render_app);
         cloud_node::register_cloud_systems(render_app);
+        lightning_node::register_lightning_systems(render_app);
         precipitation_node::register_precipitation_systems(render_app);
 
         render_app.add_systems(ExtractSchedule, extract_forest_view);
@@ -510,6 +518,7 @@ impl Plugin for ForestRenderPlugin {
                 post_nodes::forest_composite_pass.in_set(ForestRenderSystems::Composite),
                 water_node::forest_water_surface_pass.in_set(ForestRenderSystems::WaterSurface),
                 water_node::forest_underwater_pass.in_set(ForestRenderSystems::WaterUnderwater),
+                lightning_node::forest_lightning_pass.in_set(ForestRenderSystems::Lightning),
                 precipitation_node::forest_precipitation_pass.in_set(ForestRenderSystems::Precipitation),
                 post_nodes::forest_fxaa_pass.in_set(ForestRenderSystems::Fxaa),
                 // bevy_egui draws through `egui_pass`, with `prepare_egui_pass`
@@ -556,6 +565,10 @@ fn extract_forest_view(
     view.day_night = *world.resource::<DayNightCycle>();
     view.weather_offset = world.resource::<crate::weather::WeatherMotion>().offset;
     view.weather = *world.resource::<crate::weather::WeatherState>();
+    let bolt = world.resource::<crate::lightning::ActiveBolt>();
+    if bolt.generation != view.bolt.generation {
+        view.bolt = bolt.clone();
+    }
     view.draw_ocean = world.resource::<WorldOptions>().draw_ocean;
     let cache = world.resource::<ErosionCache>();
     view.lookup_minimum = (cache.lookup_minimum.x, cache.lookup_minimum.z);
@@ -766,6 +779,7 @@ mod tests {
             include_str!("../../assets/shaders/composite.wgsl"),
             include_str!("../../assets/shaders/water-surface.wgsl"),
             include_str!("../../assets/shaders/precipitation.wgsl"),
+            include_str!("../../assets/shaders/lightning.wgsl"),
             include_str!("../../assets/shaders/cloud-probe.wgsl"),
             include_str!("../../assets/shaders/water-underwater.wgsl"),
         ] {

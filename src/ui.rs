@@ -226,6 +226,16 @@ fn draw_trainer_window(
                 ui.small("Rain and snow fade above the clouds.");
             }
             ui.checkbox(&mut weather.automatic, "Move weather fronts");
+            if weather.local_precipitation.thunderstorm > 0.12
+                && ui.button("Strike lightning").clicked()
+            {
+                weather.request_strike();
+            }
+            ui.add(
+                egui::Slider::new(&mut settings.thunder_volume, 0.0..=1.0)
+                    .text("Thunder volume")
+                    .fixed_decimals(2),
+            );
 
             ui.separator();
             ui.label("Time of day");
@@ -377,6 +387,11 @@ fn draw_diagnostics_window(
                     .text("Trend transition")
                     .suffix(" s")
                     .fixed_decimals(0),
+            );
+            ui.add(
+                egui::Slider::new(&mut settings.thunder_volume, 0.0..=1.0)
+                    .text("Thunder volume")
+                    .fixed_decimals(2),
             );
 
             separator_text(ui, "Sun and time");

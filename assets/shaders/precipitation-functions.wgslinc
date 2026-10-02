@@ -39,7 +39,7 @@ fn weatherRainBand(world_xz: vec2<f32>) -> f32 {
     let broad = 0.5 + 0.5*sin(bent/150.0 + 1.2);
     let fine = 0.5 + 0.5*sin(bent/51.0 + across/190.0 + 0.6);
     let sheet = smoothstep(0.28, 0.82, broad*0.72 + fine*0.28);
-    return mix(0.18, 1.16, sheet);
+    return mix(0.45, 1.16, sheet);
 }
 
 // A cheap core query for clouds and sky shading: avoid evaluating the finer

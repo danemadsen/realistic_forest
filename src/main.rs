@@ -10,10 +10,12 @@ mod constants;
 mod day_night;
 mod erosion;
 mod grass;
+mod lightning;
 mod matrices;
 mod noise;
 mod player;
 mod render;
+mod thunder;
 mod ui;
 mod water;
 mod weather;
@@ -26,6 +28,7 @@ use crate::player::Player;
 use bevy::camera::primitives::Frustum;
 use bevy::camera::visibility::VisibleEntities;
 use bevy::camera::{Camera, ClearColorConfig, PerspectiveProjection, Projection};
+use bevy::audio::AddAudioSource;
 use bevy::prelude::*;
 use bevy::render::camera::CameraRenderGraph;
 use bevy::render::settings::{RenderCreation, WgpuSettings};
@@ -264,6 +267,9 @@ fn main() {
             day_length_minutes: automation.day_length_minutes,
         })
         .init_resource::<weather::WeatherMotion>()
+        .init_resource::<lightning::ActiveBolt>()
+        .init_resource::<thunder::ThunderQueue>()
+        .add_audio_source::<thunder::ThunderSound>()
         .insert_resource({
             let mut weather = weather::WeatherState::from_preset(
                 automation.weather_preset,
@@ -311,6 +317,8 @@ fn main() {
                 handle_global_keys,
                 day_night::advance_day_night,
                 weather::advance_weather,
+                thunder::queue_thunder,
+                thunder::play_thunder,
                 ui::ui_wants_input_system,
                 // --measure-overlap replaces normal streaming with its own
                 // driver, mirroring the C++ short-circuit in main().

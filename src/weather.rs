@@ -2,8 +2,9 @@
 
 use crate::automation::AutomationSettings;
 use crate::constants::AppSettings;
+use crate::lightning::{ActiveBolt, BoltKind};
 use crate::player::Player;
-use bevy::prelude::{Query, Real, Res, ResMut, Resource, Time};
+use bevy::prelude::{Local, Query, Real, Res, ResMut, Resource, Time};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum WeatherPreset {
@@ -219,7 +220,8 @@ pub fn rain_band_multiplier(
     let broad = 0.5 + 0.5 * (bent / 150.0 + 1.2).sin();
     let fine = 0.5 + 0.5 * (bent / 51.0 + across / 190.0 + 0.6).sin();
     let sheet = smoothstep(0.28, 0.82, broad * 0.72 + fine * 0.28);
-    0.18 + (1.16 - 0.18) * sheet
+    // Lulls between squall lines remain steady rain rather than almost dry.
+    0.45 + (1.16 - 0.45) * sheet
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -234,6 +236,21 @@ impl PrecipitationSample {
     pub fn intensity(self) -> f32 {
         self.rain + self.snow
     }
+}
+
+/// The cloud base over a point: overcast and fog fronts lower the deck, as
+/// cloudLocalLayer does in cloud-functions.wgslinc.
+pub fn local_cloud_base(
+    world_xz: [f32; 2],
+    offset: [f32; 2],
+    climate_bias: f32,
+    cloud_base_height: f32,
+    cloud_base_override: bool,
+) -> f32 {
+    let severity = front_severity(world_xz, offset, climate_bias);
+    let base_offset = -300.0 * (severity - 1.0).clamp(0.0, 1.0)
+        - 150.0 * (severity - 2.0).clamp(0.0, 1.0);
+    (cloud_base_height + if cloud_base_override { 0.0 } else { base_offset }).max(100.0)
 }
 
 /// Matches weatherPrecipitation in precipitation-functions.wgslinc. Broad
@@ -253,10 +270,9 @@ pub fn sample_precipitation(
     let score = storm_score(world_xz, offset);
     let severity = front_severity(world_xz, offset, climate_bias);
     let wet_gate = smoothstep(1.25, 2.0, severity);
-    let base_offset = -300.0 * (severity - 1.0).clamp(0.0, 1.0)
-        - 150.0 * (severity - 2.0).clamp(0.0, 1.0);
-    let cloud_base = (cloud_base_height + if cloud_base_override { 0.0 } else { base_offset })
-        .max(100.0);
+    let cloud_base = local_cloud_base(
+        world_xz, offset, climate_bias, cloud_base_height, cloud_base_override,
+    );
     let below_cloud = 1.0 - smoothstep(cloud_base + 100.0, cloud_base + 600.0, altitude);
     let storm_precipitation = smoothstep(0.74, 0.90, score + precipitation_bias)
         * wet_gate * below_cloud;
@@ -309,17 +325,61 @@ pub struct WeatherConditions {
     pub gust_strength: f32,
 }
 
+/// Each return stroke is microseconds long, but the eye and a camera hold its
+/// glare for a few hundredths of a second.
+const STROKE_DECAY_SECONDS: f32 = 0.022;
+/// Continuing current keeps some strokes glowing for longer.
+const CONTINUING_DECAY_SECONDS: f32 = 0.14;
+/// The ionised channel fades out after the last stroke.
+const AFTERGLOW_SECONDS: f32 = 0.25;
+const MAX_STROKES: usize = 6;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ReturnStroke {
+    time: f32,
+    peak: f32,
+    continuing: f32,
+}
+
+/// One frame of a discharge: scene light and the channel's own luminance.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct LightningPulse {
+    /// Scene illumination relative to the first return stroke.
+    pub flash: f32,
+    /// Main-channel luminance relative to a return stroke.
+    pub channel: f32,
+    /// Branch luminance; branches burn only with the first stroke, since
+    /// later strokes follow the main channel the first one opened.
+    pub branches: f32,
+    /// How far the leader has progressed, 0 at the cloud and 1 at contact.
+    pub leader: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct LightningEvent {
     /// Bolt's contact point, resolved to eroded terrain or sea level on spawn.
+    /// For a cloud discharge it is the point under the flash.
     pub position: [f32; 3],
-    /// Linear HDR radiance. A short sequence of flashes peaks near 12.
+    /// Linear HDR radiance of the flash. Peaks near 1: about a dim overcast
+    /// day, so a strike flickers over a daytime storm and floods the night.
     pub flash: f32,
-    /// Negative seeds denote a cloud-contained flash without a ground bolt.
+    /// Negative seeds denote a cloud discharge without a ground bolt.
     pub seed: f32,
     pub age_seconds: f32,
+    /// Altitude of the channel's top, inside the cloud above the strike.
     pub top_height: f32,
+    /// The cloud base over the discharge, which hides a channel above it.
+    pub cloud_base: f32,
+    pub kind: BoltKind,
+    /// This frame's channel luminance, see [`LightningPulse`].
+    pub channel: f32,
+    pub branches: f32,
+    pub leader: f32,
     peak_flash: f32,
+    /// A ground bolt's stepped leader, or a crawler's spread across the base.
+    leader_seconds: f32,
+    strokes: [ReturnStroke; MAX_STROKES],
+    stroke_count: usize,
 }
 
 impl Default for LightningEvent {
@@ -330,8 +390,90 @@ impl Default for LightningEvent {
             seed: 0.0,
             age_seconds: 1000.0,
             top_height: 0.0,
+            cloud_base: 0.0,
+            kind: BoltKind::Hidden,
+            channel: 0.0,
+            branches: 0.0,
+            leader: 0.0,
             peak_flash: 0.0,
+            leader_seconds: 0.07,
+            strokes: [ReturnStroke::default(); MAX_STROKES],
+            stroke_count: 0,
         }
+    }
+}
+
+impl LightningEvent {
+    /// When the first return stroke fires, after the leader's descent.
+    pub fn first_stroke_seconds(&self) -> f32 {
+        if self.stroke_count == 0 { 0.0 } else { self.strokes[0].time }
+    }
+
+    /// When nothing of the discharge remains visible.
+    #[cfg(test)]
+    pub fn duration_seconds(&self) -> f32 {
+        let last = if self.stroke_count == 0 { 0.0 } else { self.strokes[self.stroke_count - 1].time };
+        last.max(self.leader_seconds) + 1.2
+    }
+
+    /// The light of the discharge `age` seconds after it began. A ground bolt
+    /// shows a dim stepped leader feeling its way down, then a brilliant
+    /// return stroke and two to four restrikes down the same channel, some
+    /// held by continuing current, before the channel fades. A crawler
+    /// flickers while it spreads; a hidden discharge only lights the cloud.
+    pub fn pulse(&self, age: f32) -> LightningPulse {
+        if !age.is_finite() || age < 0.0 || self.stroke_count == 0 {
+            return LightningPulse::default();
+        }
+        let mut strokes = 0.0;
+        let mut first = 0.0;
+        for (index, stroke) in self.strokes[..self.stroke_count].iter().enumerate() {
+            if age < stroke.time {
+                break;
+            }
+            let since = age - stroke.time;
+            let light = stroke.peak * (-since / STROKE_DECAY_SECONDS).exp()
+                + stroke.continuing * (-since / CONTINUING_DECAY_SECONDS).exp();
+            strokes += light;
+            if index == 0 {
+                first = stroke.peak * (-since / (STROKE_DECAY_SECONDS * 1.4)).exp();
+            }
+        }
+        let leader = (age / self.leader_seconds.max(0.001)).clamp(0.0, 1.0);
+        let last = self.strokes[..self.stroke_count]
+            .iter()
+            .rev()
+            .find(|stroke| stroke.time <= age)
+            .map(|stroke| stroke.time);
+        let afterglow = last.map_or(0.0, |time| 0.08 * (-(age - time) / AFTERGLOW_SECONDS).exp());
+        match self.kind {
+            BoltKind::Hidden => LightningPulse { flash: strokes, ..LightningPulse::default() },
+            BoltKind::Ground => {
+                // The stepped leader is faint beside a return stroke, yet a
+                // camera still catches it branching down in the dark.
+                let stepping = if age < self.first_stroke_seconds() { 0.1 } else { 0.0 };
+                LightningPulse {
+                    flash: strokes + 0.03 * stepping,
+                    channel: strokes + afterglow + stepping,
+                    branches: first + stepping + 0.5 * afterglow,
+                    leader,
+                }
+            }
+            BoltKind::Crawler => LightningPulse {
+                flash: strokes,
+                channel: strokes + afterglow,
+                branches: strokes + afterglow,
+                leader,
+            },
+        }
+    }
+
+    fn apply_pulse(&mut self) {
+        let pulse = self.pulse(self.age_seconds);
+        self.flash = self.peak_flash * pulse.flash;
+        self.channel = pulse.channel;
+        self.branches = pulse.branches;
+        self.leader = pulse.leader;
     }
 }
 
@@ -570,7 +712,7 @@ impl WeatherState {
         }
         let height_density = (-(altitude - 20.0).max(0.0) / 450.0).exp();
         let extinction = base_density * (0.16 + 0.84 * height_density)
-            + precipitation.rain * 0.00085 + precipitation.snow * 0.0013
+            + precipitation.rain * 0.0021 + precipitation.snow * 0.0013
             + precipitation.thunderstorm * 0.00035;
         2.995_732_3 / extinction
     }
@@ -629,13 +771,9 @@ impl WeatherState {
     fn advance_lightning(&mut self, delta: f32, player: [f32; 3], offset: [f32; 2], settings: &AppSettings) {
         self.new_strike = false;
         self.lightning.age_seconds += delta;
-        let age = self.lightning.age_seconds;
-        // The principal return stroke and two faint after-strokes are brief.
-        // The cloud and water shaders receive this same radiance each frame.
-        let pulse = (-(age - 0.045).powi(2) / 0.0012).exp()
-            + 0.33 * (-(age - 0.155).powi(2) / 0.00045).exp()
-            + 0.14 * (-(age - 0.255).powi(2) / 0.0007).exp();
-        self.lightning.flash = self.lightning.peak_flash * pulse;
+        // The cloud, fog, terrain and water shaders receive this same
+        // radiance each frame; the lightning pass draws the channel.
+        self.lightning.apply_pulse();
         self.lightning_wait -= delta;
         if self.lightning_wait > 0.0 { return; }
 
@@ -649,7 +787,13 @@ impl WeatherState {
         // local hazard controls how frequently a player experiences it.
         for _ in 0..10 {
             let angle = self.random() * std::f32::consts::TAU;
-            let radius = 250.0 + self.random().sqrt() * 2500.0;
+            // Most strikes land a few kilometres away; now and then one
+            // comes down close enough to shake the ground.
+            let radius = if self.random() < 0.1 {
+                120.0 + 280.0 * self.random()
+            } else {
+                250.0 + self.random().sqrt() * 2500.0
+            };
             let x = player[0] + radius * angle.cos();
             let z = player[2] + radius * angle.sin();
             let cell = sample_precipitation(
@@ -659,29 +803,112 @@ impl WeatherState {
                 settings.cloud_wind_direction_degrees.to_radians(),
             );
             if cell.thunderstorm < 0.18 { continue; }
-            // Many discharges stay inside the cloud. They brighten the cloud
-            // volume and haze without painting a ground-contact bolt.
-            let cloud_flash = self.random() < 0.4;
-            let seed = self.random().max(0.0001)
-                * if cloud_flash { -1.0 } else { 1.0 };
-            self.lightning = LightningEvent {
-                position: [x, 0.0, z],
-                flash: 0.0,
-                seed,
-                age_seconds: 0.0,
-                top_height: 1650.0 + self.random() * 800.0,
-                peak_flash: if cloud_flash {
-                    4.0 + self.random() * 6.0
-                } else {
-                    7.0 + self.random() * 7.0
-                },
+            // Many discharges stay in the cloud. Some only brighten the deck
+            // and haze; others crawl visibly along its base.
+            let roll = self.random();
+            let kind = if roll < 0.2 {
+                BoltKind::Hidden
+            } else if roll < 0.4 {
+                BoltKind::Crawler
+            } else {
+                BoltKind::Ground
             };
-            self.new_strike = true;
+            self.spawn_strike([x, z], kind, offset, settings);
             break;
         }
-        // A few seconds between discharges in a strong cell; longer in a
-        // weaker one. Weather outside the cell produces no strikes nearby.
-        self.lightning_wait = (5.0 + 18.0 * (1.0 - local) + 11.0 * self.random()).max(4.0);
+        // A few seconds between discharges in a strong cell and longer in a
+        // weaker one, with occasional rapid bursts. Weather outside the cell
+        // produces no strikes nearby.
+        self.lightning_wait = if self.random() < 0.25 {
+            0.6 + 1.4 * self.random()
+        } else {
+            (2.5 + 12.0 * (1.0 - local) + 8.0 * self.random()).max(2.0)
+        };
+    }
+
+    /// Begins a discharge over `world_xz` with its stroke sequence. The
+    /// contact height is resolved afterwards, while `new_strike` is set.
+    fn spawn_strike(&mut self, world_xz: [f32; 2], kind: BoltKind, offset: [f32; 2], settings: &AppSettings) {
+        let cloud_base = local_cloud_base(
+            world_xz, offset, self.climate_bias, settings.cloud_base_height, self.overrides.base,
+        );
+        let ground = kind == BoltKind::Ground;
+        let seed = self.random().max(0.0001) * if ground { 1.0 } else { -1.0 };
+        let mut event = LightningEvent {
+            position: [world_xz[0], 0.0, world_xz[1]],
+            seed,
+            age_seconds: 0.0,
+            // A ground channel starts a few hundred metres inside the cloud;
+            // a cloud discharge lights the deck from just above its base.
+            top_height: cloud_base + if ground { 250.0 + 200.0 * self.random() } else { 400.0 },
+            cloud_base,
+            kind,
+            peak_flash: if ground {
+                0.7 + 0.9 * self.random()
+            } else {
+                0.35 + 0.65 * self.random()
+            },
+            ..LightningEvent::default()
+        };
+        let count = match kind {
+            BoltKind::Ground => match self.random() {
+                roll if roll < 0.25 => 2,
+                roll if roll < 0.6 => 3,
+                roll if roll < 0.85 => 4,
+                _ => 5,
+            },
+            BoltKind::Crawler => 3 + (self.random() * 3.99) as usize,
+            BoltKind::Hidden => 2 + (self.random() * 2.99) as usize,
+        };
+        // A stepped leader takes tens of milliseconds to reach the ground;
+        // a crawler spreads across the base for a few tenths of a second.
+        event.leader_seconds = match kind {
+            BoltKind::Ground => 0.05 + 0.04 * self.random(),
+            BoltKind::Crawler => 0.25 + 0.3 * self.random(),
+            BoltKind::Hidden => 0.05,
+        };
+        let mut time = match kind {
+            BoltKind::Ground => event.leader_seconds,
+            BoltKind::Crawler => 0.02 + 0.05 * self.random(),
+            BoltKind::Hidden => 0.0,
+        };
+        for index in 0..count.min(MAX_STROKES) {
+            if index > 0 {
+                // Restrikes follow 40-120 ms apart down a ground channel.
+                time += match kind {
+                    BoltKind::Ground => 0.04 + 0.08 * self.random(),
+                    _ => 0.05 + 0.12 * self.random(),
+                };
+            }
+            let peak = if index == 0 { 1.0 } else { 0.35 + 0.45 * self.random() };
+            let continuing = if self.random() < 0.35 { 0.12 + 0.18 * self.random() } else { 0.0 };
+            event.strokes[index] = ReturnStroke { time, peak, continuing };
+        }
+        event.stroke_count = count.min(MAX_STROKES);
+        event.apply_pulse();
+        self.lightning = event;
+        self.new_strike = true;
+    }
+
+    /// Fires a discharge at once over `world_xz` and holds it `age` seconds
+    /// after its first return stroke (negative during the leader), so a
+    /// frozen capture can show any moment of a strike.
+    pub fn force_strike(
+        &mut self,
+        world_xz: [f32; 2],
+        kind: BoltKind,
+        age: f32,
+        offset: [f32; 2],
+        settings: &AppSettings,
+    ) {
+        self.spawn_strike(world_xz, kind, offset, settings);
+        self.lightning.age_seconds = (self.lightning.first_stroke_seconds() + age).max(0.0);
+        self.lightning.apply_pulse();
+    }
+
+    /// Lets the next update discharge if the local storm can produce one.
+    pub fn request_strike(&mut self) {
+        self.lightning_wait = 0.0;
     }
 }
 
@@ -723,6 +950,8 @@ pub fn advance_weather(
     players: Query<&Player>,
     erosion: Option<Res<crate::erosion::ErosionCache>>,
     noise: Option<Res<crate::noise::NoiseField>>,
+    mut bolt: ResMut<ActiveBolt>,
+    mut forced_strike_fired: Local<bool>,
 ) {
     // Automated captures freeze both weather and the celestial clock unless
     // --advance-time was requested. Live changes to time of day affect only
@@ -739,10 +968,20 @@ pub fn advance_weather(
             settings.cloud_wind_direction_degrees,
         );
     }
-    let world_position = players.single().map_or([0.0; 3], |player| {
-        [player.position.x, player.position.y, player.position.z]
+    let (world_position, yaw) = players.single().map_or(([0.0; 3], 0.0), |player| {
+        ([player.position.x, player.position.y, player.position.z], player.yaw)
     });
     weather.advance(delta, world_position, motion.offset, &settings);
+    if let Some(strike) = automation.lightning.filter(|_| !*forced_strike_fired) {
+        *forced_strike_fired = true;
+        // The bearing is measured clockwise from the camera's heading.
+        let heading = yaw + strike.bearing_degrees.to_radians();
+        let world_xz = [
+            world_position[0] + heading.sin() * strike.distance,
+            world_position[2] - heading.cos() * strike.distance,
+        ];
+        weather.force_strike(world_xz, strike.kind, strike.age_seconds, motion.offset, &settings);
+    }
     if weather.new_strike {
         let [x, _, z] = weather.lightning.position;
         let terrain = if let (Some(cache), Some(field)) = (erosion, noise) {
@@ -750,8 +989,28 @@ pub fn advance_weather(
                 &cache, &field, x, z, [world_position[0], world_position[2]],
             )
         } else { crate::constants::SEA_LEVEL };
-        weather.lightning.position[1] = terrain.max(crate::constants::SEA_LEVEL);
-        weather.lightning.top_height += weather.lightning.position[1].max(0.0);
+        let contact = terrain.max(crate::constants::SEA_LEVEL);
+        let lightning = &mut weather.lightning;
+        lightning.position[1] = contact;
+        // A storm over a mountain still discharges from above its summit.
+        lightning.top_height = lightning.top_height.max(contact + 300.0);
+        lightning.cloud_base = lightning.cloud_base.max(contact + 150.0);
+        let segments = match lightning.kind {
+            BoltKind::Ground => {
+                // Channels slant: the top sits a little way from the contact.
+                let seed = lightning.seed;
+                let angle = seed * 40.0;
+                let reach = 100.0 + 400.0 * (seed * 13.7).fract();
+                let top = [x + angle.cos() * reach, lightning.top_height, z + angle.sin() * reach];
+                crate::lightning::ground_bolt(seed, lightning.position, top)
+            }
+            BoltKind::Crawler => crate::lightning::crawler_bolt(
+                -lightning.seed, lightning.position, lightning.cloud_base,
+            ),
+            BoltKind::Hidden => Vec::new(),
+        };
+        let kind = lightning.kind;
+        bolt.replace(kind, segments);
     }
 }
 
@@ -1017,6 +1276,7 @@ mod tests {
                 crate::automation::parse_automation(arguments.into_iter().map(str::to_string));
             world.insert_resource(automation.clone());
             world.init_resource::<WeatherMotion>();
+            world.init_resource::<ActiveBolt>();
             world.insert_resource(WeatherState::from_preset(
                 automation.weather_preset,
                 !automation.static_weather,
@@ -1085,7 +1345,8 @@ mod tests {
             minimum = minimum.min(rain);
             maximum = maximum.max(rain);
         }
-        assert!(minimum < 0.30, "rain lull should be visible: {minimum}");
+        // A lull is visibly lighter than a squall line, yet still steady rain.
+        assert!(minimum > 0.40 && minimum < 0.55, "rain lull should stay wet: {minimum}");
         assert!(maximum > 0.95, "heavy sheet should follow: {maximum}");
     }
 
@@ -1101,11 +1362,68 @@ mod tests {
         assert!(storm.local_precipitation.thunderstorm > 0.12);
         assert!(storm.new_strike);
         let strike = storm.lightning.position;
-        assert!(strike[0].hypot(strike[2]) >= 250.0);
-        storm.advance(0.045, [0.0; 3], [0.0; 2], &AppSettings::default());
-        assert!(storm.lightning.flash > 5.0);
-        storm.advance(0.4, [0.0; 3], [0.0; 2], &AppSettings::default());
-        assert!(storm.lightning.flash < 0.001);
+        assert!(strike[0].hypot(strike[2]) >= 120.0);
+        let first = storm.lightning.first_stroke_seconds();
+        storm.advance(first, [0.0; 3], [0.0; 2], &AppSettings::default());
+        assert!(storm.lightning.flash > 0.65, "first stroke: {}", storm.lightning.flash);
+        let duration = storm.lightning.duration_seconds();
+        assert!(duration < 2.5);
+        storm.advance(duration, [0.0; 3], [0.0; 2], &AppSettings::default());
+        assert!(storm.lightning.flash < 0.001, "after: {}", storm.lightning.flash);
+        assert!(storm.lightning.channel < 0.01);
+    }
+
+    #[test]
+    fn ground_bolts_restrike_down_the_main_channel_only() {
+        let settings = AppSettings::default();
+        let mut storm = WeatherState::from_preset(WeatherPreset::Thunderstorm, false);
+        for strike in 0..40 {
+            storm.force_strike([900.0, 0.0], BoltKind::Ground, -1.0, [0.0; 2], &settings);
+            let event = storm.lightning;
+            assert!((2..=5).contains(&event.stroke_count), "strokes {}", event.stroke_count);
+            let leader = event.pulse(event.first_stroke_seconds() * 0.5);
+            assert!(leader.leader > 0.3 && leader.leader < 0.7);
+            assert!(leader.channel < 0.2 && leader.flash < 0.05, "a leader is faint");
+            let first = event.pulse(event.first_stroke_seconds());
+            assert_eq!(first.leader, 1.0);
+            assert!(first.channel > 0.95 && first.branches > 0.95, "strike {strike}");
+            // Each restrike relights the channel while the branches stay dark.
+            for stroke in &event.strokes[1..event.stroke_count] {
+                let restrike = event.pulse(stroke.time);
+                assert!(restrike.channel > stroke.peak, "restrike {restrike:?}");
+                assert!(restrike.branches < 0.4 * restrike.channel, "branches {restrike:?}");
+            }
+            for pair in event.strokes[..event.stroke_count].windows(2) {
+                let gap = pair[1].time - pair[0].time;
+                assert!((0.04..=0.12).contains(&gap), "gap {gap}");
+            }
+        }
+    }
+
+    #[test]
+    fn storms_discharge_every_few_seconds_with_occasional_bursts() {
+        let settings = AppSettings::default();
+        let mut storm = WeatherState::from_preset(WeatherPreset::Thunderstorm, false);
+        let mut strikes = 0;
+        let mut quick = 0;
+        let mut previous = None;
+        let mut seconds = 0.0;
+        while seconds < 600.0 {
+            storm.advance(0.05, [0.0; 3], [0.0; 2], &settings);
+            seconds += 0.05;
+            if storm.new_strike {
+                strikes += 1;
+                if let Some(previous) = previous {
+                    if seconds - previous < 2.1 {
+                        quick += 1;
+                    }
+                }
+                previous = Some(seconds);
+            }
+        }
+        // About one discharge every 4-12 seconds under a strong cell.
+        assert!((50..150).contains(&strikes), "strikes {strikes}");
+        assert!(quick > 5, "bursts {quick}");
     }
 
     #[test]
@@ -1113,16 +1431,19 @@ mod tests {
         let mut storm = WeatherState::from_preset(WeatherPreset::Thunderstorm, false);
         let settings = AppSettings::default();
         let mut cloud_flashes = 0;
+        let mut crawlers = 0;
         let mut ground_bolts = 0;
-        for _ in 0..24 {
+        for _ in 0..40 {
             storm.advance(40.0, [0.0; 3], [0.0; 2], &settings);
             assert!(storm.new_strike);
-            if storm.lightning.seed < 0.0 {
-                cloud_flashes += 1;
-            } else {
-                ground_bolts += 1;
+            assert_eq!(storm.lightning.seed < 0.0, storm.lightning.kind != BoltKind::Ground);
+            match storm.lightning.kind {
+                BoltKind::Hidden => cloud_flashes += 1,
+                BoltKind::Crawler => crawlers += 1,
+                BoltKind::Ground => ground_bolts += 1,
             }
+            assert!(storm.lightning.top_height > storm.lightning.cloud_base);
         }
-        assert!(cloud_flashes > 0 && ground_bolts > 0);
+        assert!(cloud_flashes > 0 && crawlers > 0 && ground_bolts > 0);
     }
 }

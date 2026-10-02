@@ -75,7 +75,14 @@ pub fn update_player_system(
     erosion: Res<ErosionCache>,
     noise: Res<NoiseField>,
     ui_wants_input: Res<UiWantsInput>,
+    automation: Option<Res<crate::automation::AutomationSettings>>,
 ) {
+    // A pinned --camera capture holds its pose: a click or keystroke that
+    // lands on the window while it renders must not move the shot.
+    if automation.is_some_and(|automation| automation.has_camera && automation.shot_path.is_some()) {
+        mouse_motion.clear();
+        return;
+    }
     let Ok(mut player) = player.single_mut() else {
         return;
     };

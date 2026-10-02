@@ -51,7 +51,9 @@ Movement is unbounded in both walking and flight modes.
 The **Trainer [Tab]** button at the top right also opens a compact debug trainer.
 Choose a weather preset to apply it immediately around the player, or choose
 **Natural weather** to return to varied conditions. The **Move weather fronts**
-checkbox controls whether those conditions drift. Set the hour with
+checkbox controls whether those conditions drift. Under a thunderstorm,
+**Strike lightning** fires the next discharge at once, and **Thunder volume**
+sets the loudness of thunder. Set the hour with
 the slider or Dawn, Noon, Dusk and Night buttons; changing it holds the selected
 time until **Hold selected time** is unchecked. **Advanced diagnostics** opens
 the full panel without using F1.
@@ -75,23 +77,42 @@ and atmospheric visibility together. Fog / Whiteout produces short-range
 visibility and a diffuse, nearly colorless sky by day.
 
 Rain travels in wind-driven sheets inside the larger moving storm cells. Broad
-and fine bands bend across the landscape, so heavy rain alternates with lighter
-intervals at a fixed location. The raymarched atmosphere integrates rain, snow,
-and fog density along each view ray, making distant precipitation curtains and
-whiteout visible through the landscape. Near the camera, depth-tested rain
-drops vary in length and speed, subtly refract
-the scene, and occasionally catch sunlight or lightning; snow falls more slowly
-as flakes. The terrain darkens and grows glossier under rain and stays damp
-between passing sheets, while snowfall gives upward surfaces a light dusting.
-The F1 panel reports local intensity and
-visibility. Rain makes short-lived ripples and splashes on the water; snowflakes
-briefly fleck its surface. Local storm gusts roughen the existing wave spectrum
-without resetting it. Thunderheads dim the sky, clouds, terrain, and fog even
-between heavy rain sheets. Thunderstorm cells produce both cloud-contained
-flashes and jagged ground bolts that can strike terrain or water. The flashes
-light nearby ground, clouds, fog, rain, and water reflections. Snow phase
-normally follows altitude and the mountain snowline; selecting Rain, Snow, or
-Thunderstorm forces that phase for previews.
+and fine bands bend across the landscape, so heavy squall lines alternate with
+steadier rain at a fixed location. The raymarched atmosphere integrates rain,
+snow, and fog density along each view ray, so a downpour cuts visibility to a
+kilometre or two and distant curtains of rain stand out against the landscape.
+Two depth-tested lattices of drops surround the camera: a dense one within about
+16 m and a sparser one out to about 45 m. Each drop falls at the terminal
+velocity of its size and is drawn as the streak it traces during a 1/30 s
+exposure, leaning with the wind and storm gusts. A drop takes its colour from
+the scene around it, as the small lens it is, so rain reads light against dark
+forest and slightly darker against the sky. Camera-centred layers of finer
+streaks carry the rain out past 100 m, and splash crowns burst where drops land
+on nearby ground. Snow falls more slowly as flakes. Wet ground darkens and
+mirrors the sky, puddles collect on level ground outside the grass and ripple
+under the drops, and the ground stays damp between passing sheets, while
+snowfall gives upward surfaces a light dusting. Grass thrashes in storm gusts.
+The F1 panel reports local intensity and visibility. Rain makes short-lived
+ripples and splashes on the water; snowflakes briefly fleck its surface. Local
+storm gusts roughen the existing wave spectrum without resetting it.
+Thunderheads dim the sky, clouds, terrain, and fog even between heavy rain
+sheets. Snow phase normally follows altitude and the mountain snowline;
+selecting Rain, Snow, or Thunderstorm forces that phase for previews.
+
+Thunderstorm cells discharge every few seconds, sometimes in rapid bursts. A
+cloud-to-ground bolt follows its stepped leader: a tortuous, fractal channel
+that branches as it searches down from inside the cloud base, drawn faintly as
+it descends. A brilliant return stroke then lights the channel and its branches,
+and two to four restrikes flicker down the main channel alone, some held by
+continuing current, before it fades. Some discharges stay in the cloud: they
+only light the deck, or crawl visibly along its base as branching spider
+lightning. The channel is drawn with a white core and a blue-violet glow that
+heavy rain softens and widens, and cloud hides any part above the base. Each
+flash lights nearby ground, clouds, fog, rain, and water, and the water mirrors
+the bolt. Thunder is synthesised from the bolt itself: each part of the channel
+is heard after its own travel time at the speed of sound, so a close strike
+cracks and then rolls, a distant one only rumbles, and a flash inside the cloud
+is muffled.
 
 **Volumetric clouds** controls cloud coverage, density, base altitude, layer
 thickness, wind speed and direction, and shadow strength. **Cloud shape** expands
@@ -106,7 +127,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 
 | Flag | Effect |
 | --- | --- |
-| `--camera x,y,z,yawDeg,pitchDeg` | Pin the camera pose and fly, for reproducible shots |
+| `--camera x,y,z,yawDeg,pitchDeg` | Pin the camera pose and fly, for reproducible shots; with `--shot`, mouse and keyboard input cannot move it |
 | `--shot path.png` | Render, save a screenshot, then exit |
 | `--wait n` | Frames to render before the screenshot |
 | `--size W,H` | Window size in points (comma-separated, as the C++'s `sscanf`) |
@@ -122,6 +143,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--advance-time` | Allow the day/night cycle, weather, and cloud wind to advance during a screenshot run |
 | `--weather clear\|cloudy\|overcast\|fog\|rain\|snow\|thunderstorm` | Bias the spatial weather map toward a chosen condition; default `cloudy` (`whiteout` and `storm` are aliases) |
 | `--static-weather` | Freeze weather fronts in place; conditions still vary by location |
+| `--lightning AGE[,DIST[,BEARING[,ground\|crawler\|cloud]]]` | Fire one discharge `DIST` metres away (default `900`), `BEARING` degrees clockwise from the camera heading (default `0`), and hold it `AGE` seconds after its first return stroke (negative to show the leader); for screenshots |
 | `--raymarch-quality low\|balanced\|high` | Choose the ray sampling budget; default `balanced` (also accepts `0`, `1`, `2`) |
 | `--no-raymarch` | Disable raymarched terrain shadows, volumetric integration, clouds and terrain reflections on water |
 | `--no-clouds` | Disable cloud rendering and cloud shadows independently |

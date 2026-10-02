@@ -10,9 +10,15 @@
 //! `--cloud-density`, `--cloud-base` and `--cloud-thickness` set cloud weather.
 //! `--weather` biases the spatial weather map and `--static-weather` freezes
 //! its moving fronts without removing variation between locations.
+//! `--lightning AGE[,DIST[,BEARING[,ground|crawler|cloud]]]` fires one
+//! discharge DIST metres away (default 900) at BEARING degrees clockwise from
+//! the camera's heading (default 0) and holds it AGE seconds after its first
+//! return stroke (negative to catch the leader on its way down), so a frozen
+//! capture can show any moment of a strike.
 
 use crate::constants::AppSettings;
 use crate::erosion::TileKey;
+use crate::lightning::BoltKind;
 use crate::weather::WeatherPreset;
 use bevy::prelude::Resource;
 
@@ -29,6 +35,15 @@ use bevy::prelude::Resource;
 /// `--measure-overlap [--overlap-tile x,z]` simulates one adjacent tile pair,
 /// prints the per-metre height disagreement across their shared overlap as
 /// CSV, and exits — the seam regression check for the erosion boundaries.
+/// A discharge requested on the command line, see the module docs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ForcedLightning {
+    pub age_seconds: f32,
+    pub distance: f32,
+    pub bearing_degrees: f32,
+    pub kind: BoltKind,
+}
+
 #[derive(Clone, Debug, Resource)]
 pub struct AutomationSettings {
     pub has_camera: bool,
@@ -66,6 +81,7 @@ pub struct AutomationSettings {
     pub cloud_thickness: f32,
     pub cloud_thickness_override: bool,
     pub overlap_tile: TileKey,
+    pub lightning: Option<ForcedLightning>,
 }
 
 impl Default for AutomationSettings {
@@ -104,6 +120,7 @@ impl Default for AutomationSettings {
             cloud_thickness: render_settings.cloud_thickness,
             cloud_thickness_override: false,
             overlap_tile: TileKey { x: 0, z: 0 },
+            lightning: None,
         }
     }
 }
@@ -121,6 +138,30 @@ fn parse_floats(argument: &str, expected: usize) -> Option<Vec<f32>> {
 fn parse_ints(argument: &str, expected: usize) -> Option<Vec<i64>> {
     parse_floats(argument, expected)
         .map(|values| values.into_iter().map(|value| value as i64).collect())
+}
+
+fn parse_lightning(argument: &str) -> Option<ForcedLightning> {
+    let parts: Vec<&str> = argument.split(',').map(str::trim).collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let number = |index: usize, default: f32| -> Option<f32> {
+        parts.get(index).map_or(Some(default), |part| part.parse::<f32>().ok())
+            .filter(|value| value.is_finite())
+    };
+    let kind = match parts.get(3).copied() {
+        None | Some("ground") => BoltKind::Ground,
+        Some("crawler") => BoltKind::Crawler,
+        Some("cloud") => BoltKind::Hidden,
+        Some(_) => return None,
+    };
+    let forced = ForcedLightning {
+        age_seconds: number(0, 0.0)?,
+        distance: number(1, 900.0)?,
+        bearing_degrees: number(2, 0.0)?,
+        kind,
+    };
+    (forced.age_seconds >= -1.0 && forced.distance >= 0.0).then_some(forced)
 }
 
 /// Parses `N` floats separated by commas; accepts a trailing-`x`/`,` variant
@@ -184,6 +225,18 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--no-raymarch" => automation.no_raymarch = true,
             "--no-clouds" => automation.no_clouds = true,
             "--static-weather" => automation.static_weather = true,
+            "--lightning" => {
+                let forced = next.and_then(|value| parse_lightning(value));
+                if let Some(forced) = forced {
+                    automation.lightning = Some(forced);
+                    index += 1;
+                } else {
+                    eprintln!("WARNING: --lightning expects AGE[,DIST[,BEARING[,ground|crawler|cloud]]]");
+                    if next.is_some_and(|value| !value.starts_with("--")) {
+                        index += 1;
+                    }
+                }
+            }
             "--weather" => {
                 let preset = next.and_then(|value| match value.as_str() {
                     "clear" => Some(WeatherPreset::Clear),
@@ -425,6 +478,32 @@ mod tests {
         let settings = parse(&["--weather", "invalid", "--no-clouds"]);
         assert_eq!(settings.weather_preset, WeatherPreset::Cloudy);
         assert!(settings.no_clouds);
+    }
+
+    #[test]
+    fn lightning_flag_holds_a_discharge_at_a_chosen_moment() {
+        let settings = parse(&["--lightning", "0.08", "--pause-time"]);
+        assert_eq!(
+            settings.lightning,
+            Some(ForcedLightning {
+                age_seconds: 0.08,
+                distance: 900.0,
+                bearing_degrees: 0.0,
+                kind: BoltKind::Ground,
+            })
+        );
+        assert!(settings.pause_time);
+        let settings = parse(&["--lightning", "0.3,1800,-20,crawler"]);
+        let forced = settings.lightning.unwrap();
+        assert_eq!((forced.distance, forced.bearing_degrees), (1800.0, -20.0));
+        assert_eq!(forced.kind, BoltKind::Crawler);
+        assert_eq!(parse(&["--lightning", "0.1,500,0,cloud"]).lightning.unwrap().kind, BoltKind::Hidden);
+        assert_eq!(parse(&["--lightning", "-0.03"]).lightning.unwrap().age_seconds, -0.03);
+        for invalid in ["-2", "bad", "0.1,NaN", "0.1,900,0,spark", "0.1,-5"] {
+            let settings = parse(&["--lightning", invalid, "--no-clouds"]);
+            assert_eq!(settings.lightning, None, "{invalid}");
+            assert!(settings.no_clouds);
+        }
     }
 
     #[test]

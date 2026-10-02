@@ -59,9 +59,16 @@ fn main() {
         let entry_points = if path.file_name().is_some_and(|name| name == "precipitation.wgsl") {
             vec![
                 EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_blit".into() },
-                EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_blit".into() },
+                EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_rain_layers".into() },
                 EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_particle".into() },
                 EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_particle".into() },
+            ]
+        } else if path.file_name().is_some_and(|name| name == "lightning.wgsl") {
+            vec![
+                EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_blit".into() },
+                EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_blit".into() },
+                EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_bolt".into() },
+                EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_bolt".into() },
             ]
         } else {
             vec![EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_main".into() }]

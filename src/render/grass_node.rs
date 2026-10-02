@@ -420,14 +420,16 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
         .get_resource::<super::water_node::ExtractedWater>()
         .map_or(0.0, |w| w.elapsed);
     let direction = view.settings.cloud_wind_direction_degrees.to_radians();
-    let wind_speed = view.weather.conditions(&view.settings).wind_speed;
+    let conditions = view.weather.conditions(&view.settings);
+    // Storm gusts thrash the grass well beyond the steady breeze.
+    let gust = 1.0 + 1.6 * conditions.gust_strength;
     let frame = GrassFrame {
         mapping: terrain_node::grass_habitat_mapping(view.player_position),
         wind: [
             direction.cos(),
             direction.sin(),
             elapsed,
-            (wind_speed / 18.0).clamp(0.0, 2.0) * 0.11,
+            (conditions.wind_speed / 18.0).clamp(0.0, 2.0) * 0.11 * gust,
         ],
         range: [100.0, grass::SCATTER_RADIUS, 0.0, 0.0],
     };

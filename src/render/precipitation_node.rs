@@ -1,5 +1,7 @@
-//! Camera-near, world-anchored rain and snow rendered after the water passes.
-//! The position G-buffer clips particles hidden by terrain and vegetation.
+//! Camera-near, world-anchored rain and snow rendered after the water passes,
+//! with rain layers that carry a downpour farther out and splash crowns where
+//! drops land. The position G-buffer clips particles hidden by terrain and
+//! vegetation and places the splashes on the ground.
 
 use super::{
     ExtractedForestView, ForestGlobals, ForestShaderHandles, globals_layout,
@@ -15,10 +17,72 @@ use bevy::render::view::ViewTarget;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-// The smaller cells give heavy rain enough density while the shader culls
-// particles before rasterization outside the local, depth-tested volume.
-const RAIN_PARTICLES: u32 = 40 * 40 * 16;
-const SNOW_PARTICLES: u32 = 24 * 24 * 12;
+/// A particle lattice around the camera: cells per side, vertical layers, and
+/// cell size in metres. The shader culls cells outside the view frustum and
+/// the depth-tested volume before it evaluates the weather field.
+#[derive(Clone, Copy)]
+struct Lattice {
+    grid: u32,
+    layers: u32,
+    cell_size: f32,
+}
+
+impl Lattice {
+    const fn count(self) -> u32 {
+        self.grid * self.grid * self.layers
+    }
+}
+
+/// Dense rain within about 16 m of the camera, about 3 drops per cubic metre
+/// in a downpour.
+const RAIN_NEAR_LATTICE: Lattice = Lattice { grid: 48, layers: 20, cell_size: 0.7 };
+/// Sparser, longer streaks that carry the rain out to about 45 m.
+const RAIN_FAR_LATTICE: Lattice = Lattice { grid: 48, layers: 16, cell_size: 2.0 };
+const SNOW_LATTICE: Lattice = Lattice { grid: 24, layers: 12, cell_size: 2.0 };
+/// Screen cells that each try to place one splash crown per cycle.
+const SPLASH_CELLS: [u32; 2] = [96, 54];
+const PARTICLE_INSTANCES: u32 = RAIN_NEAR_LATTICE.count()
+    + RAIN_FAR_LATTICE.count()
+    + SNOW_LATTICE.count()
+    + SPLASH_CELLS[0] * SPLASH_CELLS[1];
+/// Rain layers reach about 110 m; precipitation that close keeps the pass on.
+const PRECIPITATION_REACH: f32 = 110.0;
+
+/// `PrecipitationFrame` in precipitation.wgsl (group 2, binding 0).
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PrecipitationFrameGpu {
+    velocity: [f32; 4],
+    rain_near: [f32; 4],
+    rain_far: [f32; 4],
+    snow: [f32; 4],
+    splash: [f32; 4],
+}
+const _: () = assert!(std::mem::size_of::<PrecipitationFrameGpu>() == 80);
+
+impl PrecipitationFrameGpu {
+    /// Lays the instance range out as near rain, far rain, snow, then splashes.
+    fn new(velocity: [f32; 4]) -> Self {
+        let lattice = |lattice: Lattice, end: u32| {
+            [lattice.grid as f32, lattice.layers as f32, lattice.cell_size, end as f32]
+        };
+        let near_end = RAIN_NEAR_LATTICE.count();
+        let far_end = near_end + RAIN_FAR_LATTICE.count();
+        let snow_end = far_end + SNOW_LATTICE.count();
+        Self {
+            velocity,
+            rain_near: lattice(RAIN_NEAR_LATTICE, near_end),
+            rain_far: lattice(RAIN_FAR_LATTICE, far_end),
+            snow: lattice(SNOW_LATTICE, snow_end),
+            splash: [
+                SPLASH_CELLS[0] as f32,
+                SPLASH_CELLS[1] as f32,
+                0.0,
+                PARTICLE_INSTANCES as f32,
+            ],
+        }
+    }
+}
 
 #[derive(Default)]
 struct PrecipitationInner {
@@ -67,49 +131,41 @@ fn prepare_precipitation(
         inner.globals_group = Some(group);
     }
     if inner.screen_layout.is_none() {
+        // Drops take their colour from the scene around them and splashes
+        // read the G-buffer to find the ground, both in the vertex stage.
+        let texture = |binding: u32, filterable: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         inner.screen_layout = Some(BindGroupLayoutDescriptor::new(
             "forest_precipitation_screen_layout",
-            &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
+            &[texture(0, true), texture(1, false), texture(2, true)],
         ));
     }
     if inner.wind_layout.is_none() {
+        let size = std::mem::size_of::<PrecipitationFrameGpu>() as u64;
         let layout = BindGroupLayoutDescriptor::new(
             "forest_precipitation_wind_layout",
             &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(16),
+                    min_binding_size: wgpu::BufferSize::new(size),
                 },
                 count: None,
             }],
         );
         let buffer = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("forest_precipitation_wind"),
-            size: 16,
+            size,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -133,11 +189,11 @@ fn prepare_precipitation(
         // unrelated field to every shader's shared GlobalUniforms ABI.
         let speed = view.settings.cloud_wind_speed * view.weather.current.wind_multiplier * 0.22;
         let direction = view.settings.cloud_wind_direction_degrees.to_radians();
-        let wind = [
+        let frame = PrecipitationFrameGpu::new([
             speed * direction.cos(), speed * direction.sin(),
-            water.draw as u32 as f32, 0.0,
-        ];
-        queue.write_buffer(buffer, 0, bytemuck::cast_slice(&wind));
+            water.draw as u32 as f32, view.weather.local_precipitation.gust,
+        ]);
+        queue.write_buffer(buffer, 0, bytemuck::bytes_of(&frame));
     }
 }
 
@@ -173,12 +229,13 @@ pub fn forest_precipitation_pass(
     if ocean_visible && extracted.player_position[1] <= SEA_LEVEL + 0.2 {
         return;
     }
-    // Rain bands can cross the near-camera particle volume before reaching
-    // the player. Sample its corners as well as the local reading so their
-    // leading edge remains visible and moves across the landscape smoothly.
+    // Rain bands can cross the particle volume and rain layers before
+    // reaching the player. Sample their extent as well as the local reading
+    // so a leading edge remains visible and moves across the landscape.
+    let reach = [-PRECIPITATION_REACH, -24.0, 0.0, 24.0, PRECIPITATION_REACH];
     let nearby_precipitation = extracted.weather.local_precipitation.intensity() > 0.001
-        || [-24.0, 0.0, 24.0].into_iter().any(|dx| {
-            [-24.0, 0.0, 24.0].into_iter().any(|dz| {
+        || reach.into_iter().any(|dx| {
+            reach.into_iter().any(|dz| {
                 crate::weather::sample_precipitation(
                     [extracted.player_position[0] + dx, extracted.player_position[2] + dz],
                     extracted.player_position[1] - 8.0,
@@ -218,7 +275,7 @@ pub fn forest_precipitation_pass(
             format,
             layouts.clone(),
             "vs_blit",
-            "fs_blit",
+            "fs_rain_layers",
             None,
             wgpu::PrimitiveTopology::TriangleList,
         ));
@@ -266,6 +323,10 @@ pub fn forest_precipitation_pass(
                 binding: 1,
                 resource: wgpu::BindingResource::TextureView(&gbuffer.position_view),
             },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&gbuffer.normal_view),
+            },
         ],
     );
     let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
@@ -298,10 +359,10 @@ pub fn forest_precipitation_pass(
     pass.set_render_pipeline(blit);
     pass.draw(0..3, 0..1);
     pass.set_render_pipeline(particles);
-    pass.draw(0..4, 0..RAIN_PARTICLES + SNOW_PARTICLES);
+    pass.draw(0..4, 0..PARTICLE_INSTANCES);
 }
 
-fn pipeline_descriptor(
+pub(super) fn pipeline_descriptor(
     label: &'static str,
     shader: &Handle<Shader>,
     format: wgpu::TextureFormat,
@@ -338,5 +399,26 @@ fn pipeline_descriptor(
             })],
         }),
         zero_initialize_workgroup_memory: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The frame uniform the pass writes must match the WGSL struct.
+    #[test]
+    fn precipitation_frame_matches_the_shader_layout() {
+        let source = include_str!("../../assets/shaders/precipitation.wgsl");
+        let module = naga::front::wgsl::parse_str(source).unwrap();
+        let (_, ty) = module
+            .types
+            .iter()
+            .find(|(_, ty)| ty.name.as_deref() == Some("PrecipitationFrame"))
+            .expect("PrecipitationFrame");
+        let naga::TypeInner::Struct { span, .. } = &ty.inner else {
+            panic!("PrecipitationFrame must be a struct");
+        };
+        assert_eq!(*span as usize, std::mem::size_of::<super::PrecipitationFrameGpu>());
+        // Instance indices travel through the uniform as floats.
+        assert!(super::PARTICLE_INSTANCES < 1 << 24);
     }
 }
