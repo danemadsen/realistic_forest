@@ -672,7 +672,7 @@ pub fn prepare_forest_globals(
         ],
         storm: [
             view.weather.precipitation_bias,
-            view.weather.target.precipitation_override() as f32,
+            view.weather.precipitation_override() as f32,
             view.weather.elapsed_seconds,
             view.weather.local_precipitation.gust,
         ],

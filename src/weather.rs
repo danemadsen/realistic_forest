@@ -241,14 +241,18 @@ pub fn sample_precipitation(
         + 70.0 * ((world_xz[0] - offset[0]) / 18000.0
             + (world_xz[1] - offset[1]) / 27000.0 + 0.7).sin();
     let snow_fraction = match override_kind {
-        1 | 3 => 0.0,
+        1 | 3 | 4 => 0.0,
         2 => 1.0,
         _ => smoothstep(80.0, 260.0, cold_altitude),
     };
     let rain = precipitation * (1.0 - snow_fraction);
     let snow = precipitation * snow_fraction;
     let convective_bias = if override_kind == 3 { precipitation_bias } else { 0.0 };
-    let thunderstorm = rain * smoothstep(0.91, 0.98, score + convective_bias);
+    let thunderstorm = if override_kind == 4 {
+        0.0
+    } else {
+        rain * smoothstep(0.91, 0.98, score + convective_bias)
+    };
     let gust = (0.18 * precipitation + 0.75 * thunderstorm).clamp(0.0, 1.0);
     PrecipitationSample { rain, snow, thunderstorm, gust }
 }
@@ -312,6 +316,8 @@ pub struct WeatherState {
     pub automatic: bool,
     /// Broad climate bias; nearby places retain their own front conditions.
     pub target: WeatherPreset,
+    /// A trainer selection follows the player instead of waiting for a front.
+    pub trainer_preset: Option<WeatherPreset>,
     pub current: WeatherProfile,
     pub transition_seconds: f32,
     pub overrides: WeatherOverrides,
@@ -349,6 +355,7 @@ impl WeatherState {
         Self {
             automatic,
             target: preset,
+            trainer_preset: None,
             current: profile,
             transition_seconds: 75.0,
             overrides: WeatherOverrides::default(),
@@ -369,7 +376,8 @@ impl WeatherState {
     }
 
     pub fn set_target(&mut self, target: WeatherPreset) {
-        if target == self.target {
+        let had_trainer_preset = self.trainer_preset.take().is_some();
+        if target == self.target && !had_trainer_preset {
             return;
         }
         self.source_bias = self.climate_bias;
@@ -379,8 +387,45 @@ impl WeatherState {
         self.in_transition = true;
     }
 
+    /// Selects weather at the player's location without the trend transition.
+    /// Call `refresh_local` with the current player pose and weather offset to
+    /// apply it in the same frame. Clearing the selection restores the natural
+    /// Cloudy trend immediately; front motion keeps its previous setting.
+    pub fn set_trainer_preset(&mut self, preset: Option<WeatherPreset>) {
+        if self.trainer_preset == preset {
+            return;
+        }
+        self.trainer_preset = preset;
+        self.in_transition = false;
+        self.transition_elapsed = 0.0;
+        self.target = preset.unwrap_or(WeatherPreset::Cloudy);
+        if preset.is_some_and(|selected| selected != WeatherPreset::Thunderstorm) {
+            // A previously spawned storm bolt must not continue flashing after
+            // the trainer has selected dry weather, rain, or snow.
+            self.lightning = LightningEvent::default();
+            self.new_strike = false;
+        }
+        if preset.is_none() {
+            self.climate_bias = WeatherPreset::Cloudy.climate_bias();
+            self.precipitation_bias = WeatherPreset::Cloudy.precipitation_bias();
+            self.source_bias = self.climate_bias;
+            self.source_precipitation_bias = self.precipitation_bias;
+        }
+    }
+
     pub fn is_transitioning(&self) -> bool {
         self.in_transition
+    }
+
+    /// Kind 4 is trainer rain: force liquid precipitation without thunder.
+    /// The render-world uniform must use this method rather than `target`'s
+    /// ordinary override so the shader receives the same kind as the CPU.
+    pub fn precipitation_override(&self) -> u32 {
+        if self.trainer_preset == Some(WeatherPreset::Rain) {
+            4
+        } else {
+            self.target.precipitation_override()
+        }
     }
 
     pub fn advance(
@@ -390,7 +435,11 @@ impl WeatherState {
         offset: [f32; 2],
         settings: &AppSettings,
     ) {
-        if delta_seconds.is_finite() && delta_seconds > 0.0 && self.in_transition {
+        if self.trainer_preset.is_none()
+            && delta_seconds.is_finite()
+            && delta_seconds > 0.0
+            && self.in_transition
+        {
             let duration = self.transition_seconds.max(0.01);
             self.transition_elapsed = (self.transition_elapsed + delta_seconds).min(duration);
             let fraction = (self.transition_elapsed / duration).clamp(0.0, 1.0);
@@ -405,20 +454,54 @@ impl WeatherState {
                 self.in_transition = false;
             }
         }
-        let world_xz = [world_position[0], world_position[2]];
-        self.local_severity = front_severity(world_xz, offset, self.climate_bias);
-        self.current = WeatherProfile::from_severity(self.local_severity);
-        self.local_precipitation = sample_precipitation(
-            world_xz, world_position[1], offset, self.climate_bias,
-            self.precipitation_bias, self.target.precipitation_override(),
-            settings.cloud_base_height, self.overrides.base,
-        );
+        self.refresh_local(world_position, offset, settings);
         if delta_seconds.is_finite() && delta_seconds > 0.0 {
             self.elapsed_seconds += delta_seconds;
             self.advance_lightning(delta_seconds, world_position, offset, settings);
         } else {
             self.new_strike = false;
         }
+    }
+
+    /// Recomputes local conditions without changing the clock or lightning.
+    /// The render shaders use these same climate and precipitation biases.
+    pub fn refresh_local(
+        &mut self,
+        world_position: [f32; 3],
+        offset: [f32; 2],
+        settings: &AppSettings,
+    ) {
+        let world_xz = [world_position[0], world_position[2]];
+        if let Some(preset) = self.trainer_preset {
+            let severity = match preset {
+                WeatherPreset::Clear => 0.0,
+                WeatherPreset::Cloudy => 1.0,
+                WeatherPreset::Overcast => 2.0,
+                WeatherPreset::Fog => 3.0,
+                // Severity 2 has a fully open wet gate and the overcast cloud
+                // profile; values above 2 also blend toward whiteout fog.
+                WeatherPreset::Rain | WeatherPreset::Snow | WeatherPreset::Thunderstorm => 2.0,
+            };
+            self.climate_bias = severity - front_severity(world_xz, offset, 0.0);
+            self.precipitation_bias = match preset {
+                WeatherPreset::Rain | WeatherPreset::Snow | WeatherPreset::Thunderstorm => {
+                    1.0 - storm_score(world_xz, offset)
+                }
+                _ => -1.0,
+            };
+        }
+        self.local_severity = front_severity(world_xz, offset, self.climate_bias);
+        self.current = WeatherProfile::from_severity(self.local_severity);
+        self.local_precipitation = sample_precipitation(
+            world_xz,
+            world_position[1],
+            offset,
+            self.climate_bias,
+            self.precipitation_bias,
+            self.precipitation_override(),
+            settings.cloud_base_height,
+            self.overrides.base,
+        );
     }
 
     pub fn override_bits(&self) -> u32 {
@@ -429,6 +512,9 @@ impl WeatherState {
     }
 
     pub fn local_condition(&self) -> WeatherPreset {
+        if let Some(preset) = self.trainer_preset {
+            return preset;
+        }
         if self.local_precipitation.thunderstorm > 0.25 {
             return WeatherPreset::Thunderstorm;
         }
@@ -536,7 +622,7 @@ impl WeatherState {
             let z = player[2] + radius * angle.sin();
             let cell = sample_precipitation(
                 [x, z], player[1], offset, self.climate_bias,
-                self.precipitation_bias, self.target.precipitation_override(),
+                self.precipitation_bias, self.precipitation_override(),
                 settings.cloud_base_height, self.overrides.base,
             );
             if cell.thunderstorm < 0.18 { continue; }
@@ -702,6 +788,114 @@ mod tests {
         assert_eq!(resolved.cloud_base_height, 2500.0);
         assert_eq!(resolved.cloud_thickness, 300.0);
         assert_eq!(resolved.fog_density, 0.0);
+    }
+
+    #[test]
+    fn trainer_weather_follows_the_player_and_moving_fronts() {
+        let settings = AppSettings::default();
+        let locations = [
+            ([0.0, 0.0, 0.0], [0.0, 0.0]),
+            ([28_000.0, 80.0, -19_000.0], [1_500.0, -700.0]),
+            ([-400_000.0, 0.0, -130_000.0], [0.0, 0.0]),
+            ([-12_000.0, 25.0, 36_000.0], [-9_000.0, 3_000.0]),
+        ];
+        for preset in WeatherPreset::ALL {
+            let mut weather = WeatherState::default();
+            weather.set_trainer_preset(Some(preset));
+            for (position, offset) in locations {
+                weather.refresh_local(position, offset, &settings);
+                assert_eq!(
+                    weather.local_condition(),
+                    preset,
+                    "{preset:?} at {position:?}"
+                );
+                let wanted_severity = match preset {
+                    WeatherPreset::Clear => 0.0,
+                    WeatherPreset::Cloudy => 1.0,
+                    WeatherPreset::Overcast => 2.0,
+                    WeatherPreset::Fog => 3.0,
+                    WeatherPreset::Rain | WeatherPreset::Snow | WeatherPreset::Thunderstorm => 2.0,
+                };
+                assert!((weather.local_severity - wanted_severity).abs() < 0.0001);
+                let precipitation = weather.local_precipitation;
+                match preset {
+                    WeatherPreset::Clear
+                    | WeatherPreset::Cloudy
+                    | WeatherPreset::Overcast
+                    | WeatherPreset::Fog => {
+                        assert_eq!(precipitation.intensity(), 0.0);
+                    }
+                    WeatherPreset::Rain => {
+                        assert!(precipitation.rain > 0.9);
+                        assert_eq!(precipitation.snow, 0.0);
+                        assert_eq!(precipitation.thunderstorm, 0.0);
+                    }
+                    WeatherPreset::Snow => {
+                        assert!(precipitation.snow > 0.9);
+                        assert_eq!(precipitation.rain, 0.0);
+                    }
+                    WeatherPreset::Thunderstorm => {
+                        assert!(precipitation.rain > 0.9);
+                        assert!(precipitation.thunderstorm > 0.9);
+                    }
+                }
+                weather.advance(0.25, position, offset, &settings);
+                assert_eq!(weather.local_condition(), preset);
+                assert!(!weather.is_transitioning());
+            }
+        }
+    }
+
+    #[test]
+    fn trainer_refresh_keeps_clock_and_lightning_untouched() {
+        let settings = AppSettings::default();
+        let mut weather = WeatherState::default();
+        weather.set_trainer_preset(Some(WeatherPreset::Thunderstorm));
+        weather.elapsed_seconds = 12.0;
+        weather.lightning.flash = 3.0;
+        weather.new_strike = true;
+        weather.refresh_local([0.0; 3], [0.0; 2], &settings);
+        assert_eq!(weather.elapsed_seconds, 12.0);
+        assert_eq!(weather.lightning.flash, 3.0);
+        assert!(weather.new_strike);
+    }
+
+    #[test]
+    fn leaving_trainer_restores_cloudy_and_normal_transitions() {
+        let settings = AppSettings::default();
+        let position = [28_000.0, 0.0, -19_000.0];
+        let offset = [1_500.0, -700.0];
+        let mut weather = WeatherState::default();
+        weather.set_trainer_preset(Some(WeatherPreset::Fog));
+        weather.refresh_local(position, offset, &settings);
+        assert_eq!(weather.local_condition(), WeatherPreset::Fog);
+        weather.set_trainer_preset(None);
+        weather.refresh_local(position, offset, &settings);
+        assert_eq!(weather.trainer_preset, None);
+        assert_eq!(weather.target, WeatherPreset::Cloudy);
+        assert_eq!(weather.climate_bias, 0.0);
+        assert_eq!(weather.precipitation_bias, 0.0);
+        assert_eq!(
+            weather.local_severity,
+            front_severity([position[0], position[2]], offset, 0.0)
+        );
+        assert!(!weather.is_transitioning());
+
+        weather.set_trainer_preset(Some(WeatherPreset::Rain));
+        weather.refresh_local(position, offset, &settings);
+        assert_eq!(weather.precipitation_override(), 4);
+        // A normal selection of the same named preset still releases the lock.
+        weather.set_target(WeatherPreset::Rain);
+        assert_eq!(weather.trainer_preset, None);
+        assert!(weather.is_transitioning());
+        assert_eq!(weather.precipitation_override(), 1);
+        weather.advance(75.0, position, offset, &settings);
+        assert_eq!(weather.climate_bias, WeatherPreset::Rain.climate_bias());
+        assert_eq!(
+            weather.precipitation_bias,
+            WeatherPreset::Rain.precipitation_bias()
+        );
+        assert!(!weather.is_transitioning());
     }
 
     #[test]

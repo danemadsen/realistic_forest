@@ -446,8 +446,9 @@ fn setup_cursor_and_player(
     );
 }
 
-/// F1 toggles the diagnostics panel (releasing the pointer when it opens,
-/// matching the C++); F12 saves a timestamped screenshot.
+/// Tab opens the compact trainer, F1 opens the full diagnostics panel, and
+/// either action releases the pointer so the controls can be used immediately.
+/// F12 saves a timestamped screenshot.
 fn handle_global_keys(
     mut settings: ResMut<AppSettings>,
     mut player: Query<&mut Player>,
@@ -455,16 +456,22 @@ fn handle_global_keys(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
 ) {
+    let mut opened_panel = false;
+    if keyboard.just_pressed(KeyCode::Tab) {
+        settings.show_trainer = !settings.show_trainer;
+        opened_panel |= settings.show_trainer;
+    }
     if keyboard.just_pressed(KeyCode::F1) {
         settings.show_ui = !settings.show_ui;
-        if settings.show_ui {
-            if let Ok(mut player) = player.single_mut() {
-                player.mouse_captured = false;
-            }
-            if let Ok((mut cursor,)) = cursor_options.single_mut() {
-                cursor.grab_mode = bevy::window::CursorGrabMode::None;
-                cursor.visible = true;
-            }
+        opened_panel |= settings.show_ui;
+    }
+    if opened_panel {
+        if let Ok(mut player) = player.single_mut() {
+            player.mouse_captured = false;
+        }
+        if let Ok((mut cursor,)) = cursor_options.single_mut() {
+            cursor.grab_mode = bevy::window::CursorGrabMode::None;
+            cursor.visible = true;
         }
     }
     if keyboard.just_pressed(KeyCode::F12) {

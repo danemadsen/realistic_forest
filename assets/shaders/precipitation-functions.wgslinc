@@ -49,12 +49,13 @@ fn weatherPrecipitation(world_position: vec3<f32>) -> vec4<f32> {
                    + (world_position.z - globals.weather.y)/27000.0 + 0.7);
     var snow_fraction = smoothstep(80.0, 260.0, cold_altitude);
     let override_kind = u32(globals.storm.y + 0.5);
-    if (override_kind == 1u || override_kind == 3u) { snow_fraction = 0.0; }
+    if (override_kind == 1u || override_kind == 3u || override_kind == 4u) { snow_fraction = 0.0; }
     if (override_kind == 2u) { snow_fraction = 1.0; }
     let rain = precipitation*(1.0 - snow_fraction);
     let snow = precipitation*snow_fraction;
     let convective_bias = select(0.0, globals.storm.x, override_kind == 3u);
-    let thunderstorm = rain*smoothstep(0.91, 0.98, score + convective_bias);
+    let thunderstorm = select(rain*smoothstep(0.91, 0.98, score + convective_bias),
+                              0.0, override_kind == 4u);
     let gust = clamp(0.18*precipitation + 0.75*thunderstorm, 0.0, 1.0);
     return vec4<f32>(rain, snow, thunderstorm, gust);
 }

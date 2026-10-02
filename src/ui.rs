@@ -44,7 +44,7 @@ use crate::noise::NoiseField;
 use crate::player::{Player, PlayerCamera, UiWantsInput};
 use crate::render::gpu_textures::GpuWorldTexturesOption;
 use crate::water::{WaterOptics, WaterSettings};
-use crate::weather::{WeatherPreset, WeatherState};
+use crate::weather::{WeatherMotion, WeatherPreset, WeatherState};
 use bevy::math::Vec3;
 use bevy::prelude::*;
 use bevy::render::render_phase::TrackedRenderPass;
@@ -63,16 +63,16 @@ const LATTICE_EXTENT: f32 = 1600.0;
 /// `DrawErosionLattice`'s maximum segment length, in metres.
 const LATTICE_SEGMENT_STEP: f32 = 64.0;
 
-/// Mirrors the C++'s `uiWantsInput`: the panel is open and egui currently
-/// claims the pointer or keyboard. Read before the frame's player update so
-/// gameplay input yields to the panel, exactly as the C++ did.
+/// Read before the frame's player update so gameplay input yields to either
+/// panel and to the trainer launcher when the pointer is over it.
 pub fn ui_wants_input_system(
     settings: Res<AppSettings>,
     egui_wants_input: Res<EguiWantsInput>,
     mut ui_wants_input: ResMut<UiWantsInput>,
 ) {
-    ui_wants_input.0 = settings.show_ui
-        && (egui_wants_input.wants_pointer_input() || egui_wants_input.wants_keyboard_input());
+    ui_wants_input.0 = egui_wants_input.wants_pointer_input()
+        || ((settings.show_ui || settings.show_trainer)
+            && egui_wants_input.wants_keyboard_input());
 }
 
 /// `DrawDiagnostics` plus the three screen-space overlays the C++ drew after
@@ -85,6 +85,7 @@ pub fn draw_diagnostics_ui(
     mut water_settings: ResMut<WaterSettings>,
     mut day_night: ResMut<DayNightCycle>,
     mut weather: ResMut<WeatherState>,
+    weather_motion: Res<WeatherMotion>,
     cache: Res<ErosionCache>,
     noise: Res<NoiseField>,
     players: Query<&Player>,
@@ -97,6 +98,34 @@ pub fn draw_diagnostics_ui(
     let Ok(ctx) = contexts.ctx_mut() else {
         return Ok(());
     };
+
+    if automation.shot_path.is_none() {
+        egui::Area::new(egui::Id::new("trainer_launcher"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 12.0))
+            .show(ctx, |ui| {
+                if ui
+                    .button(if settings.show_trainer {
+                        "Close trainer [Tab]"
+                    } else {
+                        "Trainer [Tab]"
+                    })
+                    .clicked()
+                {
+                    settings.show_trainer = !settings.show_trainer;
+                }
+            });
+    }
+
+    if settings.show_trainer {
+        draw_trainer_window(
+            ctx,
+            &mut settings,
+            &mut day_night,
+            &mut weather,
+            weather_motion.offset,
+            player,
+        );
+    }
 
     if settings.show_ui {
         draw_diagnostics_window(
@@ -133,7 +162,7 @@ pub fn draw_diagnostics_ui(
             pixels_per_point,
         );
     }
-    if player.mouse_captured && !settings.show_ui {
+    if player.mouse_captured && !settings.show_ui && !settings.show_trainer {
         draw_crosshair(&painter, viewport, pixels_per_point);
     }
     if !player.mouse_captured && automation.shot_path.is_none() {
@@ -146,6 +175,88 @@ pub fn draw_diagnostics_ui(
         );
     }
     Ok(())
+}
+
+/// A short path to the controls used most often while exploring the world.
+/// Setting a time holds it in place; the cycle can be resumed explicitly.
+fn draw_trainer_window(
+    ctx: &egui::Context,
+    settings: &mut AppSettings,
+    day_night: &mut DayNightCycle,
+    weather: &mut WeatherState,
+    weather_offset: [f32; 2],
+    player: &Player,
+) {
+    let mut open = settings.show_trainer;
+    let mut show_diagnostics = false;
+    egui::Window::new("Debug trainer")
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, 50.0))
+        .default_width(320.0)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label("Weather here");
+            let selected = weather
+                .trainer_preset
+                .map(WeatherPreset::label)
+                .unwrap_or("Natural weather");
+            let mut requested = weather.trainer_preset;
+            egui::ComboBox::from_id_salt("trainer_weather")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut requested, None, "Natural weather");
+                    for preset in WeatherPreset::ALL {
+                        ui.selectable_value(&mut requested, Some(preset), preset.label());
+                    }
+                });
+            if requested != weather.trainer_preset {
+                weather.set_trainer_preset(requested);
+                weather.refresh_local(
+                    [player.position.x, player.position.y, player.position.z],
+                    weather_offset,
+                    settings,
+                );
+            }
+            ui.small(format!("Current conditions: {}", weather.local_condition().label()));
+            if matches!(
+                weather.trainer_preset,
+                Some(WeatherPreset::Rain | WeatherPreset::Snow | WeatherPreset::Thunderstorm)
+            ) && weather.local_precipitation.intensity() < 0.05
+            {
+                ui.small("Rain and snow fade above the clouds.");
+            }
+            ui.checkbox(&mut weather.automatic, "Move weather fronts");
+
+            ui.separator();
+            ui.label("Time of day");
+            if ui
+                .add(
+                    egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99)
+                        .custom_formatter(|hours, _| {
+                            let minutes = (hours * 60.0).round() as u32 % (24 * 60);
+                            format!("{:02}:{:02}", minutes / 60, minutes % 60)
+                        }),
+                )
+                .changed()
+            {
+                day_night.paused = true;
+            }
+            ui.horizontal(|ui| {
+                for (label, hour) in [("Dawn", 6.25), ("Noon", 12.0), ("Dusk", 17.75), ("Night", 0.0)] {
+                    if ui.button(label).clicked() {
+                        day_night.time_hours = hour;
+                        day_night.paused = true;
+                    }
+                }
+            });
+            ui.checkbox(&mut day_night.paused, "Hold selected time");
+            ui.separator();
+            show_diagnostics = ui.button("Advanced diagnostics...").clicked();
+        });
+    settings.show_trainer = open && !show_diagnostics;
+    if show_diagnostics {
+        settings.show_ui = true;
+    }
 }
 
 /// The "Infinite Terrain Lab" window. Mirrors `DrawDiagnostics` widget for
@@ -501,7 +612,7 @@ fn draw_diagnostics_window(
             ui.label("WASD move  |  mouse look");
             ui.label("Space jump/up  |  Shift down");
             ui.label("V flight  |  Ctrl boost");
-            ui.label("F1 UI  |  Escape release cursor");
+            ui.label("Tab trainer  |  F1 diagnostics  |  Esc release cursor");
             // The C++ printed the noise texture's own dimensions, which are
             // NOISE_RESOLUTION square by construction.
             ui.weak(format!(

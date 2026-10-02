@@ -40,6 +40,7 @@ by naga at runtime either way.
 | Left Shift | Descend while flying |
 | Left Control | Movement boost |
 | V | Toggle flight |
+| Tab | Toggle the debug trainer and release the cursor |
 | F1 | Toggle the diagnostics panel and release the cursor |
 | F12 | Save a timestamped screenshot |
 | Escape | Release the cursor |
@@ -47,7 +48,15 @@ by naga at runtime either way.
 
 Movement is unbounded in both walking and flight modes.
 
-The F1 panel's **Sun and time** section sets the time of day, pauses the cycle,
+The **Trainer [Tab]** button at the top right also opens a compact debug trainer.
+Choose a weather preset to apply it immediately around the player, or choose
+**Natural weather** to return to varied conditions. The **Move weather fronts**
+checkbox controls whether those conditions drift. Set the hour with
+the slider or Dawn, Noon, Dusk and Night buttons; changing it holds the selected
+time until **Hold selected time** is unchecked. **Advanced diagnostics** opens
+the full panel without using F1.
+
+The diagnostics panel's **Sun and time** section sets the time of day, pauses the cycle,
 and changes its duration in real minutes. Dawn, Noon, Dusk and Night buttons
 quickly select a lighting setup. The default starts at 10:00 and completes a
 full day in 24 real minutes. **Raymarched lighting** exposes terrain shadows,
