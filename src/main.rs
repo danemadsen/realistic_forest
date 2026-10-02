@@ -63,12 +63,9 @@ struct RerunErosion(pub bool);
 /// prioritizes the quartet covering the player, so four full-budget
 /// immediate-reveal passes leave the complete four-pass blend ready at spawn.
 /// The port simulates one tile per pass across several frames, so this counts
-/// the passes still owed.
+/// the passes still owed; `--erosion-prewarm` raises it for captures.
 #[derive(Resource)]
 struct PrewarmRemaining(pub u32);
-
-/// `for (int pass = 0; pass < 4; ++pass)` in the C++.
-const PREWARM_PASSES: u32 = 4;
 
 #[derive(Resource, Default)]
 struct FrameCounter(pub u64);
@@ -287,7 +284,7 @@ fn main() {
         .insert_resource(ErosionSettings::default())
         .insert_resource(AppliedErosionSettings(ErosionSettings::default()))
         .insert_resource(RerunErosion::default())
-        .insert_resource(PrewarmRemaining(PREWARM_PASSES))
+        .insert_resource(PrewarmRemaining(automation.erosion_prewarm))
         .insert_resource(FrameCounter::default())
         .insert_resource(ShotRequested::default())
         .init_resource::<player::UiWantsInput>()
@@ -680,6 +677,7 @@ fn measure_overlap_system(
 /// camera for `--wait` frames, then save one screenshot and exit.
 fn shot_scheduling_system(
     automation: Res<AutomationSettings>,
+    cache: Res<ErosionCache>,
     mut counter: ResMut<FrameCounter>,
     mut requested: ResMut<ShotRequested>,
     mut commands: Commands,
@@ -687,6 +685,24 @@ fn shot_scheduling_system(
     let Some(shot_path) = automation.shot_path.clone() else {
         return;
     };
+    // `--wait` counts frames after the prewarmed tiles have settled, so
+    // captures of the same pose compare the same erosion however slowly the
+    // GPU (or a software rasteriser) works through the prewarm. A tile whose
+    // readback failed for good counts as settled, or the capture would wait
+    // on it forever.
+    let settled_tiles = cache
+        .tiles
+        .values()
+        .filter(|tile| {
+            matches!(
+                tile.state,
+                erosion::ErosionTileState::Ready | erosion::ErosionTileState::Failed
+            )
+        })
+        .count();
+    if settled_tiles < automation.erosion_prewarm as usize {
+        return;
+    }
     counter.0 += 1;
     if requested.0 || counter.0 < automation.wait_frames as u64 {
         // A request already made and not yet captured; AppExit is written by

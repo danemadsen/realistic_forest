@@ -1,7 +1,9 @@
 // PORT NOTES (erosion_init.fs -> erosion-init.wgsl):
 // - Single RGBA32F output at @location(0), exactly as the GLSL wrote it
-//   (`finalColor`); both uMode branches write that one output slot (mode 0
-//   stamps terrain state, any other mode clears to 0.0).
+//   (`finalColor`); every uMode branch writes that one output slot (mode 0
+//   stamps terrain state, mode 2 stamps the CPU-routed drainage area, any
+//   other mode clears to 0.0). Terrain A now carries the initial loose cover;
+//   hardness is evaluated from the shared world-keyed geology by each pass.
 // - No hoisted samples: the GLSL only texelFetches, and textureLoad carries no
 //   WGSL uniform-control-flow restriction. No dropped blit flips (the source
 //   has none). No `inverse_*` fields needed (the source inverts no matrices).
@@ -42,13 +44,14 @@ struct GlobalUniforms {
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
 struct StageUniforms {            // uMode, uWorldMin, uCellSize
-    mode: i32,                    // uMode: 0 = stamp terrain state (geology hardness), any other value = clear
+    mode: i32,                    // uMode: 0 = stamp terrain state (initial loose cover),
+                                  // 2 = stamp drainage area, any other value = clear
     world_min: vec2<f32>,         // uWorldMin: world-space XZ corner of texel (0, 0)
     cell_size: f32,               // uCellSize: world units per erosion texel
 };
 @group(2) @binding(0) var<uniform> stage: StageUniforms;
 
-@group(1) @binding(0) var tex0: texture_2d<f32>;  // texture0: base height RGBA32F (texelFetch only)
+@group(1) @binding(0) var tex0: texture_2d<f32>;  // texture0: base height (R) and CPU drainage area (G), RGBA32F, texelFetch only
 @group(1) @binding(8) var tex0_sampler: sampler;  // declared per spec; the GLSL never filters this texture
 
 struct VsOutput {
@@ -63,23 +66,71 @@ fn vs_main(@builtin(vertex_index) vertex: u32) -> VsOutput {
     return output;
 }
 
-fn hash12(position: vec2<f32>) -> f32
+// BEGIN SHARED GEOLOGY
+// World-keyed substrate resistance. The erosion passes and the terrain
+// material shader paste this block verbatim (a test keeps the copies equal),
+// so the rock that resists incision and holds steep faces in the simulation
+// is the same rock the material shader exposes. Every input is a world
+// coordinate, which keeps overlapping erosion tiles deterministic.
+//
+// Broad (~92 m) and fine (~27 m) rock bodies vary hardness without following
+// contours. A weaker bedding term adds gently dipping, warped resistant beds
+// every ~19 m of bedrock elevation: where incision or talus relaxation cuts
+// through them they hold short cliff bands and benches instead of one
+// uniform slope. The bedding is keyed to the bedrock surface, so a bench
+// stays put as loose cover accumulates above it.
+const GEOLOGY_HARDNESS_SCALE: f32 = 0.56;
+
+fn geologyHash(position: vec2<f32>) -> f32
 {
-    var p: vec3<f32> = fract(vec3<f32>(position.xyx) * 0.1031);
+    var p = fract(vec3<f32>(position.xyx) * 0.1031);
     p += dot(p, p.yzx + 33.33);
     return fract((p.x + p.y) * p.z);
 }
 
-fn valueNoise(position: vec2<f32>) -> f32
+fn geologyNoise(position: vec2<f32>) -> f32
 {
     let cell = floor(position);
-    var fraction: vec2<f32> = fract(position);
+    var fraction = fract(position);
     fraction = fraction * fraction * (3.0 - 2.0 * fraction);
-    let a = hash12(cell);
-    let b = hash12(cell + vec2<f32>(1.0, 0.0));
-    let c = hash12(cell + vec2<f32>(0.0, 1.0));
-    let d = hash12(cell + vec2<f32>(1.0, 1.0));
+    let a = geologyHash(cell);
+    let b = geologyHash(cell + vec2<f32>(1.0, 0.0));
+    let c = geologyHash(cell + vec2<f32>(0.0, 1.0));
+    let d = geologyHash(cell + vec2<f32>(1.0, 1.0));
     return mix(mix(a, b, fraction.x), mix(c, d, fraction.x), fraction.y);
+}
+
+// 0 = weak, readily weathered substrate; 1 = the most resistant rock.
+fn geologyResistance(world_xz: vec2<f32>, bedrock_height: f32) -> f32
+{
+    let broadRock = geologyNoise(world_xz / 92.0 + vec2<f32>(31.7, -18.2));
+    let fineRock = geologyNoise(world_xz / 27.0 + vec2<f32>(-73.1, 46.4));
+    let bedWarp = geologyNoise(world_xz / 310.0 + vec2<f32>(-12.9, 57.3)) - 0.5;
+    let bedCoordinate = (bedrock_height + dot(world_xz, vec2<f32>(0.017, -0.011))
+                         + bedWarp * 26.0) / 19.0;
+    let bedding = smoothstep(0.35, 0.85, 0.5 + 0.5 * sin(bedCoordinate * 6.2831853));
+    let geology = broadRock * 0.62 + fineRock * 0.24 + bedding * 0.14;
+    return smoothstep(0.25, 0.82, geology);
+}
+
+// The small spawn footprint resists destructive excavation.
+fn erosionSpawnProtection(world_xz: vec2<f32>) -> f32
+{
+    return 1.0 - smoothstep(90.0, 150.0, length(world_xz));
+}
+
+// Hardness as the erosion solver uses it: scaled resistance, raised to the
+// spawn protection inside its footprint.
+fn erosionHardness(world_xz: vec2<f32>, bedrock_height: f32) -> f32
+{
+    return max(geologyResistance(world_xz, bedrock_height) * GEOLOGY_HARDNESS_SCALE,
+               erosionSpawnProtection(world_xz) * 0.96);
+}
+// END SHARED GEOLOGY
+
+fn baseHeightAt(coord: vec2<i32>, size: vec2<i32>) -> f32
+{
+    return textureLoad(tex0, clamp(coord, vec2<i32>(0), size - vec2<i32>(1)), 0).r;
 }
 
 @fragment
@@ -87,24 +138,37 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
 {
     let size = vec2<i32>(textureDimensions(tex0, 0));
     let coord = clamp(vec2<i32>(position.xy), vec2<i32>(0), size - vec2<i32>(1));
-    let height = textureLoad(tex0, coord, 0).r;
+    let base = textureLoad(tex0, coord, 0);
+    let height = base.r;
     if (stage.mode == 0)
     {
         // Spawn protection belongs to world spawn, not to the centre of every
         // erosion scratch tile. uWorldMin is the world-space XZ corner of texel
         // (0, 0); the half-cell offset addresses texel centres.
         let worldPosition = stage.world_min + (vec2<f32>(coord) + vec2<f32>(0.5)) * stage.cell_size;
-        // World-keyed geology avoids the horizontal contour bands produced by
-        // deriving hardness from height alone. Its two scales are deterministic
-        // in every overlap and expose smaller resistant ribs for runoff to turn
-        // around, which helps branch channels without random per-tile seams.
-        let broadRock = valueNoise(worldPosition / 92.0 + vec2<f32>(31.7, -18.2));
-        let fineRock = valueNoise(worldPosition / 27.0 + vec2<f32>(-73.1, 46.4));
-        let geology = broadRock * 0.72 + fineRock * 0.28;
-        let hardness = smoothstep(0.25, 0.82, geology) * 0.56;
-        let spawnProtection = 1.0 - smoothstep(90.0, 150.0, length(worldPosition));
-        let materialHardness = max(hardness, spawnProtection * 0.96);
-        return vec4<f32>(height, 0.0, height, materialHardness);
+        // Hardness is no longer stamped: every pass evaluates the shared,
+        // world-keyed geology at the bedrock surface it actually exposes.
+        // Terrain A instead carries the loose cover (soil, regolith, talus
+        // and alluvium) above that bedrock. Soil mantles gentle ground,
+        // thins with slope and on resistant rock, and is absent where a face
+        // is already steeper than loose material can stand (~38 degrees).
+        let cell = max(stage.cell_size, 0.0001);
+        let gradient = vec2<f32>(
+            baseHeightAt(coord + vec2<i32>(1, 0), size) - baseHeightAt(coord - vec2<i32>(1, 0), size),
+            baseHeightAt(coord + vec2<i32>(0, 1), size) - baseHeightAt(coord - vec2<i32>(0, 1), size))
+            / (2.0 * cell);
+        let steepness = length(gradient);
+        let resistance = geologyResistance(worldPosition, height);
+        let soilPatch = geologyNoise(worldPosition / 41.0 + vec2<f32>(5.3, -27.7));
+        let looseCover = 1.35 * (1.0 - smoothstep(0.42, 0.78, steepness))
+                       * mix(1.0, 0.45, resistance) * mix(0.70, 1.30, soilPatch);
+        return vec4<f32>(height, 0.0, height, looseCover);
+    }
+    else if (stage.mode == 2)
+    {
+        // The CPU routes the base surface's drainage before the tile starts,
+        // so stream power acts on whole catchments from the first iteration.
+        return vec4<f32>(max(base.g, 0.0), 0.0, 0.0, 0.0);
     }
     else
     {
@@ -113,12 +177,13 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
 }
 
 // STAGE UNIFORMS:
-//   mode      : i32        — uMode: 0 = stamp terrain state (height, height, geology hardness),
+//   mode      : i32        — uMode: 0 = stamp terrain state (height, 0, height, loose cover),
+//                              2 = stamp drainage (area, 0, 0, 0) from texture0.g,
 //                              any other value clears the tile to vec4(0.0)
 //   world_min : vec2<f32>  — uWorldMin: world-space XZ corner of texel (0, 0) of the state texture
 //   cell_size : f32        — uCellSize: world units per erosion texel
 // Rust fill (uniform, 32 bytes, WGSL uniform-address alignment):
 //   [0] mode: i32, [4] pad: f32, [8] world_min: [f32; 2], [16] cell_size: f32, [20] pad: [f32; 3]
-// Textures (group 1): binding 0 = base height RGBA32F (texelFetch-only; bind a
+// Textures (group 1): binding 0 = base height (R) + drainage area (G) RGBA32F (texelFetch-only; bind a
 // non-filtering sampler at binding 8 for layout parity), group 0 binding 0 =
 // shared GlobalUniforms.

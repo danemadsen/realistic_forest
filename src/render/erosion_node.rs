@@ -4,15 +4,17 @@
 //!
 //! Frame flow, in the C++ order:
 //!
-//! 1. an init frame stamps the tile's base heights into the terrain targets
-//!    and clears water and flux (`uMode` 0 then 1), resetting all three
+//! 1. an init frame stamps the tile's base heights and initial loose cover
+//!    into the terrain targets, clears water and flux, and stamps the CPU-
+//!    routed drainage area (`uMode` 0, 1, then 2), resetting all four
 //!    ping-pong indices to zero;
-//! 2. `RunErosionIterations` runs flux -> water -> terrain into the opposite
-//!    targets in that order, so every pass reads the state its predecessor
-//!    wrote in the same iteration;
-//! 3. a finalize frame copies terrain and water back to the CPU, which crops
-//!    the retained footprint, derives the two atlas patches and publishes
-//!    `ErosionEvent::TileFinalized`.
+//! 2. `RunErosionIterations` runs flux -> water -> terrain -> thermal into the
+//!    opposite targets in that order, so every pass reads the state its
+//!    predecessor wrote in the same iteration. The terrain pass writes the
+//!    terrain and drainage states together (two colour targets);
+//! 3. a finalize frame copies terrain, water and drainage back to the CPU,
+//!    which crops the retained footprint, derives the two atlas patches and
+//!    publishes `ErosionEvent::TileFinalized`.
 //!
 //! The main world hands one frame of work over through [`ErosionBridge`]; the
 //! render world owns every GPU object behind [`ErosionSimState`]'s mutex,
@@ -22,9 +24,9 @@
 //!
 //! * `queue.write_buffer` lands before the whole submission, so one uniform
 //!   buffer cannot hold `uMode` 0 for the terrain pass and `uMode` 1 for the
-//!   water/flux passes of the same frame. The init stage therefore owns two
-//!   uniform buffers, one per mode, which preserves the C++ pass order
-//!   exactly.
+//!   water/flux passes of the same frame. The init stage therefore owns one
+//!   uniform buffer per mode (three, with the drainage stamp), which
+//!   preserves the C++ pass order exactly.
 //! * `FinalizeErosionTile` reads the state back synchronously; wgpu only maps
 //!   a buffer asynchronously, and a `map_async` issued in the frame that
 //!   records the copy would wait for the wrong submission. The copy is
@@ -56,8 +58,8 @@ use crate::render::gpu_textures::{
 };
 use crate::render::{
     globals_bind_group_entries, globals_layout, ErosionFluxStageUniforms, ErosionInitStageUniforms,
-    ErosionTerrainStageUniforms, ErosionWaterStageUniforms, ExtractedForestView, ForestGlobals,
-    ForestShaderHandles,
+    ErosionTerrainStageUniforms, ErosionThermalStageUniforms, ErosionWaterStageUniforms,
+    ExtractedForestView, ForestGlobals, ForestShaderHandles,
 };
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -93,7 +95,7 @@ const EROSION_BRUSH_STRENGTH: f32 = 0.35;
 const SIM_TEXEL_BYTES: u32 = 16;
 /// 480 * 16 = 7680, already 256-byte aligned, so the reads need no padding.
 const SIM_ROW_BYTES: u32 = SIM_TEXTURE_SIZE * SIM_TEXEL_BYTES;
-/// One full readback plane (terrain or water): 480 * 480 * 16 bytes.
+/// One full readback plane (terrain, water or drainage): 480 * 480 * 16 bytes.
 const SIM_READBACK_BYTES: u64 = SIM_ROW_BYTES as u64 * SIM_TEXTURE_SIZE as u64;
 const SIM_PIXELS: usize = EROSION_RESOLUTION * EROSION_RESOLUTION;
 /// The lookup texture is one RGBA32F texel per lattice cell.
@@ -254,6 +256,7 @@ pub fn forest_erosion_pass(world: &World, mut ctx: RenderContext) {
 enum ReadbackHalf {
     Terrain,
     Water,
+    Drainage,
 }
 
 /// One half of a readback, as reported by its map callback.
@@ -270,6 +273,7 @@ struct ReadbackSlots {
     key: Option<TileKey>,
     terrain: Option<HalfResult>,
     water: Option<HalfResult>,
+    drainage: Option<HalfResult>,
 }
 
 /// A recorded copy whose map has not been started yet: `map_async` only waits
@@ -278,6 +282,7 @@ struct ReadbackSlots {
 struct StagedReadback {
     terrain: wgpu::Buffer,
     water: wgpu::Buffer,
+    drainage: wgpu::Buffer,
     /// Value of `ErosionSim::frame` when the copy was recorded.
     issued_frame: u64,
 }
@@ -309,6 +314,7 @@ struct ErosionPipelines<'a> {
     flux: &'a RenderPipeline,
     water: &'a RenderPipeline,
     terrain: &'a RenderPipeline,
+    thermal: &'a RenderPipeline,
 }
 
 /// Every GPU object the erosion node owns, mirroring the C++ `HydraulicErosion`
@@ -318,26 +324,30 @@ struct ErosionSim {
     flux_pipeline: CachedRenderPipelineId,
     water_pipeline: CachedRenderPipelineId,
     terrain_pipeline: CachedRenderPipelineId,
+    thermal_pipeline: CachedRenderPipelineId,
 
     /// group(0): the shared per-frame globals buffer.
     globals: BindGroup,
 
-    /// `uMode` 0 and `uMode` 1 init uniforms (see the module PORT NOTES).
-    init_stage_buffers: [wgpu::Buffer; 2],
-    init_stage_groups: [BindGroup; 2],
+    /// `uMode` 0, 1 and 2 init uniforms (see the module PORT NOTES).
+    init_stage_buffers: [wgpu::Buffer; 3],
+    init_stage_groups: [BindGroup; 3],
     flux_stage_buffer: wgpu::Buffer,
     flux_stage_group: BindGroup,
     water_stage_buffer: wgpu::Buffer,
     water_stage_group: BindGroup,
     terrain_stage_buffer: wgpu::Buffer,
     terrain_stage_group: BindGroup,
+    thermal_stage_buffer: wgpu::Buffer,
+    thermal_stage_group: BindGroup,
 
     /// group(1) inputs, pre-built for every ping-pong combination because
     /// bind groups are immutable.
     init_inputs: BindGroup,
     flux_inputs: [[[BindGroup; 2]; 2]; 2],
     water_inputs: [[[BindGroup; 2]; 2]; 2],
-    terrain_inputs: [[BindGroup; 2]; 2],
+    terrain_inputs: [[[BindGroup; 2]; 2]; 2],
+    thermal_inputs: [BindGroup; 2],
 
     /// The short-lived base height map the init passes sample, one Rgba32Float
     /// 480x480 texture reused for every tile (the C++'s `base` Texture2D).
@@ -346,11 +356,13 @@ struct ErosionSim {
     terrain_views: [wgpu::TextureView; 2],
     water_views: [wgpu::TextureView; 2],
     flux_views: [wgpu::TextureView; 2],
+    drainage_views: [wgpu::TextureView; 2],
 
-    /// `terrainIndex`, `waterIndex`, `fluxIndex`.
+    /// `terrainIndex`, `waterIndex`, `fluxIndex`, plus the drainage state.
     terrain_index: usize,
     water_index: usize,
     flux_index: usize,
+    drainage_index: usize,
 
     /// `activeTile` and how many of `settings.iterations` it has run.
     active_tile: Option<TileKey>,
@@ -404,7 +416,8 @@ impl ErosionSim {
         let init_inputs_layout = sim_inputs_layout(1);
         let flux_inputs_layout = sim_inputs_layout(3);
         let water_inputs_layout = sim_inputs_layout(3);
-        let terrain_inputs_layout = sim_inputs_layout(2);
+        let terrain_inputs_layout = sim_inputs_layout(3);
+        let thermal_inputs_layout = sim_inputs_layout(1);
 
         // The C++ sets TEXTURE_FILTER_POINT on the base map and keeps every
         // simulation texture point-sampled; the sim shaders only ever
@@ -423,6 +436,10 @@ impl ErosionSim {
         let flux_views = [
             textures.sim_flux[0].create_view(&Default::default()),
             textures.sim_flux[1].create_view(&Default::default()),
+        ];
+        let drainage_views = [
+            textures.sim_drainage[0].create_view(&Default::default()),
+            textures.sim_drainage[1].create_view(&Default::default()),
         ];
 
         let base_texture = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
@@ -451,7 +468,8 @@ impl ErosionSim {
 
         // `RunErosionIterations` feeds each pass the state it must read: flux
         // takes (flux, terrain, water), water takes (water, flux, terrain) —
-        // after the flux flip — and terrain takes (terrain, water).
+        // after the flux flip — terrain takes (terrain, water, drainage) and
+        // thermal takes the terrain the terrain pass just wrote.
         let flux_inputs = std::array::from_fn(|flux_index| {
             std::array::from_fn(|terrain_index| {
                 std::array::from_fn(|water_index| {
@@ -490,49 +508,68 @@ impl ErosionSim {
         });
         let terrain_inputs = std::array::from_fn(|terrain_index| {
             std::array::from_fn(|water_index| {
-                target_bind_group(
-                    device,
-                    pipeline_cache,
-                    "erosion_terrain_inputs",
-                    &terrain_inputs_layout,
-                    &[&terrain_views[terrain_index], &water_views[water_index]],
-                    &sampler,
-                )
+                std::array::from_fn(|drainage_index| {
+                    target_bind_group(
+                        device,
+                        pipeline_cache,
+                        "erosion_terrain_inputs",
+                        &terrain_inputs_layout,
+                        &[
+                            &terrain_views[terrain_index],
+                            &water_views[water_index],
+                            &drainage_views[drainage_index],
+                        ],
+                        &sampler,
+                    )
+                })
             })
         });
+        let thermal_inputs = std::array::from_fn(|terrain_index| {
+            target_bind_group(
+                device,
+                pipeline_cache,
+                "erosion_thermal_inputs",
+                &thermal_inputs_layout,
+                &[&terrain_views[terrain_index]],
+                &sampler,
+            )
+        });
 
-        // Two init uniforms: `queue.write_buffer` is ordered before the whole
-        // submission, so one buffer cannot hold `uMode` 0 and `uMode` 1 within
-        // the same frame (see the module PORT NOTES).
+        // One init uniform per mode: `queue.write_buffer` is ordered before
+        // the whole submission, so one buffer cannot hold `uMode` 0, 1 and 2
+        // within the same frame (see the module PORT NOTES).
         let init_stage_buffers = [
             stage_buffer(device, "erosion_init_mode_0"),
             stage_buffer(device, "erosion_init_mode_1"),
+            stage_buffer(device, "erosion_init_mode_2"),
         ];
         let init_stage_groups = [
-            super::bind_group(
+            stage_bind_group(
                 device,
                 pipeline_cache,
+                &stage_layout,
                 "erosion_init_stage_0",
-                &stage_layout,
-                &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: init_stage_buffers[0].as_entire_binding(),
-                }],
+                &init_stage_buffers[0],
             ),
-            super::bind_group(
+            stage_bind_group(
                 device,
                 pipeline_cache,
-                "erosion_init_stage_1",
                 &stage_layout,
-                &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: init_stage_buffers[1].as_entire_binding(),
-                }],
+                "erosion_init_stage_1",
+                &init_stage_buffers[1],
+            ),
+            stage_bind_group(
+                device,
+                pipeline_cache,
+                &stage_layout,
+                "erosion_init_stage_2",
+                &init_stage_buffers[2],
             ),
         ];
         let flux_stage_buffer = stage_buffer(device, "erosion_flux_stage");
         let water_stage_buffer = stage_buffer(device, "erosion_water_stage");
         let terrain_stage_buffer = stage_buffer(device, "erosion_terrain_stage");
+        let thermal_stage_buffer = stage_buffer(device, "erosion_thermal_stage");
         let flux_stage_group = stage_bind_group(
             device,
             pipeline_cache,
@@ -554,32 +591,51 @@ impl ErosionSim {
             "erosion_terrain_stage_group",
             &terrain_stage_buffer,
         );
+        let thermal_stage_group = stage_bind_group(
+            device,
+            pipeline_cache,
+            &stage_layout,
+            "erosion_thermal_stage_group",
+            &thermal_stage_buffer,
+        );
 
         // Layouts: globals, inputs, stage uniforms. The sim shaders take no
-        // vertex buffers and write one colour target.
+        // vertex buffers; all but the terrain pass write one colour target.
         let init_pipeline = queue_erosion_pipeline(
             pipeline_cache,
             "erosion_init_pipeline",
             handles.erosion_init.clone(),
             vec![globals_layout.clone(), init_inputs_layout, stage_layout.clone()],
+            1,
         );
         let flux_pipeline = queue_erosion_pipeline(
             pipeline_cache,
             "erosion_flux_pipeline",
             handles.erosion_flux.clone(),
             vec![globals_layout.clone(), flux_inputs_layout, stage_layout.clone()],
+            1,
         );
         let water_pipeline = queue_erosion_pipeline(
             pipeline_cache,
             "erosion_water_pipeline",
             handles.erosion_water.clone(),
             vec![globals_layout.clone(), water_inputs_layout, stage_layout.clone()],
+            1,
         );
+        // Terrain and drainage states.
         let terrain_pipeline = queue_erosion_pipeline(
             pipeline_cache,
             "erosion_terrain_pipeline",
             handles.erosion_terrain.clone(),
-            vec![globals_layout, terrain_inputs_layout, stage_layout.clone()],
+            vec![globals_layout.clone(), terrain_inputs_layout, stage_layout.clone()],
+            2,
+        );
+        let thermal_pipeline = queue_erosion_pipeline(
+            pipeline_cache,
+            "erosion_thermal_pipeline",
+            handles.erosion_thermal.clone(),
+            vec![globals_layout, thermal_inputs_layout, stage_layout.clone()],
+            1,
         );
 
         Self {
@@ -587,6 +643,7 @@ impl ErosionSim {
             flux_pipeline,
             water_pipeline,
             terrain_pipeline,
+            thermal_pipeline,
             globals,
             init_stage_buffers,
             init_stage_groups,
@@ -596,17 +653,22 @@ impl ErosionSim {
             water_stage_group,
             terrain_stage_buffer,
             terrain_stage_group,
+            thermal_stage_buffer,
+            thermal_stage_group,
             init_inputs,
             flux_inputs,
             water_inputs,
             terrain_inputs,
+            thermal_inputs,
             base_texture,
             terrain_views,
             water_views,
             flux_views,
+            drainage_views,
             terrain_index: 0,
             water_index: 0,
             flux_index: 0,
+            drainage_index: 0,
             active_tile: None,
             active_iterations: 0,
             settings: ErosionSettings::default(),
@@ -627,6 +689,7 @@ impl ErosionSim {
             flux: cache.get_render_pipeline(self.flux_pipeline)?,
             water: cache.get_render_pipeline(self.water_pipeline)?,
             terrain: cache.get_render_pipeline(self.terrain_pipeline)?,
+            thermal: cache.get_render_pipeline(self.thermal_pipeline)?,
         })
     }
 
@@ -641,25 +704,28 @@ impl ErosionSim {
         self.deferred = Some(commands);
     }
 
-    /// `uMode` 0 and `uMode` 1 init uniforms, the base height upload and the
-    /// six init passes (`InitializeErosionTextures`).
+    /// `uMode` 0, 1 and 2 init uniforms, the base height and drainage upload
+    /// and the eight init passes (`InitializeErosionTextures`).
+    #[allow(clippy::too_many_arguments)]
     fn initialize_tile(
         &mut self,
         init_key: TileKey,
         base_height: &[f32],
+        drainage_area: &[f32],
         sim_min: [f32; 2],
         queue: &RenderQueue,
         context: &mut RenderContext<'_, '_>,
         pipelines: &ErosionPipelines<'_>,
     ) {
         if base_height.len() == SIM_PIXELS {
-            // The C++ uploads R32; the port uploads Rgba32Float because the
-            // shader only ever reads `.r` and R32Float is not filterable on
-            // every backend. One row is 480 * 16 = 7680 bytes, already
-            // 256-byte aligned.
+            // The C++ uploads R32; the port uploads Rgba32Float because R32Float
+            // is not filterable on every backend, and carries the CPU-routed
+            // drainage area in G for the `uMode` 2 stamp. One row is
+            // 480 * 16 = 7680 bytes, already 256-byte aligned.
             let mut pixels = Vec::with_capacity(SIM_PIXELS * 4);
-            for height in base_height {
-                pixels.extend_from_slice(&[*height, 0.0, 0.0, 1.0]);
+            for (index, height) in base_height.iter().enumerate() {
+                let area = drainage_area.get(index).copied().unwrap_or(1.0);
+                pixels.extend_from_slice(&[*height, area, 0.0, 1.0]);
             }
             queue.write_texture(
                 self.base_texture.as_image_copy(),
@@ -692,9 +758,12 @@ impl ErosionSim {
         queue.write_buffer(&self.init_stage_buffers[0], 0, bytemuck::bytes_of(&uniforms));
         uniforms.mode = 1;
         queue.write_buffer(&self.init_stage_buffers[1], 0, bytemuck::bytes_of(&uniforms));
+        uniforms.mode = 2;
+        queue.write_buffer(&self.init_stage_buffers[2], 0, bytemuck::bytes_of(&uniforms));
 
         // for (int i = 0; i < 2; ++i): terrain keeps the stamped state, water
-        // and flux are cleared, and both scratch copies start identical.
+        // and flux are cleared, drainage takes the routed base catchments,
+        // and both scratch copies start identical.
         for index in 0..2 {
             record_erosion_pass(
                 context,
@@ -720,11 +789,20 @@ impl ErosionSim {
                 &self.init_stage_groups[1],
                 &self.flux_views[index],
             );
+            record_erosion_pass(
+                context,
+                pipelines.init,
+                &self.globals,
+                &self.init_inputs,
+                &self.init_stage_groups[2],
+                &self.drainage_views[index],
+            );
         }
 
         self.terrain_index = 0;
         self.water_index = 0;
         self.flux_index = 0;
+        self.drainage_index = 0;
         self.active_tile = Some(init_key);
         self.active_iterations = 0;
         self.delivered = None;
@@ -766,11 +844,28 @@ impl ErosionSim {
         terrain.guard_band_pixels = EROSION_GUARD_BAND_PIXELS;
         terrain.brush_strength = EROSION_BRUSH_STRENGTH;
         terrain.world_min = sim_min;
+        terrain.fluvial_capacity = self.settings.fluvial_capacity;
+        terrain.fluvial_erosion = self.settings.fluvial_erosion;
+        terrain.fluvial_deposition = self.settings.fluvial_deposition;
+        terrain.maximum_incision = self.settings.maximum_incision;
+        terrain.drainage_saturation = EROSION_DRAINAGE_SATURATION;
         queue.write_buffer(&self.terrain_stage_buffer, 0, bytemuck::bytes_of(&terrain));
+
+        let mut thermal = ErosionThermalStageUniforms::zeroed();
+        thermal.resolution = resolution;
+        thermal.cell_size = EROSION_CELL_SIZE;
+        thermal.sea_level = SEA_LEVEL;
+        thermal.world_min = sim_min;
+        thermal.loose_rate = self.settings.talus_rate;
+        thermal.rock_rate = self.settings.rockfall_rate;
+        thermal.loose_repose = EROSION_LOOSE_REPOSE;
+        thermal.soft_rock_slope = EROSION_SOFT_ROCK_SLOPE;
+        thermal.hard_rock_slope = EROSION_HARD_ROCK_SLOPE;
+        queue.write_buffer(&self.thermal_stage_buffer, 0, bytemuck::bytes_of(&thermal));
     }
 
-    /// `RunErosionIterations`: flux, water and terrain into the opposite
-    /// targets, `count` times.
+    /// `RunErosionIterations`: flux, water, terrain (with drainage) and
+    /// thermal into the opposite targets, `count` times.
     fn run_iterations(
         &mut self,
         count: usize,
@@ -801,12 +896,25 @@ impl ErosionSim {
             self.water_index = next_water;
 
             let next_terrain = 1 - self.terrain_index;
-            record_erosion_pass(
+            let next_drainage = 1 - self.drainage_index;
+            record_erosion_pass_targets(
                 context,
                 pipelines.terrain,
                 &self.globals,
-                &self.terrain_inputs[self.terrain_index][self.water_index],
+                &self.terrain_inputs[self.terrain_index][self.water_index][self.drainage_index],
                 &self.terrain_stage_group,
+                &[&self.terrain_views[next_terrain], &self.drainage_views[next_drainage]],
+            );
+            self.terrain_index = next_terrain;
+            self.drainage_index = next_drainage;
+
+            let next_terrain = 1 - self.terrain_index;
+            record_erosion_pass(
+                context,
+                pipelines.thermal,
+                &self.globals,
+                &self.thermal_inputs[self.terrain_index],
+                &self.thermal_stage_group,
                 &self.terrain_views[next_terrain],
             );
             self.terrain_index = next_terrain;
@@ -882,6 +990,7 @@ impl ErosionSim {
             self.initialize_tile(
                 init.key,
                 &init.base_height,
+                &init.drainage_area,
                 commands.sim_min,
                 queue,
                 context,
@@ -922,13 +1031,18 @@ impl ErosionSim {
             let Ok(mut slots) = self.readback.lock() else {
                 return false;
             };
-            // A half can arrive after its pair failed, with no key: drop it,
+            // A plane can arrive after its set failed, with no key: drop it,
             // or it would block every later readback.
             if slots.key.is_none() {
                 slots.terrain = None;
                 slots.water = None;
+                slots.drainage = None;
             }
-            if slots.key.is_some() || slots.terrain.is_some() || slots.water.is_some() {
+            if slots.key.is_some()
+                || slots.terrain.is_some()
+                || slots.water.is_some()
+                || slots.drainage.is_some()
+            {
                 return false;
             }
             slots.key = Some(key);
@@ -936,6 +1050,7 @@ impl ErosionSim {
 
         let terrain_buffer = take_staging_buffer(device, &self.pool);
         let water_buffer = take_staging_buffer(device, &self.pool);
+        let drainage_buffer = take_staging_buffer(device, &self.pool);
         let layout = wgpu::TexelCopyBufferLayout {
             offset: 0,
             bytes_per_row: Some(SIM_ROW_BYTES),
@@ -962,10 +1077,19 @@ impl ErosionSim {
             },
             extent,
         );
+        encoder.copy_texture_to_buffer(
+            textures.sim_drainage[self.drainage_index].as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &drainage_buffer,
+                layout,
+            },
+            extent,
+        );
 
         self.staged = Some(StagedReadback {
             terrain: terrain_buffer,
             water: water_buffer,
+            drainage: drainage_buffer,
             issued_frame: self.frame,
         });
         true
@@ -980,10 +1104,10 @@ impl ErosionSim {
         let Some(staged) = self.staged.take() else {
             return;
         };
-        // One per half: each `map_readback` callback subtracts one, and the
+        // One per plane: each `map_readback` callback subtracts one, and the
         // count has to land back on exactly zero or `issue_readback` (which
         // refuses to start while a readback is outstanding) never runs again.
-        self.in_flight.fetch_add(2, Ordering::SeqCst);
+        self.in_flight.fetch_add(3, Ordering::SeqCst);
         map_readback(
             staged.terrain,
             self.readback.clone(),
@@ -998,6 +1122,13 @@ impl ErosionSim {
             self.in_flight.clone(),
             ReadbackHalf::Water,
         );
+        map_readback(
+            staged.drainage,
+            self.readback.clone(),
+            self.pool.clone(),
+            self.in_flight.clone(),
+            ReadbackHalf::Drainage,
+        );
     }
 
     /// Consumes a completed readback and runs the finalize half of
@@ -1009,15 +1140,20 @@ impl ErosionSim {
         let Some(key) = slots.key else {
             return ReadbackOutcome::Idle;
         };
-        let outcome = match (slots.terrain.take(), slots.water.take()) {
-            (Some(HalfResult::Ready(terrain)), Some(HalfResult::Ready(water))) => {
-                Ok((terrain, water))
-            }
-            (Some(HalfResult::Failed), _) | (_, Some(HalfResult::Failed)) => Err(()),
-            (terrain, water) => {
-                // One half is still in flight; put back what arrived.
+        let outcome = match (slots.terrain.take(), slots.water.take(), slots.drainage.take()) {
+            (
+                Some(HalfResult::Ready(terrain)),
+                Some(HalfResult::Ready(water)),
+                Some(HalfResult::Ready(drainage)),
+            ) => Ok((terrain, water, drainage)),
+            (Some(HalfResult::Failed), _, _)
+            | (_, Some(HalfResult::Failed), _)
+            | (_, _, Some(HalfResult::Failed)) => Err(()),
+            (terrain, water, drainage) => {
+                // A plane is still in flight; put back what arrived.
                 slots.terrain = terrain;
                 slots.water = water;
+                slots.drainage = drainage;
                 return ReadbackOutcome::Idle;
             }
         };
@@ -1025,10 +1161,13 @@ impl ErosionSim {
         drop(slots);
 
         match outcome {
-            Ok((terrain, water))
-                if terrain.len() == SIM_PIXELS * 4 && water.len() == SIM_PIXELS * 4 =>
+            Ok((terrain, water, drainage))
+                if terrain.len() == SIM_PIXELS * 4
+                    && water.len() == SIM_PIXELS * 4
+                    && drainage.len() == SIM_PIXELS * 4 =>
             {
-                let (tile, atlas_height, atlas_flow) = finalize_erosion_tile(key, &terrain, &water);
+                let (tile, atlas_height, atlas_flow) =
+                    finalize_erosion_tile(key, &terrain, &water, &drainage);
                 self.delivered = Some(key);
                 self.pending_atlas.push(PendingAtlasPatch {
                     key,
@@ -1136,6 +1275,7 @@ fn finalize_erosion_tile(
     key: TileKey,
     terrain_rgba: &[f32],
     flow_rgba: &[f32],
+    drainage_rgba: &[f32],
 ) -> (FinalizedTile, Vec<f32>, Vec<f32>) {
     let resolution = EROSION_RESOLUTION;
     let output_resolution = EROSION_OUTPUT_RESOLUTION;
@@ -1147,9 +1287,12 @@ fn finalize_erosion_tile(
 
     // Preserve signed displacement in R for rendering and collision. The
     // remaining channels describe the final bed: G concavity (metres),
-    // B local discharge concentration (positive log2 ratio), A hardness.
+    // B drainage concentration (positive log2 ratio of contributing area
+    // against the surrounding ring), A loose cover thickness (metres). The
+    // flow patch keeps the solver's water depth and velocity and carries the
+    // routed contributing area, in cells, in A.
     const MATERIAL_RING_OFFSET: usize = 3;
-    const DISCHARGE_EPSILON: f32 = 0.002;
+    const DRAINAGE_EPSILON: f32 = 1.0;
 
     let mut minimum = f32::INFINITY;
     let mut maximum = f32::NEG_INFINITY;
@@ -1158,6 +1301,9 @@ fn finalize_erosion_tile(
     let mut flow_axis_bias = 0.0f64;
     let mut moving_flow_cells = 0usize;
     let mut land_cells = 0usize;
+    let mut maximum_drainage = 0.0f32;
+    let mut bare_cells = 0usize;
+    let mut loose_total = 0.0f64;
     for output_z in 0..output_resolution {
         for output_x in 0..output_resolution {
             let source_x = output_x + EROSION_OUTPUT_OFFSET;
@@ -1172,7 +1318,7 @@ fn finalize_erosion_tile(
             // Sample the simulation halo too, so the 12 m axial ring does not
             // flatten at the retained footprint's edges.
             let mut surrounding_height = 0.0f32;
-            let mut surrounding_discharge = 0.0f32;
+            let mut surrounding_drainage = 0.0f32;
             for ring_z in -1i64..=1 {
                 for ring_x in -1i64..=1 {
                     if ring_x == 0 && ring_z == 0 {
@@ -1184,28 +1330,36 @@ fn finalize_erosion_tile(
                         (source_x as i64 + ring_x * MATERIAL_RING_OFFSET as i64) as usize;
                     let neighbour = neighbour_z * resolution + neighbour_x;
                     surrounding_height += terrain_rgba[neighbour * 4];
-                    surrounding_discharge += flow_rgba[neighbour * 4 + 3];
+                    surrounding_drainage += drainage_rgba[neighbour * 4].max(0.0);
                 }
             }
             surrounding_height *= 0.125;
-            surrounding_discharge *= 0.125;
+            surrounding_drainage *= 0.125;
+            let drainage_area = drainage_rgba[source * 4].max(0.0);
             output_height[destination * 4] = delta;
             output_height[destination * 4 + 1] = surrounding_height - height;
-            output_height[destination * 4 + 2] = ((flow_rgba[source * 4 + 3] + DISCHARGE_EPSILON)
-                / (surrounding_discharge + DISCHARGE_EPSILON))
+            output_height[destination * 4 + 2] = ((drainage_area + DRAINAGE_EPSILON)
+                / (surrounding_drainage + DRAINAGE_EPSILON))
                 .log2()
                 .max(0.0);
-            output_height[destination * 4 + 3] = terrain_rgba[source * 4 + 3];
-            for channel in 0..4 {
+            output_height[destination * 4 + 3] = terrain_rgba[source * 4 + 3].max(0.0);
+            for channel in 0..3 {
                 output_flow[destination * 4 + channel] = flow_rgba[source * 4 + channel];
             }
+            output_flow[destination * 4 + 3] = drainage_area;
             minimum = minimum.min(height);
             maximum = maximum.max(height);
             minimum_delta = minimum_delta.min(delta);
             maximum_delta = maximum_delta.max(delta);
             if height > SEA_LEVEL {
                 land_cells += 1;
+                let loose = terrain_rgba[source * 4 + 3].max(0.0);
+                loose_total += loose as f64;
+                if loose < 0.1 {
+                    bare_cells += 1;
+                }
             }
+            maximum_drainage = maximum_drainage.max(drainage_area);
 
             let velocity_x = flow_rgba[source * 4 + 1];
             let velocity_z = flow_rgba[source * 4 + 2];
@@ -1273,6 +1427,9 @@ fn finalize_erosion_tile(
         } else {
             0.0
         },
+        maximum_drainage,
+        bedrock_exposure: 100.0 * bare_cells as f32 / land_cells.max(1) as f32,
+        mean_loose_cover: (loose_total / land_cells.max(1) as f64) as f32,
     };
 
     let tile = FinalizedTile {
@@ -1372,9 +1529,11 @@ fn make_sim_sampler(device: &RenderDevice) -> wgpu::Sampler {
 }
 
 fn stage_buffer(device: &RenderDevice, label: &str) -> wgpu::Buffer {
+    // Large enough for every erosion stage struct (the terrain pass's 88
+    // bytes is the largest).
     device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
-        size: 64,
+        size: 128,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
@@ -1399,15 +1558,16 @@ fn stage_bind_group(
     )
 }
 
-/// Queues one simulation pipeline: a full-screen triangle into a single
-/// Rgba32Float target, no vertex buffers, no depth, no blending (the C++
-/// calls `rlDisableColorBlend` because alpha carries hardness, flux or
+/// Queues one simulation pipeline: a full-screen triangle into `targets`
+/// Rgba32Float targets, no vertex buffers, no depth, no blending (the C++
+/// calls `rlDisableColorBlend` because alpha carries loose cover, flux or
 /// discharge).
 fn queue_erosion_pipeline(
     cache: &PipelineCache,
     label: &'static str,
     shader: Handle<Shader>,
     layouts: Vec<BindGroupLayoutDescriptor>,
+    targets: usize,
 ) -> CachedRenderPipelineId {
     cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some(label.into()),
@@ -1436,11 +1596,15 @@ fn queue_erosion_pipeline(
             shader,
             shader_defs: vec![],
             entry_point: Some("fs_main".into()),
-            targets: vec![Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba32Float,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
+            targets: (0..targets)
+                .map(|_| {
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba32Float,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })
+                })
+                .collect(),
         }),
         zero_initialize_workgroup_memory: false,
     })
@@ -1454,20 +1618,39 @@ fn record_erosion_pass(
     stage: &BindGroup,
     target: &wgpu::TextureView,
 ) {
+    record_erosion_pass_targets(context, pipeline, globals, inputs, stage, &[target]);
+}
+
+/// One full-screen simulation pass into every view of `targets`, in
+/// `@location` order.
+fn record_erosion_pass_targets(
+    context: &mut RenderContext<'_, '_>,
+    pipeline: &RenderPipeline,
+    globals: &BindGroup,
+    inputs: &BindGroup,
+    stage: &BindGroup,
+    targets: &[&wgpu::TextureView],
+) {
+    let color_attachments: Vec<Option<RenderPassColorAttachment>> = targets
+        .iter()
+        .map(|target| {
+            Some(RenderPassColorAttachment {
+                view: target,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    // BeginTextureMode leaves the target's contents in place,
+                    // and the full-screen triangle overwrites every texel of
+                    // the 480x480 target, so the load value is unobservable.
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })
+        })
+        .collect();
     let mut pass = context.begin_tracked_render_pass(RenderPassDescriptor {
         label: Some("erosion_pass"),
-        color_attachments: &[Some(RenderPassColorAttachment {
-            view: target,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                // BeginTextureMode leaves the target's contents in place, and
-                // the full-screen triangle overwrites every texel of the
-                // 480x480 target, so the load value is unobservable.
-                load: wgpu::LoadOp::Load,
-                store: wgpu::StoreOp::Store,
-            },
-        })],
+        color_attachments: &color_attachments,
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,
@@ -1529,6 +1712,7 @@ fn map_readback(
             match half {
                 ReadbackHalf::Terrain => slots.terrain = Some(outcome),
                 ReadbackHalf::Water => slots.water = Some(outcome),
+                ReadbackHalf::Drainage => slots.drainage = Some(outcome),
             }
         }
         // Last, so a zero count means both halves are already stored.

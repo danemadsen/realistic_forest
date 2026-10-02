@@ -32,6 +32,9 @@ use bevy::prelude::Resource;
 /// mouse. `--lattice` overlays the 512 m erosion-tile grid on the capture;
 /// `--no-fog` zeroes the composite fog density and `--no-water` skips the
 /// ocean plane so tile-boundary geometry stays measurable.
+/// `--erosion-prewarm N` simulates the N nearest erosion tiles at full budget
+/// before the first frame instead of the default four, so a capture can show
+/// the eroded landscape well beyond the player's own lattice cell.
 /// `--measure-overlap [--overlap-tile x,z]` simulates one adjacent tile pair,
 /// prints the per-metre height disagreement across their shared overlap as
 /// CSV, and exits — the seam regression check for the erosion boundaries.
@@ -82,6 +85,8 @@ pub struct AutomationSettings {
     pub cloud_thickness_override: bool,
     pub overlap_tile: TileKey,
     pub lightning: Option<ForcedLightning>,
+    /// Tiles simulated at the full iteration budget before streaming starts.
+    pub erosion_prewarm: u32,
 }
 
 impl Default for AutomationSettings {
@@ -121,9 +126,14 @@ impl Default for AutomationSettings {
             cloud_thickness_override: false,
             overlap_tile: TileKey { x: 0, z: 0 },
             lightning: None,
+            erosion_prewarm: DEFAULT_EROSION_PREWARM,
         }
     }
 }
+
+/// `for (int pass = 0; pass < 4; ++pass)` in the C++: the four full-budget
+/// passes leave the quartet covering the player ready at spawn.
+pub const DEFAULT_EROSION_PREWARM: u32 = 4;
 
 const DEG_TO_RAD: f32 = std::f32::consts::PI / 180.0;
 
@@ -204,6 +214,18 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                         .map(|value| value as i32)
                         .unwrap_or(0)
                         .max(1);
+                }
+            }
+            "--erosion-prewarm" => {
+                if let Some(next) = next {
+                    index += 1;
+                    // The 9x9 streaming cache holds at most 81 tiles.
+                    automation.erosion_prewarm = next
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|value| value.is_finite())
+                        .map(|value| value.clamp(1.0, 81.0) as u32)
+                        .unwrap_or(DEFAULT_EROSION_PREWARM);
                 }
             }
             "--probe" => automation.probe = true,
@@ -407,6 +429,19 @@ mod tests {
 
     fn parse(arguments: &[&str]) -> AutomationSettings {
         parse_automation(arguments.iter().map(|value| (*value).to_string()))
+    }
+
+    #[test]
+    fn erosion_prewarm_is_bounded_and_keeps_following_flags() {
+        assert_eq!(parse(&[]).erosion_prewarm, DEFAULT_EROSION_PREWARM);
+        assert_eq!(parse(&["--erosion-prewarm", "16"]).erosion_prewarm, 16);
+        assert_eq!(parse(&["--erosion-prewarm", "500"]).erosion_prewarm, 81);
+        assert_eq!(parse(&["--erosion-prewarm", "0"]).erosion_prewarm, 1);
+        for invalid in ["NaN", "inf", "bad"] {
+            let settings = parse(&["--erosion-prewarm", invalid, "--pause-time"]);
+            assert_eq!(settings.erosion_prewarm, DEFAULT_EROSION_PREWARM);
+            assert!(settings.pause_time);
+        }
     }
 
     #[test]

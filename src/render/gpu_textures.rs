@@ -344,10 +344,11 @@ pub struct GpuWorldTextures {
     pub lookup_view: wgpu::TextureView,
     /// R32 blend mask (bilinear, clamp — the C++ sets CLAMP here).
     pub blend_mask_view: wgpu::TextureView,
-    /// RGBA32F pairs (point) for terrain/water/flux simulation state.
+    /// RGBA32F pairs (point) for terrain/water/flux/drainage simulation state.
     pub sim_terrain: [wgpu::Texture; 2],
     pub sim_water: [wgpu::Texture; 2],
     pub sim_flux: [wgpu::Texture; 2],
+    pub sim_drainage: [wgpu::Texture; 2],
     pub albedo_array_view: wgpu::TextureView,
     pub normal_rough_array_view: wgpu::TextureView,
     /// Rgba8Unorm 4x4 rotation noise (point, repeat).
@@ -671,6 +672,10 @@ pub fn prepare_gpu_textures(
         sim_texture(device, "sim_flux_0"),
         sim_texture(device, "sim_flux_1"),
     ];
+    let sim_drainage = [
+        sim_texture(device, "sim_drainage_0"),
+        sim_texture(device, "sim_drainage_1"),
+    ];
 
     // PBR texture arrays with CPU-built mip chains (wgpu cannot generate
     // array mips on the GPU), trilinear + repeat + max anisotropy.
@@ -795,6 +800,7 @@ pub fn prepare_gpu_textures(
         sim_terrain,
         sim_water,
         sim_flux,
+        sim_drainage,
         albedo_array_view,
         normal_rough_array_view,
         ssao_noise_view,

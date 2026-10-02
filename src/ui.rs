@@ -343,6 +343,12 @@ fn draw_diagnostics_window(
                 "Detail: {:.3}  flow axis bias: {:.3}",
                 cache.stats.erosion_detail, cache.stats.flow_axis_bias
             ));
+            ui.label(format!(
+                "Drainage: {:.0} cells  bare rock: {:.1}%  cover: {:.2} m",
+                cache.stats.maximum_drainage,
+                cache.stats.bedrock_exposure,
+                cache.stats.mean_loose_cover
+            ));
 
             separator_text(ui, "Weather");
             ui.checkbox(&mut weather.automatic, "Moving weather fronts");
@@ -585,7 +591,7 @@ fn draw_diagnostics_window(
                 ui.checkbox(&mut water_settings.flat_surface, "Flat surface (debug)");
             });
 
-            separator_text(ui, "Hydraulic erosion");
+            separator_text(ui, "Erosion");
             ui.add(egui::Slider::new(&mut erosion_settings.iterations, 20..=400).text("Iterations"));
             ui.add(egui::Slider::new(&mut erosion_settings.rain, 0.0..=0.08).text("Rain"));
             ui.add(
@@ -607,6 +613,32 @@ fn draw_diagnostics_window(
                     .fixed_decimals(1)
                     .suffix(" m"),
             );
+            ui.add(
+                egui::Slider::new(&mut erosion_settings.fluvial_capacity, 0.0..=0.2)
+                    .text("Stream power"),
+            );
+            ui.add(
+                egui::Slider::new(&mut erosion_settings.fluvial_erosion, 0.0..=0.5)
+                    .text("Channel incision"),
+            );
+            ui.add(
+                egui::Slider::new(&mut erosion_settings.fluvial_deposition, 0.0..=1.0)
+                    .text("Alluvial deposition"),
+            );
+            ui.add(
+                egui::Slider::new(&mut erosion_settings.maximum_incision, 0.0..=30.0)
+                    .text("Max incision")
+                    .fixed_decimals(1)
+                    .suffix(" m"),
+            );
+            ui.add(
+                egui::Slider::new(&mut erosion_settings.talus_rate, 0.0..=0.0625)
+                    .text("Talus slide"),
+            );
+            ui.add(
+                egui::Slider::new(&mut erosion_settings.rockfall_rate, 0.0..=0.0625)
+                    .text("Rockfall"),
+            );
             ui.horizontal(|ui| {
                 if ui.button("Regenerate erosion cache").clicked() {
                     rerun.0 = true;
@@ -614,7 +646,7 @@ fn draw_diagnostics_window(
                 ui.weak("(streams incrementally)");
             });
             ui.collapsing("Flow output", |ui| {
-                ui.label("RGBA: water, velocity X, velocity Z, discharge");
+                ui.label("RGBA: water, velocity X, velocity Z, drainage area");
                 let (response, painter) =
                     ui.allocate_painter(egui::vec2(320.0, 320.0), egui::Sense::hover());
                 painter.add(EguiBevyPaintCallback::new_paint_callback(

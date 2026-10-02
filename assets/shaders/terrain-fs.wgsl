@@ -116,16 +116,18 @@ struct StageUniforms {
     waterline_push_land: f32,              // uWaterlinePushLand (vertex stage)
     waterline_push_sea: f32,               // uWaterlinePushSea (vertex stage)
     waterline_push_scale: f32,             // uWaterlinePushScale (vertex stage)
+    snowline_altitude: f32,                // centre of the persistent snowline above sea level
 };
 @group(2) @binding(0) var<uniform> stage: StageUniforms;
 
 // GL texture unit numbers preserved (see PORTING-SPEC section 3): texture at
 // binding N, sampler at binding N + 8.
-// Native hydraulic result packing:
+// Flow atlas packing:
 //   R = water depth, G = signed velocity X, B = signed velocity Z,
-//   A = accumulated discharge.
-// Surface atlas: signed bed delta (m), local concavity (m), discharge
-// concentration (positive log2 ratio), and simulated substrate hardness.
+//   A = routed contributing area in 4x4 m cells.
+// Surface atlas: signed bed delta (m), local concavity (m), drainage
+// concentration (positive log2 ratio), and the loose cover left above
+// bedrock (m).
 @group(1) @binding(1) var texture1: texture_2d<f32>;
 @group(1) @binding(2) var texture2: texture_2d<f32>;
 @group(1) @binding(3) var texture3: texture_2d<f32>;        // Point-filtered RGBA32F tile lookup.
@@ -309,6 +311,68 @@ fn blendedFlow(worldXZ: vec2<f32>, coverage: ptr<function, f32>,
     return vec4<f32>(depth, velocity, discharge);
 }
 
+// BEGIN SHARED GEOLOGY
+// World-keyed substrate resistance. The erosion passes and the terrain
+// material shader paste this block verbatim (a test keeps the copies equal),
+// so the rock that resists incision and holds steep faces in the simulation
+// is the same rock the material shader exposes. Every input is a world
+// coordinate, which keeps overlapping erosion tiles deterministic.
+//
+// Broad (~92 m) and fine (~27 m) rock bodies vary hardness without following
+// contours. A weaker bedding term adds gently dipping, warped resistant beds
+// every ~19 m of bedrock elevation: where incision or talus relaxation cuts
+// through them they hold short cliff bands and benches instead of one
+// uniform slope. The bedding is keyed to the bedrock surface, so a bench
+// stays put as loose cover accumulates above it.
+const GEOLOGY_HARDNESS_SCALE: f32 = 0.56;
+
+fn geologyHash(position: vec2<f32>) -> f32
+{
+    var p = fract(vec3<f32>(position.xyx) * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+fn geologyNoise(position: vec2<f32>) -> f32
+{
+    let cell = floor(position);
+    var fraction = fract(position);
+    fraction = fraction * fraction * (3.0 - 2.0 * fraction);
+    let a = geologyHash(cell);
+    let b = geologyHash(cell + vec2<f32>(1.0, 0.0));
+    let c = geologyHash(cell + vec2<f32>(0.0, 1.0));
+    let d = geologyHash(cell + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, fraction.x), mix(c, d, fraction.x), fraction.y);
+}
+
+// 0 = weak, readily weathered substrate; 1 = the most resistant rock.
+fn geologyResistance(world_xz: vec2<f32>, bedrock_height: f32) -> f32
+{
+    let broadRock = geologyNoise(world_xz / 92.0 + vec2<f32>(31.7, -18.2));
+    let fineRock = geologyNoise(world_xz / 27.0 + vec2<f32>(-73.1, 46.4));
+    let bedWarp = geologyNoise(world_xz / 310.0 + vec2<f32>(-12.9, 57.3)) - 0.5;
+    let bedCoordinate = (bedrock_height + dot(world_xz, vec2<f32>(0.017, -0.011))
+                         + bedWarp * 26.0) / 19.0;
+    let bedding = smoothstep(0.35, 0.85, 0.5 + 0.5 * sin(bedCoordinate * 6.2831853));
+    let geology = broadRock * 0.62 + fineRock * 0.24 + bedding * 0.14;
+    return smoothstep(0.25, 0.82, geology);
+}
+
+// The small spawn footprint resists destructive excavation.
+fn erosionSpawnProtection(world_xz: vec2<f32>) -> f32
+{
+    return 1.0 - smoothstep(90.0, 150.0, length(world_xz));
+}
+
+// Hardness as the erosion solver uses it: scaled resistance, raised to the
+// spawn protection inside its footprint.
+fn erosionHardness(world_xz: vec2<f32>, bedrock_height: f32) -> f32
+{
+    return max(geologyResistance(world_xz, bedrock_height) * GEOLOGY_HARDNESS_SCALE,
+               erosionSpawnProtection(world_xz) * 0.96);
+}
+// END SHARED GEOLOGY
+
 // Material indices match kTerrainMaterials in main.cpp. Grass and dirt form
 // one ground cover; dirt and gravel retain two consecutive scan variants,
 // while rock carries a single scan (see accumulateGroup).
@@ -441,6 +505,49 @@ fn groundNoiseGradient(p: vec2<f32>) -> vec3<f32>
 fn groundNoise(p: vec2<f32>) -> f32
 {
     return groundNoiseGradient(p).x;
+}
+
+// Two independent values in [0, 1) per lattice cell.
+fn jointHash2(cell: vec2<f32>, seed: i32) -> vec2<f32>
+{
+    let h = surfaceCellHash(cell, seed, 1);
+    return vec2<f32>(f32(h & 0xffffu), f32(h >> 16u)) * (1.0 / 65536.0);
+}
+
+// Joint blocks: a jittered Voronoi tessellation of a projection plane, in
+// cell units. Returns the distance to the nearest block border (x, as the gap
+// to the second-nearest site), the block's facet tilt in [-1, 1] (yz), and a
+// per-block brightness hash (w). Exposed rock breaks along joint sets into
+// blocks whose faces catch the light at slightly different angles; the scan
+// alone resolves its grain but not that metre-scale fracture pattern.
+fn rockJoints(p: vec2<f32>, seed: i32) -> vec4<f32>
+{
+    let base = floor(p);
+    var nearest = 8.0;
+    var second = 8.0;
+    var nearestCell = base;
+    for (var y = -1; y <= 1; y++)
+    {
+        for (var x = -1; x <= 1; x++)
+        {
+            let cell = base + vec2<f32>(f32(x), f32(y));
+            let site = cell + vec2<f32>(0.15) + 0.70 * jointHash2(cell, seed);
+            let distance = length(p - site);
+            if (distance < nearest)
+            {
+                second = nearest;
+                nearest = distance;
+                nearestCell = cell;
+            }
+            else if (distance < second)
+            {
+                second = distance;
+            }
+        }
+    }
+    let facet = jointHash2(nearestCell + vec2<f32>(17.0, -31.0), seed) * 2.0 - vec2<f32>(1.0);
+    let shade = jointHash2(nearestCell + vec2<f32>(-53.0, 11.0), seed).x;
+    return vec4<f32>(second - nearest, facet, shade);
 }
 
 // Metre-scale weathered relief bridges the gap between scanned grains and
@@ -695,31 +802,34 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let toSunXZ = normalize(climateSun.xz);
 
     // Use the same four-tile reveal and distance fade as the actual landform.
-    // Discharge concentration distinguishes channels from the thin sheet of
-    // rainwater present across the simulation; speed alone is not evidence
-    // of a river, especially in nearly dry cells.
+    // The surface atlas carries the simulation's own record: signed bed change
+    // (R), ring concavity (G), drainage concentration (B) and the loose cover
+    // left above bedrock (A); the flow atlas adds the routed contributing area
+    // (A). Every simulated signal fades with reveal and the visibility radius,
+    // where slope, geology and the base cover estimate carry on alone.
     var flowDomain: f32;
     var surface: vec4<f32>;
     let flow = blendedFlow(worldXZ, &flowDomain, &surface);
-    let dischargeAmount = 1.0 - exp(-max(flow.a, 0.0) * 0.035);
-    // Centimetres of fresh sediment can cover vegetation; stripping the
-    // rooted soil takes a deeper cut. Calibrate against the actual solver's
-    // centimetre-to-metre output rather than forcing vegetation to survive.
-    let incision = 1.0 - exp(-max(-surface.r - 0.012, 0.0) * 3.0);
-    let deposition = 1.0 - exp(-max(surface.r - 0.004, 0.0) * 12.0);
-    // Ring concavity/convexity re-anchored to the field's real scales: the
-    // 12 m-ring relief of a common swale is 0.1-0.5 m, so the old (0.15, 2.5)
-    // ramp passed only 0.001-0.06 — every systematic snow hold landed under
-    // half a metre against the +/-15 m wander octaves. (0.05, 1.2) puts a
-    // 0.3 m swale at ~0.12 and saturates at 1.2 m bowls. These gates feed only
-    // the snow hold path (dryHollow -> snowHeight and grassDryness); the
-    // channel, incision and deposition gates below are untouched.
-    let hollow = smoothHermite(0.05, 1.2, surface.g);
-    let ridge = smoothHermite(0.05, 1.2, -surface.g);
-    let channel = smoothHermite(0.12, 1.25, surface.b)
-                * smoothHermite(0.04, 0.35, dischargeAmount);
+    // Contributing area separates rills from rivers: ~20 cells (320 m2) of
+    // catchment is still a grassed hollow, ~2000 cells (3.2 ha) a permanent
+    // stream. The ring concentration finds each channel's thalweg inside its
+    // valley.
+    let catchment = log2(1.0 + max(flow.a, 0.0));
+    let dischargeAmount = smoothHermite(4.5, 11.0, catchment);
+    let thalweg = smoothHermite(0.5, 2.8, surface.b);
+    let channel = dischargeAmount * thalweg;
     let transport = smoothHermite(0.6, 4.0, min(length(flow.gb), 8.0))
                   * smoothHermite(0.002, 0.025, flow.r) * channel;
+    // Signed bed change from fluvial transport, runoff and talus relaxation.
+    // Centimetres of fresh sediment can bury turf; stripping rooted soil
+    // takes a deeper cut.
+    let incision = 1.0 - exp(-max(-surface.r - 0.012, 0.0) * 3.0);
+    let deposition = 1.0 - exp(-max(surface.r - 0.004, 0.0) * 12.0);
+    // Ring concavity re-anchored to the field's real scales: the 12 m-ring
+    // relief of a common swale is 0.1-0.5 m, so (0.05, 1.2) puts a 0.3 m swale
+    // at ~0.12 and saturates at 1.2 m bowls.
+    let hollow = smoothHermite(0.05, 1.2, surface.g);
+    let ridge = smoothHermite(0.05, 1.2, -surface.g);
 
     // Low-frequency drift lets the grass boundary with the beach breathe a
     // few metres instead of tracing one deterministic contour. Frequency
@@ -763,65 +873,155 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         rotateUV(groundDomain * 0.137, 1.13) + vec2<f32>(73.1, -24.8));
     let soilEdge = filteredGroundNoise(
         rotateUV(groundDomain * 0.83, 2.04) + vec2<f32>(-41.6, -63.2));
+    let rockRegion = filteredGroundNoise(
+        rotateUV(groundDomain * 0.0031, 0.26) + vec2<f32>(-57.4, 18.9));
     let soilPattern = mix(soilLarge, soilSmall, mix(0.18, 0.62, groundGrowth))
                     + (soilEdge - 0.5) * 0.16;
     let soilThreshold = mix(0.64, 0.42, groundRegion);
     let soilPatches = smoothHermite(soilThreshold, soilThreshold + 0.18, soilPattern);
-    // Fine sediment favours flats. Scouring can also expose soil on banks,
-    // with retention fading as steep ground gives way to rock.
+
+    // Loose cover above bedrock: soil, colluvium, talus and alluvium. The
+    // simulation tracks it; beyond its radius (and before a tile reveals) the
+    // estimate the simulation itself starts from stands in, from the same
+    // shared geology: soil mantles gentle ground, thins with slope and on
+    // resistant rock, and is gone where a face exceeds ~38 degrees.
+    let steepness = sqrt(max(1.0 - materialNormal.y * materialNormal.y, 0.0))
+                  / max(materialNormal.y, 0.05);
+    let bedrockResistance = geologyResistance(worldXZ, height - max(surface.a, 0.0));
+    let soilBody = geologyNoise(worldXZ / 41.0 + vec2<f32>(5.3, -27.7));
+    let baseCover = 1.35 * (1.0 - smoothHermite(0.42, 0.78, steepness))
+                  * mix(1.0, 0.45, bedrockResistance) * mix(0.70, 1.30, soilBody);
+    let looseCover = max(surface.a, 0.0) + (1.0 - flowDomain) * baseCover;
+    // Above roughly the treeline altitude soils stay thin and stony: alpine
+    // turf thins out and frost-shattered rubble covers more of the ground.
+    let alpine = smoothHermite(stage.sea_level + 80.0, stage.sea_level + 165.0,
+                               height + (groundRegion - 0.5) * 30.0);
+
+    // Weathered mantle. The talus relaxation strips loose cover from every
+    // slope steeper than repose, yet weak rock keeps renewing a mantle of
+    // shattered rubble and thin turf on faces up to ~50 degrees; only
+    // resistant rock stands clean. Because the shared bedding keys hardness
+    // to bedrock elevation, a steep face reads as ledges of stone between
+    // bands of rubble and turf instead of one uniform slab.
+    let weakRock = 1.0 - smoothHermite(0.30, 0.70,
+                                       bedrockResistance + (soilSmall - 0.5) * 0.25);
+    let steepMantle = weakRock * smoothHermite(0.50, 0.80, steepness)
+                    * (1.0 - smoothHermite(0.95, 1.30, steepness));
+
+    // Bedrock shows where a face sheds faster than it weathers: steepness
+    // exposes it, resistant beds stand bare where weak ones keep a broken
+    // mantle, and any loose cover the simulation left hides it. Convex noses
+    // hold their faces, sheltered hollows keep soil, and patch noise at
+    // several scales turns a 30-45 degree slope into a mosaic of outcrop,
+    // rubble and turf instead of one slab. Past ~46 degrees little but rock
+    // remains; scoured channel beds expose it on any slope.
+    let steepFace = smoothHermite(0.55, 1.05, steepness);
+    let hardBed = smoothHermite(0.30, 0.75, bedrockResistance);
+    let outcropBreakup = (soilSmall - 0.5) * 0.35 + (soilEdge - 0.5) * 0.12
+                       + (rockRegion - 0.5) * 0.30;
+    let exposure = steepFace * mix(0.55, 1.15, hardBed)
+                 - looseCover * 0.9
+                 + 0.20 * ridge - 0.20 * hollow
+                 + outcropBreakup + 0.12 * alpine
+                 + channel * incision * 0.35 * hardBed;
+    let fRock = smoothHermite(0.30, 0.62, exposure);
+
+    // Footslopes: below an exposure, stone rarely meets closed turf. What a
+    // face sheds - frost-shattered debris, soil washed off it - comes to rest
+    // at its foot and in the hollows between its spurs as stony colluvium the
+    // turf has not closed over, so a band of dirt and rubble separates bare
+    // rock from the grass beneath it. Above a face the crest only loses
+    // material, so the turf thins to a narrow, faint rim of stony soil before
+    // the stone. The simulation records which side is which: the talus
+    // relaxation and slope wash leave deposits and concave footslopes below
+    // a face, and lower the convex crest above it. The band is the stretch of
+    // the rock's own exposure field just short of bare rock, so it widens
+    // where a face wanes gradually into its base; thick footslope deposits
+    // (not channel fill) extend it as colluvial aprons. Beyond the simulated
+    // radius, where neither side is known, only the faint rim remains.
+    // The band's outer edge is ragged at two scales, so grass islands
+    // survive in the debris and dirt bays reach into the turf over a few
+    // metres instead of meeting along one line.
+    let fringeNoise = (soilSmall - 0.5) * 0.22 + (soilEdge - 0.5) * 0.16
+                    + (groundGrowth - 0.5) * 0.06;
+    let footslope = clamp(hollow * 1.6 + smoothHermite(0.02, 0.35, surface.r)
+                          - ridge * 1.5 - smoothHermite(0.05, 0.60, -surface.r) * 0.6,
+                          0.0, 1.0);
+    let colluvium = smoothHermite(0.08, 0.90, surface.r)
+                  * smoothHermite(0.20, 0.55, steepness)
+                  * (1.0 - thalweg * dischargeAmount);
+    let fringeBelow = smoothHermite(-0.12, 0.42, exposure + fringeNoise) * footslope;
+    let fringeRim = smoothHermite(0.12, 0.40, exposure + fringeNoise) * 0.30;
+    let rockFringe = clamp(max(max(fringeBelow, fringeRim), colluvium * 0.7), 0.0, 1.0)
+                   * (1.0 - fRock);
+    // Turf thins and dries before it gives way to the debris: stressed
+    // grass on stony ground turns olive a little way out from the band.
+    let fringeApproach = smoothHermite(-0.30, 0.25, exposure + fringeNoise)
+                       * max(footslope, 0.25) * (1.0 - fRock);
+
+    // Talus: debris the relaxation dropped at the foot of steep faces, lying
+    // close to its angle of repose (~25-35 degrees). Rubble also mantles weak
+    // steep ground, increasingly above the treeline where turf gives out.
+    // Deposits steeper than repose have already slid, and gentle aprons grade
+    // into soil.
+    let talusSlope = smoothHermite(0.36, 0.58, steepness)
+                   * (1.0 - smoothHermite(0.85, 1.15, steepness));
+    let talusDeposit = smoothHermite(0.04, 0.50, surface.r) * smoothHermite(0.08, 0.45, looseCover);
+    let rubblePatch = smoothHermite(0.38, 0.62, soilLarge + (soilEdge - 0.5) * 0.30);
+    let alpineRubble = alpine * (1.0 - smoothHermite(0.45, 1.10, looseCover)) * 0.45 * rubblePatch;
+    let mantleRubble = steepMantle * mix(0.30, 0.80, alpine) * rubblePatch;
+    let scree = talusSlope * clamp(talusDeposit + alpineRubble + mantleRubble, 0.0, 1.0);
+    // Bed load: coarse gravel lines scoured, active channels and the bars
+    // they leave; where the same water slows over its own deposits, sand and
+    // silt settle instead. Fans keep a gravelly apex near their feeder.
+    let channelScour = channel * max(incision, transport);
+    let channelBar = channel * deposition;
+    let debrisHold = 1.0 - smoothHermite(0.80, 1.10, steepness);
+    // Stony colluvium carries scattered rubble patches of its own.
+    let fringeRubble = rockFringe * rubblePatch * 0.35;
+    let fGravel = clamp(max(max(scree, fringeRubble),
+                            channelScour * mix(0.55, 1.0, transport)
+                            + channelBar * mix(0.25, 0.85, transport)), 0.0, 1.0)
+                * debrisHold;
     let soilFlatness = 1.0 - smoothHermite(0.02, 0.25, slope);
-    let soilRetention = 1.0 - smoothHermite(0.12, 0.48, slope);
-    let backgroundSoil = 0.015 + 0.52 * soilPatches * mix(0.45, 1.0, groundRegion);
-    let depositedSoil = deposition * soilFlatness;
-    let scouredSoil = incision * soilRetention;
-    let channelSoil = channel * (1.0 - transport) * soilRetention;
-    // Bounded coverage union: any strong disturbance can displace grass.
-    // Noise varies the transition edges without weakening fully bare ground.
-    var disturbedSoil = 1.0 - (1.0 - depositedSoil) * (1.0 - scouredSoil)
-                              * (1.0 - channelSoil);
-    disturbedSoil += (soilEdge - 0.5) * 0.6 * disturbedSoil * (1.0 - disturbedSoil);
-    // Soil depth follows the landform, with no altitude gate for stone.
-    // Broad geology and smaller weathering patches persist outside the
-    // erosion cache. Incised, convex ground exposes resistant beds; hollows
-    // and deposited fines retain cover. Hardness only amplifies incision so
-    // the protected spawn's high hardness cannot paint a ring of rock.
-    let rockRegion = filteredGroundNoise(
-        rotateUV(groundDomain * 0.0031, 0.26) + vec2<f32>(-57.4, 18.9));
-    let resistantBed = clamp(surface.a / 0.56, 0.0, 1.0);
-    let terrainExposure = slope
-                        + (rockRegion - 0.5) * 0.22
-                        + (groundGrowth - 0.5) * 0.10
-                        + (soilLarge - 0.5) * 0.04
-                        + incision * mix(0.10, 0.24, resistantBed)
-                        + ridge * 0.10 - hollow * 0.08
-                        - deposition * soilRetention * (1.0 - transport) * 0.24;
-    // Thin soils and protruding bedrock overlap: a meadow can meet an
-    // outcrop directly, while disturbance still opens soil around its roots.
-    // Local weathering breaks the boundary instead of drawing a dirt contour
-    // around every steep face.
-    let outcropBreakup = (soilSmall - 0.5) * 0.10 + (soilEdge - 0.5) * 0.055;
-    let exposedSoil = smoothHermite(0.12, 0.40, terrainExposure);
-    let grassSoilBlend = 1.0 - (1.0 - backgroundSoil * soilFlatness)
-                               * (1.0 - disturbedSoil) * (1.0 - exposedSoil * 0.82);
-    let fRock = smoothHermite(0.18, 0.40, terrainExposure + outcropBreakup);
-    // Loose debris accumulates in cuts and concave footslopes, then sheds
-    // above its angle of repose (~34-46 degrees). Incised walls expose their
-    // substrate rather than receiving the same gravel coat as the gully bed.
-    let debrisHold = 1.0 - smoothHermite(0.17, 0.31, slope);
-    let scouredGravel = incision * mix(0.28, 1.0, transport)
-                      * mix(0.65, 1.0, resistantBed);
-    let talus = hollow * smoothHermite(0.045, 0.19, slope)
-              * (0.35 * incision + 0.45 * deposition) * resistantBed;
-    let fGravel = clamp((scouredGravel + talus) * debrisHold, 0.0, 1.0);
-    // Fine sediment bars occur where concentrated runoff slows and deposits
-    // material. Shore sand remains the coastal base, including underwater.
-    let sedimentSand = deposition * channel * (1.0 - transport) * soilFlatness;
+    let sedimentSand = channelBar * (1.0 - transport) * soilFlatness;
     let fSand = max(1.0 - fGrass, sedimentSand);
 
-    // Regional climate and local drifts use repeatable world-space fields
-    // on EVERY substrate, including rock. The broad ~600 m variation keeps
-    // entire slopes from sharing a snowline; ~77 / 20 / 7 m detail breaks
-    // up its edge and filters away only when smaller than a pixel.
+    // Soil between the turf: broad background patches, thin stony cover on
+    // steeper ground, cut banks and fresh fans beside active channels. A
+    // bounded union lets any strong disturbance displace grass while noise
+    // varies the transition edges without weakening fully bare ground.
+    let soilRetention = 1.0 - smoothHermite(0.25, 0.75, steepness);
+    let backgroundSoil = (0.015 + 0.52 * soilPatches * mix(0.45, 1.0, groundRegion)) * soilFlatness;
+    // Turf roots in a few decimetres of soil; only stony, nearly bare ground
+    // shows through it. Convex shoulders above a face keep their turf to the
+    // stone, so their thin soil shows less.
+    let thinSoil = (1.0 - smoothHermite(0.06, 0.30, looseCover + steepMantle * 0.5
+                                                    + (soilEdge - 0.5) * 0.10))
+                 * smoothHermite(0.15, 0.40, steepness) * (1.0 - 0.7 * ridge);
+    let scouredSoil = incision * soilRetention * smoothHermite(0.15, 0.45, dischargeAmount);
+    // Older fill on floodplains and fan surfaces revegetates; only deposits
+    // beside the active thread stay raw.
+    let freshFan = deposition * dischargeAmount * smoothHermite(0.25, 0.75, thalweg) * soilFlatness;
+    let channelSoil = channel * (1.0 - transport) * soilRetention;
+    var disturbedSoil = 1.0 - (1.0 - scouredSoil) * (1.0 - freshFan) * (1.0 - channelSoil);
+    disturbedSoil += (soilEdge - 0.5) * 0.6 * disturbedSoil * (1.0 - disturbedSoil);
+    let grassSoilBlend = clamp(1.0 - (1.0 - backgroundSoil) * (1.0 - disturbedSoil)
+                                   * (1.0 - thinSoil * 0.55) * (1.0 - alpine * 0.30)
+                                   * (1.0 - rockFringe * 0.90), 0.0, 1.0);
+    let resistantBed = bedrockResistance;
+
+    // Snow lies where the ground stays cold through the melt season. The
+    // regional snowline wanders with broad climate cells; shaded (poleward)
+    // slopes hold snow tens of metres lower than flat ground and sun-facing
+    // slopes lose it higher; sheltered hollows and lee slopes keep a deeper
+    // pack and wind-scoured crests and windward faces a thinner one. Snow does
+    // not flow downhill: a gully below the line melts out like any other low
+    // ground, so cover never reaches warm valleys. Only shaded avalanche
+    // gullies just under the line keep a short tongue of old debris snow.
+    // Every term is a world-space field; only the slope they read is
+    // prefiltered with distance (see the vertex stage), so cover stays put as
+    // the camera moves and only sub-vertex detail softens far away.
     let snowRegion = filteredGroundNoise(
         rotateUV(groundDomain * 0.0017, 0.63) + vec2<f32>(91.7, -53.2));
     let snowDrift = filteredGroundNoise(
@@ -830,100 +1030,70 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         rotateUV(groundDomain * 0.05, 0.41) + vec2<f32>(37.1, 12.6));
     let snowDriftMicro = filteredGroundNoise(
         rotateUV(groundDomain * 0.15, 1.87) + vec2<f32>(-61.3, -42.9));
-    // Snow settles like sediment: closed hollows retain deeper beds lower
-    // down, while eroded ridges and sun-facing slopes expose the substrate
-    // earlier. Active watercourses (channel) flush what falls into them,
-    // so only dry hollows hold the pack. Hydraulic water is a landforming
-    // signal here, not a temperature or snowmelt simulation.
-    // Weak trickles do not scour a pack: the dry gate keys to actual
-    // discharge, so intermittently flushed gullies keep part of their hold
-    // while continuously running beds lose all of it.
-    let flushSnow = smoothHermite(0.08, 0.30, dischargeAmount);
-    let dryHollow = hollow * (1.0 - channel * mix(0.45, 1.0, flushSnow));
-    let sunExposure = max(dot(materialNormal, climateSun), 0.0);
-    // Height supplies a broad climate bias, not a shared material cutoff.
-    // Curvature and solar aspect shift local retention by comparable amounts
-    // to the drift fields. Aspect remains active beyond the erosion cache.
-    let snowHeight = height + (snowRegion - 0.5) * 100.0
-                            + (snowDrift - 0.5) * 42.0
-                            + (snowDriftFine - 0.5) * 16.0
-                            + (snowDriftMicro - 0.5) * 6.0
-                            + dryHollow * 28.0 - ridge * 18.0
-                            - (sunExposure - 0.65) * 22.0;
-    let snowLine = smoothHermite(stage.sea_level + 92.0, stage.sea_level + 126.0, snowHeight);
-    let snowHold = smoothHermite(0.12, 0.72, materialNormal.y);
-    var fSnow = snowLine * snowHold;
-
-    // Wind shapes the pack the way altitude noise alone cannot: prevailing
-    // wind scours exposed windward aspects back toward bare ground while lee
-    // slopes hold their cover, so the snowline follows terrain aspect as well
-    // as height. The aspect term is slope-gated so flat snowfields (degenerate
-    // normalWorld.xz) are left alone.
+    // Melt-season insolation relative to level ground. The spring sun stands
+    // lower than the summer climate sun, so aspect matters more: a steep
+    // shaded face holds snow ~20 m lower than a meadow at the same height,
+    // and a sun-facing slope loses it ~9 m higher. The melt sun stands only a
+    // little west of south: poleward against sunward aspect dominates, and
+    // the east and west flanks of one spur stay nearly alike instead of
+    // alternating white and bare down every rib of a mountainside.
+    let meltSun = normalize(vec3<f32>(-0.22, 0.62, -0.76));
+    let meltExposure = max(dot(materialNormal, meltSun), 0.0);
+    let aspectShift = (meltSun.y - meltExposure) * 34.0;
+    // Wind: prevailing south-westerlies scour windward aspects and crests
+    // and load lee slopes; the aspect term is slope-gated so flat snowfields
+    // (degenerate aspect) are left alone.
     let aspectN = normalize(materialNormal.xz + vec2<f32>(1e-4, 0.0));
     let windAlignment = dot(aspectN, normalize(vec2<f32>(0.70, 0.42)));
-    let scour = smoothHermite(0.15, 0.60, -windAlignment)
-              * smoothHermite(0.08, 0.30, slope);
-    let leeDrift = smoothHermite(0.20, 0.70, windAlignment) * snowLine;
-    fSnow = clamp(fSnow * (1.0 - 0.70 * scour) + 0.12 * leeDrift, 0.0, 1.0);
+    let windGate = smoothHermite(0.08, 0.30, slope);
+    let scour = smoothHermite(0.15, 0.60, -windAlignment) * windGate;
+    let leeLoad = smoothHermite(0.20, 0.70, windAlignment) * windGate;
+    let snowHeight = height + (snowRegion - 0.5) * 48.0
+                            + (snowDrift - 0.5) * 16.0
+                            + (snowDriftFine - 0.5) * 6.0
+                            + (snowDriftMicro - 0.5) * 2.5
+                            + aspectShift
+                            + hollow * 7.0 - ridge * 9.0
+                            + leeLoad * 6.0 - scour * 8.0;
+    let snowLine = smoothHermite(stage.snowline_altitude - 13.0, stage.snowline_altitude + 13.0,
+                                 snowHeight - stage.sea_level);
+    // Snow cannot cling to walls: it thins past ~39 degrees, where sluffs keep
+    // clearing it, and sheds by ~55, so steep faces stay dark rock cut
+    // through the white.
+    let snowHold = 1.0 - smoothHermite(0.80, 1.45, steepness);
+    var fSnow = snowLine * snowHold;
 
-    // Thin pack opens over convex noses and active cuts at every viewing
-    // distance. Camera movement must not change where a surface holds snow.
+    // Thin pack opens first over convex noses, steep, sun-facing and freshly
+    // cut ground, at every viewing distance.
     let marginBand = snowLine * (1.0 - snowLine) * 4.0;
-    let marginShed = clamp(0.9 * ridge + smoothHermite(0.12, 0.50, slope)
-                         + 0.5 * incision + 0.5 * channel, 0.0, 1.0);
+    let marginShed = clamp(0.9 * ridge + smoothHermite(0.45, 0.95, steepness)
+                         + 0.8 * smoothHermite(0.75, 0.95, meltExposure)
+                         + 0.5 * incision, 0.0, 1.0);
     fSnow = fSnow * (1.0 - 0.70 * marginBand * marginShed);
 
-    // Sediment pack vs active drainage: the dry hollows that thicken the
-    // pack above also let it settle lower down, but the watercourses that
-    // cut the mountain keep their beds clear — a snowpack settles, it does
-    // not coat. Discharge concentration drives the cut through a dedicated
-    // low-edged gate: tributaries sit at 1.1-1.9x the ring concentration
-    // (surface.b 0.15-0.9), inside the old (0.12, 1.25) gate's dead low end
-    // where the cut parked at <=0.17 of fSnow and read as nothing at all,
-    // so (0.04, 0.70) enters at the first measurable concentration. The
-    // transport floor rises 0.50 -> 0.70 so idle tributaries still read as
-    // cleared ribbon (a partial strip at landscape range reads as nothing);
-    // incision extends the cut to the discharge-starved gorges high on the
-    // mountain, and deposition keeps slack-water flats snowy. The hardness
-    // factor moves from inside the cut to the ceiling, mirroring
-    // scouredGravel from the other side: hard beds melt through to 8% snow
-    // retention (the old 25% film read as pale snow, never as a bed), while
-    // soft beds keep the same thin skin as before.
-    let channelCut = smoothHermite(0.04, 0.70, surface.b)
-                   * smoothHermite(0.04, 0.35, dischargeAmount);
-    var snowCut = channelCut * mix(0.70, 1.0, transport)
-                + 0.60 * incision * (1.0 - deposition);
-    snowCut = clamp(snowCut, 0.0, 1.0);
-    fSnow = fSnow * (1.0 - snowCut * mix(0.92, 0.55, 1.0 - clamp(surface.a / 0.56, 0.0, 1.0)));
+    // Meltwater runs under and through the pack: permanent streams open dark
+    // ribbons, while small rills stay buried. Resistant beds melt clear;
+    // soft, debris-choked beds keep a thin skin.
+    let meltChannel = channel * smoothHermite(0.25, 0.75, dischargeAmount);
+    fSnow = fSnow * (1.0 - meltChannel * mix(0.55, 0.90, resistantBed));
 
-    // Inactive, shaded gully cores retain fingers below their local climate
-    // margin. The cubed hollow gate concentrates these in real troughs;
-    // the shared snowHeight field keeps their lower edge irregular too.
-    let gullyShade = 1.0 - 0.85 * smoothHermite(0.30, 0.85, sunExposure);
-    let fingerBand = smoothHermite(stage.sea_level + 70.0, stage.sea_level + 110.0,
-                                   snowHeight + dryHollow * 8.0);
-    let gullyFinger = 0.92 * flowDomain * (dryHollow * dryHollow * dryHollow) * gullyShade
-                    * (1.0 - 0.45 * incision)
-                    * (0.30 + 0.70 * snowHold)
-                    * fingerBand;
-    fSnow = 1.0 - (1.0 - fSnow) * (1.0 - gullyFinger);
-
-    // Steep-face shed: a settling pack coats slabs and ledges but cannot
-    // cling to walls, so real mountains stay bare rock above roughly the
-    // 50-60 degree shedding angle no matter the altitude — the high face
-    // reads as dark rock cut by drainage ribbons instead of one pale
-    // snow-flooded continuum. The gate starts at ~51 degrees and saturates
-    // at ~59; below it the tuned margin, belt and snowfield reads are
-    // untouched, and like snowHold it is a smooth per-pixel hermite on a
-    // continuous field with no distance gating.
-    fSnow = fSnow * (1.0 - 0.85 * smoothHermite(0.36, 0.52, slope));
+    // Avalanche debris: shaded gullies collect snow sliding off the steep
+    // ground above them and keep it a little below the line, as long as the
+    // ground stays cold. The tongue is short (it ends ~18 m under the local
+    // line) and sun-facing gullies get none.
+    let shade = 1.0 - smoothHermite(0.30, 0.65, meltExposure);
+    let avalancheTongue = smoothHermite(stage.snowline_altitude - 18.0, stage.snowline_altitude - 4.0,
+                                        snowHeight - stage.sea_level)
+                        * hollow * smoothHermite(0.15, 0.60, dischargeAmount) * shade
+                        * snowHold * flowDomain * 0.85;
+    fSnow = 1.0 - (1.0 - fSnow) * (1.0 - avalancheTongue);
 
     let groundCover = (1.0 - fSand) * (1.0 - fGravel) * (1.0 - fRock) * (1.0 - fSnow);
     let wSand = fSand * (1.0 - fGravel) * (1.0 - fRock) * (1.0 - fSnow);
     let wGrass = groundCover * (1.0 - grassSoilBlend);
     let wDirt = groundCover * grassSoilBlend;
-    // The eroded cuts win over the intact faces they carve, so a gully
-    // through rock reads as gravel in its bed with rock on either wall.
+    // Loose debris and channel beds lie on top of the bedrock they came from,
+    // so talus aprons and gravel bars cover rock rather than the reverse.
     let wRock = fRock * (1.0 - fGravel) * (1.0 - fSnow);
     let wGravel = fGravel * (1.0 - fSnow);
     let wSnow = fSnow;
@@ -939,10 +1109,12 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // every dirt patch with the same coloured halo.
     var grassDryness = smoothHermite(0.18, 0.84,
                                      groundRegion * 0.65 + groundGrowth * 0.35);
-    grassDryness = clamp(grassDryness - dryHollow * 0.22
+    grassDryness = clamp(grassDryness - hollow * (1.0 - channel) * 0.22
                          - dischargeAmount * (1.0 - transport) * 0.12
                          + ridge * 0.12
-                         + smoothHermite(stage.sea_level + 65.0, stage.sea_level + 150.0, height) * 0.22,
+                         + smoothHermite(0.25, 0.60, steepness) * 0.10
+                         + alpine * 0.22
+                         + fringeApproach * 0.28,
                          0.0, 1.0);
     let grassTint = mix(vec3<f32>(0.31, 0.39, 0.27), vec3<f32>(0.48, 0.40, 0.28), grassDryness)
                   * mix(0.94, 1.06, groundGrowth);
@@ -997,15 +1169,24 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         snowTint, grassTint,
         // Muted mineral sand suits a cold coastline; dampness still follows flow.
         vec3<f32>(0.49, 0.46, 0.39),
-        vec3<f32>(0.40, 0.33, 0.25),
-        // Weathered gravel should sit within the same exposure as the turf,
-        // including the small patches newly exposed in drainage channels.
-        vec3<f32>(0.52, 0.53, 0.50),
+        // Soil: humic brown in the lowlands, greyer and stonier where it is
+        // colluvium shed from rock or frost-worked ground above the treeline.
+        mix(vec3<f32>(0.40, 0.33, 0.25), vec3<f32>(0.35, 0.33, 0.30),
+            clamp(rockFringe + alpine * 0.6, 0.0, 1.0)),
+        // Weathered gravel and talus should sit within the same exposure as
+        // the turf, including the small patches newly exposed in drainage
+        // channels; a lighter tint reads as lingering snow from afar.
+        vec3<f32>(0.46, 0.46, 0.43),
         // Neutral weathered bedrock, with colour variation added below at
-        // geological scales after the scan detail has been resolved.
-        vec3<f32>(0.61, 0.59, 0.55));
+        // geological scales after the scan detail has been resolved. Kept
+        // well below the snow and a step below the scree so faces read
+        // against both, as weathered granite and gneiss do.
+        vec3<f32>(0.48, 0.46, 0.43));
+    // Stony colluvium and frost-worked alpine soil lose the humic colour of
+    // lowland soil, so the dirt desaturates with them.
     var albedoDesats = array<f32, 6>(0.0, 0.20, 0.28,
-                                     0.12, 0.0, 0.0);
+                                     mix(0.12, 0.45, clamp(rockFringe + alpine * 0.6, 0.0, 1.0)),
+                                     0.0, 0.0);
     var roughFloors = array<f32, 6>(0.72, 0.72, 0.70,
                                     0.88, 0.80, 0.65);
     // Rock's own roughness map (Rock032) runs mean 0.70 with p5 0.57, so
@@ -1042,6 +1223,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     }
     let contactDetail = 1.0 - smoothHermite(0.08, 0.65, footprint);
     var highestScore = -1.0;
+    var highestGroup = -1;
     for (var g = 0; g < 6; g++) {
         scores[g] = -1.0;
         if (groupWeights[g] <= 0.01) { continue; }
@@ -1078,10 +1260,18 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         surfaceAO[g] = cavity * invProjection;
         let relief = (surfaceAO[g] - 0.65) * 0.22 * contactDetail;
         scores[g] = groupWeights[g] + relief * 4.0 * groupWeights[g] * (1.0 - groupWeights[g]);
-        highestScore = max(highestScore, scores[g]);
+        if (scores[g] > highestScore) {
+            highestScore = scores[g];
+            highestGroup = g;
+        }
     }
     for (var g = 0; g < 6; g++) {
-        let width = 0.34 + edgeWidths[g];
+        // Turf and soil are both low, matte ground: where they meet each
+        // other, tufts grow through the soil and soil shows between tufts
+        // over metres, so their contact opens much wider than any other
+        // pair's and the two mix in proportion across the transition.
+        let groundPair = (g == 1 && highestGroup == 3) || (g == 3 && highestGroup == 1);
+        let width = 0.34 + edgeWidths[g] + select(0.0, 0.60, groundPair);
         let contact = smoothHermite(highestScore - width, highestScore, scores[g]);
         // Keep a small mineral contribution below the contact threshold;
         // thin silt and sparse grains should not vanish from distant turf.
@@ -1136,7 +1326,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         let incisedRoots = smoothHermite(0.030, 0.120, cutDepth);
         let focusedCut = smoothHermite(0.06, 0.30, surface.g)
                          * smoothHermite(0.012, 0.080, cutDepth);
-        let channelCut = smoothHermite(0.15, 0.80, surface.b)
+        let channelCut = channel
                          * smoothHermite(0.045, 0.25, surface.g)
                          * smoothHermite(0.010, 0.060, cutDepth);
         let furrow = max(incisedRoots, max(focusedCut, channelCut));
@@ -1178,6 +1368,107 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                     * (1.0 - smoothHermite(1.5, 6.0, footprint));
         albedo *= 1.0 + gRock * (weather * 0.38 + bedding * 0.045);
         rough = clamp(rough + gRock * weather * 0.10, 0.0, 1.0);
+
+        // Jointed blocks. Faces break into blocks ~3 m across, with a finer
+        // ~1 m set inside them: each block's face tilts a little its own way,
+        // weathers a little lighter or darker, and dark joints open between
+        // blocks. On the side projections the blocks are flattened into slabs
+        // (bedding planes crossed by vertical joints); seen from above they
+        // are equant. Facets fade before a block is a few pixels across, and
+        // the joints, being narrow, earlier still.
+        let coarseFade = 1.0 - smoothHermite(0.16, 0.40, footprint);
+        let fineFade = 1.0 - smoothHermite(0.06, 0.16, footprint);
+        let jointFade = 1.0 - smoothHermite(0.03, 0.09, footprint);
+        if (coarseFade > 0.001)
+        {
+            let topCoarse = rockJoints(coordY / 2.8, 31);
+            let sideXCoarse = rockJoints(coordX / vec2<f32>(3.2, 1.7), 37);
+            let sideZCoarse = rockJoints(coordZ / vec2<f32>(3.2, 1.7), 41);
+            let topFine = rockJoints(coordY / 0.95, 43);
+            let sideXFine = rockJoints(coordX / vec2<f32>(1.1, 0.6), 47);
+            let sideZFine = rockJoints(coordZ / vec2<f32>(1.1, 0.6), 53);
+            // Facet tilts enter world space through each projection's axes,
+            // as the weathering relief does.
+            let tiltCoarse = vec3<f32>(topCoarse.y, 0.0, topCoarse.z) * slopeWeights.y
+                           + vec3<f32>(0.0, sideXCoarse.z, sideXCoarse.y) * slopeWeights.x
+                           + vec3<f32>(sideZCoarse.y, sideZCoarse.z, 0.0) * slopeWeights.z;
+            let tiltFine = vec3<f32>(topFine.y, 0.0, topFine.z) * slopeWeights.y
+                         + vec3<f32>(0.0, sideXFine.z, sideXFine.y) * slopeWeights.x
+                         + vec3<f32>(sideZFine.y, sideZFine.z, 0.0) * slopeWeights.z;
+            let facetTilt = tiltCoarse * (0.22 * coarseFade) + tiltFine * (0.10 * fineFade);
+            let facetTangent = facetTilt - normalWorld * dot(facetTilt, normalWorld);
+            perturbedWorld = normalize(perturbedWorld
+                                     - facetTangent * gRock * globals.settings_b.x);
+            let border = vec3<f32>(topCoarse.x, sideXCoarse.x, sideZCoarse.x);
+            let fineBorder = vec3<f32>(topFine.x, sideXFine.x, sideZFine.x);
+            let blockShade = dot(vec3<f32>(topCoarse.w, sideXCoarse.w, sideZCoarse.w),
+                                 vec3<f32>(slopeWeights.y, slopeWeights.x, slopeWeights.z));
+            let jointCoarse = 1.0 - smoothHermite(0.0, 0.07,
+                dot(border, vec3<f32>(slopeWeights.y, slopeWeights.x, slopeWeights.z)));
+            let jointFine = 1.0 - smoothHermite(0.0, 0.05,
+                dot(fineBorder, vec3<f32>(slopeWeights.y, slopeWeights.x, slopeWeights.z)));
+            albedo *= 1.0 + gRock * ((blockShade - 0.5) * 0.16 * coarseFade
+                                     - jointCoarse * 0.42 * jointFade
+                                     - jointFine * 0.22 * jointFade * fineFade);
+            ao = mix(ao, ao * (1.0 - 0.45 * jointCoarse), gRock * jointFade);
+        }
+
+        // Runoff stains: water routed over steep rock gathers along the
+        // simulated rills and leaves dark streaks down the face, lined up with
+        // the gullies the same drainage cut below. They fade with the erosion
+        // cache like the rest of the flow evidence.
+        let runoffStain = smoothHermite(2.5, 6.5, catchment)
+                        * smoothHermite(0.45, 0.90, steepness);
+        albedo *= 1.0 - gRock * runoffStain * 0.32;
+        rough = mix(rough, rough * 0.85, gRock * runoffStain);
+        // Lichen: grey-green crusts on shaded, damp faces, ochre on sunny
+        // ones, in patches that thin toward the summits.
+        let lichen = smoothHermite(0.55, 0.80, soilSmall * 0.6 + soilEdge * 0.4)
+                   * (1.0 - 0.5 * alpine);
+        let dampFace = 1.0 - smoothHermite(0.35, 0.80, meltExposure);
+        albedo = mix(albedo, albedo * vec3<f32>(0.90, 0.98, 0.84), gRock * lichen * dampFace * 0.55);
+        albedo = mix(albedo, albedo * vec3<f32>(1.10, 0.97, 0.80),
+                     gRock * lichen * (1.0 - dampFace) * 0.40);
+    }
+
+    // Talus and rubble sort their debris along the fall line: rockfall and
+    // small debris flows leave long streaks of coarser and finer, lighter and
+    // darker scree running straight downslope, which keeps a smooth repose
+    // slope from reading as one uniform sheet. The frame follows the 4 m
+    // aspect, so streaks bend with the apron; they fade once a streak is
+    // narrower than a few pixels.
+    if (gGravel > 0.01)
+    {
+        let fallLine = normalize(materialNormal.xz + vec2<f32>(1e-4, 0.0));
+        let across = dot(worldXZ, vec2<f32>(-fallLine.y, fallLine.x));
+        let along = dot(worldXZ, fallLine);
+        let streakFade = 1.0 - smoothHermite(0.6, 2.5, footprint * 0.30);
+        let streak = groundNoise(vec2<f32>(across * 0.30, along * 0.035) + vec2<f32>(11.3, -7.7))
+                   * 0.7
+                   + groundNoise(vec2<f32>(across * 0.95, along * 0.11) + vec2<f32>(-23.1, 5.9))
+                   * 0.3;
+        let screeFace = smoothHermite(0.40, 0.65, steepness);
+        albedo *= 1.0 + gGravel * screeFace * (streak - 0.5) * 0.45 * streakFade;
+
+        // Block-scale rubble. The gravel scans resolve pebbles, which are
+        // sub-pixel beyond a few tens of metres, while a real talus slope
+        // stays lumpy with metre and half-metre blocks: lit block tops,
+        // shaded gaps. Two relief octaves tilt the normal and shade the
+        // albedo, each fading out before its blocks shrink below a pixel.
+        let blocks = groundNoiseGradient(worldXZ * 0.8 + vec2<f32>(3.7, -9.2));
+        let chips = groundNoiseGradient(worldXZ * 2.3 + vec2<f32>(-14.1, 6.6));
+        let blockFade = 1.0 - smoothHermite(0.35, 1.1, footprint * 0.8);
+        let chipFade = 1.0 - smoothHermite(0.35, 1.1, footprint * 2.3);
+        let rubbleWeight = gGravel * smoothHermite(0.30, 0.60, steepness);
+        albedo *= 1.0 + rubbleWeight * ((blocks.x - 0.5) * 0.34 * blockFade
+                                        + (chips.x - 0.5) * 0.20 * chipFade);
+        // Block heights ~0.35 m and chip heights ~0.12 m, as world slopes.
+        let rubbleGradient = blocks.yz * (0.35 * 0.8) * blockFade
+                           + chips.yz * (0.12 * 2.3) * chipFade;
+        let rubbleTilt = vec3<f32>(rubbleGradient.x, 0.0, rubbleGradient.y);
+        let rubbleTangent = rubbleTilt - normalWorld * dot(rubbleTilt, normalWorld);
+        perturbedWorld = normalize(perturbedWorld
+                                 - rubbleTangent * rubbleWeight * globals.settings_b.x);
     }
 
     // Gentle wind relief over the single powder scan, at ~22 m and ~8 m
@@ -1665,8 +1956,8 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         let speed = length(velocity);
         let direction = select(vec2<f32>(0.0), velocity / speed, speed > 0.00001);
 
-        // Red/green encode signed X/Z direction and blue encodes accumulated
-        // discharge. Brightness makes both standing water and velocity visible.
+        // Red/green encode signed X/Z direction and blue encodes the routed
+        // drainage. Brightness makes both standing water and velocity visible.
         let directionColour = vec3<f32>(direction * 0.5 + vec2<f32>(0.5), dischargeAmount);
         let speedAmount = 1.0 - exp(-speed * 0.18);
         let signal = clamp(max(waterAmount, max(dischargeAmount, speedAmount)), 0.0, 1.0);
@@ -1778,6 +2069,7 @@ fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(); }
 //   erosion_visibility_center       vec2<f32>  @248   uErosionVisibilityCenter
 //   erosion_visibility_full_radius  f32        @256   uErosionVisibilityFullRadius
 //   erosion_visibility_zero_radius  f32        @260   uErosionVisibilityZeroRadius
+//   snowline_altitude               f32        @276   persistent snowline above sea level
 // GlobalUniforms (group 0, binding 0) fields this stage reads:
 //   view (matView), camera_position.xyz (uCameraPosition),
 //   sun_direction.xyz (uSunDirectionWorld), settings_a.y (uTexScale),

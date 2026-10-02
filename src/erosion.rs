@@ -227,6 +227,9 @@ pub struct ErosionFrameCommands {
 pub struct InitTileCommand {
     pub key: TileKey,
     pub base_height: Vec<f32>,
+    /// Contributing area of every base cell (see [`route_base_drainage`]),
+    /// so stream power acts on whole catchments from the first iteration.
+    pub drainage_area: Vec<f32>,
 }
 
 pub struct IterateCommand {
@@ -335,8 +338,9 @@ impl ErosionBridge {
 // ---------------------------------------------------------------------------
 
 /// The seven per-tile summary statistics the C++ keeps flat on
-/// `HydraulicErosion` (minimumHeight .. flowAxisBias); they describe the most
-/// recently completed tile and are shown in the diagnostics window.
+/// `HydraulicErosion` (minimumHeight .. flowAxisBias), plus the drainage and
+/// loose-cover summaries of the thermal and fluvial passes; they describe the
+/// most recently completed tile and are shown in the diagnostics window.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TileDiagnostics {
     pub minimum_height: f32,
@@ -346,6 +350,12 @@ pub struct TileDiagnostics {
     pub maximum_deposition: f32,
     pub erosion_detail: f32,
     pub flow_axis_bias: f32,
+    /// Largest routed contributing area in the retained footprint, cells.
+    pub maximum_drainage: f32,
+    /// Share of land cells with less than 0.1 m of loose cover, percent.
+    pub bedrock_exposure: f32,
+    /// Mean loose cover over land cells, metres.
+    pub mean_loose_cover: f32,
 }
 
 /// CPU-side erosion tile cache: keys, readiness, reveal progress, and the
@@ -488,6 +498,67 @@ pub fn reset_erosion_cache(cache: &mut ErosionCache) {
     cache.force_reveal = None;
 }
 
+/// Contributing area, in cells and counting the cell itself, of every cell of
+/// a square height grid. Each cell passes its area to its lower neighbours in
+/// proportion to their squared slope, exactly the multiple-flow-direction
+/// shares the GPU terrain pass routes every iteration, so the simulation
+/// starts from its own converged drainage instead of growing it one cell per
+/// iteration. Cells below sea level swallow what reaches them, flats and pits
+/// keep theirs, and the grid edge is a closed wall.
+pub fn route_base_drainage(heights: &[f32], resolution: usize, cell_size: f32) -> Vec<f32> {
+    const NEIGHBOURS: [(i64, i64); 8] =
+        [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
+    let count = resolution * resolution;
+    let mut area = vec![1.0f32; count.min(heights.len())];
+    if area.len() != count {
+        return area;
+    }
+    // Highest first, so every donor has received all of its own area before
+    // it passes any on: the routing is acyclic because it only runs downhill.
+    let mut order: Vec<u32> = (0..count as u32).collect();
+    order.sort_unstable_by(|&a, &b| heights[b as usize].total_cmp(&heights[a as usize]));
+    let diagonal = cell_size * std::f32::consts::SQRT_2;
+    for &cell in &order {
+        let cell = cell as usize;
+        let height = heights[cell];
+        if height < SEA_LEVEL {
+            continue;
+        }
+        let x = (cell % resolution) as i64;
+        let z = (cell / resolution) as i64;
+        let mut shares = [(0usize, 0.0f32); 8];
+        let mut share_total = 0.0f32;
+        for (slot, (dx, dz)) in NEIGHBOURS.iter().enumerate() {
+            let (nx, nz) = (x + dx, z + dz);
+            if nx < 0 || nz < 0 || nx >= resolution as i64 || nz >= resolution as i64 {
+                continue;
+            }
+            let neighbour = nz as usize * resolution + nx as usize;
+            let distance = if *dx != 0 && *dz != 0 { diagonal } else { cell_size };
+            let slope = (height - heights[neighbour]) / distance;
+            if slope > 0.0 {
+                shares[slot] = (neighbour, slope * slope);
+                share_total += slope * slope;
+            }
+        }
+        if share_total <= 0.0 {
+            continue;
+        }
+        let passed = area[cell];
+        for (neighbour, share) in shares {
+            if share > 0.0 {
+                area[neighbour] += passed * share / share_total;
+            }
+        }
+    }
+    for (cell, height) in heights.iter().enumerate() {
+        if *height < SEA_LEVEL {
+            area[cell] = 0.0;
+        }
+    }
+    area
+}
+
 /// `BeginErosionTile`: stage one tile's base height map for GPU initialization
 /// (the render world uploads it and stamps the simulation targets), then mark
 /// it as the active simulation. Shared by the per-frame scheduler and the
@@ -502,10 +573,12 @@ pub fn begin_tile(
         return;
     }
     let base_height = crate::noise::create_base_height_map(noise, key);
+    let drainage_area = route_base_drainage(&base_height, EROSION_RESOLUTION, EROSION_CELL_SIZE);
     commands.sim_min = tile_simulation_minimum(key);
     commands.init = Some(InitTileCommand {
         key,
         base_height,
+        drainage_area,
     });
     if let Some(existing) = cache.tiles.get_mut(&key) {
         existing.state = ErosionTileState::Simulating;
@@ -649,13 +722,17 @@ pub fn apply_erosion_events(cache: &mut ErosionCache, bridge: &ErosionBridge) {
                     }
                     cache.stats = finalized.stats;
                     log::info!(
-                        "EROSION: independent pass ({}, {}) ready, range {:.1}..{:.1} m, incision {:.2} m, detail {:.3}, axis {:.3}",
+                        "EROSION: independent pass ({}, {}) ready, range {:.1}..{:.1} m, incision {:.2} m, deposition {:.2} m, detail {:.3}, axis {:.3}, drainage {:.0} cells, bedrock {:.1}%, cover {:.2} m",
                         key.x, key.z,
                         finalized.stats.minimum_height,
                         finalized.stats.maximum_height,
                         finalized.stats.maximum_incision,
+                        finalized.stats.maximum_deposition,
                         finalized.stats.erosion_detail,
                         finalized.stats.flow_axis_bias,
+                        finalized.stats.maximum_drainage,
+                        finalized.stats.bedrock_exposure,
+                        finalized.stats.mean_loose_cover,
                     );
                 }
                 cache.has_active_tile = false;
@@ -768,6 +845,7 @@ mod tests {
                 init: Some(InitTileCommand {
                     key: tile(0, 0),
                     base_height: vec![1.0, 2.0],
+                    drainage_area: vec![1.0, 1.0],
                 }),
                 iterate: Some(IterateCommand {
                     count: 6,
@@ -798,6 +876,58 @@ mod tests {
         let taken = bridge.take_commands().expect("commands");
         assert!(!taken.finalize);
         assert_eq!(taken.iterate.expect("iterate").count, 6);
+    }
+
+    /// An inclined plane drains down its slope: every row passes everything
+    /// it holds to the row below, so row z carries (z + 1) rows of cells, and
+    /// columns away from the closed side walls carry exactly z + 1 each.
+    #[test]
+    fn base_drainage_accumulates_down_a_plane() {
+        let resolution = 8;
+        let heights: Vec<f32> = (0..resolution * resolution)
+            .map(|cell| 100.0 - (cell / resolution) as f32 * 2.0)
+            .collect();
+        let area = route_base_drainage(&heights, resolution, 4.0);
+        for z in 0..resolution {
+            let row: f32 = (0..resolution).map(|x| area[z * resolution + x]).sum();
+            assert!((row - ((z + 1) * resolution) as f32).abs() < 1e-3, "row {z} = {row}");
+            // The walls' influence spreads one column per row.
+            for x in (z + 1).min(resolution)..resolution.saturating_sub(z + 1) {
+                let value = area[z * resolution + x];
+                assert!((value - (z + 1) as f32).abs() < 1e-3, "({x}, {z}) = {value}");
+            }
+        }
+    }
+
+    /// A valley gathers its sides into the thalweg, nothing is created or
+    /// lost on the way to the closed outlet row, and the sea swallows its share.
+    #[test]
+    fn base_drainage_conserves_area_into_the_valley_and_the_sea() {
+        let resolution = 9;
+        let heights: Vec<f32> = (0..resolution * resolution)
+            .map(|cell| {
+                let x = (cell % resolution) as f32;
+                let z = (cell / resolution) as f32;
+                // A V valley along x = 4 falling toward a flat strand at
+                // z = 7 that only drains into the sea row at z = 8.
+                match z as usize {
+                    8 => -5.0,
+                    7 => 1.0,
+                    _ => 40.0 + (x - 4.0).abs() * 3.0 - z,
+                }
+            })
+            .collect();
+        let area = route_base_drainage(&heights, resolution, 4.0);
+        let land_cells = resolution * (resolution - 1);
+        // The strand cells exchange nothing among themselves, so their areas
+        // partition every land cell exactly once.
+        let reaching_sea: f32 = (0..resolution)
+            .map(|x| area[(resolution - 2) * resolution + x])
+            .sum();
+        assert!((reaching_sea - land_cells as f32).abs() < 1e-2, "{reaching_sea}");
+        let thalweg = area[(resolution - 3) * resolution + 4];
+        assert!(thalweg > area[(resolution - 3) * resolution + 2] * 3.0, "{thalweg}");
+        assert!(area[(resolution - 1) * resolution + 4] == 0.0);
     }
 
     /// The ordinary path: a frame that is consumed leaves nothing behind.
