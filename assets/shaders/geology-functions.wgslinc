@@ -1,0 +1,61 @@
+// BEGIN SHARED GEOLOGY
+// World-keyed substrate resistance. The erosion passes and the terrain
+// material shader paste this block verbatim (a test keeps the copies equal),
+// so the rock that resists incision and holds steep faces in the simulation
+// is the same rock the material shader exposes. Every input is a world
+// coordinate, which keeps overlapping erosion tiles deterministic.
+//
+// Broad (~92 m) and fine (~27 m) rock bodies vary hardness without following
+// contours. A weaker bedding term adds gently dipping, warped resistant beds
+// every ~19 m of bedrock elevation: where incision or talus relaxation cuts
+// through them they hold short cliff bands and benches instead of one
+// uniform slope. The bedding is keyed to the bedrock surface, so a bench
+// stays put as loose cover accumulates above it.
+const GEOLOGY_HARDNESS_SCALE: f32 = 0.56;
+
+fn geologyHash(position: vec2<f32>) -> f32
+{
+    var p = fract(vec3<f32>(position.xyx) * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+fn geologyNoise(position: vec2<f32>) -> f32
+{
+    let cell = floor(position);
+    var fraction = fract(position);
+    fraction = fraction * fraction * (3.0 - 2.0 * fraction);
+    let a = geologyHash(cell);
+    let b = geologyHash(cell + vec2<f32>(1.0, 0.0));
+    let c = geologyHash(cell + vec2<f32>(0.0, 1.0));
+    let d = geologyHash(cell + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, fraction.x), mix(c, d, fraction.x), fraction.y);
+}
+
+// 0 = weak, readily weathered substrate; 1 = the most resistant rock.
+fn geologyResistance(world_xz: vec2<f32>, bedrock_height: f32) -> f32
+{
+    let broadRock = geologyNoise(world_xz / 92.0 + vec2<f32>(31.7, -18.2));
+    let fineRock = geologyNoise(world_xz / 27.0 + vec2<f32>(-73.1, 46.4));
+    let bedWarp = geologyNoise(world_xz / 310.0 + vec2<f32>(-12.9, 57.3)) - 0.5;
+    let bedCoordinate = (bedrock_height + dot(world_xz, vec2<f32>(0.017, -0.011))
+                         + bedWarp * 26.0) / 19.0;
+    let bedding = smoothstep(0.35, 0.85, 0.5 + 0.5 * sin(bedCoordinate * 6.2831853));
+    let geology = broadRock * 0.62 + fineRock * 0.24 + bedding * 0.14;
+    return smoothstep(0.25, 0.82, geology);
+}
+
+// The small spawn footprint resists destructive excavation.
+fn erosionSpawnProtection(world_xz: vec2<f32>) -> f32
+{
+    return 1.0 - smoothstep(90.0, 150.0, length(world_xz));
+}
+
+// Hardness as the erosion solver uses it: scaled resistance, raised to the
+// spawn protection inside its footprint.
+fn erosionHardness(world_xz: vec2<f32>, bedrock_height: f32) -> f32
+{
+    return max(geologyResistance(world_xz, bedrock_height) * GEOLOGY_HARDNESS_SCALE,
+               erosionSpawnProtection(world_xz) * 0.96);
+}
+// END SHARED GEOLOGY

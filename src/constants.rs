@@ -85,6 +85,18 @@ pub const EROSION_ATLAS_SLOTS: usize = EROSION_ATLAS_COLUMNS * EROSION_ATLAS_COL
 pub const EROSION_ATLAS_SIZE: usize = EROSION_ATLAS_COLUMNS * EROSION_ATLAS_PITCH;
 pub const EROSION_ITERATIONS_PER_FRAME: usize = 6;
 
+// Thermal (talus) relaxation. Loose cover - soil, talus, alluvium - stands
+// at its angle of repose (~34 degrees); bare bedrock holds much steeper faces,
+// from ~48 degrees in weak rock to ~68 degrees in the most resistant beds,
+// and sheds rockfall only above them.
+pub const EROSION_LOOSE_REPOSE: f32 = 0.67;
+pub const EROSION_SOFT_ROCK_SLOPE: f32 = 1.1;
+pub const EROSION_HARD_ROCK_SLOPE: f32 = 2.5;
+// Fluvial stream power saturates for catchments larger than this many cells
+// (~6.4 ha). A tile routes only its own domain, so overlapping tiles truncate
+// big rivers differently; beyond the saturation they cut alike.
+pub const EROSION_DRAINAGE_SATURATION: f32 = 4000.0;
+
 // PBR terrain texture array: one set each for snow, grass, sand and rock,
 // plus two sets each for soil within the grass cover and for gravel.
 // Retain the source scans' small stones and grass detail near the camera.
@@ -93,6 +105,12 @@ pub const TERRAIN_TILE_SIZE: usize = 1024;
 pub const TERRAIN_ATLAS_SLOTS: usize = 8;
 pub const EROSION_REVEAL_SECONDS: f32 = 0.9;
 pub const SEA_LEVEL: f32 = 0.0;
+// Centre of the persistent (late-season) snowline, metres above sea level.
+// The terrain material shader shifts it locally by climate cells, aspect,
+// shelter and wind; falling precipitation turns to snow from ~80 m upward
+// (precipitation-functions.wgslinc), so fresh snow can fall a little below
+// the ground that keeps it.
+pub const SNOWLINE_ALTITUDE: f32 = 112.0;
 
 pub const CLIP_CELLS: usize = 224;
 pub const CLIP_LEVELS: usize = 7;
@@ -126,6 +144,19 @@ pub struct ErosionSettings {
     pub sediment_capacity: f32,
     pub transport_rate: f32,
     pub maximum_erosion: f32,
+    /// Stream-power transport capacity per square-rooted catchment cell.
+    pub fluvial_capacity: f32,
+    /// Fraction of a fluvial capacity deficit detached from the bed per step.
+    pub fluvial_erosion: f32,
+    /// Fraction of a fluvial capacity excess deposited per step.
+    pub fluvial_deposition: f32,
+    /// Deepest fluvial incision below the base surface, metres.
+    pub maximum_incision: f32,
+    /// Fraction of a loose slope's excess over its angle of repose that
+    /// slides per step (pairwise, at most 1/16).
+    pub talus_rate: f32,
+    /// The same for over-steepened bedrock faces (rockfall).
+    pub rockfall_rate: f32,
 }
 
 impl Default for ErosionSettings {
@@ -139,6 +170,12 @@ impl Default for ErosionSettings {
             sediment_capacity: 3.5,
             transport_rate: 0.80,
             maximum_erosion: 3.5,
+            fluvial_capacity: 0.035,
+            fluvial_erosion: 0.12,
+            fluvial_deposition: 0.30,
+            maximum_incision: 9.0,
+            talus_rate: 0.05,
+            rockfall_rate: 0.005,
         }
     }
 }

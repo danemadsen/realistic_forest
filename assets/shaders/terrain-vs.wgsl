@@ -105,6 +105,7 @@ struct StageUniforms {
     waterline_push_land: f32,              // uWaterlinePushLand
     waterline_push_sea: f32,               // uWaterlinePushSea
     waterline_push_scale: f32,             // uWaterlinePushScale
+    snowline_altitude: f32,                // fragment stage: persistent snowline above sea level
 };
 @group(2) @binding(0) var<uniform> stage: StageUniforms;
 
@@ -377,7 +378,7 @@ struct VsOutput {
     @location(2) fragWorldPosition: vec3<f32>,  // fragWorldPosition
     @location(3) fragWorldNormal: vec3<f32>,    // fragWorldNormal
     @location(4) fragErosionDelta: f32,         // fragErosionDelta
-    @location(5) frag_material_normal: vec3<f32>, // Fixed-scale slope/aspect for material placement.
+    @location(5) frag_material_normal: vec3<f32>, // Distance-prefiltered slope/aspect for material placement.
 };
 
 @vertex
@@ -416,12 +417,20 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput
                                           2.0*normalStep,
                                           heightBack - heightFront));
 
-    // Material retention follows the same four-metre terrain interval at
-    // every clipmap level. Using the lighting normal above for slope changes
-    // rock, soil and snow coverage whenever the camera changes the mesh LOD.
+    // Material slope and aspect use a four-metre terrain interval near the
+    // camera. Farther out the clipmap's vertices are 8-64 m apart, and a 4 m
+    // slope sampled once per vertex aliases: neighbouring vertices pick up
+    // unrelated micro-relief, and the interpolated snow, rock and soil
+    // decisions turn into rows of triangles along every material margin.
+    // The interval therefore widens with horizontal camera distance to about
+    // 1.3 vertex spacings, which prefilters distant coverage the way mips
+    // prefilter a texture. It grows continuously with distance rather than
+    // following the LOD rings, so coverage never pops when the clipmap
+    // origin snaps (the lighting normal above does follow the rings).
     // terrainHeight includes the same erosion reveal and fade as the mesh.
     // Reuse the lighting samples where that LOD already has this interval.
-    let materialStep = 4.0;
+    let cameraDistance = length(worldXZ - globals.camera_position.xz);
+    let materialStep = clamp(cameraDistance / 48.0, 4.0, 96.0);
     var materialNormal = localNormal;
     if (abs(normalStep - materialStep) > 0.0001) {
         let materialLeft = terrainHeight(worldXZ - vec2<f32>(materialStep, 0.0));
@@ -495,7 +504,9 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput
 //   [240] erosion_lookup_size
 //   [248] erosion_visibility_center: [f32; 2]
 //   [256] erosion_visibility_full_radius
-//   [260] erosion_visibility_zero_radius (struct rounds to 272 bytes)
+//   [260] erosion_visibility_zero_radius
+//   [264] waterline_push_land, [268] waterline_push_sea, [272] waterline_push_scale
+//   [276] snowline_altitude (struct rounds to 288 bytes)
 // Textures (group 1): binding 0 = R32 base noise (linear sampler at 8),
 // 1 = surface atlas (linear sampler at 9), 3 = RGBA32F tile lookup
 // (TEXTURE-LOAD ONLY; non-filtering sampler at 11), 4 = blend mask (linear
@@ -507,6 +518,7 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput
 // @location(3) fragWorldNormal (world-space normal),
 // @location(4) fragErosionDelta (f32, blended erosion contribution for the
 // fragment-stage debug overlay).
-// @location(5) frag_material_normal (world-space normal over a fixed 4 m
-// interval for material slope/aspect, independent of the lighting LOD).
+// @location(5) frag_material_normal (world-space normal for material
+// slope/aspect: a 4 m interval near the camera, widening with horizontal
+// camera distance to track the vertex spacing, independent of the LOD rings).
 // group 0 binding 0 = shared GlobalUniforms.

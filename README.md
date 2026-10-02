@@ -129,7 +129,8 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | --- | --- |
 | `--camera x,y,z,yawDeg,pitchDeg` | Pin the camera pose and fly, for reproducible shots; with `--shot`, mouse and keyboard input cannot move it |
 | `--shot path.png` | Render, save a screenshot, then exit |
-| `--wait n` | Frames to render before the screenshot |
+| `--wait n` | Frames to render before the screenshot, counted once the prewarmed erosion tiles are ready |
+| `--erosion-prewarm N` | Simulate the `N` nearest erosion tiles at full budget before streaming (default `4`, the quartet around the player); raise it so a capture shows erosion beyond the player's own lattice cell |
 | `--size W,H` | Window size in points (comma-separated, as the C++'s `sscanf`) |
 | `--probe` | Print terrain and erosion statistics, then exit |
 | `--probe-extent`, `--probe-step` | Probe sampling window |
@@ -196,42 +197,81 @@ its normal sampling interval, which prevents cracks and greatly reduces LOD
 shimmer. A 5800-metre far plane bounds the finite render horizon while
 generation itself remains unbounded.
 
-Terrain uses triplanar PBR textures with a muted, earthy palette. Grass004
-covers stable ground; erosion and fresh deposition can replace it with
-Ground103 soil and subtle Ground106 variation, without a minimum grass share.
-Deposited fines favour flats, while scouring also exposes soil on banks.
-Grass, shallow soil and Rock032 outcrops overlap through a shared exposure
-field, allowing grass to meet exposed stone without a continuous dirt belt.
-Material contacts use the scans' cavity information as a local relief proxy;
-colour, normals, roughness, AO and lighting masks share the resulting coverage.
-Pixel filtering softens unresolved edges, and a small residual mix preserves
-thin sediment instead of discarding every minor material.
-Slope, incision, substrate hardness and convex ridges expose stone; sheltered
-hollows and deposited sediment retain cover. Broad, deterministic geology and
-smaller weathering patches vary those boundaries in world space, with no rock
-altitude cutoff, so high gentle benches can keep meadows and low cliffs can
-expose stone.
-Gravel fills scoured drainage and concave footslopes where loose debris can
-remain. It sheds between roughly 34 and 46 degrees, exposing the bedrock on
-steep gully walls. Material slope and aspect use a fixed four-metre terrain
-sampling interval; distant mesh interpolation still limits their detail.
-Ground093C sand follows the coast and slower depositional channels. Snow006
-combines a broad altitude climate bias with world-anchored regional variation and local drifts,
-including on exposed rock, so slopes do not share a fixed snow contour.
-It settles like sediment: it holds deeper and reaches
-lower inside dry sheltered hollows, drains down inactive gullies as fingers
-below the regional line, sheds steep walls to bare rock, melts earlier from
-sun-facing slopes, eroded ridges and scoured faces, and its melt margin
-picks up a grey-brown sediment stain where active drainage works the
-thinning pack. Retention and shedding use terrain evidence at every viewing
-distance; only unresolved fine noise is filtered away. These are
-material-placement rules derived from the erosion
-results, not a climate or snowmelt simulation.
+Terrain uses triplanar PBR textures with a muted, earthy palette, placed from
+the erosion simulation's own record of the ground. The simulation tracks the
+loose cover (soil, colluvium, talus and alluvium) left above bedrock, and the
+material shader reads it together with the shared geology. Rock032 bedrock
+shows where a face sheds faster than it weathers: steepness exposes it,
+resistant beds stand bare where weak ones keep a broken mantle of rubble and
+thin turf, and any loose cover hides it. Patch noise at several scales turns a
+30-45 degree slope into a mosaic of outcrop, rubble and turf, the dipping
+resistant beds give mountainsides ledges rather than one uniform slab, and
+little but rock remains past about 46 degrees. Convex noses hold their faces,
+sheltered hollows keep their soil, and scoured channel beds expose rock on any
+slope. Below an exposure stone rarely meets closed turf: what a face sheds
+comes to rest at its foot and in the hollows between its spurs as stony
+colluvium, so a ragged band of grey-brown soil and rubble separates bare rock
+from the grass beneath it. Above a face the crest only loses material, so the
+turf thins to just a narrow, faint rim of stony soil before the stone. The
+simulation supplies the distinction - the
+talus relaxation and slope wash leave deposits and concave footslopes below a
+face and lower the convex crest above it - and the band follows the rock's own
+exposure field, widening where a face wanes gradually into its base; thick
+footslope deposits extend it as colluvial aprons. Its outer edge is ragged
+over a few metres rather than a line: grass islands survive in the debris,
+dirt bays reach into the turf, the turf thins and dries to olive before it
+gives way, and where turf and soil meet they mix in proportion, as tufts
+growing through soil do, instead of switching at a contact edge. Beyond the erosion radius
+the shader estimates the cover the simulation starts from, so material
+boundaries stay put with distance.
+
+Grass004 covers ground with a few decimetres of soil. Ground103 soil, with
+subtle Ground106 variation, shows through thin, stony cover, in cut banks and
+fresh deposits beside active channels, and in broad background patches; older
+fill on floodplains and fan surfaces revegetates. Gravel lines scoured, active
+channels and their bars, and forms talus aprons at the foot of steep faces
+near its angle of repose; rubble mantles more of the steep ground above the
+treeline, where alpine turf thins and dries. Contributing area separates
+permanent streams from grassed hollows, so only real channels open the turf.
+Ground093C sand follows the coast and settles where channel water slows over
+its own deposits. Water routed over steep rock leaves dark streaks lined up
+with the gullies below, and lichen tints shaded faces grey-green and sunny
+ones ochre. Material contacts use the scans' cavity information as a local
+relief proxy; colour, normals, roughness, AO and lighting masks share the
+resulting coverage. Pixel filtering softens unresolved edges, and a small
+residual mix preserves thin sediment instead of discarding every minor
+material. Material slope and aspect use a four-metre terrain sampling interval
+near the camera; farther out the interval widens continuously with distance,
+tracking the clipmap's vertex spacing, so distant coverage is prefiltered
+instead of aliasing into rows of triangles along snow and rock margins.
+
+Snow006 lies where the ground stays cold through the melt season. A regional
+snowline (`SNOWLINE_ALTITUDE`, 112 metres) wanders with broad climate cells.
+Against the low spring sun, shaded poleward slopes hold snow about 20 metres
+lower than level ground at the same height and sun-facing slopes lose it about
+9 metres higher; sheltered hollows and lee slopes keep a deeper pack, while
+wind-scoured crests and windward faces lose theirs. Snow thins past about 39
+degrees and sheds by 55, so steep faces stay dark rock. It does not flow
+downhill: a gully below the line melts out like any other low ground, and only
+shaded avalanche gullies just under the line keep a short tongue of debris
+snow. Permanent streams open dark meltwater ribbons through the pack, and its
+thinning margin picks up a grey-brown sediment stain. Every term is a
+world-space field; only the slope it reads is prefiltered with distance, so
+cover stays put as the camera moves. These are
+material-placement rules derived from the erosion results and terrain aspect,
+not a snowmelt simulation.
 
 World-anchored, warped fields vary patch size and density across broad regions;
 fine breakup filters away with distance. Grass shifts between green and dry
-olive with moisture, exposure and alpine climate. Metre-scale rock relief,
-restrained tilted bedding and broad mineral variation keep exposed faces from going uniform when the scan detail mips out.
+olive with moisture, exposure and alpine climate. Exposed faces break into
+jointed blocks about three metres across, with a finer metre-scale set inside
+them: each block's face tilts and weathers a little differently and dark joints
+open between them, flattened into slabs on steep faces where bedding planes
+cross vertical joints. Together with metre-scale relief, restrained tilted
+bedding and broad mineral variation this keeps exposed faces from going uniform
+when the scan detail mips out, and every octave fades before it shrinks below a
+few pixels. Talus carries fall-line streaks and block-scale rubble relief for
+the same reason.
 Each material supplies matching colour, normal, roughness and optional
 ambient-occlusion maps. The scans retain 1024² texels per layer; albedo is resized
 and mip-filtered in linear light and decoded by the GPU's sRGB sampler, while
@@ -320,7 +360,7 @@ FastNoiseLite seeds at identical parameters the height field's sd spans
 contains the port's terrain (sd 45 metres, the 15th percentile). Run
 `cargo run --bin noise-compare` to dump the field for such a comparison.
 
-## Hydraulic erosion and flow output
+## Erosion and flow output
 
 Independent 1024×1024-metre erosion passes are centred on a globally aligned
 512-metre lattice, so neighbouring footprints overlap by exactly 50 percent.
@@ -333,22 +373,57 @@ base terrain and geology, so its result does not depend on which neighbours
 finished first. There are no hard overlap thresholds or frozen internal
 boundaries; only the distant outer guard band fades erosion back to base.
 
-Each tile runs as three fragment-shader passes with float ping-pong targets,
-which avoids compute shaders and keeps every pass a plain render target:
+Each tile iteration runs four fragment-shader passes with float ping-pong
+targets, which avoids compute shaders and keeps every pass a plain render
+target:
 
 1. Conservative pipe flux steered by a rotationally symmetric 3×3 gradient.
 2. Rain, evaporation, water transport, continuous-angle velocity, and discharge.
-3. Inertial sediment advection, erosion, settling, and deposition.
+3. Inertial runoff sediment advection, erosion, settling and deposition,
+   together with fluvial transport along routed drainage. This pass writes the
+   terrain and drainage states as two targets.
+4. Thermal (talus) relaxation of over-steepened slopes.
 
-The flow and sediment passes adapt the useful physics from the hydraulic
-erosion shader in `~/nerthus` without depending on its WebGPU compute atomics.
-Runoff retains inertia and follows a bilinearly sampled downhill direction;
-excavation is capped by the actual forward drop and becomes progressively more
-resistant with channel depth. Uphill travel and slow or evaporating water settle
-their carried sediment. World-stable multi-scale geology bends and branches
-channels consistently through tile overlaps, while a bilateral cone footprint
-removes isolated cuts without smoothing away small tributaries. Ocean cells
-remain drains, and the small spawn footprint resists destructive excavation.
+The runoff solver adapts the useful physics from the hydraulic erosion shader
+in `~/nerthus` without depending on its WebGPU compute atomics. Runoff retains
+inertia and follows a bilinearly sampled downhill direction; excavation is
+capped by the actual forward drop and becomes progressively more resistant with
+channel depth. Uphill travel and slow or evaporating water settle their carried
+sediment. World-stable multi-scale noise bends and branches channels
+consistently through tile overlaps, while a bilateral cone footprint removes
+isolated cuts without smoothing away small tributaries. Ocean cells remain
+drains, and the small spawn footprint resists destructive excavation.
+
+That rain sheet only lives a few simulated seconds, so on its own it carves
+rills and small gullies but never organises a valley. Fluvial transport
+supplies what it cannot. Contributing area is routed between bed cells with
+multiple-flow-direction shares proportional to the squared slope, so every
+channel knows its whole catchment within the tile's 1920-metre domain; the CPU
+routes the base surface before a tile starts, so this holds from the first
+iteration. A stream-power capacity proportional to √A·S then detaches bed where
+the routed sediment flux is below capacity and deposits where the flux exceeds
+it: steep, well-fed channels incise, slope breaks build fans, and valley floors
+and closed hollows fill with alluvium. Channels initiate above a few hundred
+square metres of catchment, leaving unchannelled hillslopes to the runoff
+solver; stream power saturates beyond about 6.4 hectares, because overlapping
+tiles truncate large rivers at different domain edges; and incision stops at
+**Max incision** below the base surface, never below the sea or a neighbouring
+bed.
+
+The terrain state tracks the loose cover above bedrock: deposits add to it,
+erosion entrains it before cutting bedrock, and the thermal pass uses it to
+decide which slopes stand. Loose material sheds at its ~34-degree angle of
+repose; bare bedrock only fails above a much steeper, hardness-dependent limit
+(about 48 degrees in weak rock to 68 in the most resistant beds), and then
+slowly, as rockfall. The exchange is pairwise and antisymmetric, so it conserves
+material exactly without a scatter step. Together with incision this opens
+fresh cuts into V-shaped valleys, rounds weak crests, keeps resistant rock
+standing as cliffs and gathers talus aprons below steep faces. Substrate
+resistance comes from one shared, world-keyed geology
+(`assets/shaders/geology-functions.wgslinc`): broad and fine rock bodies plus
+gently dipping, warped resistant beds every ~19 metres of elevation, evaluated
+at the bedrock surface a cut actually exposes, so incision slows on a resistant
+bed and leaves a bench. The terrain material shader reads the same geology.
 
 One scratch simulation is advanced incrementally while completed passes are
 packed into surface and flow atlases. A lookup texture maps
@@ -372,24 +447,28 @@ diagnostics view with this per-texel contract:
 | R | Water depth |
 | G | Signed world-X velocity |
 | B | Signed world-Z velocity |
-| A | Accumulated discharge |
+| A | Routed contributing area, in 4×4-metre cells |
 
 The RGBA surface atlas retains signed height displacement in R for the vertex
-shader and collision. G stores local concavity in
-metres; B stores positive log2 discharge concentration relative to a surrounding
-12-metre ring; A stores substrate hardness. These fields are derived at tile
-completion using the simulation halo, then share the same gutters, overlap
-weights, reveal and visibility as the terrain. Positive displacement is net
-deposition; suspended sediment is not treated as deposited soil. Concentrated
-discharge distinguishes drainage channels from general rainfall, and shallow
-water velocities are gated when estimating transport strength.
+shader and collision. G stores local concavity in metres; B stores the positive
+log2 concentration of contributing area relative to a surrounding 12-metre
+ring, which finds each channel's thalweg; A stores the loose cover left above
+bedrock, in metres. These fields are derived at tile completion using the
+simulation halo, then share the same gutters, overlap weights, reveal and
+visibility as the terrain. Positive displacement is net deposition; suspended
+sediment is not treated as deposited soil. Contributing area separates
+permanent channels from rills and hillslopes, and shallow water velocities are
+gated when estimating transport strength.
 
 The flow output
 remains available for later river geometry. Press F1 and enable **Flow visualization** to inspect it on the
 terrain, or expand **Flow output** to inspect the cached target. Erosion
 parameters can be edited from the same panel and applied with **Regenerate
-erosion cache**. The panel also reports maximum incision, deposited height,
-small-scale detail within actively eroded ground, and flow-axis bias for the
+erosion cache**; besides the runoff controls they include stream power,
+channel incision, alluvial deposition, maximum incision, talus slide and
+rockfall rates. The panel also reports maximum incision, deposited height,
+small-scale detail within actively eroded ground, flow-axis bias, the largest
+contributing area, the share of bare bedrock and the mean loose cover for the
 most recently completed tile.
 
 ## Day/night lighting and atmosphere

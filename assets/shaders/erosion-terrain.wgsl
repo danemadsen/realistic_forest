@@ -2,8 +2,24 @@
 // Source: /Users/danemadsen/forest/assets/shaders/erosion_terrain.fs
 //
 // Hydraulic erosion pass 3: advect sediment, then erode or deposit terrain.
-// texture0:       terrain (bed height, sediment, immutable base height, hardness)
+// texture0:       terrain (bed height, sediment, immutable base height, loose cover)
 // uWaterState:    water (depth, velocity x, velocity z, accumulated discharge)
+// uDrainage:      drainage (contributing area in cells, routed sediment flux, 0, 0)
+//
+// Two processes share the pass. The runoff solver below (the original
+// erosion_terrain.fs) carves the fine rills and gullies that the transient
+// rain sheet can reach in a few seconds. Fluvial transport adds what that
+// water never lives long enough to do: drainage area is routed between bed
+// cells (multiple flow direction, slope-squared shares), so every channel
+// knows its whole catchment, and a stream-power capacity, k*sqrt(A)*S,
+// detaches bed where the routed sediment flux is below capacity and drops it
+// where flux exceeds capacity. Steep, well-fed channels incise; slope breaks
+// build fans; valley floors and closed hollows fill with alluvium.
+//
+// Terrain A tracks the loose cover above bedrock. Deposits add to it, loose
+// material is entrained first, and only then is bedrock cut at the
+// resistance of the world-keyed geology it exposes. The thermal pass reads
+// the same cover to decide which slopes stand and which shed.
 //
 // PORT NOTES (GLSL -> WGSL deviations):
 //  - No inverse_* stage-uniform fields added: the source performs no matrix
@@ -28,9 +44,9 @@
 //  - fragTexCoord/fragColor (raylib interpolators) were declared but unused
 //    in the GLSL — nothing to port for them.
 //  - fs_main reads the previous terrain state from texture0 and writes the
-//    updated state to the single color attachment (@location(0)); exactly as
-//    with the GL FBO feedback rules, the Rust side must ping-pong terrain
-//    targets instead of sampling the attachment it renders to.
+//    updated state to @location(0), plus the routed drainage state to
+//    @location(1); exactly as with the GL FBO feedback rules, the Rust side
+//    must ping-pong both instead of sampling the attachments it renders to.
 
 // ---------------------------------------------------------------------------
 // Shared global uniforms (porting spec section 1) — pasted verbatim.
@@ -85,6 +101,11 @@ struct StageUniforms {
     // Required for the world-stable sub-cell variation below. The value is the
     // world-space XZ corner of texel (0, 0), just like erosion_init.fs.
     world_min: vec2<f32>,           // uWorldMin
+    fluvial_capacity: f32,          // stream-power capacity per sqrt(cell) of catchment
+    fluvial_erosion: f32,           // fraction of a capacity deficit detached per step
+    fluvial_deposition: f32,        // fraction of a capacity excess deposited per step
+    maximum_incision: f32,          // deepest fluvial cut below the base surface, metres
+    drainage_saturation: f32,       // catchment (cells) at which stream power saturates
 };
 @group(2) @binding(0) var<uniform> stage: StageUniforms;
 
@@ -92,14 +113,17 @@ struct StageUniforms {
 // Textures (porting spec section 3 — GL unit numbers preserved)
 // ---------------------------------------------------------------------------
 
-// texture0: terrain (bed height, sediment, immutable base height, hardness)
+// texture0: terrain (bed height, sediment, immutable base height, loose cover)
 @group(1) @binding(0) var texture0: texture_2d<f32>;
 // uWaterState: water (depth, velocity x, velocity z, accumulated discharge)
 @group(1) @binding(1) var uWaterState: texture_2d<f32>;
+// uDrainage: drainage (contributing area in cells, routed sediment flux, 0, 0)
+@group(1) @binding(2) var uDrainage: texture_2d<f32>;
 
 // Samplers sit at GL unit + 8 per the spec; this pass only texel-fetches.
 @group(1) @binding(8) var tex0_sampler: sampler;
 @group(1) @binding(9) var uWaterState_sampler: sampler;
+@group(1) @binding(10) var uDrainage_sampler: sampler;
 
 // ---------------------------------------------------------------------------
 // Fullscreen-triangle vertex shader (porting spec section 4)
@@ -156,6 +180,11 @@ fn fetchWater(coord: vec2<i32>) -> vec4<f32>
     return textureLoad(uWaterState, clampCoord(coord), 0);
 }
 
+fn fetchDrainage(coord: vec2<i32>) -> vec4<f32>
+{
+    return textureLoad(uDrainage, clampCoord(coord), 0);
+}
+
 fn sampleTerrainBilinear(texel_position: vec2<f32>) -> vec4<f32>
 {
     let max_position = vec2<f32>(gridSize() - vec2<i32>(1));
@@ -210,6 +239,68 @@ fn valueNoise(position: vec2<f32>) -> f32
     return mix(mix(n00, n10, fraction.x), mix(n01, n11, fraction.x), fraction.y);
 }
 
+// BEGIN SHARED GEOLOGY
+// World-keyed substrate resistance. The erosion passes and the terrain
+// material shader paste this block verbatim (a test keeps the copies equal),
+// so the rock that resists incision and holds steep faces in the simulation
+// is the same rock the material shader exposes. Every input is a world
+// coordinate, which keeps overlapping erosion tiles deterministic.
+//
+// Broad (~92 m) and fine (~27 m) rock bodies vary hardness without following
+// contours. A weaker bedding term adds gently dipping, warped resistant beds
+// every ~19 m of bedrock elevation: where incision or talus relaxation cuts
+// through them they hold short cliff bands and benches instead of one
+// uniform slope. The bedding is keyed to the bedrock surface, so a bench
+// stays put as loose cover accumulates above it.
+const GEOLOGY_HARDNESS_SCALE: f32 = 0.56;
+
+fn geologyHash(position: vec2<f32>) -> f32
+{
+    var p = fract(vec3<f32>(position.xyx) * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+}
+
+fn geologyNoise(position: vec2<f32>) -> f32
+{
+    let cell = floor(position);
+    var fraction = fract(position);
+    fraction = fraction * fraction * (3.0 - 2.0 * fraction);
+    let a = geologyHash(cell);
+    let b = geologyHash(cell + vec2<f32>(1.0, 0.0));
+    let c = geologyHash(cell + vec2<f32>(0.0, 1.0));
+    let d = geologyHash(cell + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, fraction.x), mix(c, d, fraction.x), fraction.y);
+}
+
+// 0 = weak, readily weathered substrate; 1 = the most resistant rock.
+fn geologyResistance(world_xz: vec2<f32>, bedrock_height: f32) -> f32
+{
+    let broadRock = geologyNoise(world_xz / 92.0 + vec2<f32>(31.7, -18.2));
+    let fineRock = geologyNoise(world_xz / 27.0 + vec2<f32>(-73.1, 46.4));
+    let bedWarp = geologyNoise(world_xz / 310.0 + vec2<f32>(-12.9, 57.3)) - 0.5;
+    let bedCoordinate = (bedrock_height + dot(world_xz, vec2<f32>(0.017, -0.011))
+                         + bedWarp * 26.0) / 19.0;
+    let bedding = smoothstep(0.35, 0.85, 0.5 + 0.5 * sin(bedCoordinate * 6.2831853));
+    let geology = broadRock * 0.62 + fineRock * 0.24 + bedding * 0.14;
+    return smoothstep(0.25, 0.82, geology);
+}
+
+// The small spawn footprint resists destructive excavation.
+fn erosionSpawnProtection(world_xz: vec2<f32>) -> f32
+{
+    return 1.0 - smoothstep(90.0, 150.0, length(world_xz));
+}
+
+// Hardness as the erosion solver uses it: scaled resistance, raised to the
+// spawn protection inside its footprint.
+fn erosionHardness(world_xz: vec2<f32>, bedrock_height: f32) -> f32
+{
+    return max(geologyResistance(world_xz, bedrock_height) * GEOLOGY_HARDNESS_SCALE,
+               erosionSpawnProtection(world_xz) * 0.96);
+}
+// END SHARED GEOLOGY
+
 fn similarityWeight(neighbour_height: f32, center_height: f32,
                     spatial_weight: f32, height_scale: f32) -> f32
 {
@@ -222,8 +313,13 @@ fn similarityWeight(neighbour_height: f32, center_height: f32,
 // ---------------------------------------------------------------------------
 
 struct FragmentOutput {
-    @location(0) final_color: vec4<f32>,   // finalColor
+    @location(0) final_color: vec4<f32>,   // finalColor: terrain state
+    @location(1) drainage: vec4<f32>,      // routed drainage state
 };
+
+// Routing treats cells beyond the grid as absent: they neither give nor
+// receive flow, which keeps the closed simulation wall closed.
+const ABSENT_BED: f32 = 3.0e38;
 
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
@@ -238,17 +334,76 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
 
     var bed_height = terrain.r;
     let base_height = terrain.b;
-    let hardness = clamp(terrain.a, 0.0, 1.0);
+    var loose = max(terrain.a, 0.0);
 
     // Ocean terrain is immutable; ocean water is rendered/supplied separately.
+    // The sea also swallows any drainage and sediment routed into it.
     if (base_height < stage.sea_level)
     {
-        return FragmentOutput(vec4<f32>(base_height, 0.0, base_height, terrain.a));
+        return FragmentOutput(vec4<f32>(base_height, 0.0, base_height, loose), vec4<f32>(0.0));
     }
 
     let dt = max(stage.delta_time, 0.0);
     let cell_size = max(stage.cell_size, 0.0001);
     let velocity = water.gb;
+
+    // Resistance belongs to the bedrock surface under the loose cover, so a
+    // cut that reaches a resistant bed slows there and leaves a bench.
+    let world_position = stage.world_min + (vec2<f32>(coord) + vec2<f32>(0.5)) * cell_size;
+    let hardness = clamp(erosionHardness(world_position, bed_height - loose), 0.0, 1.0);
+    let rock_erodibility = pow(max(1.0 - hardness, 0.0), 1.35);
+    let loose_erodibility = 1.0 - 0.96 * erosionSpawnProtection(world_position);
+
+    // Drainage routing. Every bed cell passes its contributing area, and the
+    // sediment flux it carries, to its lower neighbours in proportion to
+    // their squared slope. A 5x5 window holds each neighbour's own outflow
+    // shares, so the gather sees exactly what each donor gives away. Bed
+    // heights route the flow (not the transient water surface), which keeps
+    // the routing acyclic from one iteration to the next.
+    var beds: array<f32, 25>;
+    for (var row = 0; row < 5; row++)
+    {
+        for (var column = 0; column < 5; column++)
+        {
+            let sample_coord = coord + vec2<i32>(column - 2, row - 2);
+            let inside = all(sample_coord >= vec2<i32>(0)) && all(sample_coord < size);
+            beds[row * 5 + column] = select(ABSENT_BED, fetchTerrain(sample_coord).r, inside);
+        }
+    }
+    var drainage_area = 1.0;
+    var sediment_in = 0.0;
+    var steepest_descent = 0.0;
+    var lowest_neighbour = bed_height;
+    for (var donor = 0; donor < 9; donor++)
+    {
+        if (donor == 4) { continue; }
+        let donor_offset = vec2<i32>(donor % 3 - 1, donor / 3 - 1);
+        let donor_bed = beds[(donor_offset.y + 2) * 5 + donor_offset.x + 2];
+        if (donor_bed >= ABSENT_BED) { continue; }
+        let donor_distance = cell_size
+            * select(1.0, 1.41421356, donor_offset.x != 0 && donor_offset.y != 0);
+        let fall = (bed_height - donor_bed) / donor_distance;
+        steepest_descent = max(steepest_descent, fall);
+        lowest_neighbour = min(lowest_neighbour, donor_bed);
+        // The same pair seen from the donor: its slope toward this cell.
+        let rise = -fall;
+        if (rise <= 0.0) { continue; }
+        var share_total = 0.0;
+        for (var receiver = 0; receiver < 9; receiver++)
+        {
+            if (receiver == 4) { continue; }
+            let step = vec2<i32>(receiver % 3 - 1, receiver / 3 - 1);
+            let receiver_offset = donor_offset + step;
+            let receiver_bed = beds[(receiver_offset.y + 2) * 5 + receiver_offset.x + 2];
+            let receiver_slope = (donor_bed - receiver_bed)
+                / (cell_size * select(1.0, 1.41421356, step.x != 0 && step.y != 0));
+            if (receiver_slope > 0.0) { share_total += receiver_slope * receiver_slope; }
+        }
+        let share = rise * rise / max(share_total, 1.0e-12);
+        let donor_drainage = fetchDrainage(coord + donor_offset);
+        drainage_area += max(donor_drainage.r, 0.0) * share;
+        sediment_in += max(donor_drainage.g, 0.0) * share;
+    }
 
     // Semi-Lagrangian backtracing asks which upstream cell supplied this cell.
     // Nerthus advances droplets by a bounded step. Applying the same bound here
@@ -303,7 +458,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
     let speed = length(velocity);
     let water_depth = max(water.r, 0.0);
 
-    let world_cell = stage.world_min / cell_size + vec2<f32>(coord) + vec2<f32>(0.5);
+    let world_cell = world_position / cell_size;
     let broad_path_noise = valueNoise(world_cell * 0.16 + vec2<f32>(17.13, -9.71));
     let fine_path_noise = valueNoise(world_cell * 0.43 + vec2<f32>(-31.7, 22.9));
     let path_noise = broad_path_noise * 0.45 + fine_path_noise * 0.55;
@@ -381,6 +536,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
     {
         let deposit = min(sediment, height_change_along_path);
         bed_height += deposit;
+        loose += deposit;
         sediment -= deposit;
     }
     else if (sediment > capacity)
@@ -388,6 +544,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
         let deposit = min(sediment,
             (sediment - capacity) * max(stage.deposition_rate, 0.0) * dt);
         bed_height += deposit;
+        loose += deposit;
         sediment -= deposit;
     }
     else
@@ -396,8 +553,11 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
         // resistant ribs and tributaries instead of uniformly widening every
         // wet slope, but remains deterministic in world space.
         let material_variation = mix(0.58, 1.42, fine_path_noise);
+        // Loose cover is entrained readily; bare bedrock at its resistance.
+        let erodibility = mix(rock_erodibility, loose_erodibility,
+                              smoothstep(0.0, 0.15, loose));
         var erode = (capacity - sediment) * max(stage.erosion_rate, 0.0)
-            * pow(max(1.0 - hardness, 0.0), 1.35) * material_variation * dt;
+            * erodibility * material_variation * dt;
 
         // Excavation rapidly becomes more expensive with depth. The configured
         // maximum remains a hard limit, but is no longer the depth every active
@@ -427,6 +587,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
         erode = min(erode, min(downhill_bed_step, step_ceiling));
 
         bed_height -= erode;
+        loose = max(loose - erode, 0.0);
         sediment += erode;
         eroded_this_step = erode;
     }
@@ -441,6 +602,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
         * (0.15 + 1.85 * settle_signal), 0.0, 1.0);
     let settled = sediment * settle_fraction;
     bed_height += settled;
+    loose += settled;
     sediment -= settled;
 
     // The old binomial average blurred every hydraulically active 3x3 region.
@@ -470,7 +632,53 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
         * clamp(stage.brush_strength, 0.0, 1.0) * 0.45);
     brush_correction = min(brush_correction, sediment);
     bed_height += brush_correction;
+    loose += brush_correction;
     sediment -= brush_correction;
+
+    // Fluvial transport along the routed drainage. Capacity grows with the
+    // square root of the catchment and the steepest bed descent, saturating
+    // for catchments larger than the tile can see in full (so overlapping
+    // tiles, whose domains truncate big rivers differently, still agree).
+    // Sheet wash on unchannelled hillslopes is left to the runoff solver.
+    // Below a few hundred square metres of catchment, overland flow spreads
+    // as a sheet that vegetation holds; channels initiate above it.
+    let catchment = drainage_area * max(stage.drainage_saturation, 1.0)
+                  / (drainage_area + max(stage.drainage_saturation, 1.0));
+    let channelised = smoothstep(12.0, 60.0, drainage_area);
+    let fluvial_capacity = max(stage.fluvial_capacity, 0.0) * sqrt(catchment)
+                         * steepest_descent * channelised;
+    var fluvial_change = 0.0;
+    if (sediment_in > fluvial_capacity)
+    {
+        // Slack water drops what it can no longer carry: fans at slope
+        // breaks, alluvium on valley floors, fill in closed hollows.
+        fluvial_change = (sediment_in - fluvial_capacity)
+                       * clamp(stage.fluvial_deposition, 0.0, 1.0);
+    }
+    else
+    {
+        // Loose cover meets the deficit first; whatever remains is cut from
+        // bedrock at the geology's resistance.
+        let deficit = (fluvial_capacity - sediment_in) * max(stage.fluvial_erosion, 0.0);
+        let from_loose = min(deficit, loose);
+        var detach = from_loose * loose_erodibility + (deficit - from_loose) * rock_erodibility;
+        // Incision slows as it deepens and stops at the configured depth, so
+        // valleys deepen into V forms (the thermal pass opens their walls)
+        // rather than slots.
+        let excavation = max(base_height - bed_height, 0.0);
+        let depth_room = clamp(1.0 - excavation / max(stage.maximum_incision, 0.01), 0.0, 1.0);
+        detach = detach * depth_room * depth_room;
+        // A bed never cuts below its lowest neighbour, so no pits open, nor
+        // below the sea, so river mouths do not drown into inlets; one step
+        // stays small against the 4 m cell.
+        detach = min(detach, max(bed_height - lowest_neighbour, 0.0) * 0.5);
+        detach = min(detach, max(bed_height - stage.sea_level - 0.5, 0.0));
+        detach = min(detach, cell_size * 0.012);
+        fluvial_change = -detach;
+    }
+    bed_height += fluvial_change;
+    loose = max(loose + fluvial_change, 0.0);
+    var sediment_out = max(sediment_in - fluvial_change, 0.0);
 
     // Fade the simulation into its immutable source terrain. The outermost
     // texel is exactly baseHeight, producing a stable collision/render guard.
@@ -480,12 +688,14 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
     let simulation_weight = smoothstep(0.0, guard_width, edge_distance);
     bed_height = mix(base_height, bed_height, simulation_weight);
     sediment *= simulation_weight;
+    sediment_out *= simulation_weight;
 
-    return FragmentOutput(vec4<f32>(bed_height, max(sediment, 0.0), base_height, terrain.a));
+    return FragmentOutput(vec4<f32>(bed_height, max(sediment, 0.0), base_height, loose),
+                          vec4<f32>(drainage_area, sediment_out, 0.0, 0.0));
 }
 
 // STAGE UNIFORMS:
-//   Bind as ONE uniform buffer at @group(2) @binding(0), 64 bytes total:
+//   Bind as ONE uniform buffer at @group(2) @binding(0), 88 bytes total:
 //     offset  0  resolution:        vec2<f32>  // uResolution — simulation-domain
 //                                              //   texel resolution; a component
 //                                              //   < 1.0 falls back to the texture
@@ -506,10 +716,18 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
 //     offset 56  world_min:         vec2<f32>  // uWorldMin — world-space XZ corner
 //                                              //   of texel (0, 0) of the padded
 //                                              //   simulation domain
+//     offset 64  fluvial_capacity:  f32
+//     offset 68  fluvial_erosion:   f32
+//     offset 72  fluvial_deposition: f32
+//     offset 76  maximum_incision:  f32
+//     offset 80  drainage_saturation: f32
+//     offset 84  (struct rounds to 88 bytes)
 //   Texture bindings (RGBA32F float textures, texel loads only, no filtering):
 //     texture0    -> @group(1) @binding(0) texture_2d<f32>; sampler @binding(8) (unused)
 //     uWaterState -> @group(1) @binding(1) texture_2d<f32>; sampler @binding(9) (unused)
-//   Output: single attachment @location(0) = updated terrain
-//     (bed height, sediment, immutable base height, hardness).
-//     texture0 must NOT be the attachment fs_main renders to — ping-pong or
-//     copy the terrain state as in the GL FBO version.
+//     uDrainage   -> @group(1) @binding(2) texture_2d<f32>; sampler @binding(10) (unused)
+//   Outputs: @location(0) = updated terrain
+//     (bed height, sediment, immutable base height, loose cover);
+//     @location(1) = drainage (contributing area, sediment flux out, 0, 0).
+//     Neither input may be an attachment fs_main renders to — ping-pong both
+//     states as in the GL FBO version.

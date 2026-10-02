@@ -186,7 +186,8 @@ pub struct TerrainStageUniforms {
     pub waterline_push_land: f32,             // 264 uWaterlinePushLand
     pub waterline_push_sea: f32,              // 268 uWaterlinePushSea
     pub waterline_push_scale: f32,            // 272 uWaterlinePushScale
-    _end_pad: [f32; 3],                       // 276 (align(16) tail)
+    pub snowline_altitude: f32,               // 276 persistent snowline above sea level
+    _end_pad: [f32; 2],                       // 280 (align(16) tail)
 }
 const _: () = assert!(std::mem::size_of::<TerrainStageUniforms>() == 288);
 
@@ -256,7 +257,8 @@ impl TerrainStageUniforms {
             waterline_push_land: WATERLINE_PUSH_LAND,
             waterline_push_sea: WATERLINE_PUSH_SEA,
             waterline_push_scale: WATERLINE_PUSH_SCALE,
-            _end_pad: [0.0; 3],
+            snowline_altitude: SNOWLINE_ALTITUDE,
+            _end_pad: [0.0; 2],
         }
     }
 }
@@ -353,8 +355,31 @@ pub struct ErosionTerrainStageUniforms {
     pub brush_strength: f32,        // 48
     _align: f32,                    // 52
     pub world_min: [f32; 2],        // 56 uWorldMin
+    pub fluvial_capacity: f32,      // 64
+    pub fluvial_erosion: f32,       // 68
+    pub fluvial_deposition: f32,    // 72
+    pub maximum_incision: f32,      // 76
+    pub drainage_saturation: f32,   // 80
+    _end_pad: f32,                  // 84 (struct rounds to 88)
 }
-const _: () = assert!(std::mem::size_of::<ErosionTerrainStageUniforms>() == 64);
+const _: () = assert!(std::mem::size_of::<ErosionTerrainStageUniforms>() == 88);
+
+/// erosion-thermal stage uniforms.
+#[repr(C, align(8))]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ErosionThermalStageUniforms {
+    pub resolution: [f32; 2],   // 0
+    pub cell_size: f32,         // 8
+    pub sea_level: f32,         // 12
+    pub world_min: [f32; 2],    // 16
+    pub loose_rate: f32,        // 24
+    pub rock_rate: f32,         // 28
+    pub loose_repose: f32,      // 32
+    pub soft_rock_slope: f32,   // 36
+    pub hard_rock_slope: f32,   // 40
+    _end_pad: f32,              // 44
+}
+const _: () = assert!(std::mem::size_of::<ErosionThermalStageUniforms>() == 48);
 
 /// The group(0) bind group layout every pass shares: one uniform buffer.
 ///
@@ -395,6 +420,7 @@ pub struct ForestShaderHandles {
     pub erosion_flux: Handle<Shader>,
     pub erosion_water: Handle<Shader>,
     pub erosion_terrain: Handle<Shader>,
+    pub erosion_thermal: Handle<Shader>,
     pub ssao: Handle<Shader>,
     pub ssao_blur: Handle<Shader>,
     pub composite: Handle<Shader>,
@@ -440,6 +466,7 @@ impl Plugin for ForestRenderPlugin {
                 erosion_flux: asset_server.load::<Shader>("shaders/erosion-flux.wgsl"),
                 erosion_water: asset_server.load::<Shader>("shaders/erosion-water.wgsl"),
                 erosion_terrain: asset_server.load::<Shader>("shaders/erosion-terrain.wgsl"),
+                erosion_thermal: asset_server.load::<Shader>("shaders/erosion-thermal.wgsl"),
                 ssao: asset_server.load::<Shader>("shaders/ssao.wgsl"),
                 ssao_blur: asset_server.load::<Shader>("shaders/ssao-blur.wgsl"),
                 composite: asset_server.load::<Shader>("shaders/composite.wgsl"),
@@ -769,6 +796,19 @@ mod tests {
             include_str!("../../assets/shaders/water-underwater.wgsl"),
         ] {
             assert!(source.contains(common), "cloud shape or lighting differs between passes");
+        }
+    }
+
+    #[test]
+    fn erosion_and_materials_share_one_geology() {
+        let common = include_str!("../../assets/shaders/geology-functions.wgslinc").trim();
+        for source in [
+            include_str!("../../assets/shaders/erosion-init.wgsl"),
+            include_str!("../../assets/shaders/erosion-terrain.wgsl"),
+            include_str!("../../assets/shaders/erosion-thermal.wgsl"),
+            include_str!("../../assets/shaders/terrain-fs.wgsl"),
+        ] {
+            assert!(source.contains(common), "erosion and material geology diverged");
         }
     }
 

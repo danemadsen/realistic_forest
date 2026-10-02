@@ -13,7 +13,11 @@
 //   so leaving uv.y = 0 at the top of the viewport reproduces the exact
 //   orientation the C++ displayed. No flip is applied.
 // - Blending stays on: ImGui's pipeline always blends, and the atlas's alpha
-//   channel is discharge, so the C++ image was already composited that way.
+//   channel was discharge, so the C++ image was already composited that way.
+//   The alpha now carries routed contributing area in cells (at least one on
+//   land), so it is mapped logarithmically: ~11 doublings of catchment, a
+//   permanent stream, reach full opacity while hillslopes stay faint, as the
+//   discharge-weighted image did.
 //   The blend is the same separate-alpha pair ImGui's GL backend used
 //   (GL_SRC_ALPHA/GL_ONE_MINUS_SRC_ALPHA for colour,
 //   GL_ONE/GL_ONE_MINUS_SRC_ALPHA for alpha); the Rust pipeline sets it.
@@ -62,6 +66,7 @@ fn toLinearForSrgbTarget(colour: vec3<f32>) -> vec3<f32>
 @fragment
 fn fs_main(input: VsOutput) -> @location(0) vec4<f32> {
     let texel = textureSample(flow_atlas, flow_atlas_sampler, input.uv);
+    let drainage = clamp(log2(1.0 + max(texel.a, 0.0)) / 11.0, 0.0, 1.0);
     return vec4<f32>(toLinearForSrgbTarget(clamp(texel.rgb, vec3<f32>(0.0), vec3<f32>(1.0))),
-                     clamp(texel.a, 0.0, 1.0));
+                     drainage);
 }
