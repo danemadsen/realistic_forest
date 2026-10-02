@@ -10,6 +10,7 @@ mod constants;
 mod day_night;
 mod erosion;
 mod grass;
+mod vegetation;
 mod lightning;
 mod matrices;
 mod noise;
@@ -154,6 +155,11 @@ fn main() {
     // --probe dumps the base landform as CSV and exits with no window.
     if automation.probe {
         noise::run_probe(automation.probe_extent, automation.probe_step);
+        return;
+    }
+    // --vegetation-map charts the plant scatter and exits with no window.
+    if let Some(path) = &automation.vegetation_map {
+        vegetation::map::run_map(path, automation.map_centre, automation.map_extent);
         return;
     }
 

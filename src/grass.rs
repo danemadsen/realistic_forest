@@ -309,7 +309,7 @@ fn load_texture(
     })
 }
 
-fn generate_tangents(
+pub(crate) fn generate_tangents(
     positions: &[[f32; 3]],
     normals: &[[f32; 3]],
     uvs: &[[f32; 2]],
