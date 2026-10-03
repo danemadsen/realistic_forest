@@ -564,14 +564,13 @@ fn draw_diagnostics_window(
             }
 
             separator_text(ui, "Rivers");
-            ui.checkbox(&mut settings.rivers_visible, "River and waterfall surfaces");
+            ui.checkbox(&mut settings.rivers_visible, "River and lake surfaces");
             match rivers.and_then(|field| field.network()) {
                 Some(network) => {
                     ui.label(format!(
-                        "{} rivers, {:.1} km of channel, {} falls over 1.5 m, {} lakes (region built in {:.2} s)",
+                        "{} rivers, {:.1} km of channel, {} lakes (region built in {:.2} s)",
                         network.rivers.len(),
                         network.total_length_km(),
-                        network.waterfall_count(),
                         network.lakes.len(),
                         network.build_seconds
                     ));

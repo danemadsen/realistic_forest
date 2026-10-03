@@ -1,21 +1,12 @@
 //! The water surfaces: a ribbon across each channel at the water level, and
-//! a falling sheet over every waterfall.
+//! a flat sheet over each lake.
 //!
 //! A ribbon's cross-sections sit at the river's nodes and reach a little
 //! past each bank, so the waterline is wherever the carved bank rises through
 //! the water and never a mesh edge. Every vertex carries the flow there (the
-//! current is fastest over the thalweg and stalls at the banks), how far down
-//! the river and across the channel it lies, the channel's depth and its
-//! whitewater, which is what the water shader animates and foams.
-//!
-//! At a fall the water leaves the lip at the speed it arrived with and drops
-//! under gravity, so the sheet follows the jet's parabola out from the lip
-//! and lands in the plunge pool a little downstream, ending just under the
-//! pool's surface, which starts beneath it. The sheet hangs from the
-//! ribbon's own lip row, so surface and fall are one mesh, and `fall` runs
-//! on without a break: -1 on the river, rising to 0 over the last stretch
-//! to the lip (where the shader smooths and speeds the water), then 0 to 1
-//! down the sheet.
+//! current is fastest over the thalweg and stalls at the banks), where across
+//! the channel it lies and its whitewater, which is what the water shader
+//! animates and foams.
 //!
 //! A lake is a flat sheet at its level over its basin and the shore cells
 //! around it, so the shoreline is wherever the ground rises through it, but
@@ -25,9 +16,9 @@
 //! The mesh is cut into 256 m chunks with their bounds, so the renderer only
 //! draws what the camera can see.
 
-use super::network::{FLOW_CELL, GRAVITY, Lake, River, RiverEnd};
+use super::network::{FLOW_CELL, Lake, River, RiverEnd};
 
-/// One water-surface vertex: 48 bytes, mirrored by the river vertex inputs
+/// One water-surface vertex: 32 bytes, mirrored by the river vertex inputs
 /// in water-surface.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -38,28 +29,16 @@ pub struct SurfaceVertex {
     /// Across the channel in half widths: -1 at the left waterline, +1 at
     /// the right; beyond them the ribbon runs under the banks.
     pub across: f32,
-    /// Metres down the river from its head.
-    pub along: f32,
-    /// Depth of the thalweg below the surface.
-    pub depth: f32,
     /// Whitewater, 0..1.
     pub turbulence: f32,
-    pub half_width: f32,
-    /// On a falling sheet, the share of its fall time the water has fallen
-    /// for (0 at the lip, 1 at the pool); -1 on a river's surface, 0 on its
-    /// lip row, [`LAKE_SURFACE`] on a lake's.
-    pub fall: f32,
-    /// On a falling sheet, the height it falls; on a surface, the height of
-    /// the last fall upstream within reach of its plunge, else 0.
-    pub drop: f32,
+    /// 1 on a lake's still water, 0 on a river's.
+    pub still: f32,
 }
 
-const _: () = assert!(std::mem::size_of::<SurfaceVertex>() == 48);
+const _: () = assert!(std::mem::size_of::<SurfaceVertex>() == 32);
 
 /// Side of a culling chunk, metres.
 pub const CHUNK: f32 = 256.0;
-/// `fall` on a lake's surface.
-pub const LAKE_SURFACE: f32 = -2.0;
 /// Side of a lake surface's cells: the flow grid's.
 const LAKE_CELL: f32 = FLOW_CELL as f32;
 
@@ -132,8 +111,7 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
             &[-1.15, 0.0, 1.15]
         };
         let columns = offsets.len() as u32;
-        // Direction of the reach through each node; a fall's two nodes take
-        // the direction of the channel around them.
+        // Direction of the reach through each node.
         let direction = |i: usize| -> [f32; 2] {
             let pick = |a: usize, b: usize| {
                 let d = [nodes[b].position[0] - nodes[a].position[0], nodes[b].position[1] - nodes[a].position[1]];
@@ -144,22 +122,12 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
             let wide = if i > 0 && i < end { pick(i - 1, i + 1) } else { None };
             normalize(wide.or(after).or(before).unwrap_or([1.0, 0.0]))
         };
-        // The plunge of the last fall reaches this far down the pool.
-        let mut last_fall = (f32::NEG_INFINITY, 0.0f32);
         let mut previous_row: Option<u32> = None;
         for i in 0..=end {
             let node = &nodes[i];
-            if i > 0 && nodes[i - 1].fall > 0.0 {
-                last_fall = (nodes[i - 1].along, nodes[i - 1].fall);
-            }
             let tangent = direction(i);
             let normal = [-tangent[1], tangent[0]];
             let half_width = node.half_width.max(0.25);
-            // A plunge pool boils under its fall and settles downstream.
-            // The boil spreads a few metres, not the whole pool.
-            let plunge_reach = 1.5 * half_width + last_fall.1 + 1.5;
-            let since = node.along - last_fall.0;
-            let drop = if since < plunge_reach { last_fall.1 * (1.0 - since / plunge_reach) } else { 0.0 };
             let row = vertices.len() as u32;
             // Where the river runs into a lake its surface sinks under the
             // lake's, which then covers it.
@@ -180,67 +148,17 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
                     ],
                     velocity: [tangent[0] * speed, tangent[1] * speed],
                     across,
-                    along: node.along,
-                    depth: node.depth,
                     turbulence: node.turbulence,
-                    half_width,
-                    fall: if node.fall > 0.0 && i < end { 0.0 } else { -1.0 },
-                    drop,
+                    still: 0.0,
                 });
             }
-            // The ribbon steps down a fall through the sheet, not a ramp: no
-            // quads join a lip to its foot.
-            let crosses_fall = i > 0 && nodes[i - 1].fall > 0.0;
             let under_lake = i > 0 && nodes[i - 1].lake && node.lake;
             if let Some(previous) = previous_row
-                && !crosses_fall
                 && !under_lake
             {
                 add_quads(&mut chunk_triangles, &vertices, previous, row, columns);
             }
             previous_row = Some(row);
-
-            if node.fall > 0.0 && i < end {
-                // The sheet: out from the lip along the jet's parabola.
-                let height = node.fall;
-                let lip_speed = node.speed.max((GRAVITY * node.depth.max(0.1) * 0.5).sqrt()).max(0.6);
-                let duration = (2.0 * height / GRAVITY).sqrt();
-                let rows = ((height / 0.35).ceil() as usize).clamp(3, 12);
-                let mut sheet_previous = Some(row);
-                for r in 1..=rows {
-                    let t = r as f32 / rows as f32 * duration;
-                    let out = lip_speed * t;
-                    // The last row dips just under the pool's surface, so the
-                    // two meet without a gap.
-                    let y = node.water - 0.5 * GRAVITY * t * t - if r == rows { 0.08 } else { 0.0 };
-                    let fall = r as f32 / rows as f32;
-                    // A sheet gathers a little as it falls.
-                    let gather = 1.0 - 0.15 * fall;
-                    let base = vertices.len() as u32;
-                    for &across in offsets {
-                        let across = across.clamp(-1.0, 1.0) * gather;
-                        vertices.push(SurfaceVertex {
-                            position: [
-                                node.position[0] + tangent[0] * out + normal[0] * across * half_width,
-                                y,
-                                node.position[1] + tangent[1] * out + normal[1] * across * half_width,
-                            ],
-                            velocity: [tangent[0] * lip_speed, tangent[1] * lip_speed],
-                            across,
-                            along: node.along + out,
-                            depth: node.depth,
-                            turbulence: 1.0,
-                            half_width,
-                            fall,
-                            drop: height,
-                        });
-                    }
-                    if let Some(previous) = sheet_previous {
-                        add_quads(&mut chunk_triangles, &vertices, previous, base, columns);
-                    }
-                    sheet_previous = Some(base);
-                }
-            }
         }
     }
 
@@ -276,27 +194,25 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
 }
 
 /// A lake's sheet: a quad over every flow-grid cell of its water and of its
-/// shore, the cells around it where the ground rises through the water on
-/// every side. None over its outlet, where the ground falls away below the
-/// level and a sheet would hang in the air.
+/// shore, the cells around it where the ground rises through the water. Its
+/// outer edge sinks under the ground wherever that lies lower than the
+/// water, so the sheet never ends in the air.
 fn add_lake(
     vertices: &mut Vec<SurfaceVertex>,
     chunk_triangles: &mut std::collections::BTreeMap<(i32, i32), Vec<u32>>,
     lake: &Lake,
 ) {
+    let sunk: std::collections::HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
     let mut corner_index = std::collections::HashMap::new();
     let mut corner = |vertices: &mut Vec<SurfaceVertex>, x: i32, z: i32| -> u32 {
         *corner_index.entry((x, z)).or_insert_with(|| {
+            let height = sunk.get(&[x, z]).map_or(lake.level, |&h| h.min(lake.level));
             vertices.push(SurfaceVertex {
-                position: [x as f32 * LAKE_CELL, lake.level, z as f32 * LAKE_CELL],
+                position: [x as f32 * LAKE_CELL, height, z as f32 * LAKE_CELL],
                 velocity: [0.0, 0.0],
                 across: 0.0,
-                along: 0.0,
-                depth: 1.0,
                 turbulence: 0.0,
-                half_width: 50.0,
-                fall: LAKE_SURFACE,
-                drop: 0.0,
+                still: 1.0,
             });
             vertices.len() as u32 - 1
         })

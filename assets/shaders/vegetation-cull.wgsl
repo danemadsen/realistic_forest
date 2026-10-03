@@ -388,7 +388,7 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
 // cone that steepens away from the water) and from below (a low levee that
 // keeps the water in its channel). The upper bounds combine by minimum and
 // the lower ones by maximum, so confluences open into each other; a segment
-// has a flat start and a round end, which keeps a waterfall's lip vertical.
+// has a flat start and a round end, so it never reaches back up the channel.
 struct RiverSegment {
     a: vec2<f32>,
     b: vec2<f32>,

@@ -154,7 +154,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--cloud-thickness M` | Layer thickness in `[100, 4000]` metres; default `1200` |
 | `--no-vegetation` | Skip loading and scattering the trees, shrubs and flowers |
 | `--no-rivers` | Generate, carve and draw no rivers |
-| `--river-map path.png` | Render the river network from above, print its statistics and the rivers and waterfalls nearest `--map-centre`, then exit |
+| `--river-map path.png` | Render the river network from above, print its statistics and the rivers and lakes nearest `--map-centre`, then exit |
 | `--vegetation-map path.png` | Render the plant scatter from above, print its statistics, then exit |
 | `--map-centre x,z`, `--map-extent M` | Area of the vegetation or river map: its centre (default `0,0`) and side in metres (default `1024`, or `8192` for the river map) |
 
@@ -670,17 +670,16 @@ sends its river out through that gap, and any other is routed again through
 a wider corridor.
 
 The water surface follows the channel's ground a little below its banks and
-only ever falls downstream. A hollow the water would stand less than 1.2 m
-deep in is crossed in a cut through its rim, as a river incises the sill it
-spills over. A deeper basin holds a lake or pond: the whole basin (found by
-flood fill beyond the corridor) fills to just under the rim it spills over,
-every river that reaches it shares it (a basin holding a smaller lake drowns
-it), the reaches above it are backed up to its level, and the river leaves it
-at its outlet. Water runs down a slope, however steep, as rapids and
-cascades; a waterfall forms only where the land itself has a ledge, a drop
-steeper than about 42 degrees on average and 1.2 to 8 m tall, from the
-surface above it to the surface at its foot, and the water below scours a
-deeper plunge pool. Falls are rare: about five over 1.5 m around spawn.
+only ever falls downstream. A hollow the water would stand less than 2 m
+deep in at its deepest, or less than 0.6 m on average (a flooded flat), is
+crossed in a cut through its rim, as a river incises the sill it spills
+over. A deeper basin holds a lake or pond: the whole basin (found by flood
+fill beyond the corridor) fills to just under the rim it spills over, every
+river that reaches it shares it (a basin holding a smaller lake drowns it),
+the reaches above it are backed up to its level, and the river leaves it at
+its outlet, easing down from the lake's level over the sill rather than
+dropping out of it. Water runs down every slope, however steep, as rapids;
+there are no waterfalls.
 
 Hydraulics follow from the catchment and the slope. Bankfull discharge grows
 with the catchment, and the channel follows downstream hydraulic geometry,
@@ -691,12 +690,12 @@ the slope, and the speed is whatever carries the discharge through that
 section. A mountain stream is held in a narrower, deeper channel in boulders
 and bedrock; on the flat the same water spreads wide and shallow over its own
 gravel and silt. Around spawn, reaches draining over half a square kilometre
-average 9.7 m wide on the lowland, 6.9 m on moderate slopes and 5.0 m on steep
+average 9.5 m wide on the lowland, 6.7 m on moderate slopes and 4.9 m on steep
 ones, and no creek is narrower than 1.6 m. A river widens below a confluence
 and narrows into a steeper reach gradually, never by more than 2.5 cm per
 metre along it; it swells a little through its pools and narrows over its
-riffles, a plunge pool is scoured out deeper and wider than the stream that
-feeds it, and a river's head starts as a seep that gathers into a channel.
+riffles, churns white down its rapids, and a river's head starts as a seep
+that gathers into a channel.
 Where it meets still water (a lake it runs into or out of, or the sea) it
 spreads half as wide again and slows into it, as a mouth does. The thalweg
 hugs the outside of every bend.
@@ -706,15 +705,15 @@ regions that both see a whole catchment agree on it; when the player moves
 on, the next region is built on the async compute pool (about a second) and
 swapped in. The first region is built before anything streams.
 
-`--river-map path.png` charts a region from above (shaded relief, channels,
-lakes, falls in red) and prints its statistics, how well the channels fit the
-land (how much of their length is trenched through a rise, held in by an
-embankment, or running along a slope above its valley's floor), and the
-rivers, waterfalls and lakes nearest `--map-centre`; `--map-extent` defaults
-to 8 km here. The spawn region holds some 160 rivers, 86 km of channel and
-250 lakes and ponds; on gentle reaches the water stands 0.6 m under the
-natural ground on average, and 0.1 % of their length is trenched more than
-3 m into it.
+`--river-map path.png` charts a region from above (shaded relief, channels
+and lakes) and prints its statistics, how well the channels fit the land (how
+much of their length is trenched through a rise, held in by an embankment,
+or running along a slope above its valley's floor), how much of the lakes'
+sheet edges would stand over lower ground, and the rivers and lakes nearest
+`--map-centre`; `--map-extent` defaults to 8 km here. The spawn region holds
+some 160 rivers, 85 km of channel and 155 lakes and ponds covering 270 ha;
+on gentle reaches the water stands about a metre under the natural ground on
+average, and under 1 % of their length is trenched more than 3 m into it.
 
 ### How they shape the ground
 
@@ -727,7 +726,8 @@ waterline the ground is held a little above the water and falls gently away
 from it, the broad, low natural levee a river builds, so the channel always
 contains its river. Bounds combine across segments (minimum above, maximum
 below), so confluences open into each other. A segment has a flat start and a
-round end, which keeps a waterfall's lip a clean vertical face.
+round end, so it never reaches back up the channel over ground the segments
+above it shape.
 
 The same arithmetic runs on the CPU (`src/rivers/carve.rs`) and in the shared
 `assets/shaders/river-functions.wgslinc`, over the same uploaded segments and
@@ -742,8 +742,9 @@ trenches the channel.
 Lakes carve nothing. Each lookup-grid cell a lake reaches carries the lake's
 level and a 64-bit mask of which of its 4 m cells hold the lake or its
 shore, and ground below the level there lies under the lake: plants keep out of
-it, the terrain shades its bed and shore, the erosion leaves it as a drain,
-and the player wades and swims in it.
+it, the terrain shades its bed and shore, and the player wades and swims in
+it. The erosion leaves the lake and its shore as they are, a drain for what
+runs into it, so no gully cuts down below the water at its edge.
 
 The terrain material shader reads the river or lake at every vertex, and
 exactly at every pixel where water may lie within a triangle's span (beyond
@@ -751,7 +752,7 @@ the first ring the clipmap's triangles are wider than a creek, and would
 smear its bed across them): the bed
 sorts by the power of the water over it, silt and mud where the water all
 but stands (still pools, lake beds), gravel through every run and riffle,
-bedrock under cascades and falls, and under the water it is darkened by its
+bedrock under rapids, and under the water it is darkened by its
 film of algae and settled silt. Out of the
 water the turf runs to the waterline, darkened and glossy where it is wet,
 except where the bank says otherwise: the outside of a bend is undercut into a
@@ -783,15 +784,14 @@ forest's shade.
 
 Each river's surface is a ribbon across its channel at the water level,
 reaching under both banks so the waterline is wherever the carved bank rises
-through the water. Each waterfall is a sheet hung from the ribbon's own lip
-row, so river and fall are one surface: it leaves the lip at the speed the
-water arrived with, falls along the jet's parabola and ends just under the
-plunge pool's surface. A lake is a flat sheet at its level over its basin,
-in 4 m cells, and over the shore cells around it whose ground rises through
-the water on every side, so its shoreline is wherever the ground meets the
-water; it never reaches past its outlet, where the ground falls away below
-its level. A river's ribbon stops where it enters and starts again at the
-outlet. Water is
+through the water. A lake is a flat sheet at its level over its basin, in
+4 m cells: over the basin, the hollows beside it and a few cells up the
+shore around them, so its shoreline is wherever the ground meets the water.
+It never reaches past its outlet or over a narrow rim, where the ground falls
+away below its level, nor over a river's channel, and wherever the ground
+under its outer edge still lies lower than the water, that edge sinks just
+under the ground, so the sheet never ends in the air. A river's ribbon runs under the lake's sheet where it enters and
+starts again at the outlet. Water is
 drawn to 3.2 km in 256 m chunks culled against the view; beyond a few
 hundred metres, where the clipmap's triangles are wider than a creek, a
 river's surface is lifted by about the bank those triangles leave so it still
@@ -811,17 +811,9 @@ water does:
   the water's own speed, drawn out into streaks where it runs fast and
   chopped short over a rough bed; what a pixel cannot resolve becomes
   roughness instead of shimmer.
-- **Whitewater.** Cascades, plunge pools and eddy lines along the banks of
-  fast water carry foam that the current advects downstream.
-  Aerated water is milkier as well as whiter.
-- **Waterfalls.** Over the last stretch to a lip the water draws down,
-  speeds up and smooths into a glassy tongue. Down the sheet, everything is
-  keyed to the moment its water left the lip, so the strands fall at the
-  water's own accelerating speed and stretch as they go. It leaves the lip
-  clear (what lies behind shows through, tinted and bent), breaks up into
-  white, sunlit strands, sooner on a tall fall or a thin veil, frays at its
-  torn sides and glows when the sun is behind it, and lands in a plunge pool
-  that boils with foam the current carries off downstream.
+- **Whitewater.** Rapids and eddy lines along the banks of fast water carry
+  foam that the current advects downstream. Aerated water is milkier as well
+  as whiter.
 
 ### Wading
 

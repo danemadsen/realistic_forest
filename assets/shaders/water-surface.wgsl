@@ -1695,9 +1695,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
 // ===========================================================================
 //
 // The same water as the sea, flowing. Each river's surface is a ribbon at
-// its water level (src/rivers/surface.rs) whose vertices carry the current;
-// waterfalls are sheets falling along the jet's parabola. The surface is
-// shaded with the sea's optics (Fresnel, sky and screen-space reflections,
+// its water level (src/rivers/surface.rs) whose vertices carry the current,
+// and each lake's a flat sheet. The surface is shaded with the sea's optics (Fresnel, sky and screen-space reflections,
 // Beer-Lambert body and refraction, sun glitter, rain rings, fog) and two
 // things the sea does not have:
 //
@@ -1705,9 +1704,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
 //   downstream by the local current and cross-faded, so the texture streams
 //   with the water at its own speed, stretched along the flow where it runs
 //   fast and choppy where the bed is rough.
-// - Whitewater. Cascades, plunge pools below falls and eddy lines along
-//   fast banks carry advected foam; the falling sheets are aerated water,
-//   streaked and torn at their edges.
+// - Whitewater. Rapids and eddy lines along fast banks carry advected
+//   foam.
 
 // The plants' shadow cascades, as the composite reads them, so a creek under
 // the forest lies in the same shade as its banks. Mirrors
@@ -1757,7 +1755,6 @@ fn riverPlantShadow(world_position: vec3<f32>, view_depth: f32) -> f32 {
     return mix(1.0, mix(lit*0.25, 1.0, far_fade), vegetation_shadows.params.y);
 }
 
-const RIVER_GRAVITY: f32 = 9.81;
 // Clear stream water, faintly stained by the tannins of the forest floor:
 // red is absorbed within a couple of metres and the dissolved organic matter
 // takes some blue, so the bed shows through a shallow riffle, a pool goes
@@ -1772,12 +1769,9 @@ struct RiverVertexOutput
     @builtin(position) clip_position: vec4<f32>,
     @location(0) world_position: vec3<f32>,
     @location(1) velocity: vec2<f32>,
-    // x across the channel (-1..1 between the waterlines), y metres along
-    // the river, z thalweg depth, w whitewater.
-    @location(2) channel: vec4<f32>,
-    // x half width, y fall progress (-1 on a flat surface), z fall height
-    // (a plunge's strength on a surface), w the surface's own height.
-    @location(3) sheet: vec4<f32>,
+    // x across the channel (-1..1 between the waterlines), y whitewater,
+    // z the surface's own height.
+    @location(2) channel: vec3<f32>,
 };
 
 @vertex
@@ -1785,12 +1779,8 @@ fn vs_river(
     @location(0) position: vec3<f32>,
     @location(1) velocity: vec2<f32>,
     @location(2) across: f32,
-    @location(3) along: f32,
-    @location(4) depth: f32,
-    @location(5) turbulence: f32,
-    @location(6) half_width: f32,
-    @location(7) fall: f32,
-    @location(8) drop: f32,
+    @location(3) turbulence: f32,
+    @location(4) still: f32,
 ) -> RiverVertexOutput
 {
     // A distant channel is narrower than the clipmap's triangles there,
@@ -1800,15 +1790,13 @@ fn vs_river(
     let flat_distance = length(position.xz - globals.camera_position.xz);
     let spacing = max(1.0, flat_distance/110.0);
     // A lake is wide enough for any triangles and stays at its level.
-    let lake = fall < -1.5;
-    let lift = select(smoothstepf(150.0, 650.0, flat_distance)*min(spacing*0.45, 12.0), 0.0, lake);
+    let lift = select(smoothstepf(150.0, 650.0, flat_distance)*min(spacing*0.45, 12.0), 0.0, still > 0.5);
     let world = vec3<f32>(position.x, position.y + lift, position.z);
     var out: RiverVertexOutput;
     out.clip_position = globals.projection*globals.view*vec4<f32>(world, 1.0);
     out.world_position = world;
     out.velocity = velocity;
-    out.channel = vec4<f32>(across, along, depth, turbulence);
-    out.sheet = vec4<f32>(half_width, fall, drop, position.y);
+    out.channel = vec3<f32>(across, turbulence, position.y);
     return out;
 }
 
@@ -1902,26 +1890,12 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     let to_view = to_camera/max(view_distance, 1e-3);
     let time = stage.params.x;
     let across = in.channel.x;
-    let turbulence = in.channel.w;
-    let half_width = in.sheet.x;
-    let fall = in.sheet.y;
-    let drop = in.sheet.z;
-    let falling = fall > 0.0;
-    // Over the last stretch to a lip (`fall` rising from -1 to 0) the water
-    // draws down and speeds up, and its surface smooths into a glassy tongue.
-    let approach = smoothstepf(0.35, 1.0, clamp(fall + 1.0, 0.0, 1.0));
-    // On a sheet: how long the water takes to fall, how long this water has
-    // been falling, and so the moment it left the lip. Anything keyed to
-    // that moment moves with the water, accelerating and stretching as it
-    // falls, without a flow map.
-    let fall_time = sqrt(2.0*max(drop, 0.05)/RIVER_GRAVITY);
-    let launched = time - max(fall, 0.0)*fall_time;
-    let surface_level = in.sheet.w;
+    let turbulence = in.channel.y;
+    let surface_level = in.channel.z;
     // Derivatives first, in uniform control flow.
     let pixel_dx = dpdx(in.world_position);
     let pixel_dy = dpdy(in.world_position);
     let footprint = max(length(pixel_dx.xz), length(pixel_dy.xz));
-    let geometric = normalize(cross(pixel_dx, pixel_dy));
 
     let precipitation = weatherPrecipitation(in.world_position);
     let water_view = (globals.view*vec4<f32>(in.world_position, 1.0)).xyz;
@@ -1937,24 +1911,15 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     let to_moon = normalize(-globals.moon_direction.xyz);
     let above_water = smoothstepf(-0.08, 0.12, camera_position.y - in.world_position.y);
 
-    // --- The current, the rocks and the surface ------------------------------
-    let velocity = in.velocity*(1.0 + 1.5*approach);
+    // --- The current and the surface ------------------------------------------
+    let velocity = in.velocity;
     let speed = length(velocity);
-    let roughness = clamp(turbulence*0.8 + smoothstepf(0.6, 3.0, speed)*0.25 + drop*0.15, 0.0, 1.0)
-                  *(1.0 - 0.85*approach);
-    let ripples = riverRipples(in.world_position.xz, velocity, time, roughness, footprint)
-                * vec3<f32>(vec2<f32>(1.0 - 0.7*approach), 1.0 - 0.85*approach);
+    let roughness = clamp(turbulence*0.8 + smoothstepf(0.6, 3.0, speed)*0.25, 0.0, 1.0);
+    let ripples = riverRipples(in.world_position.xz, velocity, time, roughness, footprint);
     let impacts = waterImpacts(in.world_position.xz, globals.storm.z, footprint,
                                view_distance, precipitation.x, precipitation.y, precipitation.w);
     let slope = ripples.xy + impacts.slope;
     var normal = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
-    if (falling)
-    {
-        // A falling sheet: its own facing, corrugated by the strands that
-        // fall with it.
-        let streak = riverNoise(vec2<f32>(across*half_width*4.0, launched*6.0));
-        normal = normalize(geometric + vec3<f32>(streak.y, 0.0, streak.z)*0.07);
-    }
     if (dot(normal, to_view) < 0.0)
     {
         normal = -normal;
@@ -1983,7 +1948,7 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
                       *weatherSunMultiplier(severity)*mix(1.0, 0.42, precipitation.z)*moon_plants;
     let sky_light = skyAmbient(vec3<f32>(0.0, 1.0, 0.0), in.world_position);
     // Aerated water scatters far more: whitewater is milky even unfoamed.
-    let aeration = clamp(turbulence*0.6 + drop*0.2, 0.0, 1.0);
+    let aeration = clamp(turbulence*0.6, 0.0, 1.0);
     let sigma_t = RIVER_EXTINCTION*(1.0 + 2.0*aeration);
     let transmittance = exp(-sigma_t*optical_path);
     // The bed was lit as if in air: its light also crossed the water on the
@@ -2021,48 +1986,16 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
                        + moon_colour*max(dot(normal, to_moon), 0.0))*0.06
                       + skyAmbient(normal, in.world_position)*0.8);
     let pattern = riverFoamPattern(in.world_position.xz, velocity, time, footprint);
-    // Eddy lines along the banks of fast water; cascades; plunge pools.
+    // Eddy lines along the banks of fast water; rapids.
     let eddy_line = smoothstepf(0.62, 0.98, abs(across))*smoothstepf(0.7, 2.2, speed)*0.45;
     let cascade = smoothstepf(0.25, 0.85, turbulence)*0.85;
-    let plunge = smoothstepf(0.05, 0.9, drop)*0.95;
-    // The tongue sliding over a lip is smooth, unbroken water.
-    let amount = clamp(max(max(cascade, plunge), eddy_line)
-                       + 0.06*smoothstepf(0.2, 1.0, speed), 0.0, 1.0)*(1.0 - approach);
+    let amount = clamp(max(cascade, eddy_line) + 0.06*smoothstepf(0.2, 1.0, speed), 0.0, 1.0);
     // Foam gathers in patches and streaks the pattern carries downstream.
-    var foam = smoothstepf(1.05 - amount, 1.3 - amount*0.6, pattern)*amount
+    let foam = smoothstepf(1.05 - amount, 1.3 - amount*0.6, pattern)*amount
              + impacts.splash*0.2 + impacts.snow_fleck*0.06;
-    if (falling)
-    {
-        // The sheet leaves the lip as a clear, glassy tongue and breaks up
-        // as it falls into strands of aerated, white water: soon on a tall
-        // fall, at once on a thin veil. Its strands fall with the water
-        // (keyed to the moment it left the lip), and it frays and thins
-        // toward its torn sides.
-        let u = across*half_width;
-        let strand = valueNoise(vec2<f32>(u*3.2, launched*4.0))*0.6
-                   + valueNoise(vec2<f32>(u*9.0 + 3.7, launched*11.0))*0.4;
-        let breakup = smoothstepf(0.0, 0.6, fall*(0.55 + 0.2*min(drop, 6.0))
-                                            + 0.25*(1.0 - smoothstepf(0.1, 0.5, in.channel.z)));
-        let white = clamp(smoothstepf(0.66 - 0.42*breakup, 0.86, strand)*(0.3 + 0.7*breakup)
-                          + 0.4*breakup*breakup, 0.0, 1.0);
-        let fray = valueNoise(vec2<f32>(u*6.0 + 11.0, launched*7.0));
-        let sides = smoothstepf(1.0, 0.5 + 0.3*fray, abs(across));
-        // Clear water a few centimetres thick: what lies behind shows
-        // through, tinted and bent, under the reflections; aerated water
-        // scatters light like foam and glows when the sun is behind it.
-        let thickness = clamp(in.channel.z*0.5, 0.04, 0.5);
-        let glass = mix(scene_linear*exp(-RIVER_EXTINCTION*thickness), reflected, fresnel)
-                  + specular*sun_colour + moon_specular*moon_colour;
-        let backlight = sun_colour*0.1*pow(max(dot(-to_view, to_sun), 0.0), 4.0);
-        let sheet = mix(glass, foam_colour + backlight*(1.0 - 0.5*white), white);
-        lit = mix(scene_linear, sheet, sides);
-    }
-    else
-    {
-        lit = mix(lit, foam_colour, clamp(foam, 0.0, 1.0)*above_water);
-        // Resolve the last centimetres into the bank instead of a hard edge.
-        lit = mix(scene_linear, lit, smoothstepf(0.0, 0.05, optical_path));
-    }
+    lit = mix(lit, foam_colour, clamp(foam, 0.0, 1.0)*above_water);
+    // Resolve the last centimetres into the bank instead of a hard edge.
+    lit = mix(scene_linear, lit, smoothstepf(0.0, 0.05, optical_path));
 
     let fog = integrateAtmosphere(-to_view, view_distance);
     lit = lit*fog.transmittance + fog.scattering;

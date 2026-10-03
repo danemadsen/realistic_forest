@@ -113,16 +113,6 @@ pub fn render(noise: &NoiseField, network: &RiverNetwork, centre: [f64; 2], exte
                 plot(ax + (bx - ax) * t, ay + (by - ay) * t, [20, 70, 220]);
             }
         }
-        for node in &river.nodes {
-            if node.fall > 1.0 {
-                let (x, y) = to_pixel(node.position);
-                for dy in -1..=1 {
-                    for dx in -1..=1 {
-                        plot(x + dx as f64, y + dy as f64, [230, 30, 30]);
-                    }
-                }
-            }
-        }
     }
     image
 }
@@ -153,7 +143,7 @@ pub fn report(network: &RiverNetwork) -> Vec<String> {
     for (name, low, high) in [("lowland", 0.0f32, 0.006f32), ("moderate", 0.006, 0.03), ("steep", 0.03, 10.0)] {
         let band: Vec<&&network::RiverNode> = nodes
             .iter()
-            .filter(|n| !n.lake && n.fall == 0.0 && n.slope >= low && n.slope < high && n.area > 0.5)
+            .filter(|n| !n.lake && n.slope >= low && n.slope < high && n.area > 0.5)
             .collect();
         if band.is_empty() {
             continue;
@@ -166,15 +156,6 @@ pub fn report(network: &RiverNetwork) -> Vec<String> {
             "{name} reaches draining over 0.5 km²: {width:.1} m wide, {depth:.2} m deep, {speed:.2} m/s on average"
         ));
     }
-    let falls: Vec<f32> = nodes.iter().filter(|n| n.fall > 0.0).map(|n| n.fall).collect();
-    let tall = falls.iter().filter(|&&f| f > 1.5).count();
-    let tallest = falls.iter().copied().fold(0.0f32, f32::max);
-    lines.push(format!(
-        "{} steps and falls ({} over 1.5 m, tallest {:.1} m)",
-        falls.len(),
-        tall,
-        tallest
-    ));
     // Sinuosity of the larger rivers: channel length over straight distance
     // per 1 km window.
     let mut sinuosity = Vec::new();
@@ -232,7 +213,7 @@ pub fn terrain_fit(noise: &NoiseField, network: &RiverNetwork) -> String {
         let end = river.surface_end.min(nodes.len().saturating_sub(1));
         for i in 1..end {
             let node = &nodes[i];
-            if node.fall > 0.0 || nodes[i - 1].fall > 0.0 || node.water < SEA_LEVEL + 0.1 || node.lake {
+            if node.water < SEA_LEVEL + 0.1 || node.lake {
                 continue;
             }
             let (a, b) = (nodes[i - 1].position, nodes[i + 1].position);
@@ -279,6 +260,78 @@ pub fn terrain_fit(noise: &NoiseField, network: &RiverNetwork) -> String {
     )
 }
 
+/// Where a lake sheet's outer edge stands over ground (as the rivers carve
+/// it) lower than the sheet there, so it would end in the air: of the
+/// samples taken every half metre along every sheet's edge, how many, and
+/// per lake that has any, how many and the worst gap and where.
+pub struct LakeEdges {
+    pub samples: usize,
+    pub exposed: usize,
+    pub lakes: Vec<(usize, [f32; 2], f32, f32)>,
+}
+
+pub fn lake_edges(noise: &NoiseField, network: &RiverNetwork) -> LakeEdges {
+    let cell = network::FLOW_CELL as f32;
+    let mut edges = LakeEdges { samples: 0, exposed: 0, lakes: Vec::new() };
+    for lake in &network.lakes {
+        let sheet: std::collections::HashSet<[i32; 2]> = lake.cells.iter().chain(&lake.shore).copied().collect();
+        let sunk: std::collections::HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
+        let height = |corner: [i32; 2]| sunk.get(&corner).map_or(lake.level, |&h| h.min(lake.level));
+        let (mut exposed, mut gap, mut at) = (0usize, 0.0f32, [0.0f32; 2]);
+        for &[x, z] in &sheet {
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                if sheet.contains(&[x + dx, z + dz]) {
+                    continue;
+                }
+                let a = [x + i32::from(dx > 0), z + i32::from(dz > 0)];
+                let b = [a[0] + dz.abs(), a[1] + dx.abs()];
+                for k in 0..8 {
+                    let t = (k as f32 + 0.5) / 8.0;
+                    let p = [
+                        (a[0] as f32 + (b[0] - a[0]) as f32 * t) * cell,
+                        (a[1] as f32 + (b[1] - a[1]) as f32 * t) * cell,
+                    ];
+                    let water = height(a) + (height(b) - height(a)) * t;
+                    let ground = network.envelope(p[0], p[1]).clamp(base_height(noise, p[0], p[1]));
+                    edges.samples += 1;
+                    if ground < water - 0.02 {
+                        exposed += 1;
+                        if water - ground > gap {
+                            gap = water - ground;
+                            at = p;
+                        }
+                    }
+                }
+            }
+        }
+        if exposed > 0 {
+            edges.exposed += exposed;
+            edges.lakes.push((exposed, at, gap, lake.level));
+        }
+    }
+    edges.lakes.sort_by_key(|lake| std::cmp::Reverse(lake.0));
+    edges
+}
+
+/// How well the lakes' sheets meet their shores, and the lakes worst so,
+/// for framing a camera on them.
+pub fn lake_fit(noise: &NoiseField, network: &RiverNetwork) -> Vec<String> {
+    let edges = lake_edges(noise, network);
+    let mut lines = vec![format!(
+        "lake sheets: {:.2}% of their edges over lower ground; {} of {} lakes have such edges",
+        100.0 * edges.exposed as f64 / edges.samples.max(1) as f64,
+        edges.lakes.len(),
+        network.lakes.len()
+    )];
+    for (count, at, gap, level) in edges.lakes.iter().take(6) {
+        lines.push(format!(
+            "  {count} edge samples exposed, worst {gap:.2} m at {:.1},{:.1} (water {level:.2} m)",
+            at[0], at[1]
+        ));
+    }
+    lines
+}
+
 pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
     let region = network::region_of(centre[0], centre[1]);
     let network = network::generate(noise, region);
@@ -286,6 +339,9 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
         println!("{line}");
     }
     println!("{}", terrain_fit(noise, &network));
+    for line in lake_fit(noise, &network) {
+        println!("{line}");
+    }
     // The nodes nearest the map's centre, for framing a camera on them: the
     // heading is the `--camera` yaw that looks downstream.
     let mut nearest: Vec<(f32, &network::RiverNode, f32)> = network
@@ -315,25 +371,8 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
         }
         shown.push(node.position);
         println!(
-            "near centre ({d:.0} m): river at {:.1},{:.1} water {:.2} m, {:.1} m wide, {:.2} m deep, {:.2} m/s, slope {:.3}, fall {:.2} m, heading {heading:.0}",
-            node.position[0], node.position[1], node.water, node.half_width * 2.0, node.depth, node.speed, node.slope, node.fall
-        );
-    }
-    let mut falls: Vec<&network::RiverNode> = network
-        .rivers
-        .iter()
-        .flat_map(|r| &r.nodes)
-        .filter(|n| n.fall > 2.0)
-        .collect();
-    falls.sort_by(|a, b| {
-        let da = (a.position[0] - centre[0] as f32).hypot(a.position[1] - centre[1] as f32);
-        let db = (b.position[0] - centre[0] as f32).hypot(b.position[1] - centre[1] as f32);
-        da.total_cmp(&db)
-    });
-    for node in falls.iter().take(4) {
-        println!(
-            "waterfall at {:.1},{:.1}: {:.1} m from {:.1} m, {:.1} m wide",
-            node.position[0], node.position[1], node.fall, node.water, node.half_width * 2.0
+            "near centre ({d:.0} m): river at {:.1},{:.1} water {:.2} m, {:.1} m wide, {:.2} m deep, {:.2} m/s, slope {:.3}, heading {heading:.0}",
+            node.position[0], node.position[1], node.water, node.half_width * 2.0, node.depth, node.speed, node.slope
         );
     }
     let cell = network::FLOW_CELL as f32;
@@ -357,6 +396,28 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
             lake.level,
             lake.cells.len() as f32 * cell * cell / 1.0e4
         );
+        // Where rivers run into and out of it, and the yaw looking
+        // downstream there.
+        let inside: std::collections::HashSet<[i32; 2]> = lake.cells.iter().copied().collect();
+        let holds = |p: [f32; 2]| inside.contains(&[(p[0] / cell).floor() as i32, (p[1] / cell).floor() as i32]);
+        for river in &network.rivers {
+            for pair in river.nodes.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                if a.lake == b.lake || !(holds(a.position) || holds(b.position)) {
+                    continue;
+                }
+                let heading = (b.position[0] - a.position[0])
+                    .atan2(a.position[1] - b.position[1])
+                    .to_degrees()
+                    .rem_euclid(360.0);
+                println!(
+                    "  {} at {:.1},{:.1}, heading {heading:.0}",
+                    if b.lake { "inlet" } else { "outlet" },
+                    b.position[0],
+                    b.position[1]
+                );
+            }
+        }
     }
     let pixels = 2048usize.min((extent / 1.0) as usize).max(256);
     let image = render(noise, &network, centre, extent, pixels);
@@ -399,5 +460,17 @@ mod tests {
             super::super::carve::combine(&mut total, &super::super::carve::segment_envelope(segment, [x, z]));
         }
         assert_eq!(total.upper, envelope.upper);
+    }
+
+    /// No lake's sheet ends in the air: its outer edge runs into the ground
+    /// all the way round.
+    #[test]
+    fn spawn_region_lake_sheets_meet_their_shores() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, [0, 0]);
+        assert!(!network.lakes.is_empty());
+        let edges = lake_edges(&noise, &network);
+        assert!(edges.samples > 1000);
+        assert_eq!(edges.exposed, 0, "{:?}", &edges.lakes[..edges.lakes.len().min(4)]);
     }
 }

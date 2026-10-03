@@ -18,9 +18,9 @@
 //! neighbour's levee.
 //!
 //! Segments have a flat start and a round end: a point behind a segment's
-//! start belongs to the segment before it. That keeps a waterfall's lip a
-//! clean vertical face, since the plunge pool's segments never reach back
-//! over it, while bends stay covered by the previous segment's round end.
+//! start belongs to the segment before it, so a segment never reaches back
+//! up the channel over ground the segments above it shape, while bends stay
+//! covered by the previous segment's round end.
 //!
 //! The same arithmetic runs in `river-functions.wgslinc` on the GPU, from the
 //! same uploaded segments, so the drawn ground, the player's footing, the
@@ -61,8 +61,8 @@ pub struct RiverSegment {
     /// Thalweg skew toward the left (+) or right (-) bank, -1..1: the outer
     /// bank of a bend, where the pool is deep and the bank is cut steep.
     pub skew: f32,
-    /// Whitewater, 0 calm to 1 a cascade or waterfall: rough beds, bare
-    /// rock and foam.
+    /// Whitewater, 0 calm to 1 a cascade down rapids: rough beds, bare rock
+    /// and foam.
     pub turbulence: f32,
     /// How firmly the ground beside the channel is held above the water,
     /// 0..1: none where the river meets the sea, whose bed must not rise.

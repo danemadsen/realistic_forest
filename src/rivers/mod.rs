@@ -116,12 +116,11 @@ impl RiverField {
 
     fn install(&mut self, network: RiverNetwork) {
         log::info!(
-            "RIVERS: region ({}, {}) has {} rivers, {:.1} km of channel, {} waterfalls over 1.5 m and {} lakes, built in {:.2} s",
+            "RIVERS: region ({}, {}) has {} rivers, {:.1} km of channel and {} lakes, built in {:.2} s",
             network.region[0],
             network.region[1],
             network.rivers.len(),
             network.total_length_km(),
-            network.waterfall_count(),
             network.lakes.len(),
             network.build_seconds
         );
