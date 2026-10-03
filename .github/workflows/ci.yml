@@ -52,8 +52,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets
 
-      # The one GPU-dependent test is #[ignore]d, so this runs on a headless
-      # runner. Run it by hand on a real adapter with `-- --ignored`.
+      # The GPU-dependent tests are #[ignore]d, so this runs on a headless
+      # runner. Run them by hand on a real adapter with `-- --ignored`.
       - name: Unit tests
         if: ${{ !cancelled() }}
         run: cargo test --locked

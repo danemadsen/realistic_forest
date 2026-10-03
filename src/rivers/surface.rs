@@ -171,7 +171,6 @@ pub fn build(rivers: &[River]) -> SurfaceMesh {
                 let lip_speed = node.speed.max((GRAVITY * node.depth.max(0.1) * 0.5).sqrt()).max(0.6);
                 let duration = (2.0 * height / GRAVITY).sqrt();
                 let rows = ((height / 0.35).ceil() as usize).clamp(3, 12);
-                let sheet_row = vertices.len() as u32;
                 let mut sheet_previous: Option<u32> = None;
                 for r in 0..=rows {
                     let t = r as f32 / rows as f32 * duration;
@@ -204,7 +203,6 @@ pub fn build(rivers: &[River]) -> SurfaceMesh {
                     }
                     sheet_previous = Some(base);
                 }
-                let _ = sheet_row;
             }
         }
     }
