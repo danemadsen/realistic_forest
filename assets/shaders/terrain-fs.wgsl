@@ -1308,7 +1308,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let riverPower = input.frag_river.w*(1.0 + 1.5*riverTurbulence);
     let inRiver = 1.0 - smoothHermite(-0.30, 0.05, riverBank);
     let riverRock = smoothHermite(0.45, 0.85, riverTurbulence);
-    let riverSand = (1.0 - smoothHermite(0.35, 0.95, riverPower))*(1.0 - riverRock);
+    let riverSand = (1.0 - smoothHermite(0.12, 0.45, riverPower + (soilSmall - 0.5)*0.3))*(1.0 - riverRock);
     let riverGravel = clamp(1.0 - riverRock - riverSand, 0.0, 1.0);
     // The local bank: how steeply this very ground rises from the water.
     let bankSteep = smoothHermite(0.10, 0.35, 1.0 - normalWorld.y);
@@ -2277,6 +2277,9 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                      * (1.0 - gSnow);
         let damp = albedo * vec3<f32>(0.55, 0.57, 0.56);
         albedo = mix(albedo, damp, moisture);
+        // Under the water the bed is filmed with algae and settled silt.
+        let submergedBed = (1.0 - smoothHermite(-0.35, 0.0, input.frag_river.x)) * (1.0 - gSnow);
+        albedo = mix(albedo, albedo * vec3<f32>(0.62, 0.66, 0.46), submergedBed);
         // Damp earth stays rough; only pooled water approaches a low
         // roughness. Write the final value used by the G-buffer (snow glints
         // have already modified outRough above). Stone darkens when damp but

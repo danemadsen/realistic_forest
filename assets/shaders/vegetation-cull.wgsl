@@ -735,6 +735,10 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
     // Seat the root.
     let xz = plant.position.xz;
     var ground = 0.0;
+    // A stone carries how deep the water stands over its foot, in whole
+    // centimetres ahead of its seed's fraction, so the plant shader can wet
+    // what lies under the surface.
+    var drawn = plant;
     // Nothing grows in a river or a lake: a root stands on the dry bank,
     // clear of the waterline by its trunk or stems.
     if (model.habitat != 2u) {
@@ -753,7 +757,15 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
     if (model.habitat == 2u) {
         // A boulder sits where the river put it, in the bed or the bank,
         // settled a third of its height into the ground.
-        ground = terrainHeight(xz) - height * ROCK_EMBEDDED;
+        let bed = terrainHeight(xz);
+        ground = bed - height * ROCK_EMBEDDED;
+        let river = riverEnvelope(xz);
+        var water = select(-RIVER_NONE, river.water, river.bank_distance < 0.4);
+        if (bed < river.lake) {
+            water = max(water, river.lake);
+        }
+        let depth = clamp(water - ground, 0.0, 99.0);
+        drawn.seed = fract(plant.seed) + floor(depth * 100.0);
     } else if (model.habitat == 1u) {
         if (cull.counts.z == 0u) {
             return;
@@ -802,7 +814,7 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
 
     for (var c = 0u; c < 4u; c++) {
         if ((shadows & (1u << c)) != 0u) {
-            append(plant, model, LOD_SLOTS + c, model.shadow_word[c], model.shadow_count[c], root, 1.0);
+            append(drawn, model, LOD_SLOTS + c, model.shadow_word[c], model.shadow_count[c], root, 1.0);
         }
     }
     if (!seen) {
@@ -831,10 +843,10 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
         let end = model.lod_end[lod];
         let t = clamp((units - end * (1.0 - LOD_FADE_BAND)) / (end * LOD_FADE_BAND), 0.0, 1.0);
         if (t > 0.0) {
-            emit(plant, model, lod, root, -t);
-            emit(plant, model, lod + 1u, root, t);
+            emit(drawn, model, lod, root, -t);
+            emit(drawn, model, lod + 1u, root, t);
             return;
         }
     }
-    emit(plant, model, lod, root, visibility);
+    emit(drawn, model, lod, root, visibility);
 }

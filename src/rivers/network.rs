@@ -1433,6 +1433,10 @@ fn build_nodes(noise: &NoiseField, centreline: Vec<PathPoint>, end_level: Option
         let width = 2.0 * node.half_width as f64;
         let swell = field_noise([node.along as f64, offset], (5.5 * width).max(9.0), 311);
         node.half_width *= 0.8 + 0.4 * swell;
+        // Its banks change too: here a low shelving edge, there a steeper
+        // face where roots or a harder layer hold the soil.
+        let firmness = field_noise([node.along as f64, offset + 57.0], (4.0 * width).max(8.0), 313);
+        node.bank *= 0.7 + 0.6 * firmness;
         // The same water runs faster through the narrows.
         let mean_depth = (node.depth / 1.5).max(0.05);
         node.speed = (node.discharge / (2.0 * node.half_width * mean_depth)).clamp(0.15, 6.0);

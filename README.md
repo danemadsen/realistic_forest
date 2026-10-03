@@ -735,8 +735,10 @@ it, the terrain shades its bed and shore, the erosion leaves it as a drain,
 and the player wades and swims in it.
 
 The terrain material shader reads the river or lake at every vertex: the bed
-sorts by the power of the water over it, sand in slow pools and lake beds,
-gravel in riffles and runs, bedrock under cascades and falls. Out of the
+sorts by the power of the water over it, sand where the water all but stands
+(still pools, lake beds), gravel through every run and riffle, bedrock under
+cascades and falls, and under the water it is darkened by its film of algae
+and settled silt. Out of the
 water the turf runs to the waterline, darkened and glossy where it is wet,
 except where the bank says otherwise: the outside of a bend is undercut into a
 steep bank of bare soil, the inside keeps a bar of sand and gravel standing
@@ -764,7 +766,9 @@ its plunge pool. A lake's silt bed has none. The spawn region holds some
 river shader; the smaller ones pave the bed without disturbing the current.
 
 They are drawn through the plant pipeline, settled a third of their height
-into the bed, never moved by the wind, and cast shadows. Only the stones
+into the bed, never moved by the wind, and cast shadows. The cull passes each
+stone the depth of water over its foot, so below the waterline it is drawn
+wet, glossy and filmed with olive algae, with a damp splash band just above. Only the stones
 within 760 m of the player go to the GPU, and each is drawn as far as its
 size carries: a cobble to about a hundred metres, a metre-wide boulder to
 about five hundred. Pebbles cast shadows in the nearest cascade only.
