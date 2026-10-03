@@ -73,6 +73,14 @@ pub struct Report {
     pub forest_fraction: f32,
     pub closed_forest_stems_per_hectare: f32,
     pub lavender_in_clearings: f32,
+    /// Closest two lavender tufts come, metres.
+    pub lavender_min_spacing: f32,
+    /// Share of the 25 m cells of lavender ground holding at least one tuft.
+    pub lavender_spread: f32,
+    /// Coefficient of variation of the tufts per occupied cell.
+    pub lavender_density_variation: f32,
+    /// Share of the broadleaf plants with the sea close down the fall line.
+    pub broadleaf_on_shore: f32,
 }
 
 pub fn report(noise: &NoiseField, catalog: &Catalog, plants: &[PlantInstance], minimum: [f64; 2], maximum: [f64; 2]) -> Report {
@@ -167,6 +175,70 @@ pub fn report(noise: &NoiseField, catalog: &Catalog, plants: &[PlantInstance], m
         .count();
     let lavender_in_clearings = lavender_open as f32 / lavender.len().max(1) as f32;
 
+    // How the tufts spread: nearest neighbours, and tufts per 25 m cell over
+    // the ground the habitat offers lavender at all.
+    let mut tufts: std::collections::HashMap<(i32, i32), Vec<[f32; 2]>> = Default::default();
+    for tuft in &lavender {
+        let p = [tuft.position[0], tuft.position[2]];
+        tufts.entry(((p[0] / 4.0).floor() as i32, (p[1] / 4.0).floor() as i32)).or_default().push(p);
+    }
+    let mut lavender_min_spacing = f32::INFINITY;
+    for (&(bx, bz), list) in &tufts {
+        for (index, a) in list.iter().enumerate() {
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    for (other, b) in tufts.get(&(bx + dx, bz + dz)).map(Vec::as_slice).unwrap_or(&[]).iter().enumerate() {
+                        if (dx, dz, other) == (0, 0, index) {
+                            continue;
+                        }
+                        lavender_min_spacing = lavender_min_spacing.min((a[0] - b[0]).hypot(a[1] - b[1]));
+                    }
+                }
+            }
+        }
+    }
+    let cell = 25.0;
+    let mut per_cell: std::collections::HashMap<(i64, i64), usize> = Default::default();
+    for tuft in &lavender {
+        let key = ((tuft.position[0] as f64 / cell).floor() as i64, (tuft.position[2] as f64 / cell).floor() as i64);
+        *per_cell.entry(key).or_default() += 1;
+    }
+    let (mut ground_cells, mut occupied) = (0usize, Vec::new());
+    let mut z = (minimum[1] / cell).floor() as i64;
+    while (z as f64) * cell < maximum[1] {
+        let mut x = (minimum[0] / cell).floor() as i64;
+        while (x as f64) * cell < maximum[0] {
+            let centre = [(x as f64 + 0.5) * cell, (z as f64 + 0.5) * cell];
+            let inside = centre[0] > minimum[0] && centre[0] < maximum[0] && centre[1] > minimum[1] && centre[1] < maximum[1];
+            if inside && ecology::habitat(&sampler, centre[0], centre[1]).lavender > 0.002 {
+                ground_cells += 1;
+                if let Some(&count) = per_cell.get(&(x, z)) {
+                    occupied.push(count as f64);
+                }
+            }
+            x += 1;
+        }
+        z += 1;
+    }
+    let lavender_spread = occupied.len() as f32 / ground_cells.max(1) as f32;
+    let mean = occupied.iter().sum::<f64>() / occupied.len().max(1) as f64;
+    let variance = occupied.iter().map(|c| (c - mean) * (c - mean)).sum::<f64>() / occupied.len().max(1) as f64;
+    let lavender_density_variation = (variance.sqrt() / mean.max(1e-9)) as f32;
+    let mut sorted = occupied.clone();
+    sorted.sort_by(f64::total_cmp);
+    let percentile = |q: f64| sorted.get(((sorted.len() as f64 - 1.0) * q).round() as usize).copied().unwrap_or(0.0);
+
+    // Broadleaf plants belong to the shore.
+    let broadleaf: Vec<&PlantInstance> = plants
+        .iter()
+        .filter(|p| catalog.models[p.model as usize].species == Species::Broadleaf)
+        .collect();
+    let on_shore = broadleaf
+        .iter()
+        .filter(|p| sampler.site(p.position[0] as f64, p.position[2] as f64).shore < ecology::SHORE_SEARCH)
+        .count();
+    let broadleaf_on_shore = on_shore as f32 / broadleaf.len().max(1) as f32;
+
     lines.push(format!(
         "VEGETATION: {:.2} km² ({:.2} km² land, {:.0}% forest, {:.2} km² closed)",
         area_m2 / 1e6,
@@ -198,9 +270,25 @@ pub fn report(noise: &NoiseField, catalog: &Catalog, plants: &[PlantInstance], m
         expected_same * 100.0
     ));
     lines.push(format!(
-        "  lavender: {} clumps, {:.0}% in clearings",
+        "  lavender: {} tufts, {:.0}% in clearings, at least {:.2} m apart",
         lavender.len(),
-        lavender_in_clearings * 100.0
+        lavender_in_clearings * 100.0,
+        lavender_min_spacing
+    ));
+    let per_100 = 100.0 / (cell * cell);
+    lines.push(format!(
+        "  lavender ground: {:.0}% of {} cells of {cell} m hold tufts; per 100 m² p10 {:.2}, median {:.2}, p90 {:.2} (variation {:.2})",
+        lavender_spread * 100.0,
+        ground_cells,
+        percentile(0.1) * per_100,
+        percentile(0.5) * per_100,
+        percentile(0.9) * per_100,
+        lavender_density_variation
+    ));
+    lines.push(format!(
+        "  broadleaf: {} plants, {:.0}% along the shore",
+        broadleaf.len(),
+        broadleaf_on_shore * 100.0
     ));
     Report {
         lines,
@@ -211,6 +299,10 @@ pub fn report(noise: &NoiseField, catalog: &Catalog, plants: &[PlantInstance], m
         forest_fraction,
         closed_forest_stems_per_hectare: closed_density as f32,
         lavender_in_clearings,
+        lavender_min_spacing,
+        lavender_spread,
+        lavender_density_variation,
+        broadleaf_on_shore,
     }
 }
 
@@ -380,6 +472,52 @@ mod tests {
         assert!(crossing > 0);
     }
 
+    /// Lavender tufts keep their spacing across chunk borders too: a 2x2
+    /// block of chunks through a clearing, generated independently.
+    #[test]
+    fn lavender_keeps_its_spacing_across_chunks() {
+        let noise = NoiseField::new();
+        let catalog = catalog();
+        let mut tufts = Vec::new();
+        for chunk in [[-3, 2], [-2, 2], [-3, 3], [-2, 3]] {
+            tufts.extend(
+                scatter::generate_level(&noise, &catalog, chunk, scatter::LEVEL_GROUND)
+                    .into_iter()
+                    .filter(|p| p.layer == Layer::Lavender as u32),
+            );
+        }
+        assert!(tufts.len() > 1000, "{}", tufts.len());
+        let reach = |p: &PlantInstance| catalog.models[p.model as usize].crown_radius * p.scale;
+        let mut buckets: std::collections::HashMap<(i32, i32), Vec<usize>> = Default::default();
+        for (index, tuft) in tufts.iter().enumerate() {
+            buckets.entry(((tuft.position[0] / 2.0).floor() as i32, (tuft.position[2] / 2.0).floor() as i32)).or_default().push(index);
+        }
+        let border = |a: f32, b: f32, line: f32| (a < line) != (b < line);
+        let mut crossing = 0;
+        for (index, a) in tufts.iter().enumerate() {
+            let (bx, bz) = ((a.position[0] / 2.0).floor() as i32, (a.position[2] / 2.0).floor() as i32);
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    for &other in buckets.get(&(bx + dx, bz + dz)).map(Vec::as_slice).unwrap_or(&[]) {
+                        if other <= index {
+                            continue;
+                        }
+                        let b = &tufts[other];
+                        let d = (a.position[0] - b.position[0]).hypot(a.position[2] - b.position[2]);
+                        let limit = scatter::LAVENDER_OVERLAP * (reach(a) + reach(b));
+                        assert!(d >= limit - 1e-3, "tufts {d:.2} m apart, limit {limit:.2}");
+                        if d < 2.0
+                            && (border(a.position[0], b.position[0], -512.0) || border(a.position[2], b.position[2], 768.0))
+                        {
+                            crossing += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(crossing > 0, "no close pair spans a chunk border");
+    }
+
     #[test]
     fn composition_follows_the_brief() {
         let noise = NoiseField::new();
@@ -414,8 +552,16 @@ mod tests {
             report.closed_forest_stems_per_hectare
         );
         assert!((0.35..0.80).contains(&report.forest_fraction), "{}", report.forest_fraction);
+        // Lavender: single tufts, never touching, spread through most of the
+        // ground that suits it at a density that varies widely.
         assert!(report.lavender_in_clearings > 0.7, "{}", report.lavender_in_clearings);
-        // Nothing grows in the sea or on the beach.
+        assert!(report.lavender_min_spacing > 0.5, "{}", report.lavender_min_spacing);
+        assert!(report.lavender_spread > 0.5, "{}", report.lavender_spread);
+        assert!(report.lavender_density_variation > 0.6, "{}", report.lavender_density_variation);
+        // Broadleaf plants line the shore.
+        assert!(count(Species::Broadleaf) > 500, "{}", count(Species::Broadleaf));
+        assert!(report.broadleaf_on_shore > 0.95, "{}", report.broadleaf_on_shore);
+        // Nothing grows in the sea or in the wave wash.
         assert!(plants.iter().all(|p| p.position[1] > 1.0), "plant below the shore");
         assert!(plants.iter().all(|p| p.scale.is_finite() && p.scale > 0.0));
     }

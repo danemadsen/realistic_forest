@@ -14,8 +14,9 @@
 //! 2. **Regeneration.** Saplings and poles fill the gaps the canopy leaves,
 //!    most of them along edges and in open stands.
 //! 3. **Shrubs** grow under crown edges and in belts along the forest margin.
-//! 4. **Herbs and lavender** carpet the ground wherever the trees and shrubs
-//!    leave it, lavender only in sun.
+//! 4. **Broadleaf plants and lavender** take the ground the trees and shrubs
+//!    leave: the broadleaf plants in colonies along the shore, the lavender
+//!    as single tufts, kept apart, scattered through sunny clearings.
 //!
 //! Every test of a candidate reads only candidates within a bounded distance,
 //! so a chunk computed alone matches the same ground computed with its
@@ -109,13 +110,16 @@ const FORMS: &[(Species, &str, f32, f32)] = &[
     (Species::Bush, "small", 0.35, 0.75),
     (Species::Bush, "medium", 0.7, 1.3),
     (Species::Bush, "big", 1.2, 2.0),
-    (Species::Broadleaf, "", 0.2, 0.5),
-    (Species::Lavender, "", 0.45, 0.85),
+    (Species::Broadleaf, "", 0.3, 0.7),
+    (Species::Lavender, "", 0.6, 0.95),
 ];
 
-/// No model is stretched or shrunk past these factors of its authored size.
+/// No model is stretched or shrunk past these factors of its authored size,
+/// except the lavender tuft: a plain star of cards, authored 2 m tall, that
+/// takes any scale.
 const MIN_SCALE: f32 = 0.5;
 const MAX_SCALE: f32 = 2.6;
+const MIN_LAVENDER_SCALE: f32 = 0.25;
 
 impl Catalog {
     pub fn from_assets(assets: &VegetationAssets) -> Self {
@@ -161,7 +165,8 @@ impl Catalog {
             return None;
         }
         let model = variants[((random(key, 41) * variants.len() as f32) as usize).min(variants.len() - 1)];
-        let scale = (height / self.models[model].height).clamp(MIN_SCALE, MAX_SCALE);
+        let smallest = if species == Species::Lavender { MIN_LAVENDER_SCALE } else { MIN_SCALE };
+        let scale = (height / self.models[model].height).clamp(smallest, MAX_SCALE);
         Some((model as u32, scale))
     }
 }
@@ -172,7 +177,7 @@ impl Catalog {
 
 /// Ecological fields evaluated every 4 m and interpolated, so the dozen noise
 /// fields cost one evaluation per 16 m² rather than one per candidate. The
-/// finest field (lavender texture) has an 11 m wavelength.
+/// finest field (the lavender's patch scale) has an 18 m wavelength.
 struct HabitatGrid {
     origin: [f64; 2],
     width: usize,
@@ -231,6 +236,8 @@ fn lerp_habitat(a: &Habitat, b: &Habitat, t: f32) -> Habitat {
             insolation: l(a.site.insolation, b.site.insolation),
             hollow: l(a.site.hollow, b.site.hollow),
             valley: l(a.site.valley, b.site.valley),
+            turf: l(a.site.turf, b.site.turf),
+            shore: l(a.site.shore, b.site.shore),
         },
         forest: l(a.forest, b.forest),
         edge: l(a.edge, b.edge),
@@ -265,8 +272,23 @@ struct LayerSpec {
 const CANOPY: LayerSpec = LayerSpec { spacing: 3.0, salt: 0xC4_0001, overlap: 0.66 };
 const REGENERATION: LayerSpec = LayerSpec { spacing: 3.5, salt: 0xC4_0002, overlap: 0.80 };
 const SHRUB: LayerSpec = LayerSpec { spacing: 2.2, salt: 0xC4_0003, overlap: 0.75 };
-const HERB: LayerSpec = LayerSpec { spacing: 1.3, salt: 0xC4_0004, overlap: 0.0 };
-const LAVENDER: LayerSpec = LayerSpec { spacing: 0.8, salt: 0xC4_0005, overlap: 0.0 };
+const HERB: LayerSpec = LayerSpec { spacing: 1.3, salt: 0xC4_0004, overlap: 1.0 };
+const LAVENDER: LayerSpec = LayerSpec { spacing: 0.7, salt: 0xC4_0005, overlap: LAVENDER_OVERLAP };
+/// Two lavender tufts stand at least this many times their summed crown
+/// reaches apart: never touching, however dense the patch.
+pub const LAVENDER_OVERLAP: f32 = 1.15;
+
+/// Widest lavender tuft (a 0.95 m tuft of the 2 m, 1 m-wide model): bounds
+/// the tufts' conflict search.
+const MAX_LAVENDER_REACH: f32 = 0.5;
+
+/// Lowest ground above the sea a shore plant roots in; the grass habitat on
+/// the GPU also keeps it above the wave crests.
+const LOWEST_SHORE_ROOT: f32 = 1.2;
+
+/// Widest broadleaf plant (0.65 m of the smallest model, scaled up):
+/// bounds the shore plants' conflict search.
+const MAX_BROADLEAF_REACH: f32 = 0.95;
 
 /// Largest crown reach any canopy tree reaches (a 30 m oak at full scale),
 /// which bounds every conflict search.
@@ -421,10 +443,13 @@ impl CandidateGrid {
     }
 }
 
+/// A placed plant's position and crown reach.
+type Placed = (f64, f64, f32);
+
 /// Plants already placed, bucketed for "is anything within r" queries.
 struct Occupancy {
     bucket: f64,
-    buckets: std::collections::HashMap<(i64, i64), Vec<(f64, f64, f32)>>,
+    buckets: std::collections::HashMap<(i64, i64), Vec<Placed>>,
     max_reach: f32,
 }
 
@@ -636,12 +661,21 @@ fn herb_candidate(
     key: u64,
 ) -> Option<(f32, f32, u32, f32)> {
     let habitat = habitats.sample(x, z);
-    if random(key, 2) >= habitat.herbs * (HERB.spacing * HERB.spacing) as f32 {
+    // The strip's density is interpolated between lattice points; on a steep
+    // shore that would carry it past the waterline, so test the root itself.
+    if habitat.site.height < LOWEST_SHORE_ROOT || habitat.herbs <= 0.0 {
         return None;
     }
-    let height = 0.22 + 0.24 * random(key, 20);
+    // Knee-high, standing out of the turf around them.
+    let height = 0.35 + 0.3 * random(key, 20).powf(0.7);
     let (model, scale) = catalog.choose(Species::Broadleaf, height, key)?;
-    Some((random(key, 3), reach(catalog, model, scale), model, scale))
+    let reach = reach(catalog, model, scale);
+    let conflict = std::f32::consts::PI * (HERB.overlap * 2.0 * reach).powi(2);
+    let cell_area = (HERB.spacing * HERB.spacing) as f32;
+    if random(key, 2) >= eligibility(habitat.herbs * conflict, conflict, cell_area) {
+        return None;
+    }
+    Some((random(key, 3), reach, model, scale))
 }
 
 fn lavender_candidate(
@@ -652,12 +686,22 @@ fn lavender_candidate(
     key: u64,
 ) -> Option<(f32, f32, u32, f32)> {
     let habitat = habitats.sample(x, z);
-    if random(key, 2) >= habitat.lavender * (LAVENDER.spacing * LAVENDER.spacing) as f32 {
+    if habitat.lavender <= 0.0 {
         return None;
     }
-    let height = 0.45 + 0.40 * random(key, 20).powf(0.8);
+    // Tufts stand clear of the grass, from 0.6 m to their flower spikes'
+    // full 0.95 m.
+    let height = 0.6 + 0.35 * random(key, 20).powf(0.8);
     let (model, scale) = catalog.choose(Species::Lavender, height, key)?;
-    Some((random(key, 3), reach(catalog, model, scale), model, scale))
+    let reach = reach(catalog, model, scale);
+    // Enough candidates that, once neighbours closer than the layer's
+    // spacing have thinned them, the tufts left match the habitat's density.
+    let conflict = std::f32::consts::PI * (LAVENDER.overlap * 2.0 * reach).powi(2);
+    let cell_area = (LAVENDER.spacing * LAVENDER.spacing) as f32;
+    if random(key, 2) >= eligibility(habitat.lavender * conflict, conflict, cell_area) {
+        return None;
+    }
+    Some((random(key, 3), reach, model, scale))
 }
 
 // ---------------------------------------------------------------------------
@@ -758,21 +802,30 @@ pub fn generate_level(noise: &NoiseField, catalog: &Catalog, chunk: [i64; 2], le
             for shrub in shrubs.survivors(SHRUB.overlap, 2.4, near_min, near_max) {
                 cover.insert(shrub.x, shrub.z, shrub.reach);
             }
-            // Herbs fill shade between trunks; lavender needs open sky.
-            let herbs = CandidateGrid::build(&HERB, minimum, maximum, |x, z, key| {
+            // Shore plants stand between the trunks and shrubs and lavender
+            // needs open sky; both keep room between their own plants.
+            let herb_margin = (HERB.overlap * 2.0 * MAX_BROADLEAF_REACH) as f64 + 0.5;
+            let (herb_min, herb_max) = grow(minimum, maximum, herb_margin);
+            let herbs = CandidateGrid::build(&HERB, herb_min, herb_max, |x, z, key| {
                 let candidate = herb_candidate(catalog, &habitats, x, z, key)?;
                 (!trees.blocks(x, z, 0.5, 0.12) && !cover.blocks(x, z, 0.1, 0.6)).then_some(candidate)
             });
-            out.extend(herbs.cells.iter().filter(|c| c.eligible && inside(c)).map(|c| c.instance(&sampler, Layer::Herb)));
-            let lavender = CandidateGrid::build(&LAVENDER, minimum, maximum, |x, z, key| {
+            out.extend(
+                herbs
+                    .survivors(HERB.overlap, MAX_BROADLEAF_REACH, minimum, maximum)
+                    .iter()
+                    .map(|c| c.instance(&sampler, Layer::Herb)),
+            );
+            let tuft_margin = (LAVENDER.overlap * 2.0 * MAX_LAVENDER_REACH) as f64 + 0.5;
+            let (tuft_min, tuft_max) = grow(minimum, maximum, tuft_margin);
+            let lavender = CandidateGrid::build(&LAVENDER, tuft_min, tuft_max, |x, z, key| {
                 let candidate = lavender_candidate(catalog, &habitats, x, z, key)?;
                 (!trees.blocks(x, z, 0.4, 0.85) && !cover.blocks(x, z, 0.2, 0.9)).then_some(candidate)
             });
             out.extend(
                 lavender
-                    .cells
+                    .survivors(LAVENDER.overlap, MAX_LAVENDER_REACH, minimum, maximum)
                     .iter()
-                    .filter(|c| c.eligible && inside(c))
                     .map(|c| c.instance(&sampler, Layer::Lavender)),
             );
         }

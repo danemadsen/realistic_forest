@@ -2,11 +2,11 @@
 //!
 //! The main world owns the scatter. It loads the plant library on a
 //! background task at startup, then streams 256 m chunks around the player
-//! at three detail levels (trees out to ~2 km, shrubs to ~1 km, herbs and
-//! lavender to ~270 m), each level generated on the async compute pool. The
-//! render world receives the library once and a flat snapshot of every
-//! streamed plant whenever the set changes; it seats, culls and draws them on
-//! the GPU (src/render/vegetation_node.rs).
+//! at three detail levels (trees out to ~2 km, shrubs to ~1 km, the shore's
+//! broadleaf plants and the lavender to ~270 m), each level generated on the
+//! async compute pool. The render world receives the library once and a flat
+//! snapshot of every streamed plant whenever the set changes; it seats, culls
+//! and draws them on the GPU (src/render/vegetation_node.rs).
 
 pub mod assets;
 pub mod ecology;
@@ -89,8 +89,9 @@ pub fn render_profile(species: Species, form: &str) -> RenderProfile {
                 shadow_cascades: 1,
             },
         },
+        // Shoreline colonies are seen along open beaches.
         Species::Broadleaf => RenderProfile {
-            max_distance: 110.0,
+            max_distance: 170.0,
             lod_end: [12.0, 24.0, 48.0],
             ground_habitat: true,
             translucency: 0.9,

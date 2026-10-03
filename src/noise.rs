@@ -209,6 +209,29 @@ pub fn base_height(noise: &NoiseField, x: f32, z: f32) -> f32 {
     push_from_waterline(lerp(safe_height, height, smoothstep(22.0, 90.0, distance_from_spawn)))
 }
 
+/// The terrain shader's grass line: `grassHeight` in terrain-fs.wgsl, the
+/// point's height drifted up to a few metres by the noise field, so the
+/// beach's sand gives way to turf along a wandering line instead of one
+/// contour. Turf dominates the ground where it exceeds about 3.4 m above the
+/// sea. Mirrors the shader's `mirrorTile(rotateUV(worldXZ * 0.0045, 0.85) +
+/// (0.43, 0.67))` lookup, bilinear and repeating like its sampler.
+pub fn grass_line_height(noise: &NoiseField, x: f32, z: f32, height: f32) -> f32 {
+    let (sin, cos) = 0.85f32.sin_cos();
+    let (u, v) = (x * 0.0045, z * 0.0045);
+    let mirror = |p: f32| ((p - 2.0 * (p / 2.0).floor()) - 1.0).abs();
+    let u_rotated = mirror(cos * u - sin * v + 0.43);
+    let v_rotated = mirror(sin * u + cos * v + 0.67);
+    let pixel_x = u_rotated * NOISE_RESOLUTION_F - 0.5;
+    let pixel_z = v_rotated * NOISE_RESOLUTION_F - 0.5;
+    let (x0, z0) = (pixel_x.floor(), pixel_z.floor());
+    let (tx, tz) = (pixel_x - x0, pixel_z - z0);
+    let wrap = |v: f32| (v as i32).rem_euclid(NOISE_RESOLUTION as i32) as usize;
+    let at = |x: f32, z: f32| noise.samples[wrap(z) * NOISE_RESOLUTION + wrap(x)];
+    let south = lerp(at(x0, z0), at(x0 + 1.0, z0), tx);
+    let north = lerp(at(x0, z0 + 1.0), at(x0 + 1.0, z0 + 1.0), tx);
+    height + (lerp(south, north, tz) - 0.5) * 7.0
+}
+
 /// The 480x480 base height map one erosion tile simulates, sampled at cell
 /// centres (mirrors `CreateBaseHeightMap`).
 pub fn create_base_height_map(noise: &NoiseField, tile: crate::erosion::TileKey) -> Vec<f32> {
