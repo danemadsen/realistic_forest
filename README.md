@@ -631,7 +631,7 @@ most recently completed tile.
 Rivers and creeks run from the mountains to the sea, through lakes where
 their water fills a basin. They are generated in `src/rivers` for a 16 km
 region around the player, follow the land the way its water would, are cut
-into the terrain, lined with boulders and bank plants, and drawn with their
+into the terrain, lined with bank plants, and drawn with their
 own flowing-water shader; their current pushes the player about.
 
 ### Where they run
@@ -682,7 +682,7 @@ the power laws real rivers are fitted with, plus the slope's own terms: width
 grows as the square root of the discharge and shrinks with the slope
 (as S^-0.35), depth grows as Q^0.35 and a little with the slope, and the
 speed is whatever carries the discharge through that section. A mountain
-stream is held in a narrow, deep slot between boulders and bedrock; on the
+stream is held in a narrow, deep slot in boulders and bedrock; on the
 flat the same water spreads wide and shallow over its own gravel and silt.
 Around spawn, reaches draining over half a square kilometre average 7.5 m
 wide, 0.43 m deep and 0.6 m/s on the lowland, 2.7 m, 0.58 m and 1.3 m/s on
@@ -722,7 +722,7 @@ round end, which keeps a waterfall's lip a clean vertical face.
 The same arithmetic runs on the CPU (`src/rivers/carve.rs`) and in the shared
 `assets/shaders/river-functions.wgslinc`, over the same uploaded segments and
 a 32 m lookup grid, so the drawn ground, the player's footing, the seated
-plants and boulders, the lighting heightfield and the erosion all see one
+plants, the lighting heightfield and the erosion all see one
 channel; tests hold the shader copies identical and the GPU result to the
 CPU's. The erosion tiles simulate over the carved base, and cells under a
 river's water are fixed drains there, like the sea: the river carries away
@@ -751,37 +751,19 @@ the water up exactly at every texel of its capture, so no blade roots in a
 creek however narrow or far off. Every edge wanders, so no waterline runs
 parallel to its channel, and running water never holds snow.
 
-### Rocks and plants
+### Plants
 
-Stones come from `rock-1.glb` to `rock-40.glb`, placed by walking each river
-with densities that follow its stream power, in the mix of sizes a real bed
-sorts into. Cobbles pave every gravel bed, from one per eight square metres of
-a slow, sandy pool to four per square metre of a cascade, and pile along both
-waterlines, half in the water and half out. Boulders lie among them, one per
-60 m² of a lowland bed and one per 6 m² of a cascade's, sized the same way,
-and steep reaches have more lodged in their banks. Every waterfall's lip
-carries a ledge of flat blocks with gaps for the water, with more tumbled into
-its plunge pool. A lake's silt bed has none. The spawn region holds some
-450,000 stones, of which the 78,000 over 40 cm across part the water in the
-river shader; the smaller ones pave the bed without disturbing the current.
-
-They are drawn through the plant pipeline, settled a third of their height
-into the bed, never moved by the wind, and cast shadows. The cull passes each
-stone the depth of water over its foot, so below the waterline it is drawn
-wet, glossy and filmed with olive algae, with a damp splash band just above. Only the stones
-within 760 m of the player go to the GPU, and each is drawn as far as its
-size carries: a cobble to about a hundred metres, a metre-wide boulder to
-about five hundred. Pebbles cast shadows in the nearest cascade only.
-
-No plant stands in a river or a lake: the scatter keeps each layer's stems a
-set distance past the waterline (trees lean their crowns over the water from
-the bank; lavender, which wants dry ground, keeps well back), the GPU cull
-refuses any root it seats in a channel or under a lake's level, and the grass
-habitat refuses roots in the water and on the wet margin, as well as on bare
-cut banks and gravel bars. Riverbanks are damp ground in the ecology, and broadleaf
-plants line them the way they line the shore: in colonies along the strip of
-bank just above the water, thickest a metre or two up, thinning a few metres
-back, and tolerant of a gallery forest's shade.
+No plant stands in a river or a lake, nor on the margin its floods scour:
+trees and shrubs keep at least four metres back from the waterline (more for
+a tall tree), ground plants a metre and a half, and lavender, which wants dry
+ground, three. The scatter keeps each layer's stems to its margin, the GPU
+cull refuses any root it would seat closer to a channel or a lake's
+shoreline, and the grass habitat refuses roots in the water and on the wet
+margin, as well as on bare cut banks and gravel bars. Riverbanks are damp
+ground in the ecology, and broadleaf plants line them the way they line the
+shore: in colonies along the strip of bank behind the open margin, thickest a
+few metres back from the water and thinning beyond, tolerant of a gallery
+forest's shade.
 
 ### The water
 
@@ -789,8 +771,10 @@ Each river's surface is a ribbon across its channel at the water level,
 reaching under both banks so the waterline is wherever the carved bank rises
 through the water. Each waterfall is a sheet that leaves its lip at the speed
 the water arrived with and falls along the jet's parabola into the plunge
-pool. A lake is a flat sheet at its level over its basin, reaching a cell
-past the shore so its shoreline is wherever the ground rises through it; a
+pool. A lake is a flat sheet at its level over its basin, in 4 m cells, and
+over the shore cells around it whose ground rises through the water on every
+side, so its shoreline is wherever the ground meets the water; it never
+reaches past its outlet, where the ground falls away below its level. A
 river's ribbon stops where it enters and starts again at the outlet. Water is
 drawn to 3.2 km in 256 m chunks culled against the view; beyond a few
 hundred metres, where the clipmap's triangles are wider than a creek, a
@@ -811,15 +795,8 @@ water does:
   the water's own speed, drawn out into streaks where it runs fast and
   chopped short over a rough bed; what a pixel cannot resolve becomes
   roughness instead of shimmer.
-- **Boulders.** Every rock near a point is found through the lookup grid.
-  Water parts around one that breaks the surface as potential flow around a
-  cylinder, heaps into a pillow against its upstream face (the stagnation
-  head, v²/2g), and leaves a slack, churning, foamy wake behind it. A rock
-  just under the surface lifts a standing hump, and where the water pours over
-  it fast enough (a Froude number over about one) it breaks into a foaming
-  hole downstream.
-- **Whitewater.** Cascades, plunge pools, eddy lines along the banks of fast
-  water and the rocks' wakes carry foam that the current advects downstream.
+- **Whitewater.** Cascades, plunge pools and eddy lines along the banks of
+  fast water carry foam that the current advects downstream.
   Aerated water is milkier as well as whiter. Falling sheets are strands of
   water streaming down at the speed of the fall, glassy at the lip and white
   as they break up, torn at their edges, thin enough on a small creek to show

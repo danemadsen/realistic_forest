@@ -592,11 +592,10 @@ fn rockWeathering(p: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec3<f32>
 //
 // river_grid holds an eight-word header (origin XZ and cell size as f32
 // bits, resolution, segment count), then three words per cell, then the
-// index lists the cells point into: a cell's segments, then the rocks whose
-// wakes reach it. A cell's words are the offset of its lists, the segment
-// count in the low and the rock count in the high 16 bits, and the level of
-// any lake reaching into the cell as f32 bits (RIVER_NO_LAKE if none). A
-// zero resolution means there are no rivers.
+// segment lists the cells point into. A cell's words are the offset of its
+// list, the list's length, and the level of any lake reaching into the cell
+// as f32 bits (RIVER_NO_LAKE if none). A zero resolution means there are no
+// rivers.
 //
 // A lake has no channel: ground below its level near it lies under its
 // water, and riverBankAt measures the shore in a river bank's terms.
@@ -740,7 +739,7 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
     if (any(cell < vec2<f32>(0.0)) || any(cell >= vec2<f32>(f32(resolution)))) { return total; }
     let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*RIVER_GRID_CELL_WORDS;
     let offset = river_grid[entry];
-    let count = min(river_grid[entry + 1u] & 0xffffu, RIVER_MAX_CANDIDATES);
+    let count = min(river_grid[entry + 1u], RIVER_MAX_CANDIDATES);
     for (var i = 0u; i < count; i += 1u)
     {
         riverCombine(&total, riverSegmentEnvelope(river_segments[river_grid[offset + i]], p));

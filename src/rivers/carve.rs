@@ -245,34 +245,16 @@ pub fn combine(total: &mut Envelope, next: &Envelope) {
     }
 }
 
-/// A boulder as the water shader sees it: 16 bytes, mirrored by
-/// `RiverRock` in water-surface.wgsl.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct RockObstacle {
-    pub position: [f32; 2],
-    /// Horizontal radius at the waterline, metres.
-    pub radius: f32,
-    /// Height of the rock's top, world metres.
-    pub top: f32,
-}
-
-/// How far downstream of a rock its wake can reach, in rock radii: the
-/// water shader looks rocks up within this of a point.
-pub const ROCK_WAKE_RADII: f32 = 7.0;
-
-/// A uniform grid of segment and rock lists over the network's whole
-/// domain, with the level of any lake reaching into each cell. Uploaded to
-/// the GPU as one `u32` array: an eight-word header, then
-/// `(offset, segment count | rock count << 16, lake level bits)` per cell,
-/// then the index lists those point into, each cell's segments before its
-/// rocks.
+/// A uniform grid of segment lists over the network's whole domain, with
+/// the level of any lake reaching into each cell. Uploaded to the GPU as one
+/// `u32` array: an eight-word header, then `(offset, segment count, lake
+/// level bits)` per cell, then the index lists those point into.
 #[derive(Clone, Debug, Default)]
 pub struct SegmentGrid {
     pub origin: [f32; 2],
     pub resolution: usize,
-    /// Per cell: offset into `indices`, segment count, rock count.
-    pub cells: Vec<[u32; 3]>,
+    /// Per cell: offset into `indices` and segment count.
+    pub cells: Vec<[u32; 2]>,
     pub indices: Vec<u32>,
     /// Per cell, the highest lake level reaching into it; empty when there
     /// are no lakes.
@@ -288,7 +270,7 @@ pub const GRID_CELL_WORDS: usize = 3;
 pub const GRID_HEADER_WORDS: usize = 8;
 
 impl SegmentGrid {
-    pub fn build(origin: [f32; 2], resolution: usize, segments: &[RiverSegment], rocks: &[RockObstacle]) -> Self {
+    pub fn build(origin: [f32; 2], resolution: usize, segments: &[RiverSegment]) -> Self {
         let cell_range = |minimum: [f32; 2], maximum: [f32; 2]| {
             let cell = |value: f32, axis: usize| ((value - origin[axis]) / GRID_CELL).floor() as i64;
             (
@@ -311,25 +293,11 @@ impl SegmentGrid {
                 }
             }
         }
-        let mut rock_buckets: Vec<Vec<u32>> = vec![Vec::new(); resolution * resolution];
-        for (index, rock) in rocks.iter().enumerate() {
-            let reach = rock.radius * ROCK_WAKE_RADII + 1.0;
-            let (x0, x1, z0, z1) = cell_range(
-                [rock.position[0] - reach, rock.position[1] - reach],
-                [rock.position[0] + reach, rock.position[1] + reach],
-            );
-            for z in z0..=z1 {
-                for x in x0..=x1 {
-                    rock_buckets[z as usize * resolution + x as usize].push(index as u32);
-                }
-            }
-        }
         let mut cells = Vec::with_capacity(segment_buckets.len());
         let mut indices = Vec::new();
-        for (segment_bucket, rock_bucket) in segment_buckets.iter().zip(&rock_buckets) {
-            cells.push([indices.len() as u32, segment_bucket.len() as u32, rock_bucket.len().min(0xffff) as u32]);
-            indices.extend_from_slice(segment_bucket);
-            indices.extend_from_slice(&rock_bucket[..rock_bucket.len().min(0xffff)]);
+        for bucket in &segment_buckets {
+            cells.push([indices.len() as u32, bucket.len() as u32]);
+            indices.extend_from_slice(bucket);
         }
         Self {
             origin,
@@ -349,7 +317,7 @@ impl SegmentGrid {
         Some(z as usize * self.resolution + x as usize)
     }
 
-    fn cell(&self, p: [f32; 2]) -> Option<[u32; 3]> {
+    fn cell(&self, p: [f32; 2]) -> Option<[u32; 2]> {
         self.cell_index(p).map(|index| self.cells[index])
     }
 
@@ -388,19 +356,7 @@ impl SegmentGrid {
     /// The segment indices whose reach may cover `p`.
     pub fn candidates(&self, p: [f32; 2]) -> &[u32] {
         match self.cell(p) {
-            Some([offset, count, _]) => &self.indices[offset as usize..(offset + count) as usize],
-            None => &[],
-        }
-    }
-
-    /// The rock indices whose wake may reach `p`: what the water shader
-    /// reads from the GPU copy of this grid.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn rock_candidates(&self, p: [f32; 2]) -> &[u32] {
-        match self.cell(p) {
-            Some([offset, count, rocks]) => {
-                &self.indices[(offset + count) as usize..(offset + count + rocks) as usize]
-            }
+            Some([offset, count]) => &self.indices[offset as usize..(offset + count) as usize],
             None => &[],
         }
     }
@@ -418,7 +374,7 @@ impl SegmentGrid {
         for (index, cell) in self.cells.iter().enumerate() {
             // Offsets are into the whole word array.
             words.push(cell[0] + base);
-            words.push(cell[1].min(0xffff) | (cell[2] << 16));
+            words.push(cell[1]);
             words.push(self.lakes.get(index).copied().unwrap_or(NO_LAKE).to_bits());
         }
         words.extend_from_slice(&self.indices);
@@ -510,7 +466,7 @@ mod tests {
                 s
             })
             .collect();
-        let grid = SegmentGrid::build([-100.0, -100.0], 16, &segments, &[]);
+        let grid = SegmentGrid::build([-100.0, -100.0], 16, &segments);
         for z in -60..120 {
             for x in -60..260 {
                 let p = [x as f32 * 1.3, z as f32 * 1.1];
@@ -523,20 +479,11 @@ mod tests {
                 assert_eq!(brute.lower, fast.lower);
             }
         }
-        // Every rock is listed in the cell it stands in.
-        let rocks: Vec<RockObstacle> = (0..10)
-            .map(|i| RockObstacle { position: [i as f32 * 17.0, 5.0], radius: 0.6, top: 11.0 })
-            .collect();
-        let with_rocks = SegmentGrid::build([-100.0, -100.0], 16, &segments, &rocks);
-        for (index, rock) in rocks.iter().enumerate() {
-            assert!(with_rocks.rock_candidates(rock.position).contains(&(index as u32)));
-        }
-        assert_eq!(with_rocks.candidates([3.0, 2.0]), grid.candidates([3.0, 2.0]));
         // The GPU words point at the same lists.
         let words = grid.gpu_words(segments.len());
         let cell = 5 * 16 + 7;
         let offset = words[GRID_HEADER_WORDS + cell * GRID_CELL_WORDS] as usize;
-        let count = (words[GRID_HEADER_WORDS + cell * GRID_CELL_WORDS + 1] & 0xffff) as usize;
+        let count = words[GRID_HEADER_WORDS + cell * GRID_CELL_WORDS + 1] as usize;
         assert_eq!(&words[offset..offset + count], &grid.indices[grid.cells[cell][0] as usize..][..count]);
     }
 }

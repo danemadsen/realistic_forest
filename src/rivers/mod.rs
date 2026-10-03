@@ -11,13 +11,12 @@
 //! channels.
 //!
 //! The render world receives the finished network whenever it changes and
-//! uploads its carve segments, lookup grid and rocks for the terrain, plant
-//! and water shaders, plus the water-surface ribbons.
+//! uploads its carve segments and lookup grid for the terrain, plant and
+//! water shaders, plus the water surfaces.
 
 pub mod carve;
 pub mod map;
 pub mod network;
-pub mod rocks;
 pub mod surface;
 
 use crate::noise::NoiseField;
@@ -27,17 +26,15 @@ use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 use network::RiverNetwork;
 use std::sync::Arc;
 
-/// GPU capacities: the uploaded grid words, carve segments and rocks. A
-/// network that needs more keeps what lies nearest its region's centre.
+/// GPU capacities: the uploaded grid words and carve segments. A network
+/// that needs more keeps what lies nearest its region's centre.
 pub const GPU_GRID_WORDS: usize = 2_621_440;
 pub const GPU_SEGMENTS: usize = 131_072;
-pub const GPU_ROCKS: usize = 98_304;
 
 /// What the GPU receives of a network.
 pub struct GpuPayload {
     pub grid_words: Vec<u32>,
     pub segments: Vec<carve::RiverSegment>,
-    pub rocks: Vec<carve::RockObstacle>,
 }
 
 impl RiverNetwork {
@@ -50,29 +47,22 @@ impl RiverNetwork {
             };
             let segments: Vec<carve::RiverSegment> =
                 self.segments.iter().filter(|s| near(s.a)).copied().collect();
-            let rocks: Vec<carve::RockObstacle> = self
-                .rocks
-                .iter()
-                .filter(|r| r.radius >= rocks::OBSTACLE_RADIUS && near(r.position))
-                .map(|r| r.obstacle())
-                .collect();
             let grid = if radius.is_finite() {
-                let mut grid = carve::SegmentGrid::build(self.grid.origin, self.grid.resolution, &segments, &rocks);
+                let mut grid = carve::SegmentGrid::build(self.grid.origin, self.grid.resolution, &segments);
                 grid.lakes = self.grid.lakes.clone();
                 grid
             } else {
                 self.grid.clone()
             };
             let grid_words = grid.gpu_words(segments.len());
-            if (segments.len() <= GPU_SEGMENTS && rocks.len() <= GPU_ROCKS && grid_words.len() <= GPU_GRID_WORDS)
+            if (segments.len() <= GPU_SEGMENTS && grid_words.len() <= GPU_GRID_WORDS)
                 || radius < 1000.0
             {
                 if radius.is_finite() {
                     log::warn!("RIVERS: the GPU holds the rivers within {radius:.0} m of the region centre");
                 }
-                let mut payload = GpuPayload { grid_words, segments, rocks };
+                let mut payload = GpuPayload { grid_words, segments };
                 payload.segments.truncate(GPU_SEGMENTS);
-                payload.rocks.truncate(GPU_ROCKS);
                 payload.grid_words.truncate(GPU_GRID_WORDS);
                 return payload;
             }
@@ -126,13 +116,13 @@ impl RiverField {
 
     fn install(&mut self, network: RiverNetwork) {
         log::info!(
-            "RIVERS: region ({}, {}) has {} rivers, {:.1} km of channel, {} waterfalls over 1.5 m and {} rocks, built in {:.2} s",
+            "RIVERS: region ({}, {}) has {} rivers, {:.1} km of channel, {} waterfalls over 1.5 m and {} lakes, built in {:.2} s",
             network.region[0],
             network.region[1],
             network.rivers.len(),
             network.total_length_km(),
             network.waterfall_count(),
-            network.rocks.len(),
+            network.lakes.len(),
             network.build_seconds
         );
         self.current = Some(Arc::new(network));

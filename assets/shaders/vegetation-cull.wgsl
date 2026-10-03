@@ -375,11 +375,10 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
 //
 // river_grid holds an eight-word header (origin XZ and cell size as f32
 // bits, resolution, segment count), then three words per cell, then the
-// index lists the cells point into: a cell's segments, then the rocks whose
-// wakes reach it. A cell's words are the offset of its lists, the segment
-// count in the low and the rock count in the high 16 bits, and the level of
-// any lake reaching into the cell as f32 bits (RIVER_NO_LAKE if none). A
-// zero resolution means there are no rivers.
+// segment lists the cells point into. A cell's words are the offset of its
+// list, the list's length, and the level of any lake reaching into the cell
+// as f32 bits (RIVER_NO_LAKE if none). A zero resolution means there are no
+// rivers.
 //
 // A lake has no channel: ground below its level near it lies under its
 // water, and riverBankAt measures the shore in a river bank's terms.
@@ -523,7 +522,7 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
     if (any(cell < vec2<f32>(0.0)) || any(cell >= vec2<f32>(f32(resolution)))) { return total; }
     let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*RIVER_GRID_CELL_WORDS;
     let offset = river_grid[entry];
-    let count = min(river_grid[entry + 1u] & 0xffffu, RIVER_MAX_CANDIDATES);
+    let count = min(river_grid[entry + 1u], RIVER_MAX_CANDIDATES);
     for (var i = 0u; i < count; i += 1u)
     {
         riverCombine(&total, riverSegmentEnvelope(river_segments[river_grid[offset + i]], p));
@@ -619,9 +618,6 @@ const LOD_SLOTS: u32 = 4u;
 /// Least grass suitability a small plant roots in, from the habitat capture;
 /// the grass's own clumps take root from 0.02.
 const SMALL_PLANT_ROOT: f32 = 0.06;
-/// Share of a boulder's height sunk into the bed it rests on; mirrors
-/// `RiverRock::EMBEDDED`, which the water shader's obstacles are built from.
-const ROCK_EMBEDDED: f32 = 0.3;
 
 fn sphereVisible(centre: vec3<f32>, radius: f32) -> bool {
     for (var i = 0; i < 4; i++) {
@@ -710,24 +706,14 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
     let flat_distance = length(plant.position.xz - eye.xz);
     // The far edge breathes a little per plant, so the forest does not end
     // on a circle.
-    var reach = model.max_distance * (0.93 + 0.14 * fract(plant.seed * 7.31));
-    let size = model.bound_radius * plant.scale;
-    if (model.habitat == 2u) {
-        // A cobble is a speck a hundred metres off; a boulder carries to
-        // the river's far bends.
-        reach = min(reach, 40.0 + 450.0 * size);
-    }
+    let reach = model.max_distance * (0.93 + 0.14 * fract(plant.seed * 7.31));
     if (flat_distance > reach) {
         return;
     }
-    let radius = max(height * 0.5, size) + cull.ground.w;
+    let radius = max(height * 0.5, model.bound_radius * plant.scale) + cull.ground.w;
     let centre = vec3<f32>(plant.position.x, plant.position.y + height * 0.5, plant.position.z);
     let seen = sphereVisible(centre, radius);
-    var shadows = shadowCascades(centre, radius, model);
-    if (model.habitat == 2u && size < 0.35) {
-        // Only the nearest cascade resolves a pebble's shadow.
-        shadows &= 1u;
-    }
+    let shadows = shadowCascades(centre, radius, model);
     if (!seen && shadows == 0u) {
         return;
     }
@@ -735,38 +721,21 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
     // Seat the root.
     let xz = plant.position.xz;
     var ground = 0.0;
-    // A stone carries how deep the water stands over its foot, in whole
-    // centimetres ahead of its seed's fraction, so the plant shader can wet
-    // what lies under the surface.
-    var drawn = plant;
-    // Nothing grows in a river or a lake: a root stands on the dry bank,
-    // clear of the waterline by its trunk or stems.
-    if (model.habitat != 2u) {
-        let footing = select(0.4 + 0.015 * height,
-                             max(0.2, model.crown_radius * plant.scale * 0.6),
-                             model.habitat == 1u);
-        let river = riverEnvelope(xz);
-        var bank = river.bank_distance;
-        if (river.lake > RIVER_NO_LAKE) {
-            bank = riverBankAt(river, terrainHeight(xz));
-        }
-        if (bank < footing) {
-            return;
-        }
+    // Nothing grows in a river or a lake, nor on the margin its floods
+    // scour: a tree or shrub stands back from the waterline by a few metres
+    // and its crown, a ground plant by a metre and a half.
+    let footing = select(4.0 + 0.06 * height,
+                         max(1.5, model.crown_radius * plant.scale + 1.0),
+                         model.habitat == 1u);
+    let river = riverEnvelope(xz);
+    var bank = river.bank_distance;
+    if (river.lake > RIVER_NO_LAKE) {
+        bank = riverBankAt(river, terrainHeight(xz));
     }
-    if (model.habitat == 2u) {
-        // A boulder sits where the river put it, in the bed or the bank,
-        // settled a third of its height into the ground.
-        let bed = terrainHeight(xz);
-        ground = bed - height * ROCK_EMBEDDED;
-        let river = riverEnvelope(xz);
-        var water = select(-RIVER_NONE, river.water, river.bank_distance < 0.4);
-        if (bed < river.lake) {
-            water = max(water, river.lake);
-        }
-        let depth = clamp(water - ground, 0.0, 99.0);
-        drawn.seed = fract(plant.seed) + floor(depth * 100.0);
-    } else if (model.habitat == 1u) {
+    if (bank < footing) {
+        return;
+    }
+    if (model.habitat == 1u) {
         if (cull.counts.z == 0u) {
             return;
         }
@@ -814,7 +783,7 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
 
     for (var c = 0u; c < 4u; c++) {
         if ((shadows & (1u << c)) != 0u) {
-            append(drawn, model, LOD_SLOTS + c, model.shadow_word[c], model.shadow_count[c], root, 1.0);
+            append(plant, model, LOD_SLOTS + c, model.shadow_word[c], model.shadow_count[c], root, 1.0);
         }
     }
     if (!seen) {
@@ -843,10 +812,10 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
         let end = model.lod_end[lod];
         let t = clamp((units - end * (1.0 - LOD_FADE_BAND)) / (end * LOD_FADE_BAND), 0.0, 1.0);
         if (t > 0.0) {
-            emit(drawn, model, lod, root, -t);
-            emit(drawn, model, lod + 1u, root, t);
+            emit(plant, model, lod, root, -t);
+            emit(plant, model, lod + 1u, root, t);
             return;
         }
     }
-    emit(drawn, model, lod, root, visibility);
+    emit(plant, model, lod, root, visibility);
 }

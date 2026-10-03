@@ -13,10 +13,10 @@
 //! and lands in the plunge pool a little downstream. The pool's own surface
 //! starts beneath it.
 //!
-//! A lake is a flat sheet at its level over its basin, reaching a cell past
-//! the shore so the shoreline is wherever the ground rises through it. A
-//! river's ribbon stops where it enters a lake and starts again at its
-//! outlet.
+//! A lake is a flat sheet at its level over its basin and the shore cells
+//! around it, so the shoreline is wherever the ground rises through it, but
+//! never past its outlet, where the ground falls away. A river's ribbon
+//! stops where it enters a lake and starts again at its outlet.
 //!
 //! The mesh is cut into 256 m chunks with their bounds, so the renderer only
 //! draws what the camera can see.
@@ -55,8 +55,8 @@ const _: () = assert!(std::mem::size_of::<SurfaceVertex>() == 48);
 pub const CHUNK: f32 = 256.0;
 /// `fall` on a lake's surface.
 pub const LAKE_SURFACE: f32 = -2.0;
-/// Side of a lake surface's cells: two flow cells.
-const LAKE_CELL: f32 = 2.0 * FLOW_CELL as f32;
+/// Side of a lake surface's cells: the flow grid's.
+const LAKE_CELL: f32 = FLOW_CELL as f32;
 
 /// A contiguous run of indices and its bounds.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -252,23 +252,15 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
     }
 }
 
-/// A lake's sheet: the cells of a lattice twice as coarse as the flow grid
-/// that hold any of its water, grown by one so the sheet runs under the
-/// shore.
+/// A lake's sheet: a quad over every flow-grid cell of its water and of its
+/// shore, the cells around it where the ground rises through the water on
+/// every side. None over its outlet, where the ground falls away below the
+/// level and a sheet would hang in the air.
 fn add_lake(
     vertices: &mut Vec<SurfaceVertex>,
     chunk_triangles: &mut std::collections::BTreeMap<(i32, i32), Vec<u32>>,
     lake: &Lake,
 ) {
-    let mut covered = std::collections::BTreeSet::new();
-    for cell in &lake.cells {
-        let coarse = [cell[0].div_euclid(2), cell[1].div_euclid(2)];
-        for dz in -1..=1 {
-            for dx in -1..=1 {
-                covered.insert((coarse[1] + dz, coarse[0] + dx));
-            }
-        }
-    }
     let mut corner_index = std::collections::HashMap::new();
     let mut corner = |vertices: &mut Vec<SurfaceVertex>, x: i32, z: i32| -> u32 {
         *corner_index.entry((x, z)).or_insert_with(|| {
@@ -286,7 +278,7 @@ fn add_lake(
             vertices.len() as u32 - 1
         })
     };
-    for &(z, x) in &covered {
+    for &[x, z] in lake.cells.iter().chain(&lake.shore) {
         let i00 = corner(vertices, x, z);
         let i10 = corner(vertices, x + 1, z);
         let i01 = corner(vertices, x, z + 1);

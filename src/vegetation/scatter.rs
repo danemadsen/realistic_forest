@@ -56,8 +56,6 @@ pub enum Layer {
     Shrub = 2,
     Herb = 3,
     Lavender = 4,
-    /// A river's boulder, placed by the rivers rather than the scatter.
-    Rock = 5,
 }
 
 /// Detail levels a chunk is generated at: trees only, then shrubs, then the
@@ -738,11 +736,12 @@ const TREE_CONTEXT: f64 = 24.0;
 /// trees; 1 the shrubs; 2 the herbs and lavender. Each level recomputes the
 /// trees around the chunk to stay clear of them, which keeps every level a
 /// pure function of the chunk coordinates.
-/// How far past a river's waterline each layer's stems stand at least: trees
-/// lean their crowns over the water from the bank, shrubs crowd the bank,
-/// the bank's broadleaf plants grow right to the damp edge, and lavender,
-/// which wants dry ground, keeps well back.
-const RIVER_CLEARANCE: [f32; 5] = [0.9, 0.8, 0.6, 0.35, 2.5];
+/// How far past a river's or lake's waterline each layer's stems stand at
+/// least: the margin its floods scour stays open turf, trees and shrubs keep
+/// a few metres back, the bank's broadleaf plants begin a metre and a half
+/// up, and lavender, which wants dry ground, keeps well back. The GPU cull
+/// holds the drawn plants to the same margin.
+const RIVER_CLEARANCE: [f32; 5] = [4.5, 4.0, 3.5, 1.5, 3.0];
 
 pub fn generate_level(
     noise: &NoiseField,

@@ -135,15 +135,11 @@ fn upload_rivers(
     if !payload.segments.is_empty() {
         queue.write_buffer(&textures.river_segments, 0, bytemuck::cast_slice(&payload.segments));
     }
-    if !payload.rocks.is_empty() {
-        queue.write_buffer(&textures.river_rocks, 0, bytemuck::cast_slice(&payload.rocks));
-    }
     queue.write_buffer(&textures.river_grid, 0, bytemuck::cast_slice(&payload.grid_words));
     textures.revision.note_atlas_upload();
     log::info!(
-        "RIVERS: uploaded {} segments, {} rocks and {:.1} MiB of lookup grid",
+        "RIVERS: uploaded {} segments and {:.1} MiB of lookup grid",
         payload.segments.len(),
-        payload.rocks.len(),
         payload.grid_words.len() as f64 * 4.0 / (1024.0 * 1024.0)
     );
 }

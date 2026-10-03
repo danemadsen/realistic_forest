@@ -169,18 +169,11 @@ pub fn report(network: &RiverNetwork) -> Vec<String> {
     let falls: Vec<f32> = nodes.iter().filter(|n| n.fall > 0.0).map(|n| n.fall).collect();
     let tall = falls.iter().filter(|&&f| f > 1.5).count();
     let tallest = falls.iter().copied().fold(0.0f32, f32::max);
-    let boulders = network
-        .rocks
-        .iter()
-        .filter(|rock| rock.radius >= super::rocks::OBSTACLE_RADIUS)
-        .count();
     lines.push(format!(
-        "{} steps and falls ({} over 1.5 m, tallest {:.1} m), {} rocks ({} over 40 cm across, which part the water)",
+        "{} steps and falls ({} over 1.5 m, tallest {:.1} m)",
         falls.len(),
         tall,
-        tallest,
-        network.rocks.len(),
-        boulders
+        tallest
     ));
     // Sinuosity of the larger rivers: channel length over straight distance
     // per 1 km window.
@@ -231,6 +224,9 @@ pub fn report(network: &RiverNetwork) -> Vec<String> {
 pub fn terrain_fit(noise: &NoiseField, network: &RiverNetwork) -> String {
     let mut total = 0.0f64;
     let (mut trench, mut perched, mut off_floor) = (0.0f64, 0.0f64, 0.0f64);
+    // Mean depth of the surface under the natural ground: (sum, length)
+    // over gentle and over steep reaches.
+    let mut incision = [(0.0f64, 0.0f64); 2];
     for river in &network.rivers {
         let nodes = &river.nodes;
         let end = river.surface_end.min(nodes.len().saturating_sub(1));
@@ -251,6 +247,9 @@ pub fn terrain_fit(noise: &NoiseField, network: &RiverNetwork) -> String {
             if node.slope < network::STEP_SLOPE && at(0.0) - node.water > 3.0 {
                 trench += weight;
             }
+            let band = usize::from(node.slope >= network::STEP_SLOPE);
+            incision[band].0 += (at(0.0) - node.water).max(0.0) as f64 * weight;
+            incision[band].1 += weight;
             let reach = [1.0f32, 2.5, 5.0];
             let spills = [-1.0f32, 1.0]
                 .iter()
@@ -268,12 +267,15 @@ pub fn terrain_fit(noise: &NoiseField, network: &RiverNetwork) -> String {
         }
     }
     let share = |v: f64| 100.0 * v / total.max(1.0);
+    let mean = |(sum, length): (f64, f64)| sum / length.max(1.0);
     format!(
-        "terrain fit over {:.1} km: {:.1}% trenched over 3 m (gentle reaches), {:.1}% held up by levees, {:.1}% above the valley floor",
+        "terrain fit over {:.1} km: {:.1}% trenched over 3 m (gentle reaches), {:.1}% held up by levees, {:.1}% above the valley floor; water {:.2} m under the ground on gentle reaches, {:.2} m on steep",
         total / 1000.0,
         share(trench),
         share(perched),
-        share(off_floor)
+        share(off_floor),
+        mean(incision[0]),
+        mean(incision[1])
     )
 }
 
@@ -389,7 +391,7 @@ mod tests {
         let cz = ((z - origin[1]) / cell).floor() as usize;
         let entry = 8 + (cz * resolution + cx) * super::super::carve::GRID_CELL_WORDS;
         let offset = words[entry] as usize;
-        let count = (words[entry + 1] & 0xffff) as usize;
+        let count = words[entry + 1] as usize;
         assert!(count > 0);
         let mut total = super::super::carve::Envelope::NONE;
         for i in 0..count {

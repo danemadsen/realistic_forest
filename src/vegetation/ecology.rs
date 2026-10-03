@@ -591,12 +591,13 @@ pub fn habitat_at(site: Site, p: [f64; 2]) -> Habitat {
     let near_sea = 1.0 - smoothstep(0.6 * SHORE_SEARCH, SHORE_SEARCH, site.shore);
     let colony = smoothstep(0.38, 0.64, noise2(q, 40.0, seed::HERB));
     let shore_herbs = SHORE_HERB_PEAK * strip * near_sea * (0.15 + 0.85 * colony) * (1.0 - 0.8 * forest);
-    // And along rivers and creeks: the damp strip of bank above the water,
-    // thickest a metre or two up and thinning out a few metres back, in
-    // colonies that leave stretches of open bank. They tolerate the shade of
-    // a gallery forest better than the light-hungry shore plants.
+    // And along rivers and creeks: the damp strip of bank behind the open
+    // margin the floods keep, thickest a few metres back from the water and
+    // thinning out beyond, in colonies that leave stretches of open bank.
+    // They tolerate the shade of a gallery forest better than the
+    // light-hungry shore plants.
     let bank_reach = 4.5 + 2.0 * noise(q, 60.0, seed::RIVER_HERB);
-    let bank_across = (site.river - 0.4) / bank_reach;
+    let bank_across = (site.river - 1.6) / bank_reach;
     let bank_strip = smoothstep(-0.05, 0.22, bank_across) * (1.0 - smoothstep(0.5, 1.0, bank_across));
     let bank_colony = smoothstep(0.30, 0.58, noise2(q, 28.0, seed::RIVER_HERB + 1));
     let river_herbs = RIVER_HERB_PEAK * bank_strip * (0.2 + 0.8 * bank_colony) * (1.0 - 0.45 * forest);

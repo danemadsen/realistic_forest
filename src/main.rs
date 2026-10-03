@@ -206,11 +206,11 @@ fn main() {
         // Bevy's logger does not exist yet; the summary goes straight out.
         if let Some(network) = field.network() {
             println!(
-                "RIVERS: {} rivers, {:.1} km of channel, {} falls over 1.5 m, {} rocks, built in {:.2} s",
+                "RIVERS: {} rivers, {:.1} km of channel, {} falls over 1.5 m, {} lakes, built in {:.2} s",
                 network.rivers.len(),
                 network.total_length_km(),
                 network.waterfall_count(),
-                network.rocks.len(),
+                network.lakes.len(),
                 network.build_seconds
             );
         }

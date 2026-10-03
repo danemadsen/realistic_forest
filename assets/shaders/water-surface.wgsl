@@ -1698,36 +1698,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
 // its water level (src/rivers/surface.rs) whose vertices carry the current;
 // waterfalls are sheets falling along the jet's parabola. The surface is
 // shaded with the sea's optics (Fresnel, sky and screen-space reflections,
-// Beer-Lambert body and refraction, sun glitter, rain rings, fog) and three
+// Beer-Lambert body and refraction, sun glitter, rain rings, fog) and two
 // things the sea does not have:
 //
 // - Flow-mapped ripples. Two phases of procedural ripple noise are carried
 //   downstream by the local current and cross-faded, so the texture streams
 //   with the water at its own speed, stretched along the flow where it runs
 //   fast and choppy where the bed is rough.
-// - Boulders. Every rock near a point is looked up through the river grid.
-//   Water parts around one that breaks the surface as potential flow around
-//   a cylinder, heaps into a pillow against its upstream face (the
-//   stagnation head, v^2/2g), and leaves a slow, churning, foamy wake. A
-//   rock just under the surface lifts a standing hump, and where the water
-//   pours over it fast enough it breaks into a foaming hole downstream.
-// - Whitewater. Cascades, plunge pools below falls, eddy lines along fast
-//   banks and the wakes above all carry advected foam; the falling sheets
-//   are aerated water, streaked and torn at their edges.
-
-// A boulder as the water sees it. Mirrors `RockObstacle` in
-// src/rivers/carve.rs (16 bytes).
-struct RiverRock
-{
-    position: vec2<f32>,
-    radius: f32,
-    top: f32,
-};
-
-// The river lookup grid (see river-functions.wgslinc for its layout): each
-// cell lists, after its carve segments, the rocks whose wakes reach it.
-@group(2) @binding(1) var<storage, read> river_rocks: array<RiverRock>;
-@group(2) @binding(2) var<storage, read> river_grid: array<u32>;
+// - Whitewater. Cascades, plunge pools below falls and eddy lines along
+//   fast banks carry advected foam; the falling sheets are aerated water,
+//   streaked and torn at their edges.
 
 // The plants' shadow cascades, as the composite reads them, so a creek under
 // the forest lies in the same shade as its banks. Mirrors
@@ -1739,9 +1719,9 @@ struct VegetationShadows {
     light: vec4<f32>,
     params: vec4<f32>,
 };
-@group(2) @binding(3) var vegetation_shadow_map: texture_depth_2d_array;
-@group(2) @binding(4) var<uniform> vegetation_shadows: VegetationShadows;
-@group(2) @binding(5) var vegetation_shadow_sampler: sampler_comparison;
+@group(2) @binding(1) var vegetation_shadow_map: texture_depth_2d_array;
+@group(2) @binding(2) var<uniform> vegetation_shadows: VegetationShadows;
+@group(2) @binding(3) var vegetation_shadow_sampler: sampler_comparison;
 
 // Light reaching a water point through the plants: the cascade covering its
 // view depth, with a 2x2 grid of bilinear comparisons (the composite's
@@ -1786,8 +1766,6 @@ const RIVER_GRAVITY: f32 = 9.81;
 // reflections give it its colour.
 const RIVER_EXTINCTION: vec3<f32> = vec3<f32>(0.40, 0.14, 0.21);
 const RIVER_SCATTER: vec3<f32> = vec3<f32>(0.006, 0.010, 0.006);
-// Rocks a fragment considers at most.
-const RIVER_MAX_ROCKS: u32 = 24u;
 
 struct RiverVertexOutput
 {
@@ -1849,103 +1827,6 @@ fn riverNoise(p: vec2<f32>) -> vec3<f32>
     let value = a + (b - a)*u.x + (c - a)*u.y + k*u.x*u.y;
     let gradient = du*vec2<f32>(b - a + k*u.y, c - a + k*u.x);
     return vec3<f32>(value, gradient);
-}
-
-struct RiverFlow
-{
-    velocity: vec2<f32>,
-    // Surface gradient from the humps the rocks raise.
-    slope: vec2<f32>,
-    foam: f32,
-    // Extra roughness: wakes and holes churn the surface.
-    churn: f32,
-};
-
-// What the boulders near a point do to the water there.
-fn riverRockFlow(p: vec2<f32>, base: vec2<f32>, surface: f32) -> RiverFlow
-{
-    var result = RiverFlow(base, vec2<f32>(0.0), 0.0, 0.0);
-    let resolution = river_grid[3];
-    if (resolution == 0u) { return result; }
-    let origin = vec2<f32>(bitcast<f32>(river_grid[0]), bitcast<f32>(river_grid[1]));
-    let cell = floor((p - origin)/bitcast<f32>(river_grid[2]));
-    if (any(cell < vec2<f32>(0.0)) || any(cell >= vec2<f32>(f32(resolution)))) { return result; }
-    let speed = length(base);
-    if (speed < 0.03) { return result; }
-    // Three words per cell: see river-functions.wgslinc.
-    let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*3u;
-    let offset = river_grid[entry];
-    let packed = river_grid[entry + 1u];
-    let first_rock = offset + (packed & 0xffffu);
-    let rock_count = min(packed >> 16u, RIVER_MAX_ROCKS);
-    let e = base/speed;
-    let n = vec2<f32>(-e.y, e.x);
-    let head = speed*speed/(2.0*RIVER_GRAVITY);
-    var deflection = vec2<f32>(0.0);
-    for (var k = 0u; k < rock_count; k += 1u)
-    {
-        let rock = river_rocks[river_grid[first_rock + k]];
-        let r = p - rock.position;
-        let reach = rock.radius*7.0;
-        if (dot(r, r) > reach*reach) { continue; }
-        let x = dot(r, e);
-        let y = dot(r, n);
-        let emergence = rock.top - surface;
-        if (emergence > 0.0)
-        {
-            // Radius where the rounded block meets the water.
-            let radius = rock.radius*clamp(0.6 + emergence/(rock.radius*0.9), 0.6, 1.0);
-            let r2 = max(x*x + y*y, radius*radius);
-            let ratio = radius*radius/(r2*r2);
-            // Potential flow past a cylinder: the stream parts around the
-            // rock, slows ahead of it and speeds past its flanks.
-            let around = e*(-speed*ratio*(x*x - y*y)) + n*(-speed*2.0*ratio*x*y);
-            // Behind it the flow separates: a slack, churning wake.
-            let wake_width = radius*(1.0 + 0.2*max(x, 0.0)/radius);
-            let wake = select(0.0,
-                              exp(-(y*y)/(wake_width*wake_width))
-                              *exp(-max(x - 0.5*radius, 0.0)/(5.0*radius)),
-                              x > -0.2*radius);
-            deflection += around*(1.0 - wake) - base*wake*0.7;
-            // The pillow against the upstream face, and its gradient.
-            let pillow_centre = vec2<f32>(-1.05*radius, 0.0);
-            let q = vec2<f32>(x, y) - pillow_centre;
-            let spread = 0.45*radius + 0.06;
-            let pillow = head*exp(-dot(q, q)/(spread*spread));
-            let local_slope = -2.0*pillow*q/(spread*spread);
-            result.slope += e*local_slope.x + n*local_slope.y;
-            // Foam where the water piles on the rock, and down its wake.
-            let rim = exp(-pow((sqrt(x*x + y*y) - radius)/(0.15*radius + 0.05), 2.0));
-            result.foam = max(result.foam, rim*smoothstep(0.15, 1.0, speed)*0.85);
-            result.foam = max(result.foam, wake*smoothstep(0.3, 1.4, speed)*0.75);
-            result.churn += wake*smoothstep(0.2, 1.0, speed);
-        }
-        else
-        {
-            // Under the surface: the water rises over the rock in a standing
-            // hump, highest when it only just covers it, and breaks into a
-            // hole behind it once it pours over fast (a Froude number over
-            // about one).
-            let cover = -emergence;
-            let froude = speed*speed/(RIVER_GRAVITY*max(cover, 0.02));
-            let height = min(head, 0.3*rock.radius)*exp(-cover/(0.5*rock.radius + 0.08));
-            let q = vec2<f32>(x - 0.35*rock.radius, y);
-            let spread = 1.1*rock.radius + 0.05;
-            let hump = height*exp(-dot(q, q)/(spread*spread));
-            let local_slope = -2.0*hump*q/(spread*spread);
-            result.slope += e*local_slope.x + n*local_slope.y;
-            let hole_q = vec2<f32>((x - 1.4*rock.radius)/(0.7*rock.radius + 0.05),
-                                   y/(0.9*rock.radius + 0.05));
-            let hole = exp(-dot(hole_q, hole_q))*smoothstep(0.5, 2.5, froude)
-                     *exp(-cover/(rock.radius + 0.1));
-            result.foam = max(result.foam, hole*0.9);
-            result.churn += hole + hump*4.0;
-            // The current speeds over the crest and slackens behind it.
-            deflection += base*(hump/max(cover + 0.1, 0.1) - 0.4*hole);
-        }
-    }
-    result.velocity = base + deflection;
-    return result;
 }
 
 // Ripples carried by the current: (height gradient xz, subpixel slope
@@ -2048,14 +1929,13 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     let above_water = smoothstepf(-0.08, 0.12, camera_position.y - in.world_position.y);
 
     // --- The current, the rocks and the surface ------------------------------
-    let flow = riverRockFlow(in.world_position.xz, in.velocity, surface_level);
-    let speed = length(flow.velocity);
-    let roughness = clamp(turbulence*0.8 + flow.churn*0.6 + smoothstepf(0.6, 3.0, speed)*0.25
-                          + drop*0.15, 0.0, 1.0);
-    let ripples = riverRipples(in.world_position.xz, flow.velocity, time, roughness, footprint);
+    let velocity = in.velocity;
+    let speed = length(velocity);
+    let roughness = clamp(turbulence*0.8 + smoothstepf(0.6, 3.0, speed)*0.25 + drop*0.15, 0.0, 1.0);
+    let ripples = riverRipples(in.world_position.xz, velocity, time, roughness, footprint);
     let impacts = waterImpacts(in.world_position.xz, globals.storm.z, footprint,
                                view_distance, precipitation.x, precipitation.y, precipitation.w);
-    let slope = ripples.xy + flow.slope + impacts.slope;
+    let slope = ripples.xy + impacts.slope;
     var normal = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
     if (falling)
     {
@@ -2091,7 +1971,7 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
                       *weatherSunMultiplier(severity)*mix(1.0, 0.42, precipitation.z)*moon_plants;
     let sky_light = skyAmbient(vec3<f32>(0.0, 1.0, 0.0), in.world_position);
     // Aerated water scatters far more: whitewater is milky even unfoamed.
-    let aeration = clamp(turbulence*0.6 + flow.churn*0.3 + drop*0.2, 0.0, 1.0);
+    let aeration = clamp(turbulence*0.6 + drop*0.2, 0.0, 1.0);
     let sigma_t = RIVER_EXTINCTION*(1.0 + 2.0*aeration);
     let transmittance = exp(-sigma_t*optical_path);
     // The bed was lit as if in air: its light also crossed the water on the
@@ -2128,12 +2008,12 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
                     *((sun_colour*max(dot(normal, to_sun), 0.0)
                        + moon_colour*max(dot(normal, to_moon), 0.0))*0.06
                       + skyAmbient(normal, in.world_position)*0.8);
-    let pattern = riverFoamPattern(in.world_position.xz, flow.velocity, time, footprint);
+    let pattern = riverFoamPattern(in.world_position.xz, velocity, time, footprint);
     // Eddy lines along the banks of fast water; cascades; plunge pools.
     let eddy_line = smoothstepf(0.62, 0.98, abs(across))*smoothstepf(0.7, 2.2, speed)*0.45;
     let cascade = smoothstepf(0.25, 0.85, turbulence)*0.85;
     let plunge = smoothstepf(0.05, 0.9, drop)*0.95;
-    let amount = clamp(max(max(cascade, plunge), max(flow.foam, eddy_line))
+    let amount = clamp(max(max(cascade, plunge), eddy_line)
                        + 0.06*smoothstepf(0.2, 1.0, speed), 0.0, 1.0);
     // Foam gathers in patches and streaks the pattern carries downstream.
     var foam = smoothstepf(1.05 - amount, 1.3 - amount*0.6, pattern)*amount

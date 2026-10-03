@@ -58,7 +58,6 @@ fn species_colour(species: Species) -> [u8; 3] {
         Species::Bush => [75, 120, 60],
         Species::Broadleaf => [40, 190, 170],
         Species::Lavender => [150, 70, 230],
-        Species::Rock => [120, 120, 120],
     }
 }
 

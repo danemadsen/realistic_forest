@@ -540,8 +540,7 @@ fn build_library(
             ],
             max_distance: profile.max_distance,
             lod_count: (model.lods.len() as u32).min(LOD_SLOTS as u32),
-            // 2: a boulder, seated into the bed and never moved by wind.
-            habitat: if model.species == Species::Rock { 2 } else { profile.ground_habitat as u32 },
+            habitat: profile.ground_habitat as u32,
             region: 0,
             draw_word: [0; 4],
             draw_count: [0; 4],
@@ -1491,9 +1490,9 @@ mod tests {
         }
     }
 
-    /// The rivers carve the clipmap, seat the plants and the boulders, and
-    /// the CPU's footing and erosion bases (src/rivers/carve.rs) from one
-    /// envelope; the pasted copies of its shader must not drift apart.
+    /// The rivers carve the clipmap, keep the plants out of the water, and
+    /// shape the CPU's footing and erosion bases (src/rivers/carve.rs) from
+    /// one envelope; the pasted copies of its shader must not drift apart.
     #[test]
     fn rivers_carve_the_same_ground_everywhere() {
         let common = include_str!("../../assets/shaders/river-functions.wgslinc").trim();

@@ -100,19 +100,7 @@ struct VsOut {
     @location(5) shade: vec3<f32>,
     @location(6) @interpolate(flat) fade: f32,
     @location(7) @interpolate(flat) seed: f32,
-    // A stone's waterline, world height; far below the world for anything
-    // standing dry.
-    @location(8) @interpolate(flat) waterline: f32,
 };
-
-// The cull passes a stone the depth of water over its foot in whole
-// centimetres ahead of its seed: (seed, waterline above the root).
-fn rockSeed(model: ModelParams, seed: f32) -> vec2<f32> {
-    if (model.habitat != 2u) {
-        return vec2<f32>(seed, -1.0e6);
-    }
-    return vec2<f32>(fract(seed), floor(seed) / 100.0);
-}
 
 fn yawRotate(v: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
     return vec3<f32>(v.x * c + v.z * s, v.y, -v.x * s + v.z * c);
@@ -141,9 +129,7 @@ fn placeVertex(model: ModelParams, position: vec3<f32>, normal: vec3<f32>, root:
     // Every plant leans a little its own way, more with height, as trees
     // that grew toward light or settled on soft ground do.
     let lean_direction = fract(seed * 91.7) * 6.2831853;
-    let rock = model.habitat == 2u;
-    // A boulder rests tipped on the bed however it came to rest.
-    let lean = (0.006 + 0.03 * fract(seed * 37.1)) * select(1.0, 7.0, rock);
+    let lean = 0.006 + 0.03 * fract(seed * 37.1);
     var local = position;
     local.x += cos(lean_direction) * lean * max(position.y, 0.0);
     local.z += sin(lean_direction) * lean * max(position.y, 0.0);
@@ -155,7 +141,7 @@ fn placeVertex(model: ModelParams, position: vec3<f32>, normal: vec3<f32>, root:
     // together; each stem then sways at a rate set by its height (tall trees
     // are slow) and bends from the root, roughly quadratically with height.
     let t = frame.wind.z;
-    let strength = select(frame.wind.w, 0.0, rock);
+    let strength = frame.wind.w;
     let downwind = vec3<f32>(frame.wind.x, 0.0, frame.wind.y);
     let gust_phase = dot(root.xz, frame.wind.xy) * 0.021 - t * 0.85;
     let gust = 0.6 + 0.4 * sin(gust_phase) * sin(gust_phase * 0.41 + 1.3);
@@ -189,11 +175,10 @@ fn vs_main(
     @location(9) model_index: u32,
 ) -> VsOut {
     let model = models[model_index];
-    let decoded = rockSeed(model, seed);
     let height01 = clamp(position.y / max(model.height, 0.01), 0.0, 1.0);
     let c = cos(yaw);
     let s = sin(yaw);
-    let world = placeVertex(model, position, normal, root, scale, yaw, decoded.x);
+    let world = placeVertex(model, position, normal, root, scale, yaw, seed);
 
     var out: VsOut;
     out.clip = globals.projection * globals.view * vec4<f32>(world, 1.0);
@@ -211,8 +196,7 @@ fn vs_main(
     let interior = 1.0 - clamp(length(position.xz) / reach, 0.0, 1.0);
     out.shade = vec3<f32>(interior, height01, max(position.y, 0.0) * scale);
     out.fade = fade;
-    out.seed = decoded.x;
-    out.waterline = select(-1.0e6, root.y + decoded.y, decoded.y > 0.0);
+    out.seed = seed;
     return out;
 }
 
@@ -274,16 +258,7 @@ fn fs_main(in: VsOut, @builtin(front_facing) front: bool) -> Gbuffer {
         ao *= mix(0.78, 1.0, in.shade.y);
         albedo *= mix(0.9, 1.08, variation);
     }
-    var roughness = clamp(detail.b * material.params.z, select(0.5, 0.62, kind > 0.5), 1.0);
-    if (in.waterline > -1.0e5) {
-        // Stone under the water is wet, glossy and filmed with olive algae;
-        // a hand's breadth above it stays damp from the splash.
-        let submerged = 1.0 - smoothstep(in.waterline - 0.02, in.waterline + 0.02, in.world.y);
-        let splash = 1.0 - smoothstep(in.waterline, in.waterline + 0.12, in.world.y);
-        albedo *= mix(vec3<f32>(1.0), vec3<f32>(0.42, 0.44, 0.33), submerged);
-        albedo *= mix(1.0, 0.72, splash * (1.0 - submerged));
-        roughness = mix(roughness, 0.3, max(submerged, splash * 0.6));
-    }
+    let roughness = clamp(detail.b * material.params.z, select(0.5, 0.62, kind > 0.5), 1.0);
 
     // As the terrain does, rebuild the view-space position from the world
     // position rather than interpolating it.
@@ -316,8 +291,7 @@ fn vs_shadow(
     @location(8) fade: f32,
     @location(9) model_index: u32,
 ) -> ShadowOut {
-    let model = models[model_index];
-    let world = placeVertex(model, position, normal, root, scale, yaw, rockSeed(model, seed).x);
+    let world = placeVertex(models[model_index], position, normal, root, scale, yaw, seed);
     var out: ShadowOut;
     out.clip = cascade.view_projection * vec4<f32>(world, 1.0);
     out.uv = uv;

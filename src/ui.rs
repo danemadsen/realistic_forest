@@ -568,11 +568,11 @@ fn draw_diagnostics_window(
             match rivers.and_then(|field| field.network()) {
                 Some(network) => {
                     ui.label(format!(
-                        "{} rivers, {:.1} km of channel, {} falls over 1.5 m, {} rocks (region built in {:.2} s)",
+                        "{} rivers, {:.1} km of channel, {} falls over 1.5 m, {} lakes (region built in {:.2} s)",
                         network.rivers.len(),
                         network.total_length_km(),
                         network.waterfall_count(),
-                        network.rocks.len(),
+                        network.lakes.len(),
                         network.build_seconds
                     ));
                     let here = network.envelope(player.position.x, player.position.z);

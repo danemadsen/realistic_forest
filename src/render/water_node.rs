@@ -236,8 +236,8 @@ struct WaterInner {
     surface_pipeline: HashMap<TextureFormat, CachedRenderPipelineId>,
     blit_pipeline: HashMap<TextureFormat, CachedRenderPipelineId>,
     river_pipeline: HashMap<TextureFormat, CachedRenderPipelineId>,
-    /// Group 2 for the rivers: the surface stage block, the rocks and the
-    /// river lookup grid.
+    /// Group 2 for the rivers: the surface stage block and the plants'
+    /// shadow cascades.
     river_stage: Option<(BindGroupLayoutDescriptor, BindGroup)>,
     underwater_pipeline: HashMap<TextureFormat, CachedRenderPipelineId>,
     /// Ring centre the instance buffers currently hold, so a static camera
@@ -441,7 +441,6 @@ fn prepare_water(
     globals: Res<ForestGlobals>,
     terrain: Res<TerrainNodeState>,
     water: Res<ExtractedWater>,
-    world_textures: Res<crate::render::gpu_textures::GpuWorldTexturesOption>,
     plant_shadows: Res<crate::render::vegetation_shadows::VegetationShadowMaps>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
@@ -502,22 +501,8 @@ fn prepare_water(
         ));
     }
     if inner.river_stage.is_none()
-        && let (Some(textures), Some(stage), Some(shadows)) = (
-            world_textures.0.as_deref(),
-            inner.surface_stage.as_ref(),
-            plant_shadows.targets.as_ref(),
-        )
+        && let (Some(stage), Some(shadows)) = (inner.surface_stage.as_ref(), plant_shadows.targets.as_ref())
     {
-        let storage = |binding: u32| BindGroupLayoutEntry {
-            binding,
-            visibility: ShaderStages::FRAGMENT,
-            ty: BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
         let layout = BindGroupLayoutDescriptor::new(
             "forest_river_stage",
             &[
@@ -531,10 +516,8 @@ fn prepare_water(
                     },
                     count: None,
                 },
-                storage(1),
-                storage(2),
                 BindGroupLayoutEntry {
-                    binding: 3,
+                    binding: 1,
                     visibility: ShaderStages::FRAGMENT,
                     ty: BindingType::Texture {
                         sample_type: TextureSampleType::Depth,
@@ -544,7 +527,7 @@ fn prepare_water(
                     count: None,
                 },
                 BindGroupLayoutEntry {
-                    binding: 4,
+                    binding: 2,
                     visibility: ShaderStages::FRAGMENT,
                     ty: BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
@@ -556,7 +539,7 @@ fn prepare_water(
                     count: None,
                 },
                 BindGroupLayoutEntry {
-                    binding: 5,
+                    binding: 3,
                     visibility: ShaderStages::FRAGMENT,
                     ty: BindingType::Sampler(SamplerBindingType::Comparison),
                     count: None,
@@ -575,22 +558,14 @@ fn prepare_water(
                 },
                 BindGroupEntry {
                     binding: 1,
-                    resource: textures.river_rocks.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: textures.river_grid.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 3,
                     resource: BindingResource::TextureView(&shadows.array_view),
                 },
                 BindGroupEntry {
-                    binding: 4,
+                    binding: 2,
                     resource: shadows.uniform.as_entire_binding(),
                 },
                 BindGroupEntry {
-                    binding: 5,
+                    binding: 3,
                     resource: BindingResource::Sampler(&shadows.sampler),
                 },
             ],
