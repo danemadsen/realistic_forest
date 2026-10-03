@@ -1,5 +1,6 @@
-//! Where the rivers run: drainage routing, channel extraction, meanders and
-//! the long profile, down to the steps of a mountain creek.
+//! Where the rivers run: drainage routing, channel extraction, the course
+//! each river's water finds over the land, lakes, and the long profile, down
+//! to the steps of a mountain creek.
 //!
 //! 1. **Routing.** The base landform is sampled on a world-aligned 32 m grid
 //!    over the region plus a margin. A priority flood from the sea and the
@@ -10,21 +11,25 @@
 //!    Each channel head is traced downstream; at a confluence the larger
 //!    branch keeps the name and the smaller one ends on it, so the network
 //!    is a tree of rivers, each ending in the sea or on its parent.
-//! 3. **Plan form.** The grid path is smoothed, pulled onto the real valley
-//!    floor (the routing grid is coarser than a mountain valley), and given
-//!    meanders: a Kinoshita curve whose wavelength follows the channel width
-//!    and whose sinuosity grows as the valley flattens, scaled to the room
-//!    the valley floor leaves. Steep creeks wander a little; lowland rivers
-//!    swing in skewed loops between their bluffs.
-//! 4. **Long profile.** The water surface follows the valley floor below its
-//!    banks and only ever falls downstream: a reach that would have to climb
-//!    (a spur a meander cuts into, the saddle a lake spills over) is carved
-//!    through instead. Where the fall is steep the surface breaks into a
-//!    staircase of pools and drops: step-pools on a steep creek, cascades
+//! 3. **Course.** The coarse path only says which way the water goes. Its
+//!    course is traced over a 4 m grid of the natural ground in a corridor
+//!    around it: a priority flood from where the river leaves the corridor
+//!    fills every hollow to its spill level and the water runs down the
+//!    steepest descent of that filled surface, so it keeps to the valley
+//!    floor and bends where the land bends it.
+//! 4. **Lakes.** A basin the water would stand deeper than [`LAKE_DEPTH`] in
+//!    holds a lake, filled over its whole extent to just under the rim it
+//!    spills over; the river cuts through the rims of shallower hollows.
+//! 5. **Long profile.** The water surface follows the ground below its banks
+//!    and only ever falls downstream, held at a lake's level through it and
+//!    backed up to it above. Where the fall is steep the surface breaks into
+//!    a staircase of pools and drops: step-pools on a steep creek, cascades
 //!    and waterfalls where it falls off the mountainside.
-//! 5. **Hydraulics.** Bankfull discharge grows with catchment; width follows
-//!    downstream hydraulic geometry, and depth and speed come from Manning's
-//!    equation with a roughness that grows with the slope.
+//! 6. **Hydraulics.** Bankfull discharge grows with catchment. Width and
+//!    depth follow downstream hydraulic geometry with the slope's terms
+//!    ([`channel`]): more water makes a channel wider and deeper, a steeper
+//!    slope narrower, deeper and faster; it swells and narrows through its
+//!    pools and riffles, and a plunge pool is scoured out deep and wide.
 //!
 //! Everything is a function of world position: the grid is world-aligned and
 //! every random choice is keyed by world coordinates or by a river's head
@@ -33,7 +38,7 @@
 use super::carve::{RiverSegment, RockObstacle, SegmentGrid, GRID_CELL};
 use crate::constants::SEA_LEVEL;
 use crate::noise::{NoiseField, base_height};
-use crate::vegetation::ecology::{cell_key, random};
+use crate::vegetation::ecology::{cell_key, noise2 as field_noise, random};
 use std::collections::BinaryHeap;
 
 /// Side of the square the rivers are extracted from, metres.
@@ -632,25 +637,29 @@ pub fn discharge(area_km2: f32) -> f32 {
     1.4 * area_km2.max(0.01).powf(0.8)
 }
 
-/// Wetted half width, metres.
+/// A typical wetted half width for a catchment, metres, for spacing work
+/// done before the slope is known; [`channel`] gives the real one.
 pub fn half_width(area_km2: f32) -> f32 {
     0.5 * (1.0 + 3.2 * area_km2.max(0.0).sqrt())
 }
 
-/// Manning roughness: gravel-bed rivers to boulder-choked step-pools.
-fn manning(slope: f32) -> f32 {
-    0.034 + 0.05 * smoothstep(0.01, 0.12, slope)
-}
-
-/// (thalweg depth, mean speed) for a discharge in a channel of this half
-/// width and slope.
-pub fn depth_and_speed(discharge: f32, half_width: f32, slope: f32) -> (f32, f32) {
-    let width = 2.0 * half_width.max(0.2);
-    let slope = slope.max(4e-4);
-    let mean_depth = (discharge * manning(slope) / (width * slope.sqrt())).powf(0.6);
-    let thalweg = (mean_depth * 1.5).max(0.18);
-    let speed = discharge / (width * mean_depth.max(0.05));
-    (thalweg, speed.clamp(0.15, 6.0))
+/// The bankfull channel a discharge cuts on a slope: (half width, thalweg
+/// depth, mean speed). Downstream hydraulic geometry, the power laws real
+/// rivers follow (width ~ Q^0.5, depth ~ Q^0.35, so speed ~ Q^0.15), with
+/// the slope's own terms: on a steep slope a stream is held in a narrow,
+/// deep slot between boulders and bedrock (width ~ S^-0.35, depth ~ S^0.1);
+/// on the flat it spreads wide and shallow over its own gravel and silt.
+/// The speed is what carries the discharge through that section, so it
+/// rises with slope too. A parabolic section's thalweg is half as deep again
+/// as its mean.
+pub fn channel(discharge: f32, slope: f32) -> (f32, f32, f32) {
+    let q = discharge.max(1e-3);
+    let s = (slope / 0.01).clamp(0.08, 30.0);
+    let width = 2.8 * q.powf(0.5) * s.powf(-0.35);
+    let mean_depth = 0.33 * q.powf(0.35) * s.powf(0.1);
+    let half_width = (0.5 * width).max(0.3);
+    let speed = q / (2.0 * half_width * mean_depth);
+    (half_width, (1.5 * mean_depth).max(0.15), speed.clamp(0.15, 6.0))
 }
 
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
@@ -1175,7 +1184,7 @@ fn water_profile(noise: &NoiseField, points: Vec<PathPoint>, end_level: Option<f
             let bank = if pass == 0 {
                 0.45
             } else {
-                let (depth, _) = depth_and_speed(discharge(points[i].area as f32), half_width(points[i].area as f32), slope[i]);
+                let (_, depth, _) = channel(discharge(points[i].area as f32), slope[i]);
                 0.25 + 0.6 * depth
             };
             let raw = ground[i] - bank;
@@ -1251,6 +1260,9 @@ fn find_steps(profile: &Profiled, seed: u64) -> Steps {
     while position < length {
         let slope = interpolate(&profile.s, &profile.slope, position);
         let i = profile.s.partition_point(|&v| v < position).min(n - 1);
+        // Steps and falls are set by the valley and its bedrock, not by how
+        // narrow the stream has become: spaced in the catchment's typical
+        // widths.
         let width = 2.0 * half_width(profile.points[i].area as f32);
         if slope < STEP_SLOPE {
             position += (width as f64).max(2.0);
@@ -1381,11 +1393,15 @@ fn build_nodes(noise: &NoiseField, centreline: Vec<PathPoint>, end_level: Option
             last_drop = nodes[i - 1].fall;
         }
         let node = &mut nodes[i];
-        let (depth, _) = depth_and_speed(node.discharge, node.half_width, node.slope);
+        let (half_width, depth, _) = channel(node.discharge, node.slope);
+        node.half_width = half_width;
         // A plunge pool is scoured deep beneath the fall and shoals toward
         // the next lip.
-        let scour = (0.35 * last_drop).min(2.5) * (1.0 - smoothstep(0.0, 3.0 * node.half_width + 2.0, since_fall));
+        let plunging = 1.0 - smoothstep(0.0, 3.0 * node.half_width + 2.0, since_fall);
+        let scour = (0.35 * last_drop).min(2.5) * plunging;
         node.depth = depth + scour;
+        // ...and wider than the channel that feeds it.
+        node.half_width *= 1.0 + 0.5 * plunging * smoothstep(0.3, 2.0, last_drop);
         let mean_depth = node.depth / 1.5;
         node.speed = (node.discharge / (2.0 * node.half_width * mean_depth.max(0.05))).clamp(0.15, 6.0);
         let cascade = smoothstep(0.02, 0.12, node.slope);
@@ -1406,6 +1422,20 @@ fn build_nodes(noise: &NoiseField, centreline: Vec<PathPoint>, end_level: Option
         let grow = 0.35 + 0.65 * smoothstep(0.0, head_length, node.along);
         node.half_width *= grow;
         node.depth *= grow;
+        // ...carrying the water the seep has gathered so far.
+        node.discharge *= grow * grow;
+    }
+    // No channel keeps one width: it swells through its pools and narrows
+    // over its riffles every few widths, irregularly. A lake's water has
+    // no channel to vary.
+    let offset = (seed % 100_000) as f64 * 5.3;
+    for node in nodes.iter_mut().filter(|node| !node.lake) {
+        let width = 2.0 * node.half_width as f64;
+        let swell = field_noise([node.along as f64, offset], (5.5 * width).max(9.0), 311);
+        node.half_width *= 0.8 + 0.4 * swell;
+        // The same water runs faster through the narrows.
+        let mean_depth = (node.depth / 1.5).max(0.05);
+        node.speed = (node.discharge / (2.0 * node.half_width * mean_depth)).clamp(0.15, 6.0);
     }
     // Skew from the signed curvature: the thalweg hugs the outside of a bend.
     let curvature = signed_curvature(&nodes);
@@ -1642,7 +1672,11 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
     let grid_origin = [origin[0] as f32, origin[1] as f32];
     let grid = SegmentGrid::build(grid_origin, resolution, &segments, &[]);
     let rocks = super::rocks::place_rocks(noise, &finished, &segments, &grid);
-    let obstacles: Vec<RockObstacle> = rocks.iter().map(RiverRock::obstacle).collect();
+    let obstacles: Vec<RockObstacle> = rocks
+        .iter()
+        .filter(|rock| rock.radius >= super::rocks::OBSTACLE_RADIUS)
+        .map(RiverRock::obstacle)
+        .collect();
     let mut grid = SegmentGrid::build(grid_origin, resolution, &segments, &obstacles);
     let lakes = lakes.lakes;
     for lake in &lakes {

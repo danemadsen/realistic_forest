@@ -53,7 +53,7 @@ impl RiverNetwork {
             let rocks: Vec<carve::RockObstacle> = self
                 .rocks
                 .iter()
-                .filter(|r| near(r.position))
+                .filter(|r| r.radius >= rocks::OBSTACLE_RADIUS && near(r.position))
                 .map(|r| r.obstacle())
                 .collect();
             let grid = if radius.is_finite() {

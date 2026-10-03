@@ -628,10 +628,11 @@ most recently completed tile.
 
 ## Rivers and creeks
 
-Rivers and creeks run from the mountains to the sea. They are generated in
-`src/rivers` for a 16 km region around the player, carved into the terrain,
-lined with boulders and bank plants, and drawn with their own flowing-water
-shader; their current pushes the player about.
+Rivers and creeks run from the mountains to the sea, through lakes where
+their water fills a basin. They are generated in `src/rivers` for a 16 km
+region around the player, follow the land the way its water would, are cut
+into the terrain, lined with boulders and bank plants, and drawn with their
+own flowing-water shader; their current pushes the player about.
 
 ### Where they run
 
@@ -647,33 +648,50 @@ level ground, and with progressively less on steep ground, as real channel
 heads do; once begun it runs on to the sea. At a confluence the larger
 branch keeps its course and the smaller one ends on it.
 
-The grid path is then made into a river. It is smoothed and pulled onto the
-actual valley floor (the grid is coarser than a mountain valley) and given
-meanders: a Kinoshita curve, the shape of real meander bends with their
-skewed, flattened loops, whose wavelength follows the channel's width and
-whose sinuosity grows as the valley flattens, lengthening and tightening from
-bend to bend so no two are alike. The loops are scaled to the room the valley
-floor leaves between its sides, so a lowland creek swings across its
-floodplain while a mountain stream only wanders down its V. A tributary that
-runs beside its parent down the same valley joins it where it first comes
-close instead of weaving through the parent's bends.
+The coarse grid decides the network, which catchments drain where and how
+much water each river carries, but not the course: a 32 m cell is wider than
+many valleys. Each river's course is traced the way its water would find it,
+over a 4 m grid of the natural ground in a corridor 72 m either side of the
+coarse path. A priority flood from where the river leaves the corridor (the
+sea, the channel of the river it joins, or the edge of the domain) fills
+every hollow to the level it spills at, and the water runs down the steepest
+descent of that filled surface: along the valley floor, around every spur
+and knoll, across a filled hollow by the shortest way to its spill. The grid's
+stair-steps are smoothed out and the path settled back onto the lowest ground
+across it. Its bends are the land's own, so a lowland creek wanders over its
+floodplain while a mountain stream keeps to the bottom of its V. A tributary
+runs until it reaches its parent's channel, wherever the ground brings it
+there.
 
-The water surface follows the valley floor below its banks and only ever
-falls downstream: where a meander swings into a spur, or a channel breaches
-the saddle a lake would spill over, it is carved through rather than made to
-climb. Where the surface falls more steeply than about 3 % it breaks into a
-staircase of pools and drops, the step-pool form of real mountain creeks:
-steps every two or three channel widths, low on a steep creek, growing into
-cascades and waterfalls several to fifteen metres high where the stream
-falls off a mountainside. Each pool lies level with its lip, and the water
-below a fall scours a deeper plunge pool.
+The water surface follows the channel's ground below its banks and only ever
+falls downstream. A hollow the water would stand less than 2.5 m deep in is
+crossed in a cut through its rim, as a river incises the sill it spills over.
+A deeper basin holds a lake: the whole basin (found by flood fill beyond the
+corridor) fills to just under the rim it spills over, every river that
+reaches it shares it, the reaches above it are backed up to its level, and
+the river leaves it at its outlet. Where the surface falls more steeply than
+about 3 % it breaks into a staircase of pools and drops, the step-pool form of
+real mountain creeks: steps every two or three channel widths, low on a steep
+creek, growing into cascades and waterfalls several to fifteen metres high
+where the stream falls off a mountainside. Each pool lies level with its lip,
+and the water below a fall scours a deeper plunge pool.
 
-Hydraulics follow from the catchment. Bankfull discharge grows with it,
-width follows downstream hydraulic geometry (a creek of a metre or two to
-rivers several metres wide on these islands), and depth and speed come from
-Manning's equation with a roughness that grows from a gravel bed to a
-boulder-choked step-pool, so a steep creek runs shallow and fast and a
-lowland reach deeper and slower. The thalweg hugs the outside of every bend.
+Hydraulics follow from the catchment and the slope. Bankfull discharge grows
+with the catchment, and the channel follows downstream hydraulic geometry,
+the power laws real rivers are fitted with, plus the slope's own terms: width
+grows as the square root of the discharge and shrinks with the slope
+(as S^-0.35), depth grows as Q^0.35 and a little with the slope, and the
+speed is whatever carries the discharge through that section. A mountain
+stream is held in a narrow, deep slot between boulders and bedrock; on the
+flat the same water spreads wide and shallow over its own gravel and silt.
+Around spawn, reaches draining over half a square kilometre average 7.5 m
+wide, 0.43 m deep and 0.6 m/s on the lowland, 2.7 m, 0.58 m and 1.3 m/s on
+moderate slopes, and 1.5 m, 0.85 m and 1.7 m/s on steep ones; a confluence
+widens the river below it. No reach keeps one width: the channel swells
+through its pools and narrows, running faster, over its riffles every few
+widths, a plunge pool is scoured out deeper and wider than the stream that
+feeds it, and a river's head starts as a seep that gathers into a channel.
+The thalweg hugs the outside of every bend.
 
 Every choice is keyed by world position or by a river's head cell, so two
 regions that both see a whole catchment agree on it; when the player moves
@@ -681,9 +699,13 @@ on, the next region is built on the async compute pool (about a second) and
 swapped in. The first region is built before anything streams.
 
 `--river-map path.png` charts a region from above (shaded relief, channels,
-falls in red) and prints its statistics and the nearest rivers and
-waterfalls to `--map-centre`; `--map-extent` defaults to 8 km here. The spawn
-region holds some 385 rivers and 160 km of channel.
+lakes, falls in red) and prints its statistics, how well the channels fit the
+land (how much of their length is trenched through a rise, held in by an
+embankment, or running along a slope above its valley's floor), and the
+rivers, waterfalls and lakes nearest `--map-centre`; `--map-extent` defaults
+to 8 km here. The spawn region holds some 350 rivers, 140 km of channel and
+150 lakes; under 5 % of the gentle reaches are trenched more than 3 m into
+the natural ground.
 
 ### How they shape the ground
 
@@ -707,28 +729,52 @@ river's water are fixed drains there, like the sea: the river carries away
 what reaches it, so tributary gullies grade to it and nothing fills or
 trenches the channel.
 
-The terrain material shader reads the river at every vertex: the bed sorts
-by the power of the water over it, sand in slow pools and on point bars,
-gravel in riffles and runs, bedrock under cascades and falls; a strip of bank
-just above the water is damp soil and gravel the turf has not closed over,
-wet and glossy at the waterline; and running water never holds snow.
+Lakes carve nothing. The lookup grid carries the level of any lake reaching
+into each cell, and ground below it lies under the lake: plants keep out of
+it, the terrain shades its bed and shore, the erosion leaves it as a drain,
+and the player wades and swims in it.
+
+The terrain material shader reads the river or lake at every vertex: the bed
+sorts by the power of the water over it, sand in slow pools and lake beds,
+gravel in riffles and runs, bedrock under cascades and falls. Out of the
+water the turf runs to the waterline, darkened and glossy where it is wet,
+except where the bank says otherwise: the outside of a bend is undercut into a
+steep bank of bare soil, the inside keeps a bar of sand and gravel standing
+out of the water, and beside whitewater the banks are stone. A calm stream's
+banks are earth bound by roots, so for a few metres around it the rules that
+bare a hillside of the same steepness to scree and bedrock, or leave the
+erosion's furrows gravelly, give way to soil and a lush, dark riparian turf,
+with earth showing through it on the steepest faces. The grass habitat looks
+the water up exactly at every texel of its capture, so no blade roots in a
+creek however narrow or far off. Every edge wanders, so no waterline runs
+parallel to its channel, and running water never holds snow.
 
 ### Rocks and plants
 
-Boulders come from `rock-1.glb` to `rock-40.glb`, placed by walking each
-river with a density that follows its stream power: one stone per 250 m² of a
-lowland bed (gathered toward the banks), one per 14 m² of a cascade's, sized
-the same way. Every waterfall's lip carries a ledge of flat blocks with gaps
-for the water, with more tumbled into its plunge pool, and steep reaches have
-boulders lodged in their banks. They are drawn through the plant pipeline,
-settled a third of their height into the bed, never moved by the wind, and
-cast shadows.
+Stones come from `rock-1.glb` to `rock-40.glb`, placed by walking each river
+with densities that follow its stream power, in the mix of sizes a real bed
+sorts into. Cobbles pave every gravel bed, from one per eight square metres of
+a slow, sandy pool to four per square metre of a cascade, and pile along both
+waterlines, half in the water and half out. Boulders lie among them, one per
+60 m² of a lowland bed and one per 6 m² of a cascade's, sized the same way,
+and steep reaches have more lodged in their banks. Every waterfall's lip
+carries a ledge of flat blocks with gaps for the water, with more tumbled into
+its plunge pool. A lake's silt bed has none. The spawn region holds some
+450,000 stones, of which the 78,000 over 40 cm across part the water in the
+river shader; the smaller ones pave the bed without disturbing the current.
 
-No plant stands in a river: the scatter keeps each layer's stems a set
-distance past the waterline (trees lean their crowns over the water from the
-bank; lavender, which wants dry ground, keeps well back), the GPU cull
-refuses any root it seats in a channel, and the grass habitat refuses roots
-on the wet bank. Riverbanks are damp ground in the ecology, and broadleaf
+They are drawn through the plant pipeline, settled a third of their height
+into the bed, never moved by the wind, and cast shadows. Only the stones
+within 760 m of the player go to the GPU, and each is drawn as far as its
+size carries: a cobble to about a hundred metres, a metre-wide boulder to
+about five hundred. Pebbles cast shadows in the nearest cascade only.
+
+No plant stands in a river or a lake: the scatter keeps each layer's stems a
+set distance past the waterline (trees lean their crowns over the water from
+the bank; lavender, which wants dry ground, keeps well back), the GPU cull
+refuses any root it seats in a channel or under a lake's level, and the grass
+habitat refuses roots in the water and on the wet margin, as well as on bare
+cut banks and gravel bars. Riverbanks are damp ground in the ecology, and broadleaf
 plants line them the way they line the shore: in colonies along the strip of
 bank just above the water, thickest a metre or two up, thinning a few metres
 back, and tolerant of a gallery forest's shade.
@@ -739,10 +785,13 @@ Each river's surface is a ribbon across its channel at the water level,
 reaching under both banks so the waterline is wherever the carved bank rises
 through the water. Each waterfall is a sheet that leaves its lip at the speed
 the water arrived with and falls along the jet's parabola into the plunge
-pool. Rivers are drawn to 3.2 km in 256 m chunks culled against the view;
-beyond a few hundred metres, where the clipmap's triangles are wider than a
-creek, a surface is lifted by about the bank those triangles leave so it
-still shows from a ridge.
+pool. A lake is a flat sheet at its level over its basin, reaching a cell
+past the shore so its shoreline is wherever the ground rises through it; a
+river's ribbon stops where it enters and starts again at the outlet. Water is
+drawn to 3.2 km in 256 m chunks culled against the view; beyond a few
+hundred metres, where the clipmap's triangles are wider than a creek, a
+river's surface is lifted by about the bank those triangles leave so it still
+shows from a ridge (a lake, wide enough for any triangles, never is).
 
 The river shader (`vs_river`/`fs_river` in `water-surface.wgsl`) shades the
 water with the sea's own optics, sky and screen-space reflections, sun
@@ -777,7 +826,8 @@ bed reduce. Knee-deep water slows a wade, more so walking upstream; a gentle
 current is stood against; a strong one carries the body along more and more,
 and once its drag outweighs the footing it sweeps the player off their feet
 and away downstream, over a fall if one is coming. Water too deep to stand in
-floats the player with the current. The F1 panel's **Rivers** section
+floats the player with the current; a lake's still water only floats them.
+The F1 panel's **Rivers** section
 reports the network, the nearest channel and the current the player stands
 in, and can hide the water surfaces.
 

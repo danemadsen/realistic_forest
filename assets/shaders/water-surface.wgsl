@@ -1778,10 +1778,14 @@ fn riverPlantShadow(world_position: vec3<f32>, view_depth: f32) -> f32 {
 }
 
 const RIVER_GRAVITY: f32 = 9.81;
-// Clear, slightly green river water: red is absorbed within a couple of
-// metres, the bed shows through a shallow riffle and a pool goes bottle green.
-const RIVER_EXTINCTION: vec3<f32> = vec3<f32>(0.38, 0.12, 0.10);
-const RIVER_SCATTER: vec3<f32> = vec3<f32>(0.030, 0.052, 0.040);
+// Clear stream water, faintly stained by the tannins of the forest floor:
+// red is absorbed within a couple of metres and the dissolved organic matter
+// takes some blue, so the bed shows through a shallow riffle, a pool goes
+// deep green-brown and a lake dark. Fresh water scatters little (it carries
+// none of the sea's plankton), so its body is dark and the bed and the
+// reflections give it its colour.
+const RIVER_EXTINCTION: vec3<f32> = vec3<f32>(0.40, 0.14, 0.21);
+const RIVER_SCATTER: vec3<f32> = vec3<f32>(0.006, 0.010, 0.006);
 // Rocks a fragment considers at most.
 const RIVER_MAX_ROCKS: u32 = 24u;
 

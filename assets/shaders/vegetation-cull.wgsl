@@ -411,6 +411,10 @@ struct RiverEnvelope {
     velocity: vec2<f32>,
     half_width: f32,
     turbulence: f32,
+    // Which side of a bend the point lies on: toward +0.6 on the outside,
+    // where the current cuts a steep bank, toward -0.6 on the inside, where
+    // it drops its point bar.
+    bend: f32,
     // The level of a lake reaching here, or RIVER_NO_LAKE.
     lake: f32,
 };
@@ -428,7 +432,7 @@ const RIVER_MAX_CANDIDATES: u32 = 64u;
 fn riverNone() -> RiverEnvelope
 {
     return RiverEnvelope(RIVER_NONE, -RIVER_NONE, RIVER_NONE, -RIVER_NONE,
-                         vec2<f32>(0.0), 0.0, 0.0, RIVER_NO_LAKE);
+                         vec2<f32>(0.0), 0.0, 0.0, 0.0, RIVER_NO_LAKE);
 }
 
 fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
@@ -457,7 +461,8 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
     let speed = mix(segment.speed.x, segment.speed.y, t);
     let direction = ab/segmentLength;
     var envelope = RiverEnvelope(RIVER_NONE, -RIVER_NONE, pastBank, water,
-                                 direction*speed, halfWidth, segment.turbulence, RIVER_NO_LAKE);
+                                 direction*speed, halfWidth, segment.turbulence, skew*side,
+                                 RIVER_NO_LAKE);
     if (pastBank < 0.0)
     {
         // Skewed parabola: zero at both banks, deepest toward the outer one.
@@ -504,6 +509,7 @@ fn riverCombine(total: ptr<function, RiverEnvelope>, next: RiverEnvelope)
         (*total).velocity = next.velocity;
         (*total).half_width = next.half_width;
         (*total).turbulence = next.turbulence;
+        (*total).bend = next.bend;
     }
 }
 
@@ -704,14 +710,24 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
     let flat_distance = length(plant.position.xz - eye.xz);
     // The far edge breathes a little per plant, so the forest does not end
     // on a circle.
-    let reach = model.max_distance * (0.93 + 0.14 * fract(plant.seed * 7.31));
+    var reach = model.max_distance * (0.93 + 0.14 * fract(plant.seed * 7.31));
+    let size = model.bound_radius * plant.scale;
+    if (model.habitat == 2u) {
+        // A cobble is a speck a hundred metres off; a boulder carries to
+        // the river's far bends.
+        reach = min(reach, 40.0 + 450.0 * size);
+    }
     if (flat_distance > reach) {
         return;
     }
-    let radius = max(height * 0.5, model.bound_radius * plant.scale) + cull.ground.w;
+    let radius = max(height * 0.5, size) + cull.ground.w;
     let centre = vec3<f32>(plant.position.x, plant.position.y + height * 0.5, plant.position.z);
     let seen = sphereVisible(centre, radius);
-    let shadows = shadowCascades(centre, radius, model);
+    var shadows = shadowCascades(centre, radius, model);
+    if (model.habitat == 2u && size < 0.35) {
+        // Only the nearest cascade resolves a pebble's shadow.
+        shadows &= 1u;
+    }
     if (!seen && shadows == 0u) {
         return;
     }

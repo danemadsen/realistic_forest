@@ -1499,6 +1499,7 @@ mod tests {
         let common = include_str!("../../assets/shaders/river-functions.wgslinc").trim();
         for source in [
             include_str!("../../assets/shaders/terrain-vs.wgsl"),
+            include_str!("../../assets/shaders/terrain-fs.wgsl"),
             include_str!("../../assets/shaders/vegetation-cull.wgsl"),
         ] {
             assert!(source.contains(common), "river carve diverged");

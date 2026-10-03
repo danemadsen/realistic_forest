@@ -96,6 +96,9 @@ pub struct Envelope {
     pub half_width: f32,
     /// Its whitewater, 0..1.
     pub turbulence: f32,
+    /// Which side of a bend the point lies on: toward +0.6 on the outside
+    /// (a cut bank), toward -0.6 on the inside (a point bar).
+    pub bend: f32,
     /// The level of a lake whose basin reaches here, or -infinity: ground
     /// below it lies under the lake.
     pub lake: f32,
@@ -115,6 +118,7 @@ impl Envelope {
         velocity: [0.0, 0.0],
         half_width: 0.0,
         turbulence: 0.0,
+        bend: 0.0,
         lake: f32::NEG_INFINITY,
     };
 
@@ -192,6 +196,7 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
         velocity: [direction[0] * speed, direction[1] * speed],
         half_width,
         turbulence: segment.turbulence,
+        bend: skew * side,
         lake: f32::NEG_INFINITY,
     };
     if past_bank < 0.0 {
@@ -236,6 +241,7 @@ pub fn combine(total: &mut Envelope, next: &Envelope) {
         total.velocity = next.velocity;
         total.half_width = next.half_width;
         total.turbulence = next.turbulence;
+        total.bend = next.bend;
     }
 }
 

@@ -432,6 +432,10 @@ struct RiverEnvelope {
     velocity: vec2<f32>,
     half_width: f32,
     turbulence: f32,
+    // Which side of a bend the point lies on: toward +0.6 on the outside,
+    // where the current cuts a steep bank, toward -0.6 on the inside, where
+    // it drops its point bar.
+    bend: f32,
     // The level of a lake reaching here, or RIVER_NO_LAKE.
     lake: f32,
 };
@@ -449,7 +453,7 @@ const RIVER_MAX_CANDIDATES: u32 = 64u;
 fn riverNone() -> RiverEnvelope
 {
     return RiverEnvelope(RIVER_NONE, -RIVER_NONE, RIVER_NONE, -RIVER_NONE,
-                         vec2<f32>(0.0), 0.0, 0.0, RIVER_NO_LAKE);
+                         vec2<f32>(0.0), 0.0, 0.0, 0.0, RIVER_NO_LAKE);
 }
 
 fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
@@ -478,7 +482,8 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
     let speed = mix(segment.speed.x, segment.speed.y, t);
     let direction = ab/segmentLength;
     var envelope = RiverEnvelope(RIVER_NONE, -RIVER_NONE, pastBank, water,
-                                 direction*speed, halfWidth, segment.turbulence, RIVER_NO_LAKE);
+                                 direction*speed, halfWidth, segment.turbulence, skew*side,
+                                 RIVER_NO_LAKE);
     if (pastBank < 0.0)
     {
         // Skewed parabola: zero at both banks, deepest toward the outer one.
@@ -525,6 +530,7 @@ fn riverCombine(total: ptr<function, RiverEnvelope>, next: RiverEnvelope)
         (*total).velocity = next.velocity;
         (*total).half_width = next.half_width;
         (*total).turbulence = next.turbulence;
+        (*total).bend = next.bend;
     }
 }
 
@@ -573,7 +579,7 @@ struct VsOutput {
     @location(4) fragErosionDelta: f32,         // fragErosionDelta
     @location(5) frag_material_normal: vec3<f32>, // Distance-prefiltered slope/aspect for material placement.
     // The nearest river or lake: metres past its waterline (negative under
-    // water), water surface above this ground, whitewater, flow speed.
+    // water), side of the bend (+ outside, - inside), whitewater, flow speed.
     @location(6) frag_river: vec4<f32>,
 };
 
@@ -607,7 +613,7 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput
     let bank = riverBankAt(river, height);
     let still = bank < river.bank_distance;
     output.frag_river = vec4<f32>(clamp(bank, -40.0, 40.0),
-                                  clamp(max(river.water, river.lake) - height, -40.0, 40.0),
+                                  select(river.bend, 0.0, still),
                                   select(river.turbulence, 0.0, still),
                                   select(length(river.velocity), 0.0, still));
 

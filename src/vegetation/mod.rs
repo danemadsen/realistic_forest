@@ -155,7 +155,16 @@ pub struct VegetationField {
     /// network generation they came from.
     rocks: Arc<Vec<PlantInstance>>,
     rock_generation: u64,
+    /// Where the player stood when the rocks were last published: only
+    /// those within `ROCK_RADIUS` of it go to the GPU.
+    rock_centre: [f64; 2],
 }
+
+/// Rocks are published this far around the player (the largest boulders
+/// are drawn to about 520 m), and republished once the player has moved
+/// `ROCK_REPUBLISH` from where they were.
+const ROCK_RADIUS: f64 = 760.0;
+const ROCK_REPUBLISH: f64 = 200.0;
 
 impl VegetationField {
     pub fn new(noise: Arc<NoiseField>, enabled: bool) -> Self {
@@ -194,6 +203,7 @@ impl VegetationField {
             settled: !enabled,
             rocks: Arc::new(Vec::new()),
             rock_generation: 0,
+            rock_centre: [f64::INFINITY; 2],
         }
     }
 
@@ -233,14 +243,20 @@ impl VegetationField {
         self.tasks.len()
     }
 
-    fn publish(&mut self) {
+    fn publish(&mut self, centre: [f64; 2]) {
         let mut plants = Vec::with_capacity(self.snapshot.plants.len());
         for levels in self.chunks.values() {
             for level in levels.iter().flatten() {
                 plants.extend_from_slice(level);
             }
         }
-        plants.extend_from_slice(&self.rocks);
+        let reach = (ROCK_RADIUS * ROCK_RADIUS) as f32;
+        let (cx, cz) = (centre[0] as f32, centre[1] as f32);
+        plants.extend(self.rocks.iter().filter(|rock| {
+            let (dx, dz) = (rock.position[0] - cx, rock.position[2] - cz);
+            dx * dx + dz * dz <= reach
+        }));
+        self.rock_centre = centre;
         self.snapshot = Arc::new(VegetationSnapshot {
             generation: self.snapshot.generation + 1,
             plants,
@@ -327,6 +343,9 @@ pub fn stream_vegetation(
     };
     let (px, pz) = (player.position.x as f64, player.position.z as f64);
     field.since_publish += time.delta_secs();
+    if (px - field.rock_centre[0]).hypot(pz - field.rock_centre[1]) > ROCK_REPUBLISH {
+        field.dirty = true;
+    }
 
     // Collect finished levels.
     let finished: Vec<([i64; 2], u8)> = field
@@ -395,6 +414,6 @@ pub fn stream_vegetation(
     field.settled = wanted.is_empty() && field.tasks.is_empty();
 
     if field.dirty && (field.since_publish >= PUBLISH_INTERVAL || field.tasks.is_empty()) {
-        field.publish();
+        field.publish([px, pz]);
     }
 }

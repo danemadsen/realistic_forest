@@ -1,13 +1,16 @@
-//! Boulders in and along the channels.
+//! Stones in and along the channels.
 //!
-//! A channel's bed reflects the power of the water over it. Lowland rivers
-//! run over gravel and sand with the odd stone; a steep creek's bed is
-//! boulders the water cannot move, packed into the step lips that hold its
-//! pools; a waterfall pours over a ledge of blocks with more tumbled into its
-//! plunge pool. Rocks are placed by walking each river and drawing from a
-//! density that follows its slope, sized by the same stream power, kept from
-//! overlapping, and sorted by how far they stand out of the water: big ones
-//! break the surface, small ones lie under it and make it boil.
+//! A channel's bed reflects the power of the water over it. Every stream
+//! that runs over gravel is paved with cobbles, which pile along its
+//! waterlines, half in the water and half out; boulders lie scattered among
+//! them, sparse in a lowland river and crowding a steep creek's bed, packed
+//! into the step lips that hold its pools and lodged in its banks; a
+//! waterfall pours over a ledge of blocks with more tumbled into its plunge
+//! pool. Only a slow, sandy reach has few, and a lake's silt bed none. Rocks
+//! are placed by walking each river and drawing from densities that follow
+//! its slope and speed, sized by the same stream power and kept from
+//! overlapping; big ones break the surface, small ones lie under it and
+//! make it boil.
 
 use super::carve::{envelope_at, RiverSegment, SegmentGrid};
 use super::network::{River, RiverRock};
@@ -83,6 +86,10 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
+
+/// Stones smaller than this (radius, metres) pave the bed but leave the
+/// current alone: the water shader only sees the larger ones.
+pub const OBSTACLE_RADIUS: f32 = 0.2;
 
 /// Rocks already placed, bucketed by 4 m cell for overlap tests.
 struct Placed {
@@ -224,9 +231,62 @@ pub fn place_rocks(
                     }, false);
                 }
             }
-            // Scattered boulders on the bed: one per 250 m² of a lowland
-            // bed, one per 14 m² of a cascade's.
-            let density = 0.004 + 0.07 * rocky;
+            // How much of the bed is gravel and cobble rather than sand: a
+            // slow lowland reach settles sand over its stones.
+            let stony = (0.3 + 0.7 * smoothstep(0.25, 0.8, a.speed)).max(rocky);
+            // Cobbles pave the bed, from four per square metre of a
+            // cascade's to one per eight of a sandy pool's.
+            let cobbles = (0.12 + 0.5 * stony + 3.4 * rocky) * width * length;
+            let count = cobbles.floor() as usize + usize::from(next(30) < cobbles.fract());
+            for _ in 0..count {
+                let along = next(31) * length;
+                let u = (next(32) * 2.0 - 1.0) * 1.02;
+                let size = next(33);
+                let radius = 0.06 + (0.08 + 0.08 * rocky) * size * size + 0.05 * size;
+                let p = [
+                    a.position[0] + tangent[0] * along + normal[0] * u * a.half_width,
+                    a.position[1] + tangent[1] * along + normal[1] * u * a.half_width,
+                ];
+                try_place(&mut rocks, RiverRock {
+                    position: p,
+                    radius,
+                    height: 0.0,
+                    yaw: next(34) * std::f32::consts::TAU,
+                    seed: next(35),
+                    river: river_index as u32,
+                    bed: 0.0,
+                    model: 0,
+                    scale: 1.0,
+                }, true);
+            }
+            // Stones piled along both waterlines, half out of the water.
+            let edge = (0.6 + 1.2 * stony + 1.5 * rocky) * length;
+            let count = edge.floor() as usize + usize::from(next(40) < edge.fract());
+            for _ in 0..count {
+                let side = if next(41) < 0.5 { -1.0 } else { 1.0 };
+                let size = next(42);
+                let radius = 0.08 + (0.12 + 0.25 * rocky) * size * size;
+                let lateral = side * (a.half_width + radius * (next(43) * 1.2 - 0.6));
+                let along = next(44) * length;
+                let p = [
+                    a.position[0] + tangent[0] * along + normal[0] * lateral,
+                    a.position[1] + tangent[1] * along + normal[1] * lateral,
+                ];
+                try_place(&mut rocks, RiverRock {
+                    position: p,
+                    radius,
+                    height: 0.0,
+                    yaw: next(45) * std::f32::consts::TAU,
+                    seed: next(46),
+                    river: river_index as u32,
+                    bed: 0.0,
+                    model: 0,
+                    scale: 1.0,
+                }, next(47) < 0.6);
+            }
+            // Boulders among them: one per 60 m² of a lowland bed, one per
+            // 6 m² of a cascade's.
+            let density = 0.012 + 0.15 * rocky + 0.01 * stony;
             let expected = density * width * length;
             let count = expected.floor() as usize + usize::from(next(13) < expected.fract());
             for _ in 0..count {
@@ -236,7 +296,7 @@ pub fn place_rocks(
                 let raw = next(15) * 2.0 - 1.0;
                 let u = raw.signum() * raw.abs().powf(0.6 - 0.35 * rocky) * 0.95;
                 let size = next(16);
-                let radius = (0.18 + (0.25 + 0.95 * rocky) * size * size) * (0.75 + 0.25 * (a.half_width / 3.0).min(1.5));
+                let radius = (0.22 + (0.25 + 0.95 * rocky) * size * size) * (0.75 + 0.25 * (a.half_width / 3.0).min(1.5));
                 let p = [
                     a.position[0] + tangent[0] * along + normal[0] * u * a.half_width,
                     a.position[1] + tangent[1] * along + normal[1] * u * a.half_width,
@@ -254,7 +314,7 @@ pub fn place_rocks(
                 }, false);
             }
             // Boulders lodged in the banks of steep reaches.
-            let bank_rocks = 0.03 * rocky * length * 2.0;
+            let bank_rocks = 0.08 * rocky * length * 2.0;
             let count = bank_rocks.floor() as usize + usize::from(next(20) < bank_rocks.fract());
             for _ in 0..count {
                 let side = if next(21) < 0.5 { -1.0 } else { 1.0 };

@@ -148,15 +148,39 @@ pub fn report(network: &RiverNetwork) -> Vec<String> {
         "largest catchment {largest:.1} km², widest channel {widest:.1} m, fastest flow {fastest:.2} m/s, {} carve segments",
         network.segments.len()
     ));
+    // Width and depth by slope: steep channels narrow and deep, lowland
+    // ones wide and shallow.
+    for (name, low, high) in [("lowland", 0.0f32, 0.006f32), ("moderate", 0.006, 0.03), ("steep", 0.03, 10.0)] {
+        let band: Vec<&&network::RiverNode> = nodes
+            .iter()
+            .filter(|n| !n.lake && n.fall == 0.0 && n.slope >= low && n.slope < high && n.area > 0.5)
+            .collect();
+        if band.is_empty() {
+            continue;
+        }
+        let count = band.len() as f32;
+        let width = band.iter().map(|n| n.half_width * 2.0).sum::<f32>() / count;
+        let depth = band.iter().map(|n| n.depth).sum::<f32>() / count;
+        let speed = band.iter().map(|n| n.speed).sum::<f32>() / count;
+        lines.push(format!(
+            "{name} reaches draining over 0.5 km²: {width:.1} m wide, {depth:.2} m deep, {speed:.2} m/s on average"
+        ));
+    }
     let falls: Vec<f32> = nodes.iter().filter(|n| n.fall > 0.0).map(|n| n.fall).collect();
     let tall = falls.iter().filter(|&&f| f > 1.5).count();
     let tallest = falls.iter().copied().fold(0.0f32, f32::max);
+    let boulders = network
+        .rocks
+        .iter()
+        .filter(|rock| rock.radius >= super::rocks::OBSTACLE_RADIUS)
+        .count();
     lines.push(format!(
-        "{} steps and falls ({} over 1.5 m, tallest {:.1} m), {} rocks",
+        "{} steps and falls ({} over 1.5 m, tallest {:.1} m), {} rocks ({} over 40 cm across, which part the water)",
         falls.len(),
         tall,
         tallest,
-        network.rocks.len()
+        network.rocks.len(),
+        boulders
     ));
     // Sinuosity of the larger rivers: channel length over straight distance
     // per 1 km window.
@@ -308,6 +332,28 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
         println!(
             "waterfall at {:.1},{:.1}: {:.1} m from {:.1} m, {:.1} m wide",
             node.position[0], node.position[1], node.fall, node.water, node.half_width * 2.0
+        );
+    }
+    let cell = network::FLOW_CELL as f32;
+    let mut lakes: Vec<(f32, [f32; 2], &network::Lake)> = network
+        .lakes
+        .iter()
+        .map(|lake| {
+            let count = lake.cells.len() as f32;
+            let middle = lake.cells.iter().fold([0.0f32; 2], |sum, c| {
+                [sum[0] + (c[0] as f32 + 0.5) * cell / count, sum[1] + (c[1] as f32 + 0.5) * cell / count]
+            });
+            ((middle[0] - centre[0] as f32).hypot(middle[1] - centre[1] as f32), middle, lake)
+        })
+        .collect();
+    lakes.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for (d, middle, lake) in lakes.iter().take(3) {
+        println!(
+            "lake at {:.0},{:.0} ({d:.0} m away): water {:.2} m, {:.1} ha",
+            middle[0],
+            middle[1],
+            lake.level,
+            lake.cells.len() as f32 * cell * cell / 1.0e4
         );
     }
     let pixels = 2048usize.min((extent / 1.0) as usize).max(256);
