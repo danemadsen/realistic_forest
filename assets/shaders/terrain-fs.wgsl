@@ -1315,7 +1315,8 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let cutBank = bankSteep*(0.45 + 0.55*smoothHermite(0.0, 0.35, riverBend))
                 * (1.0 - smoothHermite(0.25, 0.75 + 0.6*soilSmall, riverBank))*(1.0 - inRiver);
     let pointBar = smoothHermite(0.04, 0.30, -riverBend)*(1.0 - bankSteep)
-                 * (1.0 - smoothHermite(0.30, 1.0 + 1.6*soilLarge, riverBank))*(1.0 - inRiver);
+                 * (1.0 - smoothHermite(0.20, 0.55 + 1.0*soilLarge, riverBank))*(1.0 - inRiver)
+                 * smoothHermite(0.30, 0.60, soilSmall + (soilEdge - 0.5)*0.5);
     let stoneBank = riverRock*(1.0 - smoothHermite(0.15, 0.9 + 0.6*soilEdge, riverBank))*(1.0 - inRiver);
     // A calm stream's banks are cohesive earth bound by roots, not the
     // scree and bedrock a hillside of the same steepness sheds, nor the bare
@@ -2272,14 +2273,16 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         // water, splashed higher beside whitewater.
         let riverWet = 1.0 - smoothHermite(0.0, 0.35 + 0.9*input.frag_river.z,
                                            input.frag_river.x);
+        // A bar the river last covered, and the stones beside whitewater,
+        // stay damp and stained.
         let moisture = clamp(waterAmount * 0.52 + channel * 0.25 + shoreWet * 0.65
-                             + riverWet * 0.72, 0.0, 0.72)
+                             + riverWet * 0.72 + pointBar * 0.6 + stoneBank * 0.5, 0.0, 0.72)
                      * (1.0 - gSnow);
         let damp = albedo * vec3<f32>(0.55, 0.57, 0.56);
         albedo = mix(albedo, damp, moisture);
         // Under the water the bed is filmed with algae and settled silt.
         let submergedBed = (1.0 - smoothHermite(-0.35, 0.0, input.frag_river.x)) * (1.0 - gSnow);
-        albedo = mix(albedo, albedo * vec3<f32>(0.62, 0.66, 0.46), submergedBed);
+        albedo = mix(albedo, albedo * vec3<f32>(0.50, 0.55, 0.36), submergedBed);
         // Damp earth stays rough; only pooled water approaches a low
         // roughness. Write the final value used by the G-buffer (snow glints
         // have already modified outRough above). Stone darkens when damp but

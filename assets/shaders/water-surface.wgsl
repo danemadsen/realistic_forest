@@ -2094,10 +2094,14 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     let aeration = clamp(turbulence*0.6 + flow.churn*0.3 + drop*0.2, 0.0, 1.0);
     let sigma_t = RIVER_EXTINCTION*(1.0 + 2.0*aeration);
     let transmittance = exp(-sigma_t*optical_path);
+    // The bed was lit as if in air: its light also crossed the water on the
+    // way down, a path of its depth over the sun's height.
+    let bed_depth = min(optical_path, 8.0)*max(to_view.y, 0.05);
+    let downwelling = exp(-sigma_t*bed_depth/max(to_sun.y, 0.25));
     let in_scatter = (RIVER_SCATTER*(1.0 + 4.0*aeration))
                    *(sun_colour*0.08 + moon_colour*0.08 + sky_light*0.35)
                    *(1.0 - transmittance)/max(sigma_t, vec3<f32>(1e-3));
-    var body = scene_linear*transmittance + in_scatter;
+    var body = scene_linear*transmittance*downwelling + in_scatter;
 
     // --- Reflection and glitter -------------------------------------------
     let n_dot_v = max(dot(normal, to_view), 0.0);

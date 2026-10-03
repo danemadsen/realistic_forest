@@ -800,7 +800,11 @@ shows from a ridge (a lake, wide enough for any triangles, never is).
 The river shader (`vs_river`/`fs_river` in `water-surface.wgsl`) shades the
 water with the sea's own optics, sky and screen-space reflections, sun
 glitter, Beer-Lambert body and refraction, rain rings and fog, and the
-plants' shadow cascades, plus what flowing water does:
+plants' shadow cascades. Its water is fresh: clear, faintly stained by the
+forest's tannins, and scattering little, so a riffle shows its bed and a pool
+or lake goes dark green-brown; the bed's light is dimmed for its path down
+through the water as well as back up. On top of that comes what flowing
+water does:
 
 - **Flow-mapped ripples.** Two phases of procedural ripple noise are carried
   downstream by the local current and cross-faded, so the surface streams at
