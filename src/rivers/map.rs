@@ -376,7 +376,7 @@ mod tests {
     fn spawn_region_channels_are_carved() {
         let noise = NoiseField::new();
         let network = network::generate(&noise, [0, 0]);
-        let node = network.rivers.iter().flat_map(|r| &r.nodes).find(|n| n.depth > 0.3 && n.water > 2.0).unwrap();
+        let node = network.rivers.iter().flat_map(|r| &r.nodes).find(|n| n.depth > 0.3 && n.water > 2.0 && !n.lake).unwrap();
         let (x, z) = (node.position[0], node.position[1]);
         let envelope = network.envelope(x, z);
         let carved = envelope.clamp(base_height(&noise, x, z));

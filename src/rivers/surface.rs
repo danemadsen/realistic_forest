@@ -25,7 +25,7 @@
 //! The mesh is cut into 256 m chunks with their bounds, so the renderer only
 //! draws what the camera can see.
 
-use super::network::{FLOW_CELL, GRAVITY, Lake, River};
+use super::network::{FLOW_CELL, GRAVITY, Lake, River, RiverEnd};
 
 /// One water-surface vertex: 48 bytes, mirrored by the river vertex inputs
 /// in water-surface.wgsl.
@@ -112,7 +112,16 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
     };
     for river in rivers {
         let nodes = &river.nodes;
-        let end = river.surface_end.min(nodes.len().saturating_sub(1));
+        // A river's surface runs on past where its own water ends, sunk
+        // under the still water it meets, so it never ends in an edge: one
+        // node into its parent's channel, and out past the shore under the
+        // sea.
+        let last = nodes.len().saturating_sub(1);
+        let (end, sink) = match river.end {
+            RiverEnd::Sea => (last, 0.3),
+            RiverEnd::Confluence(..) => ((river.surface_end + 1).min(last), 0.12),
+            RiverEnd::Edge => (river.surface_end.min(last), 0.0),
+        };
         if end < 1 {
             continue;
         }
@@ -147,13 +156,20 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
             let normal = [-tangent[1], tangent[0]];
             let half_width = node.half_width.max(0.25);
             // A plunge pool boils under its fall and settles downstream.
-            let plunge_reach = 3.0 * half_width + 2.0 * last_fall.1 + 2.0;
+            // The boil spreads a few metres, not the whole pool.
+            let plunge_reach = 1.5 * half_width + last_fall.1 + 1.5;
             let since = node.along - last_fall.0;
             let drop = if since < plunge_reach { last_fall.1 * (1.0 - since / plunge_reach) } else { 0.0 };
             let row = vertices.len() as u32;
-            // Where the river runs into a lake its surface dips just under
-            // the lake's, which then covers it.
-            let level = if node.lake { node.water - 0.03 } else { node.water };
+            // Where the river runs into a lake its surface sinks under the
+            // lake's, which then covers it.
+            let level = if node.lake {
+                node.water - 0.12
+            } else if i > river.surface_end {
+                node.water - sink
+            } else {
+                node.water
+            };
             for &across in offsets {
                 let speed = node.speed * lateral(across);
                 vertices.push(SurfaceVertex {

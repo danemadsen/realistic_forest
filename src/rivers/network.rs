@@ -38,7 +38,7 @@
 use super::carve::{RiverSegment, SegmentGrid, GRID_CELL};
 use crate::constants::SEA_LEVEL;
 use crate::noise::{NoiseField, base_height};
-use crate::vegetation::ecology::{cell_key, noise2 as field_noise, random};
+use crate::vegetation::ecology::{cell_key, noise2 as field_noise};
 use std::collections::BinaryHeap;
 
 /// Side of the square the rivers are extracted from, metres.
@@ -52,18 +52,22 @@ pub const ROUTING_MARGIN: f64 = 2048.0;
 pub const ROUTING_CELL: f64 = 32.0;
 pub const ROUTING_RESOLUTION: usize = ((REGION_SIZE + 2.0 * ROUTING_MARGIN) / ROUTING_CELL) as usize;
 /// Catchment at which a channel begins on level ground, km² (rainfall
-/// weighted); steep ground starts one with less, down to the minimum.
+/// weighted); steeper ground starts one with a little less, down to the
+/// minimum.
 pub const CHANNEL_AREA: f32 = 0.32;
 pub const MINIMUM_CHANNEL_AREA: f32 = 0.05;
 /// km² per routing cell.
 const CELL_AREA_KM2: f32 = (ROUTING_CELL * ROUTING_CELL / 1.0e6) as f32;
-/// Slope above which a channel breaks into steps and pools.
+/// Slope above which a reach counts as steep: rapids and cascades.
 pub const STEP_SLOPE: f32 = 0.028;
 /// Gravity, m/s².
 pub const GRAVITY: f32 = 9.81;
 /// A hollow the water would stand deeper than this in holds a lake; the
 /// river cuts through the rim of a shallower one.
 pub const LAKE_DEPTH: f32 = 1.2;
+/// A creek begins where the land along it first eases below this slope:
+/// the steep mountainside above is seeps and sheet wash, not a channel.
+const HEAD_SLOPE: f64 = 0.22;
 /// Fine cells a lake may cover (about 2.4 km²); a basin that would take
 /// more is cut through instead.
 const MAX_LAKE_CELLS: usize = 150_000;
@@ -307,9 +311,8 @@ fn route(noise: &NoiseField, region: [i64; 2]) -> Routing {
             area[r as usize] += area[cell as usize];
         }
     }
-    // Channels begin where enough water gathers, sooner on steep ground
-    // (the slope-area threshold of channel initiation), and once begun they
-    // run on to the sea.
+    // Channels begin where enough water gathers, a little sooner on steeper
+    // ground, and once begun they run on to the sea.
     let mut channel = vec![false; count];
     for &cell in order.iter().rev() {
         let cell = cell as usize;
@@ -324,7 +327,7 @@ fn route(noise: &NoiseField, region: [i64; 2]) -> Routing {
             ROUTING_CELL
         };
         let slope = ((heights[cell] - heights[r]) as f64 / run).max(0.0) as f32;
-        let threshold = (CHANNEL_AREA / (1.0 + 9.0 * slope)).max(MINIMUM_CHANNEL_AREA) / CELL_AREA_KM2;
+        let threshold = (CHANNEL_AREA / (1.0 + 2.0 * slope)).max(MINIMUM_CHANNEL_AREA) / CELL_AREA_KM2;
         if area[cell] >= threshold {
             channel[cell] = true;
         }
@@ -616,18 +619,18 @@ pub fn half_width(area_km2: f32) -> f32 {
 /// The bankfull channel a discharge cuts on a slope: (half width, thalweg
 /// depth, mean speed). Downstream hydraulic geometry, the power laws real
 /// rivers follow (width ~ Q^0.5, depth ~ Q^0.35, so speed ~ Q^0.15), with
-/// the slope's own terms: on a steep slope a stream is held in a narrow,
-/// deep slot between boulders and bedrock (width ~ S^-0.35, depth ~ S^0.1);
+/// the slope's own terms: on a steep slope a stream is held in a narrower,
+/// deeper slot between boulders and bedrock (width ~ S^-0.25, depth ~ S^0.1);
 /// on the flat it spreads wide and shallow over its own gravel and silt.
 /// The speed is what carries the discharge through that section, so it
 /// rises with slope too. A parabolic section's thalweg is half as deep again
 /// as its mean.
 pub fn channel(discharge: f32, slope: f32) -> (f32, f32, f32) {
     let q = discharge.max(1e-3);
-    let s = (slope / 0.01).clamp(0.08, 30.0);
-    let width = 5.0 * q.powf(0.5) * s.powf(-0.35);
+    let s = (slope / 0.01).clamp(0.2, 10.0);
+    let width = 7.0 * q.powf(0.5) * s.powf(-0.25);
     let mean_depth = 0.3 * q.powf(0.35) * s.powf(0.1);
-    let half_width = (0.5 * width).max(0.55);
+    let half_width = (0.5 * width).max(0.8);
     let speed = q / (2.0 * half_width * mean_depth);
     (half_width, (1.5 * mean_depth).max(0.15), speed.clamp(0.15, 6.0))
 }
@@ -1154,6 +1157,26 @@ fn snap_to_floor(noise: &NoiseField, points: &mut [PathPoint], reach: f64, step:
     }
 }
 
+/// Start a creek where it really begins: past the steep upper reach of a
+/// mountainside, at the first point where the ground along it, over the
+/// next 30 m, falls more gently than `HEAD_SLOPE`. False if it never does.
+fn trim_steep_head(noise: &NoiseField, points: &mut Vec<PathPoint>) -> bool {
+    let n = points.len();
+    let s = arc_lengths(points);
+    let ground: Vec<f64> = points.iter().map(|p| base_height(noise, p.p[0] as f32, p.p[1] as f32) as f64).collect();
+    let start = (0..n).find(|&i| {
+        let j = s.partition_point(|&v| v < s[i] + 30.0).min(n - 1);
+        j <= i || (ground[i] - ground[j]) / (s[j] - s[i]).max(1.0) < HEAD_SLOPE
+    });
+    match start {
+        Some(start) if n - start >= 2 => {
+            points.drain(..start);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Relax bends tighter than a channel can turn (radius under 1.6 widths).
 fn relax_tight_bends(points: &mut [PathPoint]) {
     let n = points.len();
@@ -1284,71 +1307,43 @@ fn interpolate(s: &[f64], values: &[f32], at: f64) -> f32 {
     values[i - 1] + (values[i] - values[i - 1]) * t
 }
 
-fn find_steps(profile: &Profiled, seed: u64) -> Steps {
+/// Where the water surface drops more steeply than this the land is a ledge
+/// the water leaves: a waterfall. Anywhere less steep, however steep, the
+/// water runs down the slope as rapids.
+const FALL_SLOPE: f32 = 0.75;
+/// A ledge lower than this is a chute the water slides down; one taller
+/// than `MAX_FALL`, or gentler than `LEDGE_SLOPE` on average, is a
+/// mountainside the water cascades down.
+const MIN_FALL: f32 = 1.2;
+const MAX_FALL: f32 = 8.0;
+const LEDGE_SLOPE: f32 = 0.9;
+
+/// The falls: one at the top of every ledge in the land, from the surface
+/// above it to the surface at its foot, with the plunge pool lying level
+/// over the ledge's own run.
+fn find_steps(profile: &Profiled) -> Steps {
     let n = profile.s.len();
     let mut steps = Steps { pools: Vec::new(), falls: Vec::new() };
-    if n < 3 {
-        return steps;
-    }
-    let length = profile.s[n - 1];
-    let mut position = 0.0;
-    let mut step_index = 0u64;
-    // (end, level) of the pool just laid, when the next one follows it.
-    let mut previous: Option<(f64, f32)> = None;
-    while position < length {
-        let slope = interpolate(&profile.s, &profile.slope, position);
-        let i = profile.s.partition_point(|&v| v < position).min(n - 1);
-        // Steps and falls are set by the valley and its bedrock, not by how
-        // narrow the stream has become: spaced in the catchment's typical
-        // widths.
-        let width = 2.0 * half_width(profile.points[i].area as f32);
-        if slope < STEP_SLOPE {
-            position += (width as f64).max(2.0);
-            previous = None;
+    let local = |k: usize| {
+        (profile.water[k] - profile.water[k + 1]) / (profile.s[k + 1] - profile.s[k]).max(0.1) as f32
+    };
+    let mut k = 0;
+    while k + 1 < n {
+        if local(k) <= FALL_SLOPE {
+            k += 1;
             continue;
         }
-        // Steps about two and a half widths apart, irregular; drops grow
-        // with slope into waterfalls where the mountainside is steep.
-        let jitter = 0.65 + 0.7 * random(seed ^ 0x57E9, step_index);
-        step_index += 1;
-        // Each pool is cut into the slope as deep as the drop at its head, so
-        // a drop stays a few metres even on a mountainside: it steps down in
-        // a cascade rather than one fall in a gorge.
-        let maximum_drop = 0.8 + 2.4 * smoothstep(0.10, 0.5, slope) + 2.8 * smoothstep(0.5, 1.2, slope);
-        let drop = (slope * 2.6 * width * jitter).clamp(0.22, maximum_drop);
-        let spacing = ((drop / slope) as f64).max(1.6 * width as f64);
-        // The next step goes where the land itself drops most steeply near
-        // there, a natural ledge, so its pool needs the least cutting.
-        let window = spacing * 0.3;
-        let lo = profile.s.partition_point(|&v| v < position + spacing - window).max(1);
-        let hi = profile.s.partition_point(|&v| v <= position + spacing + window).min(n - 1);
-        let mut end = position + spacing;
-        let mut steepest = f32::NEG_INFINITY;
-        for k in lo..hi {
-            let run = (profile.s[k + 1] - profile.s[k - 1]).max(0.1) as f32;
-            let local = (profile.water[k - 1] - profile.water[k + 1]) / run;
-            if local > steepest {
-                steepest = local;
-                end = profile.s[k];
-            }
+        let top = k;
+        while k + 1 < n && local(k) > FALL_SLOPE * 0.7 {
+            k += 1;
         }
-        let end = end.max(position + 1.2 * width as f64);
-        if end >= length - (width as f64) * 1.5 {
-            break;
+        let (upper, lower) = (profile.water[top], profile.water[k]);
+        let height = upper - lower;
+        let run = (profile.s[k] - profile.s[top]).max(0.1) as f32;
+        if (MIN_FALL..=MAX_FALL).contains(&height) && height / run >= LEDGE_SLOPE {
+            steps.falls.push((profile.s[top], upper, lower));
+            steps.pools.push((profile.s[top], profile.s[k], lower));
         }
-        // The pool lies at the surface's level at its lip: the reach is
-        // carved down to it, never filled.
-        let level = interpolate(&profile.s, &profile.water, end);
-        let upper = match previous {
-            Some((previous_end, previous_level)) if (previous_end - position).abs() < 1e-6 => previous_level,
-            _ => interpolate(&profile.s, &profile.water, position),
-        };
-        if upper - level > 0.12 {
-            steps.falls.push((position, upper, level));
-        }
-        steps.pools.push((position, end, level));
-        previous = Some((end, level));
-        position = end;
     }
     steps
 }
@@ -1373,7 +1368,7 @@ fn build_nodes(noise: &NoiseField, centreline: Vec<PathPoint>, end_level: Option
         return Vec::new();
     }
     let profile = water_profile(noise, centreline, end_level);
-    let steps = find_steps(&profile, seed);
+    let steps = find_steps(&profile);
     let n = profile.points.len();
 
     // Stepped surface: within a pool the water is level with its lip.
@@ -1436,8 +1431,15 @@ fn build_nodes(noise: &NoiseField, centreline: Vec<PathPoint>, end_level: Option
         nodes[i].water = nodes[i].water.min(nodes[i - 1].water);
     }
 
-    // Hydraulics, plunge pools and whitewater.
+    // Hydraulics, plunge pools and whitewater. A channel answers to the
+    // slope of its valley over a long reach, not to every steeper or
+    // gentler stretch, so it widens and narrows gradually.
     let count = nodes.len();
+    let mean_spacing = ((nodes[count - 1].along - nodes[0].along) as f64 / (count - 1).max(1) as f64).max(0.5);
+    let reach_slope = smooth_values(
+        &nodes.iter().map(|node| node.slope as f64).collect::<Vec<_>>(),
+        (40.0 / mean_spacing).clamp(2.0, 20.0),
+    );
     let mut since_fall = f32::INFINITY;
     let mut last_drop = 0.0f32;
     for i in 0..count {
@@ -1449,25 +1451,24 @@ fn build_nodes(noise: &NoiseField, centreline: Vec<PathPoint>, end_level: Option
             last_drop = nodes[i - 1].fall;
         }
         let node = &mut nodes[i];
-        let (half_width, depth, _) = channel(node.discharge, node.slope);
+        let (half_width, depth, _) = channel(node.discharge, reach_slope[i] as f32);
         node.half_width = half_width;
         // A plunge pool is scoured deep beneath the fall and shoals toward
-        // the next lip.
+        // the next lip...
         let plunging = 1.0 - smoothstep(0.0, 3.0 * node.half_width + 2.0, since_fall);
         let scour = (0.35 * last_drop).min(2.5) * plunging;
         node.depth = depth + scour;
-        // ...and wider than the channel that feeds it.
-        node.half_width *= 1.0 + 0.5 * plunging * smoothstep(0.3, 2.0, last_drop);
-        let mean_depth = node.depth / 1.5;
-        node.speed = (node.discharge / (2.0 * node.half_width * mean_depth.max(0.05))).clamp(0.15, 6.0);
+        // ...and a little wider than the channel that feeds it.
+        node.half_width *= 1.0 + 0.3 * plunging * smoothstep(0.3, 2.0, last_drop);
+        // Rapids churn white as the slope steepens; a plunge pool boils.
         let cascade = smoothstep(0.02, 0.12, node.slope);
-        let plunge = 1.0 - smoothstep(0.0, 2.5 * node.half_width + 3.0, since_fall);
+        let plunge = 1.0 - smoothstep(0.0, 1.5 * node.half_width + 2.0, since_fall);
         node.turbulence = (0.15 * smoothstep(0.004, 0.02, node.slope) + 0.6 * cascade
             + plunge * smoothstep(0.1, 1.2, last_drop))
             .min(1.0);
-        // Lowland banks are low and grassy; mountain channels cut steep
+        // Lowland banks are low and grassy; mountain channels cut steeper
         // banks into stony ground.
-        node.bank = 0.55 + 0.9 * smoothstep(0.003, 0.08, node.slope);
+        node.bank = 0.55 + 0.45 * smoothstep(0.003, 0.08, node.slope);
     }
     // Heads begin as a seep that gathers into a channel.
     let head_length = 30.0f32;
@@ -1478,19 +1479,21 @@ fn build_nodes(noise: &NoiseField, centreline: Vec<PathPoint>, end_level: Option
         // ...carrying the water the seep has gathered so far.
         node.discharge *= grow * grow;
     }
-    // No channel keeps one width: it swells through its pools and narrows
-    // over its riffles every few widths, irregularly. A lake's water has
-    // no channel to vary.
+    // No channel keeps exactly one width: it swells a little through its
+    // pools and narrows over its riffles, and its banks change from a low
+    // shelving edge to a steeper face where roots or a harder layer hold
+    // the soil. A lake's water has no channel to vary.
     let offset = (seed % 100_000) as f64 * 5.3;
     for node in nodes.iter_mut().filter(|node| !node.lake) {
         let width = 2.0 * node.half_width as f64;
-        let swell = field_noise([node.along as f64, offset], (5.5 * width).max(9.0), 311);
-        node.half_width *= 0.8 + 0.4 * swell;
-        // Its banks change too: here a low shelving edge, there a steeper
-        // face where roots or a harder layer hold the soil.
+        let swell = field_noise([node.along as f64, offset], (10.0 * width).max(16.0), 311);
+        node.half_width *= 0.92 + 0.16 * swell;
         let firmness = field_noise([node.along as f64, offset + 57.0], (4.0 * width).max(8.0), 313);
         node.bank *= 0.7 + 0.6 * firmness;
-        // The same water runs faster through the narrows.
+    }
+    limit_width_change(&mut nodes);
+    // The same water runs faster through the narrows.
+    for node in nodes.iter_mut() {
         let mean_depth = (node.depth / 1.5).max(0.05);
         node.speed = (node.discharge / (2.0 * node.half_width * mean_depth)).clamp(0.15, 6.0);
     }
@@ -1503,6 +1506,24 @@ fn build_nodes(noise: &NoiseField, centreline: Vec<PathPoint>, end_level: Option
         node.skew = (-k * width * 1.6).clamp(-0.6, 0.6) as f32;
     }
     nodes
+}
+
+/// Most a channel's half width may change per metre along it: a river
+/// widens below a confluence or at its mouth over many metres, never in a
+/// step.
+const WIDTH_CHANGE: f32 = 0.025;
+
+/// Hold the half width to `WIDTH_CHANGE` per metre, by easing it down
+/// toward each narrower neighbour, along the river and back.
+fn limit_width_change(nodes: &mut [RiverNode]) {
+    for i in 1..nodes.len() {
+        let run = (nodes[i].along - nodes[i - 1].along).abs();
+        nodes[i].half_width = nodes[i].half_width.min(nodes[i - 1].half_width + WIDTH_CHANGE * run);
+    }
+    for i in (0..nodes.len().saturating_sub(1)).rev() {
+        let run = (nodes[i + 1].along - nodes[i].along).abs();
+        nodes[i].half_width = nodes[i].half_width.min(nodes[i + 1].half_width + WIDTH_CHANGE * run);
+    }
 }
 
 fn signed_curvature(nodes: &[RiverNode]) -> Vec<f64> {
@@ -1708,6 +1729,9 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
         let mut centreline = resample(&centreline, |_| FLOW_CELL);
         smooth(&mut centreline, 1.0);
         relax_tight_bends(&mut centreline);
+        if !trim_steep_head(noise, &mut centreline) {
+            continue;
+        }
         for point in centreline.iter_mut() {
             point.lake = lakes.level_at(point.p);
         }
@@ -1745,6 +1769,25 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
                 nodes.truncate(keep);
             }
             RiverEnd::Edge => {}
+        }
+        // Where a river meets still water, a lake it runs into or out of or
+        // the sea at its mouth, it spreads out and slows into it rather than
+        // ending as a channel.
+        let mut mouths: Vec<f32> = (1..nodes.len())
+            .filter(|&i| nodes[i].lake != nodes[i - 1].lake)
+            .map(|i| 0.5 * (nodes[i].along + nodes[i - 1].along))
+            .collect();
+        if end == RiverEnd::Sea {
+            mouths.push(nodes[surface_end].along);
+        }
+        for node in nodes.iter_mut().filter(|node| !node.lake) {
+            let reach = (8.0 * node.half_width).max(15.0);
+            let near = mouths.iter().map(|&m| (node.along - m).abs()).fold(f32::INFINITY, f32::min);
+            let t = 1.0 - smoothstep(0.0, reach, near);
+            node.half_width *= 1.0 + 0.5 * t;
+            node.speed *= 1.0 - 0.6 * t;
+            node.turbulence *= 1.0 - t;
+            node.depth *= 1.0 - 0.3 * t;
         }
         rivers[index] = Some(River {
             nodes,

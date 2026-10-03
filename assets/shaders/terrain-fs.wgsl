@@ -645,7 +645,7 @@ const RIVER_LAKE_CELLS_ACROSS: u32 = 8u;
 const RIVER_LAKE_SHORE_RUN: f32 = 6.0;
 const RIVER_BANK_REACH: f32 = 12.0;
 const RIVER_BANK_CURVE: f32 = 0.16;
-const RIVER_LEVEE_OUTER_SLOPE: f32 = 0.6;
+const RIVER_LEVEE_OUTER_SLOPE: f32 = 0.15;
 const RIVER_MAX_CANDIDATES: u32 = 64u;
 
 fn riverNone() -> RiverEnvelope

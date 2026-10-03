@@ -34,8 +34,9 @@ pub const BANK_REACH: f32 = 12.0;
 pub const BANK_CURVE: f32 = 0.16;
 /// Segments a lookup reads from one grid cell at most, here and on the GPU.
 pub const MAX_CANDIDATES: usize = 64;
-/// Slope of a levee's outer face back down to the terrain.
-pub const LEVEE_OUTER_SLOPE: f32 = 0.6;
+/// Slope of a levee's outer face back down to the terrain: a natural levee
+/// is a broad, low ridge, not a dike.
+pub const LEVEE_OUTER_SLOPE: f32 = 0.15;
 /// Side of a cell of the segment lookup grid, metres.
 pub const GRID_CELL: f32 = 32.0;
 
