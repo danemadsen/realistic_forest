@@ -57,7 +57,9 @@ impl RiverNetwork {
                 .map(|r| r.obstacle())
                 .collect();
             let grid = if radius.is_finite() {
-                carve::SegmentGrid::build(self.grid.origin, self.grid.resolution, &segments, &rocks)
+                let mut grid = carve::SegmentGrid::build(self.grid.origin, self.grid.resolution, &segments, &rocks);
+                grid.lakes = self.grid.lakes.clone();
+                grid
             } else {
                 self.grid.clone()
             };

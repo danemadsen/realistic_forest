@@ -260,9 +260,12 @@ impl SiteSampler {
         let mut any = false;
         for z in 0..depth {
             for x in 0..width {
+                let (wx, wz) = (origin[0] + x as f64 * spacing, origin[1] + z as f64 * spacing);
+                // A lake's shore counts as a bank, by how far the ground
+                // stands above its water.
                 let bank = network
-                    .envelope((origin[0] + x as f64 * spacing) as f32, (origin[1] + z as f64 * spacing) as f32)
-                    .bank_distance
+                    .envelope(wx as f32, wz as f32)
+                    .bank_at(self.fine.sample(wx, wz))
                     .min(RIVER_SEARCH);
                 any |= bank < RIVER_SEARCH;
                 heights.push(bank);
@@ -280,7 +283,8 @@ impl SiteSampler {
         self
     }
 
-    /// Metres past the nearest river's waterline, `RIVER_SEARCH` at most.
+    /// Metres past the nearest river's or lake's waterline, `RIVER_SEARCH`
+    /// at most.
     pub fn river_bank(&self, x: f64, z: f64) -> f32 {
         self.river.as_ref().map_or(RIVER_SEARCH, |grid| grid.sample(x, z))
     }

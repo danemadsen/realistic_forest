@@ -13,10 +13,15 @@
 //! and lands in the plunge pool a little downstream. The pool's own surface
 //! starts beneath it.
 //!
+//! A lake is a flat sheet at its level over its basin, reaching a cell past
+//! the shore so the shoreline is wherever the ground rises through it. A
+//! river's ribbon stops where it enters a lake and starts again at its
+//! outlet.
+//!
 //! The mesh is cut into 256 m chunks with their bounds, so the renderer only
 //! draws what the camera can see.
 
-use super::network::{GRAVITY, River};
+use super::network::{FLOW_CELL, GRAVITY, Lake, River};
 
 /// One water-surface vertex: 48 bytes, mirrored by the river vertex inputs
 /// in water-surface.wgsl.
@@ -37,7 +42,7 @@ pub struct SurfaceVertex {
     pub turbulence: f32,
     pub half_width: f32,
     /// On a falling sheet, how far down it the vertex is (0 at the lip, 1 at
-    /// the pool); -1 on a flat surface.
+    /// the pool); -1 on a river's surface, [`LAKE_SURFACE`] on a lake's.
     pub fall: f32,
     /// On a falling sheet, the height it falls; on a surface, the height of
     /// the last fall upstream within reach of its plunge, else 0.
@@ -48,6 +53,10 @@ const _: () = assert!(std::mem::size_of::<SurfaceVertex>() == 48);
 
 /// Side of a culling chunk, metres.
 pub const CHUNK: f32 = 256.0;
+/// `fall` on a lake's surface.
+pub const LAKE_SURFACE: f32 = -2.0;
+/// Side of a lake surface's cells: two flow cells.
+const LAKE_CELL: f32 = 2.0 * FLOW_CELL as f32;
 
 /// A contiguous run of indices and its bounds.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -75,7 +84,7 @@ fn lateral(across: f32) -> f32 {
     (1.0 - (across * across).min(1.0)).powf(0.35) * 1.25
 }
 
-pub fn build(rivers: &[River]) -> SurfaceMesh {
+pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
     let mut vertices: Vec<SurfaceVertex> = Vec::new();
     // Triangles per chunk, gathered before they are laid out chunk by chunk.
     let mut chunk_triangles: std::collections::BTreeMap<(i32, i32), Vec<u32>> = Default::default();
@@ -137,12 +146,15 @@ pub fn build(rivers: &[River]) -> SurfaceMesh {
             let since = node.along - last_fall.0;
             let drop = if since < plunge_reach { last_fall.1 * (1.0 - since / plunge_reach) } else { 0.0 };
             let row = vertices.len() as u32;
+            // Where the river runs into a lake its surface dips just under
+            // the lake's, which then covers it.
+            let level = if node.lake { node.water - 0.03 } else { node.water };
             for &across in offsets {
                 let speed = node.speed * lateral(across);
                 vertices.push(SurfaceVertex {
                     position: [
                         node.position[0] + normal[0] * across * half_width,
-                        node.water,
+                        level,
                         node.position[1] + normal[1] * across * half_width,
                     ],
                     velocity: [tangent[0] * speed, tangent[1] * speed],
@@ -158,8 +170,10 @@ pub fn build(rivers: &[River]) -> SurfaceMesh {
             // The ribbon steps down a fall through the sheet, not a ramp: no
             // quads join a lip to its foot.
             let crosses_fall = i > 0 && nodes[i - 1].fall > 0.0;
+            let under_lake = i > 0 && nodes[i - 1].lake && node.lake;
             if let Some(previous) = previous_row
                 && !crosses_fall
+                && !under_lake
             {
                 add_quads(&mut chunk_triangles, &vertices, previous, row, columns);
             }
@@ -207,6 +221,10 @@ pub fn build(rivers: &[River]) -> SurfaceMesh {
         }
     }
 
+    for lake in lakes {
+        add_lake(&mut vertices, &mut chunk_triangles, lake);
+    }
+
     let mut indices = Vec::new();
     let mut chunks = Vec::new();
     for (_, triangles) in chunk_triangles {
@@ -231,5 +249,55 @@ pub fn build(rivers: &[River]) -> SurfaceMesh {
         vertices,
         indices,
         chunks,
+    }
+}
+
+/// A lake's sheet: the cells of a lattice twice as coarse as the flow grid
+/// that hold any of its water, grown by one so the sheet runs under the
+/// shore.
+fn add_lake(
+    vertices: &mut Vec<SurfaceVertex>,
+    chunk_triangles: &mut std::collections::BTreeMap<(i32, i32), Vec<u32>>,
+    lake: &Lake,
+) {
+    let mut covered = std::collections::BTreeSet::new();
+    for cell in &lake.cells {
+        let coarse = [cell[0].div_euclid(2), cell[1].div_euclid(2)];
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                covered.insert((coarse[1] + dz, coarse[0] + dx));
+            }
+        }
+    }
+    let mut corner_index = std::collections::HashMap::new();
+    let mut corner = |vertices: &mut Vec<SurfaceVertex>, x: i32, z: i32| -> u32 {
+        *corner_index.entry((x, z)).or_insert_with(|| {
+            vertices.push(SurfaceVertex {
+                position: [x as f32 * LAKE_CELL, lake.level, z as f32 * LAKE_CELL],
+                velocity: [0.0, 0.0],
+                across: 0.0,
+                along: 0.0,
+                depth: 1.0,
+                turbulence: 0.0,
+                half_width: 50.0,
+                fall: LAKE_SURFACE,
+                drop: 0.0,
+            });
+            vertices.len() as u32 - 1
+        })
+    };
+    for &(z, x) in &covered {
+        let i00 = corner(vertices, x, z);
+        let i10 = corner(vertices, x + 1, z);
+        let i01 = corner(vertices, x, z + 1);
+        let i11 = corner(vertices, x + 1, z + 1);
+        let key = (
+            (((x as f32 + 0.5) * LAKE_CELL) / CHUNK).floor() as i32,
+            (((z as f32 + 0.5) * LAKE_CELL) / CHUNK).floor() as i32,
+        );
+        chunk_triangles
+            .entry(key)
+            .or_default()
+            .extend_from_slice(&[i00, i01, i11, i00, i11, i10]);
     }
 }

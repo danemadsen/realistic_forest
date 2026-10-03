@@ -157,7 +157,8 @@ pub fn place_rocks(
             let b = &nodes[i + 1];
             let d = [b.position[0] - a.position[0], b.position[1] - a.position[1]];
             let length = d[0].hypot(d[1]);
-            if length < 1e-3 {
+            // A lake's bed is silt, not boulders.
+            if length < 1e-3 || a.lake || b.lake {
                 continue;
             }
             let tangent = [d[0] / length, d[1] / length];

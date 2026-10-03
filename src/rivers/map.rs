@@ -42,6 +42,9 @@ pub fn render(noise: &NoiseField, network: &RiverNetwork, centre: [f64; 2], exte
                         let colour: [f32; 3] = if h < SEA_LEVEL {
                             let depth = (-h / 60.0).min(1.0);
                             [30.0 - 20.0 * depth, 90.0 - 50.0 * depth, 150.0 - 60.0 * depth]
+                        } else if h < envelope.lake {
+                            let depth = ((envelope.lake - h) / 12.0).min(1.0);
+                            [50.0 - 25.0 * depth, 120.0 - 50.0 * depth, 190.0 - 40.0 * depth]
                         } else if envelope.bank_distance < 0.0 && h < envelope.water {
                             if envelope.turbulence > 0.6 {
                                 [200.0, 230.0, 245.0]
@@ -179,8 +182,75 @@ pub fn report(network: &RiverNetwork) -> Vec<String> {
         mean(&upland),
         upland.len()
     ));
+    let cell_area = (network::FLOW_CELL * network::FLOW_CELL) as f32;
+    let lake_areas: Vec<f32> = network.lakes.iter().map(|l| l.cells.len() as f32 * cell_area / 1.0e4).collect();
+    lines.push(format!(
+        "{} lakes, {:.1} ha of water, largest {:.1} ha",
+        network.lakes.len(),
+        lake_areas.iter().sum::<f32>(),
+        lake_areas.iter().copied().fold(0.0f32, f32::max)
+    ));
     lines.push(format!("built in {:.2} s", network.build_seconds));
     lines
+}
+
+/// How well the channels sit in the land they cross, over the natural
+/// (uncarved, uneroded) ground: a river that follows the terrain runs on its
+/// valley floor, its surface a little below the ground at its banks. Shares
+/// of channel length (falls and the sea excluded) where
+/// - on a gentle reach, the surface lies over 3 m under the natural ground:
+///   a trench cut through a rise;
+/// - the natural ground beside the channel lies under the surface, so the
+///   water is held in by the carve's levee rather than by the land;
+/// - lower ground lies within 25 m across: the river runs along a slope
+///   above its valley's floor.
+pub fn terrain_fit(noise: &NoiseField, network: &RiverNetwork) -> String {
+    let mut total = 0.0f64;
+    let (mut trench, mut perched, mut off_floor) = (0.0f64, 0.0f64, 0.0f64);
+    for river in &network.rivers {
+        let nodes = &river.nodes;
+        let end = river.surface_end.min(nodes.len().saturating_sub(1));
+        for i in 1..end {
+            let node = &nodes[i];
+            if node.fall > 0.0 || nodes[i - 1].fall > 0.0 || node.water < SEA_LEVEL + 0.1 || node.lake {
+                continue;
+            }
+            let (a, b) = (nodes[i - 1].position, nodes[i + 1].position);
+            let length = (b[0] - a[0]).hypot(b[1] - a[1]).max(1e-3);
+            let normal = [-(b[1] - a[1]) / length, (b[0] - a[0]) / length];
+            let weight = (length * 0.5) as f64;
+            total += weight;
+            let at = |offset: f32| {
+                base_height(noise, node.position[0] + normal[0] * offset, node.position[1] + normal[1] * offset)
+            };
+            // Steep creeks cut their pools into the slope by design.
+            if node.slope < network::STEP_SLOPE && at(0.0) - node.water > 3.0 {
+                trench += weight;
+            }
+            let reach = [1.0f32, 2.5, 5.0];
+            let spills = [-1.0f32, 1.0]
+                .iter()
+                .any(|&side| reach.iter().all(|&d| at(side * (node.half_width + d)) < node.water - 0.25));
+            if spills {
+                perched += weight;
+            }
+            let floor = at(0.0);
+            let lower = [-25.0f32, -18.0, -12.0, -8.0, 8.0, 12.0, 18.0, 25.0]
+                .iter()
+                .any(|&d| d.abs() > node.half_width + 2.0 && at(d) < floor - 1.5);
+            if lower {
+                off_floor += weight;
+            }
+        }
+    }
+    let share = |v: f64| 100.0 * v / total.max(1.0);
+    format!(
+        "terrain fit over {:.1} km: {:.1}% trenched over 3 m (gentle reaches), {:.1}% held up by levees, {:.1}% above the valley floor",
+        total / 1000.0,
+        share(trench),
+        share(perched),
+        share(off_floor)
+    )
 }
 
 pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
@@ -189,16 +259,28 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
     for line in report(&network) {
         println!("{line}");
     }
-    // The nodes nearest the map's centre, for framing a camera on them.
-    let mut nearest: Vec<(f32, &network::RiverNode)> = network
+    println!("{}", terrain_fit(noise, &network));
+    // The nodes nearest the map's centre, for framing a camera on them: the
+    // heading is the `--camera` yaw that looks downstream.
+    let mut nearest: Vec<(f32, &network::RiverNode, f32)> = network
         .rivers
         .iter()
-        .flat_map(|r| &r.nodes)
-        .map(|n| ((n.position[0] - centre[0] as f32).hypot(n.position[1] - centre[1] as f32), n))
+        .flat_map(|r| {
+            let nodes = &r.nodes;
+            (0..nodes.len()).map(move |i| {
+                let (a, b) = (&nodes[i.saturating_sub(1)], &nodes[(i + 1).min(nodes.len() - 1)]);
+                let heading = (b.position[0] - a.position[0])
+                    .atan2(a.position[1] - b.position[1])
+                    .to_degrees()
+                    .rem_euclid(360.0);
+                (&nodes[i], heading)
+            })
+        })
+        .map(|(n, heading)| ((n.position[0] - centre[0] as f32).hypot(n.position[1] - centre[1] as f32), n, heading))
         .collect();
     nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut shown: Vec<[f32; 2]> = Vec::new();
-    for (d, node) in nearest {
+    for (d, node, heading) in nearest {
         if shown.len() >= 8 {
             break;
         }
@@ -207,7 +289,7 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
         }
         shown.push(node.position);
         println!(
-            "near centre ({d:.0} m): river at {:.1},{:.1} water {:.2} m, {:.1} m wide, {:.2} m deep, {:.2} m/s, slope {:.3}, fall {:.2} m",
+            "near centre ({d:.0} m): river at {:.1},{:.1} water {:.2} m, {:.1} m wide, {:.2} m deep, {:.2} m/s, slope {:.3}, fall {:.2} m, heading {heading:.0}",
             node.position[0], node.position[1], node.water, node.half_width * 2.0, node.depth, node.speed, node.slope, node.fall
         );
     }
@@ -259,7 +341,7 @@ mod tests {
         let resolution = words[3] as usize;
         let cx = ((x - origin[0]) / cell).floor() as usize;
         let cz = ((z - origin[1]) / cell).floor() as usize;
-        let entry = 8 + (cz * resolution + cx) * 2;
+        let entry = 8 + (cz * resolution + cx) * super::super::carve::GRID_CELL_WORDS;
         let offset = words[entry] as usize;
         let count = (words[entry + 1] & 0xffff) as usize;
         assert!(count > 0);

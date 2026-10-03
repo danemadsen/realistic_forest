@@ -374,11 +374,15 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
 // `river_segments: array<RiverSegment>` as read-only storage.
 //
 // river_grid holds an eight-word header (origin XZ and cell size as f32
-// bits, resolution, segment count), then an (offset, count) pair per cell,
-// then the index lists the pairs point into: a cell's segments, then the
-// rocks whose wakes reach it (the pair's second word holds the segment count
-// in its low and the rock count in its high 16 bits). A zero resolution
-// means there are no rivers.
+// bits, resolution, segment count), then three words per cell, then the
+// index lists the cells point into: a cell's segments, then the rocks whose
+// wakes reach it. A cell's words are the offset of its lists, the segment
+// count in the low and the rock count in the high 16 bits, and the level of
+// any lake reaching into the cell as f32 bits (RIVER_NO_LAKE if none). A
+// zero resolution means there are no rivers.
+//
+// A lake has no channel: ground below its level near it lies under its
+// water, and riverBankAt measures the shore in a river bank's terms.
 //
 // Each segment bounds the ground from above (the channel bed, then a bank
 // cone that steepens away from the water) and from below (a low levee that
@@ -407,9 +411,15 @@ struct RiverEnvelope {
     velocity: vec2<f32>,
     half_width: f32,
     turbulence: f32,
+    // The level of a lake reaching here, or RIVER_NO_LAKE.
+    lake: f32,
 };
 
 const RIVER_NONE: f32 = 1.0e30;
+const RIVER_NO_LAKE: f32 = -1.0e30;
+const RIVER_GRID_CELL_WORDS: u32 = 3u;
+// Metres of shore per metre of rise above a lake's water.
+const RIVER_LAKE_SHORE_RUN: f32 = 6.0;
 const RIVER_BANK_REACH: f32 = 12.0;
 const RIVER_BANK_CURVE: f32 = 0.16;
 const RIVER_LEVEE_OUTER_SLOPE: f32 = 0.6;
@@ -418,7 +428,7 @@ const RIVER_MAX_CANDIDATES: u32 = 64u;
 fn riverNone() -> RiverEnvelope
 {
     return RiverEnvelope(RIVER_NONE, -RIVER_NONE, RIVER_NONE, -RIVER_NONE,
-                         vec2<f32>(0.0), 0.0, 0.0);
+                         vec2<f32>(0.0), 0.0, 0.0, RIVER_NO_LAKE);
 }
 
 fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
@@ -447,7 +457,7 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
     let speed = mix(segment.speed.x, segment.speed.y, t);
     let direction = ab/segmentLength;
     var envelope = RiverEnvelope(RIVER_NONE, -RIVER_NONE, pastBank, water,
-                                 direction*speed, halfWidth, segment.turbulence);
+                                 direction*speed, halfWidth, segment.turbulence, RIVER_NO_LAKE);
     if (pastBank < 0.0)
     {
         // Skewed parabola: zero at both banks, deepest toward the outer one.
@@ -505,14 +515,22 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
     let origin = vec2<f32>(bitcast<f32>(river_grid[0]), bitcast<f32>(river_grid[1]));
     let cell = floor((p - origin)/bitcast<f32>(river_grid[2]));
     if (any(cell < vec2<f32>(0.0)) || any(cell >= vec2<f32>(f32(resolution)))) { return total; }
-    let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*2u;
+    let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*RIVER_GRID_CELL_WORDS;
     let offset = river_grid[entry];
     let count = min(river_grid[entry + 1u] & 0xffffu, RIVER_MAX_CANDIDATES);
     for (var i = 0u; i < count; i += 1u)
     {
         riverCombine(&total, riverSegmentEnvelope(river_segments[river_grid[offset + i]], p));
     }
+    total.lake = bitcast<f32>(river_grid[entry + 2u]);
     return total;
+}
+
+// Metres past the nearest waterline, a river's or a lake's, for ground at
+// `height`: negative under water.
+fn riverBankAt(envelope: RiverEnvelope, height: f32) -> f32
+{
+    return min(envelope.bank_distance, (height - envelope.lake)*RIVER_LAKE_SHORE_RUN);
 }
 
 // The ground with the channels cut into it and their banks held up.
@@ -701,13 +719,18 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
     // Seat the root.
     let xz = plant.position.xz;
     var ground = 0.0;
-    // Nothing grows in a river: a root stands on the dry bank, clear of the
-    // waterline by its trunk or stems.
+    // Nothing grows in a river or a lake: a root stands on the dry bank,
+    // clear of the waterline by its trunk or stems.
     if (model.habitat != 2u) {
         let footing = select(0.4 + 0.015 * height,
                              max(0.2, model.crown_radius * plant.scale * 0.6),
                              model.habitat == 1u);
-        if (riverEnvelope(xz).bank_distance < footing) {
+        let river = riverEnvelope(xz);
+        var bank = river.bank_distance;
+        if (river.lake > RIVER_NO_LAKE) {
+            bank = riverBankAt(river, terrainHeight(xz));
+        }
+        if (bank < footing) {
             return;
         }
     }

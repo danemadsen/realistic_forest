@@ -1817,7 +1817,9 @@ fn vs_river(
     // distance, a metre per 110 m), so a river still shows from a ridge.
     let flat_distance = length(position.xz - globals.camera_position.xz);
     let spacing = max(1.0, flat_distance/110.0);
-    let lift = smoothstepf(150.0, 650.0, flat_distance)*min(spacing*0.45, 12.0);
+    // A lake is wide enough for any triangles and stays at its level.
+    let lake = fall < -1.5;
+    let lift = select(smoothstepf(150.0, 650.0, flat_distance)*min(spacing*0.45, 12.0), 0.0, lake);
     let world = vec3<f32>(position.x, position.y + lift, position.z);
     var out: RiverVertexOutput;
     out.clip_position = globals.projection*globals.view*vec4<f32>(world, 1.0);
@@ -1866,7 +1868,8 @@ fn riverRockFlow(p: vec2<f32>, base: vec2<f32>, surface: f32) -> RiverFlow
     if (any(cell < vec2<f32>(0.0)) || any(cell >= vec2<f32>(f32(resolution)))) { return result; }
     let speed = length(base);
     if (speed < 0.03) { return result; }
-    let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*2u;
+    // Three words per cell: see river-functions.wgslinc.
+    let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*3u;
     let offset = river_grid[entry];
     let packed = river_grid[entry + 1u];
     let first_rock = offset + (packed & 0xffffu);

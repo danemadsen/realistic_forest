@@ -96,7 +96,15 @@ pub struct Envelope {
     pub half_width: f32,
     /// Its whitewater, 0..1.
     pub turbulence: f32,
+    /// The level of a lake whose basin reaches here, or -infinity: ground
+    /// below it lies under the lake.
+    pub lake: f32,
 }
+
+/// Metres from a lake's shore per metre the ground stands above or below
+/// its water, for a shore's typical slope; how near the shore a point is,
+/// in the same terms as a river's bank distance.
+pub const LAKE_SHORE_RUN: f32 = 6.0;
 
 impl Envelope {
     pub const NONE: Envelope = Envelope {
@@ -107,7 +115,25 @@ impl Envelope {
         velocity: [0.0, 0.0],
         half_width: 0.0,
         turbulence: 0.0,
+        lake: f32::NEG_INFINITY,
     };
+
+    /// Distance past the nearest waterline, river or lake, for ground at
+    /// `height`: negative under water.
+    pub fn bank_at(&self, height: f32) -> f32 {
+        self.bank_distance.min((height - self.lake) * LAKE_SHORE_RUN)
+    }
+
+    /// The water standing over ground at `height` here, if any: a river's
+    /// surface in its channel, a lake's over its bed.
+    pub fn water_over(&self, height: f32) -> Option<f32> {
+        let river = (self.bank_distance < 0.0).then_some(self.water);
+        let lake = (height < self.lake).then_some(self.lake);
+        match (river, lake) {
+            (Some(r), Some(l)) => Some(r.max(l)),
+            (r, l) => r.or(l),
+        }
+    }
 
     /// Apply the envelope to a terrain height.
     pub fn clamp(&self, height: f32) -> f32 {
@@ -166,6 +192,7 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
         velocity: [direction[0] * speed, direction[1] * speed],
         half_width,
         turbulence: segment.turbulence,
+        lake: f32::NEG_INFINITY,
     };
     if past_bank < 0.0 {
         // Skewed parabola: (1 - u^2)(1 + skew u) is zero at both banks and
@@ -229,9 +256,11 @@ pub struct RockObstacle {
 pub const ROCK_WAKE_RADII: f32 = 7.0;
 
 /// A uniform grid of segment and rock lists over the network's whole
-/// domain. Uploaded to the GPU as one `u32` array: an eight-word header,
-/// then `(offset, segment count | rock count << 16)` per cell, then the
-/// index lists those point into, each cell's segments before its rocks.
+/// domain, with the level of any lake reaching into each cell. Uploaded to
+/// the GPU as one `u32` array: an eight-word header, then
+/// `(offset, segment count | rock count << 16, lake level bits)` per cell,
+/// then the index lists those point into, each cell's segments before its
+/// rocks.
 #[derive(Clone, Debug, Default)]
 pub struct SegmentGrid {
     pub origin: [f32; 2],
@@ -239,7 +268,15 @@ pub struct SegmentGrid {
     /// Per cell: offset into `indices`, segment count, rock count.
     pub cells: Vec<[u32; 3]>,
     pub indices: Vec<u32>,
+    /// Per cell, the highest lake level reaching into it; empty when there
+    /// are no lakes.
+    pub lakes: Vec<f32>,
 }
+
+/// The "no lake" level on the GPU, where infinities are best avoided.
+pub const NO_LAKE: f32 = -1.0e30;
+/// Words per cell in the GPU grid.
+pub const GRID_CELL_WORDS: usize = 3;
 
 /// Words in the GPU grid header.
 pub const GRID_HEADER_WORDS: usize = 8;
@@ -293,16 +330,53 @@ impl SegmentGrid {
             resolution,
             cells,
             indices,
+            lakes: Vec::new(),
         }
     }
 
-    fn cell(&self, p: [f32; 2]) -> Option<[u32; 3]> {
+    fn cell_index(&self, p: [f32; 2]) -> Option<usize> {
         let x = ((p[0] - self.origin[0]) / GRID_CELL).floor();
         let z = ((p[1] - self.origin[1]) / GRID_CELL).floor();
         if x < 0.0 || z < 0.0 || x >= self.resolution as f32 || z >= self.resolution as f32 {
             return None;
         }
-        Some(self.cells[z as usize * self.resolution + x as usize])
+        Some(z as usize * self.resolution + x as usize)
+    }
+
+    fn cell(&self, p: [f32; 2]) -> Option<[u32; 3]> {
+        self.cell_index(p).map(|index| self.cells[index])
+    }
+
+    /// Mark the grid cells a lake's water may reach: every cell holding one
+    /// of its flow-grid cells (`cell_size` metres) or touching one.
+    pub fn add_lake(&mut self, level: f32, cells: &[[i32; 2]], cell_size: f32) {
+        if self.lakes.is_empty() {
+            self.lakes = vec![NO_LAKE; self.cells.len()];
+        }
+        for cell in cells {
+            let x0 = cell[0] as f32 * cell_size;
+            let z0 = cell[1] as f32 * cell_size;
+            // The flow cell grown by one on every side, in grid cells.
+            let first = self.cell_index([x0 - cell_size, z0 - cell_size]);
+            let last = self.cell_index([x0 + 2.0 * cell_size, z0 + 2.0 * cell_size]);
+            let (Some(first), Some(last)) = (first, last) else {
+                continue;
+            };
+            for z in first / self.resolution..=last / self.resolution {
+                for x in first % self.resolution..=last % self.resolution {
+                    let slot = &mut self.lakes[z * self.resolution + x];
+                    *slot = slot.max(level);
+                }
+            }
+        }
+    }
+
+    /// The level of a lake reaching `p`, or `NO_LAKE`.
+    pub fn lake(&self, p: [f32; 2]) -> f32 {
+        match self.cell_index(p) {
+            Some(index) if !self.lakes.is_empty() => self.lakes[index],
+            _ => NO_LAKE,
+        }
     }
 
     /// The segment indices whose reach may cover `p`.
@@ -327,18 +401,19 @@ impl SegmentGrid {
 
     /// The GPU layout: header, cell table, index lists.
     pub fn gpu_words(&self, segment_count: usize) -> Vec<u32> {
-        let mut words = Vec::with_capacity(GRID_HEADER_WORDS + self.cells.len() * 2 + self.indices.len());
+        let mut words = Vec::with_capacity(GRID_HEADER_WORDS + self.cells.len() * GRID_CELL_WORDS + self.indices.len());
         words.push(self.origin[0].to_bits());
         words.push(self.origin[1].to_bits());
         words.push(GRID_CELL.to_bits());
         words.push(self.resolution as u32);
         words.push(segment_count as u32);
         words.extend_from_slice(&[0, 0, 0]);
-        let base = (GRID_HEADER_WORDS + self.cells.len() * 2) as u32;
-        for cell in &self.cells {
+        let base = (GRID_HEADER_WORDS + self.cells.len() * GRID_CELL_WORDS) as u32;
+        for (index, cell) in self.cells.iter().enumerate() {
             // Offsets are into the whole word array.
             words.push(cell[0] + base);
             words.push(cell[1].min(0xffff) | (cell[2] << 16));
+            words.push(self.lakes.get(index).copied().unwrap_or(NO_LAKE).to_bits());
         }
         words.extend_from_slice(&self.indices);
         words
@@ -351,6 +426,10 @@ pub fn envelope_at(segments: &[RiverSegment], grid: &SegmentGrid, p: [f32; 2]) -
     for &index in grid.candidates(p).iter().take(MAX_CANDIDATES) {
         let envelope = segment_envelope(&segments[index as usize], p);
         combine(&mut total, &envelope);
+    }
+    let lake = grid.lake(p);
+    if lake > NO_LAKE {
+        total.lake = lake;
     }
     total
 }
@@ -450,14 +529,15 @@ mod tests {
         // The GPU words point at the same lists.
         let words = grid.gpu_words(segments.len());
         let cell = 5 * 16 + 7;
-        let offset = words[GRID_HEADER_WORDS + cell * 2] as usize;
-        let count = (words[GRID_HEADER_WORDS + cell * 2 + 1] & 0xffff) as usize;
+        let offset = words[GRID_HEADER_WORDS + cell * GRID_CELL_WORDS] as usize;
+        let count = (words[GRID_HEADER_WORDS + cell * GRID_CELL_WORDS + 1] & 0xffff) as usize;
         assert_eq!(&words[offset..offset + count], &grid.indices[grid.cells[cell][0] as usize..][..count]);
     }
 }
 
 #[cfg(test)]
 mod gpu_tests {
+    use super::NO_LAKE;
     use bevy::tasks::block_on;
     use wgpu::util::DeviceExt;
 
@@ -484,7 +564,7 @@ mod gpu_tests {
                  if (id.x >= arrayLength(&samples)) {{ return; }}
                  let p = samples[id.x].xy;
                  let e = riverEnvelope(p);
-                 samples[id.x] = vec4<f32>(e.upper, e.lower, e.bank_distance, e.water);
+                 samples[id.x] = vec4<f32>(e.upper, e.lower, e.bank_distance, e.lake);
              }}"
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -504,6 +584,13 @@ mod gpu_tests {
         for node in network.rivers.iter().flat_map(|r| &r.nodes).step_by(7).take(4000) {
             for offset in [-6.0f32, -2.0, -0.7, 0.0, 0.4, 1.3, 3.0, 9.0] {
                 points.push([node.position[0] + offset, node.position[1] - offset * 0.5]);
+            }
+        }
+        // ...and over the lakes and their shores.
+        let cell = crate::rivers::network::FLOW_CELL as f32;
+        for lake in &network.lakes {
+            for c in lake.cells.iter().step_by(37).take(20) {
+                points.push([(c[0] as f32 + 0.5) * cell, (c[1] as f32 + 0.5) * cell]);
             }
         }
         let samples: Vec<[f32; 4]> = points.iter().map(|p| [p[0], p[1], 0.0, 0.0]).collect();
@@ -553,15 +640,21 @@ mod gpu_tests {
         let mapped = readback.get_mapped_range(..);
         let results: &[[f32; 4]] = bytemuck::cast_slice(&mapped);
         let mut inside = 0;
+        let mut lakes = 0;
         for (p, gpu) in points.iter().zip(results) {
             let cpu = network.envelope(p[0], p[1]);
             let close = |a: f32, b: f32| (a.min(1e29) - b.min(1e29)).abs() <= 2e-3 * a.abs().clamp(1.0, 1e29);
             assert!(close(gpu[0], cpu.upper.min(1e30)), "upper at {p:?}: GPU {gpu:?} CPU {cpu:?}");
             assert!(close(-gpu[1], -cpu.lower.max(-1e30)), "lower at {p:?}: GPU {gpu:?} CPU {cpu:?}");
+            assert!(close(-gpu[3], -cpu.lake.max(NO_LAKE)), "lake at {p:?}: GPU {gpu:?} CPU {cpu:?}");
             if cpu.bank_distance < 0.0 {
                 inside += 1;
             }
+            if cpu.lake > NO_LAKE {
+                lakes += 1;
+            }
         }
         assert!(inside > 1000, "{inside}");
+        assert!(lakes > 100, "{lakes}");
     }
 }

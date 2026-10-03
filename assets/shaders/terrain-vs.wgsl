@@ -395,11 +395,15 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
 // `river_segments: array<RiverSegment>` as read-only storage.
 //
 // river_grid holds an eight-word header (origin XZ and cell size as f32
-// bits, resolution, segment count), then an (offset, count) pair per cell,
-// then the index lists the pairs point into: a cell's segments, then the
-// rocks whose wakes reach it (the pair's second word holds the segment count
-// in its low and the rock count in its high 16 bits). A zero resolution
-// means there are no rivers.
+// bits, resolution, segment count), then three words per cell, then the
+// index lists the cells point into: a cell's segments, then the rocks whose
+// wakes reach it. A cell's words are the offset of its lists, the segment
+// count in the low and the rock count in the high 16 bits, and the level of
+// any lake reaching into the cell as f32 bits (RIVER_NO_LAKE if none). A
+// zero resolution means there are no rivers.
+//
+// A lake has no channel: ground below its level near it lies under its
+// water, and riverBankAt measures the shore in a river bank's terms.
 //
 // Each segment bounds the ground from above (the channel bed, then a bank
 // cone that steepens away from the water) and from below (a low levee that
@@ -428,9 +432,15 @@ struct RiverEnvelope {
     velocity: vec2<f32>,
     half_width: f32,
     turbulence: f32,
+    // The level of a lake reaching here, or RIVER_NO_LAKE.
+    lake: f32,
 };
 
 const RIVER_NONE: f32 = 1.0e30;
+const RIVER_NO_LAKE: f32 = -1.0e30;
+const RIVER_GRID_CELL_WORDS: u32 = 3u;
+// Metres of shore per metre of rise above a lake's water.
+const RIVER_LAKE_SHORE_RUN: f32 = 6.0;
 const RIVER_BANK_REACH: f32 = 12.0;
 const RIVER_BANK_CURVE: f32 = 0.16;
 const RIVER_LEVEE_OUTER_SLOPE: f32 = 0.6;
@@ -439,7 +449,7 @@ const RIVER_MAX_CANDIDATES: u32 = 64u;
 fn riverNone() -> RiverEnvelope
 {
     return RiverEnvelope(RIVER_NONE, -RIVER_NONE, RIVER_NONE, -RIVER_NONE,
-                         vec2<f32>(0.0), 0.0, 0.0);
+                         vec2<f32>(0.0), 0.0, 0.0, RIVER_NO_LAKE);
 }
 
 fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
@@ -468,7 +478,7 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
     let speed = mix(segment.speed.x, segment.speed.y, t);
     let direction = ab/segmentLength;
     var envelope = RiverEnvelope(RIVER_NONE, -RIVER_NONE, pastBank, water,
-                                 direction*speed, halfWidth, segment.turbulence);
+                                 direction*speed, halfWidth, segment.turbulence, RIVER_NO_LAKE);
     if (pastBank < 0.0)
     {
         // Skewed parabola: zero at both banks, deepest toward the outer one.
@@ -526,14 +536,22 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
     let origin = vec2<f32>(bitcast<f32>(river_grid[0]), bitcast<f32>(river_grid[1]));
     let cell = floor((p - origin)/bitcast<f32>(river_grid[2]));
     if (any(cell < vec2<f32>(0.0)) || any(cell >= vec2<f32>(f32(resolution)))) { return total; }
-    let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*2u;
+    let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*RIVER_GRID_CELL_WORDS;
     let offset = river_grid[entry];
     let count = min(river_grid[entry + 1u] & 0xffffu, RIVER_MAX_CANDIDATES);
     for (var i = 0u; i < count; i += 1u)
     {
         riverCombine(&total, riverSegmentEnvelope(river_segments[river_grid[offset + i]], p));
     }
+    total.lake = bitcast<f32>(river_grid[entry + 2u]);
     return total;
+}
+
+// Metres past the nearest waterline, a river's or a lake's, for ground at
+// `height`: negative under water.
+fn riverBankAt(envelope: RiverEnvelope, height: f32) -> f32
+{
+    return min(envelope.bank_distance, (height - envelope.lake)*RIVER_LAKE_SHORE_RUN);
 }
 
 // The ground with the channels cut into it and their banks held up.
@@ -554,8 +572,8 @@ struct VsOutput {
     @location(3) fragWorldNormal: vec3<f32>,    // fragWorldNormal
     @location(4) fragErosionDelta: f32,         // fragErosionDelta
     @location(5) frag_material_normal: vec3<f32>, // Distance-prefiltered slope/aspect for material placement.
-    // The nearest river: metres past its waterline (negative in the
-    // channel), water surface above this ground, whitewater, flow speed.
+    // The nearest river or lake: metres past its waterline (negative under
+    // water), water surface above this ground, whitewater, flow speed.
     @location(6) frag_river: vec4<f32>,
 };
 
@@ -584,10 +602,14 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput
     var output: VsOutput;
     output.fragErosionDelta = erosionContribution;
     // Bounded, so a triangle straddling a river's reach interpolates sanely.
-    output.frag_river = vec4<f32>(clamp(river.bank_distance, -40.0, 40.0),
-                                  clamp(river.water - height, -40.0, 40.0),
-                                  river.turbulence,
-                                  length(river.velocity));
+    // A lake's still water and silted bed take over where its shore is
+    // nearer than any river's bank.
+    let bank = riverBankAt(river, height);
+    let still = bank < river.bank_distance;
+    output.frag_river = vec4<f32>(clamp(bank, -40.0, 40.0),
+                                  clamp(max(river.water, river.lake) - height, -40.0, 40.0),
+                                  select(river.turbulence, 0.0, still),
+                                  select(length(river.velocity), 0.0, still));
 
     // Evaluate normals at a world-space interval appropriate to this LOD. This
     // avoids the high-frequency shimmer produced by differentiating the mesh.

@@ -175,9 +175,19 @@ pub fn update_player_system(
         let here = erosion::sample_eroded_height(
             &erosion, &noise, player.position.x, player.position.z,
             visibility_center.to_array());
-        let depth = if envelope.bank_distance < 0.5 { envelope.water - here } else { 0.0 };
+        // The water over the player's feet: a river's (a little splash past
+        // its waterline counts) or a lake's still water.
+        let river = (envelope.bank_distance < 0.5).then_some(envelope.water);
+        let lake = (here < envelope.lake).then_some(envelope.lake);
+        let (surface, flowing) = match (river, lake) {
+            (Some(r), Some(l)) if l > r => (l, false),
+            (Some(r), _) => (r, true),
+            (None, Some(l)) => (l, false),
+            (None, None) => (here, false),
+        };
+        let depth = surface - here;
         if depth > 0.02 {
-            let current = Vec2::from(envelope.velocity);
+            let current = if flowing { Vec2::from(envelope.velocity) } else { Vec2::ZERO };
             let wading = wade(player.velocity, walk, current, depth, envelope.turbulence, dt);
             player.velocity = wading.velocity;
             player.swept = wading.swept;
@@ -203,7 +213,7 @@ pub fn update_player_system(
             visibility_center.to_array()) + EYE_HEIGHT;
         // Water too deep to stand in floats the player, head out.
         if depth > EYE_HEIGHT - SWIM_FREEBOARD {
-            ground = ground.max(envelope.water + SWIM_FREEBOARD);
+            ground = ground.max(surface + SWIM_FREEBOARD);
         }
         if keys.just_pressed(KeyCode::Space)
             && player.position.y <= ground + 0.03

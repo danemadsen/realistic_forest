@@ -254,8 +254,9 @@ pub fn create_base_height_map(
             if let Some(network) = rivers {
                 let envelope = network.envelope(wx, wz);
                 height[index] = envelope.clamp(height[index]);
-                // A cell whose middle the water covers belongs to the river.
-                if envelope.bank_distance < 0.0 && height[index] < envelope.water {
+                // A cell whose middle the water covers belongs to the river,
+                // or to a lake: the erosion drains both and leaves their beds.
+                if envelope.water_over(height[index]).is_some_and(|water| height[index] < water) {
                     river[index] = 1.0;
                 }
             }
