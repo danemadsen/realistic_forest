@@ -170,6 +170,7 @@ pub fn forest_erosion_pass(world: &World, mut ctx: RenderContext) {
     let records = bridge.take_lookup();
     if let Some(records) = records.as_deref() {
         if records.len() == EROSION_LOOKUP_DIAMETER * EROSION_LOOKUP_DIAMETER * 4 {
+            textures.revision.note_lookup(records);
             write_padded_at(
                 queue,
                 &textures.lookup_texture,
@@ -1263,6 +1264,7 @@ impl ErosionSim {
                 origin,
                 0,
             );
+            textures.revision.note_atlas_upload();
             log::info!(
                 "EROSION: atlas patch ({}, {}) uploaded to slot ({}, {})",
                 patch.key.x,

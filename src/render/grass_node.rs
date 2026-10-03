@@ -2,6 +2,7 @@
 //! CPU erosion readback, or alternative approximation of the biome rules.
 use super::{ExtractedForestView, ForestGlobals, ForestShaderHandles, terrain_node};
 use crate::grass::{self, GrassInstance, GrassTexture, SharedGrassAssets};
+use crate::grass_cull::{self, ChunkGrid, Footprint, LAYER_COUNT, Reach};
 use bevy::mesh::VertexBufferLayout;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -17,6 +18,7 @@ struct GrassFrame {
     mapping: [f32; 4],
     wind: [f32; 4],
     range: [f32; 4],
+    layer_end: [f32; 4],
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -25,7 +27,7 @@ struct MaterialUniform {
     pbr: [f32; 4],
     shape: [f32; 4],
 }
-const _: () = assert!(std::mem::size_of::<GrassFrame>() == 48);
+const _: () = assert!(std::mem::size_of::<GrassFrame>() == 64);
 const _: () = assert!(std::mem::size_of::<MaterialUniform>() == 48);
 
 struct GrassMesh {
@@ -33,8 +35,10 @@ struct GrassMesh {
     indices: Buffer,
     index_count: u32,
     material: BindGroup,
-    instances: Buffer,
-    instance_count: u32,
+    /// This model's instances per layer, ordered by chunk; `None` when empty.
+    layers: [Option<Buffer>; LAYER_COUNT],
+    /// Per layer, where each chunk's instances start (`grass::GrassBatch`).
+    chunk_start: [Vec<u32>; LAYER_COUNT],
 }
 struct GrassResources {
     pipeline: CachedRenderPipelineId,
@@ -42,6 +46,11 @@ struct GrassResources {
     frame_buffer: Buffer,
     frame_layout: BindGroupLayoutDescriptor,
     meshes: Vec<GrassMesh>,
+    /// The chunk grid the current instance buffers were scattered on.
+    grid: ChunkGrid,
+    /// The widest root radius and the tallest blade of any model, unscaled.
+    widest: f32,
+    tallest: f32,
     anchor: Option<[i64; 2]>,
 }
 #[derive(Resource, Default)]
@@ -67,14 +76,14 @@ fn sampler_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
         count: None,
     }
 }
-fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+fn uniform_entry(binding: u32, size: u64) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
         ty: wgpu::BindingType::Buffer {
             ty: wgpu::BufferBindingType::Uniform,
             has_dynamic_offset: false,
-            min_binding_size: wgpu::BufferSize::new(48),
+            min_binding_size: wgpu::BufferSize::new(size),
         },
         count: None,
     }
@@ -152,7 +161,7 @@ fn prepare_grass(
         &[
             texture_entry(0, wgpu::ShaderStages::VERTEX),
             sampler_entry(1, wgpu::ShaderStages::VERTEX),
-            uniform_entry(2),
+            uniform_entry(2, std::mem::size_of::<GrassFrame>() as u64),
             texture_entry(3, wgpu::ShaderStages::VERTEX),
         ],
     );
@@ -163,7 +172,7 @@ fn prepare_grass(
             texture_entry(1, wgpu::ShaderStages::FRAGMENT),
             texture_entry(2, wgpu::ShaderStages::FRAGMENT),
             sampler_entry(3, wgpu::ShaderStages::FRAGMENT),
-            uniform_entry(4),
+            uniform_entry(4, std::mem::size_of::<MaterialUniform>() as u64),
         ],
     );
     let global_layout = super::globals_layout();
@@ -176,7 +185,7 @@ fn prepare_grass(
     );
     let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("grass_frame"),
-        size: 48,
+        size: std::mem::size_of::<GrassFrame>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -292,13 +301,8 @@ fn prepare_grass(
                 }),
                 index_count: model.indices.len() as u32,
                 material,
-                instances: device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("grass_instances_empty"),
-                    size: 32,
-                    usage: wgpu::BufferUsages::VERTEX,
-                    mapped_at_creation: false,
-                }),
-                instance_count: 0,
+                layers: Default::default(),
+                chunk_start: Default::default(),
             }
         })
         .collect();
@@ -358,12 +362,17 @@ fn prepare_grass(
         }),
         zero_initialize_workgroup_memory: false,
     });
+    let widest = active_models.iter().map(|model| model.radius).fold(0.0, f32::max);
+    let tallest = active_models.iter().map(|model| model.height).fold(0.0, f32::max);
     *state = Some(GrassResources {
         pipeline,
         globals: global_group,
         frame_buffer,
         frame_layout,
         meshes,
+        grid: ChunkGrid { min: [0.0; 2], chunk_size: 1.0, per_side: 0 },
+        widest,
+        tallest,
         anchor: None,
     });
 }
@@ -376,6 +385,9 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
         return;
     };
     let Some(view) = world.get_resource::<ExtractedForestView>() else {
+        return;
+    };
+    let Some(globals) = world.get_resource::<ForestGlobals>() else {
         return;
     };
     let Some(device) = world.get_resource::<RenderDevice>() else {
@@ -401,16 +413,18 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
     let center = [view.player_position[0], view.player_position[2]];
     let anchor = grass::scatter_anchor(center);
     if resources.anchor != Some(anchor) {
-        let candidates = grass::scatter_grass(center, resources.meshes.len());
-        for (mesh, instances) in resources.meshes.iter_mut().zip(candidates) {
-            mesh.instance_count = instances.len() as u32;
-            if !instances.is_empty() {
-                mesh.instances =
+        let field = grass::scatter_grass(center, resources.meshes.len());
+        resources.grid = field.grid;
+        for (mesh, batches) in resources.meshes.iter_mut().zip(field.batches) {
+            for (layer, batch) in batches.into_iter().enumerate() {
+                mesh.layers[layer] = (!batch.instances.is_empty()).then(|| {
                     device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
                         label: Some("grass_instances"),
-                        contents: bytemuck::cast_slice(&instances),
+                        contents: bytemuck::cast_slice(&batch.instances),
                         usage: wgpu::BufferUsages::VERTEX,
-                    });
+                    })
+                });
+                mesh.chunk_start[layer] = batch.chunk_start;
             }
         }
         resources.anchor = Some(anchor);
@@ -422,16 +436,23 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
     let conditions = view.weather.conditions(&view.settings);
     // Storm gusts thrash the grass well beyond the steady breeze.
     let gust = 1.0 + 1.6 * conditions.gust_strength;
+    let wind_strength = (conditions.wind_speed / 18.0).clamp(0.0, 2.0) * 0.11 * gust;
     let frame = GrassFrame {
-        mapping: terrain_node::grass_habitat_mapping(view.player_position),
-        wind: [
-            direction.cos(),
-            direction.sin(),
-            elapsed,
-            (conditions.wind_speed / 18.0).clamp(0.0, 2.0) * 0.11 * gust,
-        ],
+        mapping: gbuffer.grass_habitat_mapping,
+        wind: [direction.cos(), direction.sin(), elapsed, wind_strength],
         range: [100.0, grass::SCATTER_RADIUS, 0.0, 0.0],
+        layer_end: [grass::LAYER_END[1], grass::LAYER_END[2], grass::LAYER_END[3], 0.0],
     };
+    // Which chunks can reach the screen. A blade strays from its root by at
+    // most its widest card, scaled, plus the wind's bend of its tallest tip
+    // (grass.wgsl: `offset.x += wind.x * gust * bend * wind.w`, |gust| <= 1).
+    let reach = Reach {
+        layer_end: grass::LAYER_END,
+        blade_extent: grass::MAX_SCALE * (resources.widest + resources.tallest * wind_strength.abs())
+            + 0.25,
+    };
+    let footprint = Footprint::new(center, &globals.globals.view, &globals.globals.projection);
+    let runs = grass_cull::visible_runs(&resources.grid, &footprint, &reach);
     queue.write_buffer(&resources.frame_buffer, 0, bytemuck::bytes_of(&frame));
     // Rebinding the capture view also handles window resize without stale views.
     let sampler = device
@@ -500,14 +521,27 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
     pass.set_bind_group(0, &resources.globals, &[]);
     pass.set_bind_group(1, &frame_group, &[]);
     for mesh in &resources.meshes {
-        if mesh.instance_count == 0 {
-            continue;
-        }
         pass.set_bind_group(2, &mesh.material, &[]);
         pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-        pass.set_vertex_buffer(1, mesh.instances.slice(..));
         pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-        pass.draw_indexed(0..mesh.index_count, 0, 0..mesh.instance_count);
+        for (layer, layer_runs) in runs.iter().enumerate() {
+            let Some(instances) = &mesh.layers[layer] else {
+                continue;
+            };
+            let starts = &mesh.chunk_start[layer];
+            let mut bound = false;
+            for run in layer_runs {
+                let range = starts[run.start as usize]..starts[run.end as usize];
+                if range.is_empty() {
+                    continue;
+                }
+                if !bound {
+                    pass.set_vertex_buffer(1, instances.slice(..));
+                    bound = true;
+                }
+                pass.draw_indexed(0..mesh.index_count, 0, range);
+            }
+        }
     }
 }
 

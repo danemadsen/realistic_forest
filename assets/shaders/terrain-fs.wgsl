@@ -2104,6 +2104,9 @@ fn fs_main(input: FsInput) -> FsOutput
 // from one evaluation of the same material blend as the visible G-buffer.
 // The consumer reconstructs upward normal Y. Capturing the actual terrain
 // meshes preserves their erosion, reveal and morph state.
+// The capture is kept across frames until its inputs change (HabitatKey in
+// terrain_node.rs). Before reading another global or stage value here, make
+// sure the key covers it, or a stale capture will outlive a change to it.
 @fragment
 fn fs_grass_habitat(input: FsInput) -> GrassHabitatOutput
 {

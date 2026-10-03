@@ -24,6 +24,7 @@ use bevy::render::render_resource::{
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
 use bevy::shader::Shader;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -88,6 +89,105 @@ pub fn grass_habitat_mapping(position: [f32; 3]) -> [f32; 4] {
     ]
 }
 
+// The capture is kept across frames and the player walks off its centre, so
+// the erosion fade it was rendered with must be flat over every texel it
+// holds: the window's far corner plus the 8 m snap, with room to spare, lies
+// well inside the radius where erosion is at full strength.
+const _: () = assert!(
+    (GRASS_HABITAT_SPAN / 2.0 + 8.0) * 1.5 < EROSION_VISIBILITY_FULL_RADIUS,
+    "the grass habitat window must sit inside the full-strength erosion radius"
+);
+
+/// The globals the habitat capture renders with: a top-down orthographic view
+/// of the window `mapping` describes. The material shader's one use of the
+/// camera is how far its slope samples reach (`materialStep` in terrain-vs),
+/// so the "camera" is the middle of the window rather than the player. That
+/// makes the capture a function of its window alone, and a capture taken
+/// anywhere in the window is the one every other position in it would take.
+/// `crest` is the ocean's wave-crest clearance when there is an ocean.
+fn habitat_capture_globals(
+    globals: &GlobalUniformsGpu,
+    mapping: [f32; 4],
+    crest: Option<f32>,
+) -> GlobalUniformsGpu {
+    let mut capture = *globals;
+    capture.view = Mat4::IDENTITY.to_cols_array();
+    let scale = 2.0 / mapping[2];
+    capture.projection = [
+        scale, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        0.0, -scale, 0.0, 0.0,
+        -mapping[0] * scale, mapping[1] * scale, 0.5, 1.0,
+    ];
+    // The snap puts the player within 8 m of the window's corner; the middle
+    // of that square is the best single stand-in for them.
+    capture.camera_position = [
+        mapping[0] + 4.0,
+        0.0,
+        mapping[1] + 4.0,
+        crest.unwrap_or(globals.camera_position[3]),
+    ];
+    capture
+}
+
+/// Everything the habitat capture and the ground average derived from it
+/// depend on. While this is unchanged the held capture is exactly what a new
+/// one would be, so it is kept. Anything the capture reads belongs here: when
+/// the shader gains an input, add it, or a stale capture will outlive it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HabitatKey {
+    /// The snapped window (centre XZ), as bit patterns so equality is exact.
+    mapping: [u32; 2],
+    /// The clipmap's centre. Its triangle layout and LOD morph follow it, and
+    /// the capture draws those triangles.
+    clip_origin: [u32; 2],
+    lookup_minimum: (i64, i64),
+    /// Erosion lookup and atlas contents, see `TerrainRevision`.
+    terrain_revision: u64,
+    /// The globals the material shader reads in a capture, as shaded: texture
+    /// scale, variant scale, normal strength, flow and erosion debug.
+    shading: [u32; 5],
+    /// The sea state behind the wave-crest clearance (amplitude, wind
+    /// direction, flat), when there is an ocean.
+    sea: Option<[u32; 3]>,
+}
+
+impl HabitatKey {
+    fn new(
+        player_position: [f32; 3],
+        lookup_minimum: (i64, i64),
+        globals: &GlobalUniformsGpu,
+        water: Option<&super::water_node::ExtractedWater>,
+        terrain_revision: u64,
+    ) -> Self {
+        let mapping = grass_habitat_mapping(player_position);
+        Self {
+            mapping: [mapping[0].to_bits(), mapping[1].to_bits()],
+            clip_origin: TerrainStageUniforms::clip_origin(player_position).map(f32::to_bits),
+            lookup_minimum,
+            terrain_revision,
+            shading: [
+                globals.settings_a[1].to_bits(),
+                globals.settings_a[3].to_bits(),
+                globals.settings_b[0].to_bits(),
+                globals.settings_b[2].to_bits(),
+                globals.settings_b[3].to_bits(),
+            ],
+            sea: water.map(|water| {
+                [
+                    water.settings.sea_state_amplitude.to_bits(),
+                    water.settings.wind_direction_degrees.to_bits(),
+                    water.settings.flat_surface as u32,
+                ]
+            }),
+        }
+    }
+}
+
+/// Captures are numbered, never reusing a number, so a consumer can tell "the
+/// same capture as last frame" from "a new one" even across a G-buffer rebuild.
+static HABITAT_GENERATIONS: AtomicU64 = AtomicU64::new(1);
+
 /// Shared by the terrain capture and water sampling; xy = centre, z = span,
 /// w = metres per texel. One source prevents the shoreline drifting between
 /// the vertex and fragment passes or when crossing a snap boundary.
@@ -121,9 +221,24 @@ pub struct GbufferTargets {
     pub grass_habitat_view: wgpu::TextureView,
     /// Linear terrain albedo at the same world-space texels as grass_habitat_view.
     pub grass_ground_albedo_view: wgpu::TextureView,
-    /// Linear terrain albedo averaged over neighboring ground texels.
+    /// Linear terrain albedo averaged over neighboring ground texels, as the
+    /// terrain pass leaves it: before any tree crown shades it.
+    pub grass_ground_base_view: wgpu::TextureView,
+    /// `grass_ground_base_view` with the crowns' shade multiplied into its
+    /// alpha, which is what the grass reads. The vegetation pass makes it from
+    /// the base (the shade is a multiply, so it must start from the base each
+    /// time); until then it is a plain copy.
     pub grass_ground_average_view: wgpu::TextureView,
     grass_ground_average_bind_group: BindGroup,
+    /// The window the held capture covers, in `grass_habitat_mapping` layout.
+    /// The capture is kept until its inputs change, and the player moves about
+    /// inside it meanwhile, so everything that reads the capture must use this
+    /// rather than the player's position.
+    pub grass_habitat_mapping: [f32; 4],
+    /// Which capture is held; changes whenever it is re-rendered.
+    pub grass_habitat_generation: u64,
+    /// What the held capture was rendered from, `None` until there is one.
+    grass_habitat_key: Option<HabitatKey>,
     pub grass_habitat_ready: bool,
     pub width: u32,
     pub height: u32,
@@ -341,29 +456,37 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
     }
 
     // Capture the *visible clipmap's* interpolated height and material contacts.
-    // Re-evaluate after erosion each frame, so reveals/regeneration cannot leave
-    // stale grass growing through newly exposed soil or an excavated channel.
-    gbuffer.grass_habitat_ready = false;
-    if let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.habitat_pipeline) {
-        let mapping = grass_habitat_mapping(view.player_position);
-        let mut habitat_globals = globals.globals;
-        habitat_globals.view = Mat4::IDENTITY.to_cols_array();
-        let scale = 2.0 / mapping[2];
-        habitat_globals.projection = [
-            scale, 0.0, 0.0, 0.0,
-            0.0, 0.0, 0.0, 0.0,
-            0.0, -scale, 0.0, 0.0,
-            -mapping[0] * scale, mapping[1] * scale, 0.5, 1.0,
-        ];
+    // The capture is a function of the inputs in `HabitatKey`; it is redone when
+    // one of them changes (the player crossing into the next 8 m window, a
+    // freshly streamed erosion tile, a settings change) and kept otherwise, so
+    // standing still costs nothing. Reveals and regeneration still reach the
+    // grass: they move the key.
+    let mapping = grass_habitat_mapping(view.player_position);
+    let water = world.get_resource::<super::water_node::ExtractedWater>();
+    let terrain_revision = world
+        .get_resource::<GpuWorldTexturesOption>()
+        .and_then(|option| option.0.as_deref())
+        .map_or(0, |textures| textures.revision.current());
+    let key = HabitatKey::new(
+        view.player_position,
+        view.lookup_minimum,
+        &globals.globals,
+        water,
+        terrain_revision,
+    );
+    if !(gbuffer.grass_habitat_ready && gbuffer.grass_habitat_key == Some(key))
+        && let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.habitat_pipeline)
+    {
+        gbuffer.grass_habitat_ready = false;
         // A crest bound protects roots even when the user increases the sea state.
-        if let Some(water) = world.get_resource::<super::water_node::ExtractedWater>() {
+        let crest = water.map(|water| {
             let spectrum = crate::water::waves::build(
                 water.settings.sea_state_amplitude,
                 water.settings.wind_direction_degrees.to_radians(),
             );
-            habitat_globals.camera_position[3] =
-                crate::water::displacement_bounds(&spectrum, water.settings.flat_surface) + 0.10;
-        }
+            crate::water::displacement_bounds(&spectrum, water.settings.flat_surface) + 0.10
+        });
+        let habitat_globals = habitat_capture_globals(&globals.globals, mapping, crest);
         queue.write_buffer(&resources.habitat_globals.buffer, 0, bytemuck::bytes_of(&habitat_globals));
         let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
             label: Some("forest_grass_habitat"),
@@ -408,15 +531,17 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
 
         // Four full-resolution ground samples become one filterable texel in
         // linear RGB. This pass runs after the latest erosion/material capture
-        // and before any grass is drawn, so every clump reads this frame's
-        // local ground colour with a single vertex texture lookup.
+        // and before any grass is drawn, so every clump reads the local ground
+        // colour with a single vertex texture lookup. It writes the base, which
+        // is then copied to the texture the grass reads, and the vegetation pass
+        // copies it again before shading it under the crowns.
         if let Some(average_pipeline) = pipeline_cache
             .get_render_pipeline(resources.grass_ground_average_pipeline)
         {
             let mut average_pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
                 label: Some("forest_grass_ground_average"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &gbuffer.grass_ground_average_view,
+                    view: &gbuffer.grass_ground_base_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -433,6 +558,10 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
             average_pass.set_bind_group(0, &gbuffer.grass_ground_average_bind_group, &[]);
             average_pass.draw(0..3, 0..1);
             drop(average_pass);
+            copy_ground_average(ctx.command_encoder(), gbuffer);
+            gbuffer.grass_habitat_key = Some(key);
+            gbuffer.grass_habitat_mapping = mapping;
+            gbuffer.grass_habitat_generation = HABITAT_GENERATIONS.fetch_add(1, Ordering::Relaxed);
             gbuffer.grass_habitat_ready = true;
         }
     }
@@ -1232,6 +1361,28 @@ fn prepare_terrain(
     // keep the layouts alive for as long as the pipelines exist.
 }
 
+/// Reset the ground average the grass reads to the terrain pass's untouched
+/// one, discarding any shade the vegetation pass multiplied into it.
+pub fn copy_ground_average(encoder: &mut wgpu::CommandEncoder, gbuffer: &GbufferTargets) {
+    fn whole(view: &wgpu::TextureView) -> wgpu::TexelCopyTextureInfo<'_> {
+        wgpu::TexelCopyTextureInfo {
+            texture: view.texture(),
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        }
+    }
+    encoder.copy_texture_to_texture(
+        whole(&gbuffer.grass_ground_base_view),
+        whole(&gbuffer.grass_ground_average_view),
+        wgpu::Extent3d {
+            width: GRASS_GROUND_AVERAGE_SIZE,
+            height: GRASS_GROUND_AVERAGE_SIZE,
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
 /// `CreateGBuffer` plus the main loop's `rlViewport(0, 0, ssao.width,
 /// ssao.height)`: (re)creates the colour targets and the depth texture
 /// whenever the physical window size changes, along with the three filter
@@ -1326,6 +1477,21 @@ pub(crate) fn resize_gbuffer(
                 resource: wgpu::BindingResource::TextureView(&grass_ground_albedo_view),
             }],
         );
+        let grass_ground_base_view = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("forest_grass_ground_base"),
+            size: wgpu::Extent3d {
+                width: GRASS_GROUND_AVERAGE_SIZE, height: GRASS_GROUND_AVERAGE_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        }).create_view(&Default::default());
         let grass_ground_average_view = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
             label: Some("forest_grass_ground_average"),
             size: wgpu::Extent3d {
@@ -1336,7 +1502,9 @@ pub(crate) fn resize_gbuffer(
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         }).create_view(&Default::default());
 
@@ -1386,8 +1554,12 @@ pub(crate) fn resize_gbuffer(
                 view_formats: &[],
             }).create_view(&Default::default()),
             grass_ground_albedo_view,
+            grass_ground_base_view,
             grass_ground_average_view,
             grass_ground_average_bind_group,
+            grass_habitat_mapping: [0.0; 4],
+            grass_habitat_generation: 0,
+            grass_habitat_key: None,
             grass_habitat_ready: false,
             shore_heightfield_ready: false,
             width,
@@ -1412,4 +1584,177 @@ pub fn register_terrain_systems(render_app: &mut bevy::app::SubApp) {
             // guard in `prepare_terrain` still covers a reordering.
             .after(crate::render::gpu_textures::prepare_gpu_textures),
     );
+}
+
+#[cfg(test)]
+mod habitat_cache_tests {
+    use super::*;
+    use crate::render::water_node::ExtractedWater;
+
+    fn key_with(
+        position: [f32; 3],
+        edit: impl FnOnce(&mut GlobalUniformsGpu, &mut Option<ExtractedWater>, &mut u64, &mut (i64, i64)),
+    ) -> HabitatKey {
+        let mut globals = GlobalUniformsGpu::default();
+        let mut water = Some(ExtractedWater::default());
+        let (mut revision, mut lookup) = (0, (0, 0));
+        edit(&mut globals, &mut water, &mut revision, &mut lookup);
+        HabitatKey::new(position, lookup, &globals, water.as_ref(), revision)
+    }
+
+    fn key(position: [f32; 3]) -> HabitatKey {
+        key_with(position, |_, _, _, _| {})
+    }
+
+    #[test]
+    fn walking_inside_one_window_keeps_the_capture() {
+        // The same 8 m window and the same 64 m clipmap cell, whatever the
+        // player's height or the globals' camera say.
+        assert_eq!(key([65.0, 20.0, 1.0]), key([71.9, 55.0, 7.9]));
+        assert_eq!(key([0.0, 3.0, 0.0]), key([7.99, 3.0, 7.99]));
+    }
+
+    #[test]
+    fn crossing_into_the_next_window_retakes_it() {
+        assert_ne!(key([71.9, 20.0, 1.0]), key([72.1, 20.0, 1.0]));
+        assert_ne!(key([65.0, 20.0, 7.9]), key([65.0, 20.0, 8.1]));
+        // West and south of the origin too: the window floors, never truncates.
+        assert_ne!(key([-0.1, 20.0, 0.0]), key([0.1, 20.0, 0.0]));
+    }
+
+    #[test]
+    fn the_clipmap_origin_is_part_of_the_key() {
+        // The clipmap recentres every 64 m, which moves the LOD morph the
+        // capture's triangles carry.
+        let before = key([31.9, 0.0, 0.0]);
+        let after = key([32.1, 0.0, 0.0]);
+        assert_ne!(before.clip_origin, after.clip_origin);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn terrain_and_settings_changes_retake_it() {
+        let base = key([10.0, 0.0, 10.0]);
+        assert_ne!(base, key_with([10.0, 0.0, 10.0], |_, _, revision, _| *revision = 1));
+        assert_ne!(base, key_with([10.0, 0.0, 10.0], |_, _, _, lookup| *lookup = (1, 0)));
+        for slot in [1usize, 3] {
+            assert_ne!(
+                base,
+                key_with([10.0, 0.0, 10.0], |globals, _, _, _| globals.settings_a[slot] += 0.5),
+                "settings_a[{slot}]"
+            );
+        }
+        for slot in [0usize, 2, 3] {
+            assert_ne!(
+                base,
+                key_with([10.0, 0.0, 10.0], |globals, _, _, _| globals.settings_b[slot] += 1.0),
+                "settings_b[{slot}]"
+            );
+        }
+        assert_ne!(base, key_with([10.0, 0.0, 10.0], |_, water, _, _| *water = None));
+        assert_ne!(
+            base,
+            key_with([10.0, 0.0, 10.0], |_, water, _, _| {
+                water.as_mut().unwrap().settings.sea_state_amplitude += 0.1;
+            })
+        );
+        assert_ne!(
+            base,
+            key_with([10.0, 0.0, 10.0], |_, water, _, _| {
+                water.as_mut().unwrap().settings.flat_surface = true;
+            })
+        );
+    }
+
+    #[test]
+    fn settings_the_capture_never_reads_do_not_retake_it() {
+        // Sun, fog and sparkle move every few frames; none of them is in a capture.
+        let base = key([10.0, 0.0, 10.0]);
+        let moved = key_with([10.0, 0.0, 10.0], |globals, _, _, _| {
+            globals.settings_a[0] = 3.0;
+            globals.settings_b[1] = 2.0;
+            globals.sun_direction = [0.1, -0.9, 0.2, 0.0];
+            globals.camera_position = [10.0, 99.0, 10.0, 0.0];
+            globals.params[0] = 0.5;
+        });
+        assert_eq!(base, moved);
+    }
+
+    #[test]
+    fn the_capture_does_not_see_where_the_player_stands() {
+        let a = GlobalUniformsGpu {
+            camera_position: [66.0, 20.0, 3.0, 0.0],
+            ..Default::default()
+        };
+        let b = GlobalUniformsGpu {
+            camera_position: [71.0, 55.0, 6.0, 0.0],
+            ..a
+        };
+        let mapping = grass_habitat_mapping([66.0, 20.0, 3.0]);
+        assert_eq!(mapping, grass_habitat_mapping([71.0, 55.0, 6.0]));
+        let capture = |globals: &GlobalUniformsGpu| {
+            bytemuck::bytes_of(&habitat_capture_globals(globals, mapping, Some(0.4))).to_vec()
+        };
+        assert_eq!(capture(&a), capture(&b));
+    }
+
+    #[test]
+    fn the_capture_window_maps_world_to_texture_like_the_shader_expects() {
+        let mapping = grass_habitat_mapping([66.0, 20.0, 3.0]);
+        let globals = habitat_capture_globals(&GlobalUniformsGpu::default(), mapping, None);
+        let p = globals.projection;
+        // World (x, z) -> clip: x_clip = scale * (x - cx), y_clip = -scale * (z - cz).
+        let clip = |x: f32, z: f32| (p[0] * x + p[12], p[9] * z + p[13]);
+        let (cx, cz) = (mapping[0], mapping[1]);
+        assert!((clip(cx, cz).0).abs() < 1e-5 && (clip(cx, cz).1).abs() < 1e-5);
+        assert!((clip(cx + GRASS_HABITAT_SPAN / 2.0, cz).0 - 1.0).abs() < 1e-5);
+        assert!((clip(cx, cz + GRASS_HABITAT_SPAN / 2.0).1 + 1.0).abs() < 1e-5);
+        assert_eq!(globals.camera_position[3], 0.0);
+        assert_eq!(
+            habitat_capture_globals(&GlobalUniformsGpu::default(), mapping, Some(0.7)).camera_position[3],
+            0.7
+        );
+    }
+
+    /// The capture is kept across frames, so it is only right while every input
+    /// the shaders read is in `HabitatKey`. This lists the globals the terrain
+    /// shaders read; a new one means the key (and this list) must be revisited.
+    #[test]
+    fn the_terrain_shaders_read_only_globals_the_key_accounts_for() {
+        let fragment = include_str!("../../assets/shaders/terrain-fs.wgsl");
+        let vertex = include_str!("../../assets/shaders/terrain-vs.wgsl");
+        let uses = |source: &str, prefix: &str| -> std::collections::BTreeSet<String> {
+            let mut found = std::collections::BTreeSet::new();
+            for (at, _) in source.match_indices(prefix) {
+                let rest = &source[at + prefix.len()..];
+                let end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                found.insert(rest[..end].to_string());
+            }
+            found
+        };
+        let set = |names: &[&str]| -> std::collections::BTreeSet<String> {
+            names.iter().map(|name| name.to_string()).collect()
+        };
+        // Fragment: view-space outputs (identity in a capture), the camera's
+        // w (crest clearance, in the key through the sea state), the sun and
+        // camera position for the snow glints a capture skips, and the shading
+        // settings the key holds.
+        assert_eq!(
+            uses(fragment, "globals."),
+            set(&["camera_position", "settings_a", "settings_b", "sun_direction", "view"]),
+            "terrain-fs.wgsl reads a global HabitatKey does not know about"
+        );
+        // Of settings_a only texture scale (y) and variant scale (w) are read.
+        assert_eq!(uses(fragment, "globals.settings_a."), set(&["w", "y"]));
+        // Vertex: the camera enters only through materialStep, which a capture
+        // takes from the middle of its window; heightfield is the separate
+        // lighting-map pass.
+        assert_eq!(
+            uses(vertex, "globals."),
+            set(&["camera_position", "heightfield", "projection", "view"]),
+            "terrain-vs.wgsl reads a global HabitatKey does not know about"
+        );
+    }
 }

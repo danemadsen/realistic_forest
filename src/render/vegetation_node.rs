@@ -251,6 +251,29 @@ struct SnapshotResources {
 struct VegetationResources {
     library: LibraryResources,
     snapshot: Option<SnapshotResources>,
+    /// Which (habitat capture, plant snapshot) the crowns' shade now on the
+    /// grass's ground average was drawn from. The shade is a multiply into the
+    /// texture's alpha, so it is applied once per pair, from the terrain pass's
+    /// untouched copy, and left alone while the pair stands.
+    canopy_stamp: Option<(u64, u64)>,
+}
+
+/// Take the crowns' shade back off the ground average the grass reads, if it
+/// is on there: the plants are no longer drawn, so the grass must not keep
+/// growing around them.
+fn clear_canopy(
+    resources: &mut Option<VegetationResources>,
+    gbuffer: &terrain_node::GbufferTargets,
+    ctx: &mut RenderContext,
+) {
+    if let Some(resources) = resources.as_mut()
+        && resources
+            .canopy_stamp
+            .take()
+            .is_some_and(|(capture, _)| capture == gbuffer.grass_habitat_generation)
+    {
+        terrain_node::copy_ground_average(ctx.command_encoder(), gbuffer);
+    }
 }
 
 #[derive(Resource, Default)]
@@ -989,6 +1012,7 @@ fn prepare_vegetation(
         *state = Some(VegetationResources {
             library: build_library(&device, &queue, &cache, &shaders, global_buffer, assets),
             snapshot: None,
+            canopy_stamp: None,
         });
     }
     let Some(resources) = state.as_mut() else {
@@ -1074,6 +1098,12 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
         return;
     };
     if !view.settings.vegetation_enabled {
+        if let Some(terrain) = world.get_resource::<terrain_node::TerrainNodeState>() {
+            let gbuffer = terrain.gbuffer.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(gbuffer) = gbuffer.as_ref() {
+                clear_canopy(&mut state.0.lock().unwrap_or_else(|e| e.into_inner()), gbuffer, &mut ctx);
+            }
+        }
         return;
     }
     let (Some(terrain), Some(globals), Some(textures), Some(device), Some(queue), Some(cache)) = (
@@ -1093,12 +1123,19 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
     let Some(gbuffer) = gbuffer.as_ref() else {
         return;
     };
-    let guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(resources) = guard.as_ref() else {
+    let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    if guard
+        .as_ref()
+        .is_none_or(|r| r.snapshot.as_ref().is_none_or(|s| s.plant_count == 0))
+    {
+        clear_canopy(&mut guard, gbuffer, &mut ctx);
+        return;
+    }
+    let Some(resources) = guard.as_mut() else {
         return;
     };
     let library = &resources.library;
-    let Some(snapshot) = resources.snapshot.as_ref().filter(|s| s.plant_count > 0) else {
+    let Some(snapshot) = resources.snapshot.as_ref() else {
         return;
     };
     let (Some(cull_pipeline), Some(draw_pipeline)) = (
@@ -1129,7 +1166,7 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
     let mut cull = CullUniform {
         planes: frustum_planes(&globals.globals.view, &globals.globals.projection),
         camera: [camera[0], camera[1], camera[2], view.settings.vegetation_detail.clamp(0.25, 4.0)],
-        habitat_mapping: terrain_node::grass_habitat_mapping(eye),
+        habitat_mapping: gbuffer.grass_habitat_mapping,
         counts: [
             snapshot.plant_count,
             snapshot.plant_count,
@@ -1280,10 +1317,15 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
         }
     }
 
-    // Shade under the crowns for the grass, which is drawn next.
+    // Shade under the crowns for the grass, which is drawn next. It only
+    // changes with the capture it is drawn over and the plants it is drawn
+    // from, so it is not redrawn every frame.
+    let stamp = (gbuffer.grass_habitat_generation, snapshot.generation);
     if gbuffer.grass_habitat_ready
+        && resources.canopy_stamp != Some(stamp)
         && let Some(canopy_pipeline) = cache.get_render_pipeline(library.canopy_pipeline)
     {
+        terrain_node::copy_ground_average(ctx.command_encoder(), gbuffer);
         let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
             label: Some("forest_vegetation_canopy"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1304,6 +1346,7 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
         pass.set_bind_group(0, &library.draw_globals, &[]);
         pass.set_bind_group(1, &snapshot.frame_group, &[]);
         pass.draw(0..6, 0..snapshot.plant_count);
+        resources.canopy_stamp = Some(stamp);
     }
 
     let Some((targets, shadow_pipeline, light, cascades, moon)) = shadows else {
