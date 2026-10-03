@@ -152,6 +152,9 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--cloud-density N` | Density multiplier in `[0, 4]`; default `1` |
 | `--cloud-base M` | Cloud base altitude in `[100, 6000]` metres; default `1300` |
 | `--cloud-thickness M` | Layer thickness in `[100, 4000]` metres; default `1200` |
+| `--no-vegetation` | Skip loading and scattering the trees, shrubs and flowers |
+| `--vegetation-map path.png` | Render the plant scatter from above, print its statistics, then exit |
+| `--map-centre x,z`, `--map-extent M` | Area of the vegetation map: its centre (default `0,0`) and side in metres (default `1024`) |
 
 Screenshot runs freeze the celestial clock, weather fronts, and cloud wind automatically, so
 erosion warm-up does not change the selected weather or lighting. Keep the same
@@ -299,14 +302,12 @@ whitecaps and subsurface light, with foam detail also filtered at distance.
 
 ## Imported grass
 
-The nine separate grass pack 2 models live in `assets/models/`, with one
-shared material set in `assets/textures/grass/`. They retain their authored
-metre scale and individual shapes. The unused pack 1 models and textures are
-archived in `tmp/unused/`; its human reference and display stand were never
-extracted. `assets/models/grass-manifest.json` records each active source mesh
-and material; `assets/models/GRASS-ATTRIBUTION.md` preserves the original
-licence and author credit. Run
-`python3 scripts/extract_grass.py --validate` to verify the extracted assets.
+The nine separate grass models (`grass-{large,medium,small}-{1,2,3}.glb`) live
+in `assets/models/`, with one shared material set in `assets/textures/grass/`.
+They retain their authored metre scale and individual shapes.
+`assets/models/grass-manifest.json` records each source mesh and material;
+`assets/models/GRASS-ATTRIBUTION.md` preserves the original licence and author
+credit.
 
 Grass is scattered deterministically in world cells, so camera movement and
 streaming do not reshuffle plants. Density and size vary in broad patches:
@@ -314,7 +315,7 @@ the nearby carpet places up to 64 candidates per square metre, thinning to
 eight through 110 metres, then three through 170 metres, and finally a sparse
 field of larger clumps. Each tier fades over distance rather than ending at a
 hard ring. Grass fades beyond 213 metres and reaches its draw limit at 235 metres.
-Pack 2's medium and small clumps dominate the carpet. The GPU captures
+The medium and small clumps dominate the carpet. The GPU captures
 a 512-metre local map of terrain height, grass suitability and ground colour
 every frame, using the terrain's actual snow, sand, soil, rock, gravel and
 erosion material weights. Roots are admitted where grass dominates the visible
@@ -325,7 +326,7 @@ water body; it does not remove otherwise healthy valley grass. Each
 clump checks its root footprint, rather than only its centre. The capture
 retains sub-metre root precision while covering the distant field.
 
-Pack 2's grayscale blade texture supplies light and dark detail. Each frame the
+The grass's grayscale blade texture supplies light and dark detail. Each frame the
 GPU averages nearby unlit terrain colours, and every clump samples that local
 average at its root for colour. The atlas's visible-pixel average normalises
 its grayscale detail; a canopy brightness factor compensates for the lower
@@ -337,6 +338,114 @@ lighting composite applies the same raymarched terrain and cloud shadows,
 volumetric atmosphere, moonlight and fog to the grass. A small transmitted-light
 term keeps thin leaf cards readable when backlit while respecting those
 raymarched shadows. Wind bends the blade tips and leaves roots anchored.
+
+## Trees, shrubs and flowers
+
+The plant library in `assets/models/` holds 86 models in eight families: fir,
+pine, oak, maple, lilac bush, bush, broadleaf plant and lavender. Each model is
+a set of `name-lod-N.glb` files (`fir-large-2-lod-0.glb` … `-lod-3.glb`): three
+mesh LODs of bark and foliage cards and a billboard, or a single LOD for
+lavender. Textures live in `assets/textures/`. A background task loads the
+library at startup, in about two seconds. Foliage, bark and billboard textures
+are capped in resolution to keep about 230 MiB of video memory. Mip levels of
+alpha-tested cards keep the coverage of the full-size image, so distant
+crowns stay full, and transparent texels take the colour of the nearest leaves
+so filtering never draws dark fringes.
+
+### Where plants grow
+
+Placement is ecological and deterministic: every plant is a pure function of
+its world position, generated in 256-metre chunks that stream around the
+player and match exactly where they meet. The same base landform the terrain
+uses supplies height, slope, sun exposure, hollows and valleys, from which
+smooth fields describe the forest:
+
+- **Forest stands** follow a broad mosaic, with ragged edges and small
+  glades, and stop at the coast, on faces too steep to hold soil, and at a
+  treeline that rises on sunny slopes. Wet valley floors and exposed crests
+  stay meadow.
+- **Fir and pine** grow in single-species stands, about three firs to every
+  pine. Pine takes warm, dry, well-drained ground and sandy lowlands, and a
+  sharp disturbance-history field makes the stands mostly one species,
+  mixing only along their borders, with groups of the other scattered through.
+  A conifer's nearest conifer neighbour is the same species about 80 % of the
+  time, against about 64 % if they were mixed at random.
+- **Oak and maple** are sparse, scattered through the conifers, more along
+  edges, in warm moist lowlands and standing alone in clearings. Oaks prefer
+  sunny, dry ground.
+- **Lilac and common bushes** form a thin understory, dense belts along the
+  forest edge and thickets in clearings. They outnumber oak and maple and are
+  far fewer than the conifers.
+- **Broadleaf plants** carpet moist, shaded forest floor in clonal patches.
+- **Lavender** grows in drifts in sunny, dry, well-drained clearings.
+
+Plants are placed in layers, each a Matérn hard-core point process, the model
+forest ecology uses for competition between trees. Candidates are thinned by
+the local stocking, and a survivor keeps its place only if no taller candidate
+stands within the sum of their crown reaches. Closed forest comes out evenly
+spaced at about 190 stems per hectare (one tree per 52 m²), while open
+woodland keeps a clumpier pattern. Saplings and poles fill the gaps along
+edges and in open stands, then shrubs grow around the trees, and herbs and
+lavender fill what remains of the ground. Height grows with the stand's age
+and vigour, so old stands are tall and the trees shrink toward the treeline,
+the coast and thin soil. Each tree picks its size class and model from that
+height and gets its own scale, rotation, lean and tint.
+
+Chunks are generated at three detail levels: trees out to about 2 km, shrubs to
+1 km, and herbs and lavender to 270 m. Each level runs on the async compute
+pool, nearest first, so the forest fills in around the player within a few
+seconds and is not regenerated when the player walks back and forth across a
+boundary.
+
+`--vegetation-map path.png` renders the scatter from above without opening a
+window and prints its statistics. `--map-centre x,z` and `--map-extent metres`
+(default `1024`) choose the area:
+
+```sh
+cargo run --release --bin realistic_forest -- --vegetation-map forest.png --map-centre 0,0 --map-extent 1600
+```
+
+### Drawing them
+
+The scatter knows only the base landform. Every frame, a compute pass on the
+GPU (`vegetation-cull.wgsl`) handles every streamed plant. It seats each root
+on the eroded terrain, using the same height function as the clipmap, and
+sinks trunks a little into slopes. It drops plants that land on steep faces,
+in incised channels or at the waterline, and grows small plants only where the
+grass would grow. It culls against the view, picks a LOD and compacts the
+survivors into one list per model and LOD, counting them straight into the
+indirect draw arguments. One indirect draw per model, LOD and material then
+renders them into the G-buffer between the terrain and the grass; the CPU
+never reads anything back.
+
+LODs switch at a fixed multiple of each plant's own height, so a sapling
+simplifies at the same size on screen as a 30 m pine: trees use their full
+meshes to about 6.5 heights and billboards beyond 23. Every switch
+cross-fades through a screen-door dither, each plant at a slightly different
+distance, so no ring of popping trees follows the camera. Trees are drawn to
+2 km, bushes and lilacs to between 160 and 900 metres depending on their size,
+herbs to 110 m and lavender to 230 m, each dissolving out at its edge. Wind
+from the weather bends every stem from its root, with gusts sweeping across
+the canopy and leaves fluttering at the crown's rim.
+
+Plants are lit by the same composite as the ground, with terrain, cloud and
+volumetric lighting. Foliage shades as one rounded crown rather than a stack
+of flat cards: it darkens toward the trunk and the crown's base, and thin
+leaves let some light through. The plants also cast their own shadows. Four
+cascaded shadow maps (2048² each) are drawn from the sun, or from the moon at
+night, depth-only and alpha-tested. They cover the view out to 20, 70, 280 and
+2000 metres, with texels from about 3 cm near the eye to 2.7 m at the far end.
+Each cascade only moves in whole texels, so shadows stay still as the camera
+turns and walks. Trees shade the ground, the grass, each other and their own
+crowns, out to the far cascade. The cull pass gathers shadow casters even
+behind the camera, at a cheaper LOD per cascade. The tree crowns are also
+laid over the grass's 512-metre capture from above, so the grass thins out and
+stays short in the shade under a closed canopy and grows back in its gaps.
+
+The diagnostics panel's **Vegetation** section turns the plants and their
+shadows on and off, scales every LOD distance with **Plant detail distance**,
+and reports how many plants and chunks are streamed. `--no-vegetation` skips
+loading the library entirely.
 
 ## Fidelity of the noise substitution
 
@@ -562,11 +671,12 @@ quality or disable clouds independently if the frame rate becomes too low.
 ## Render pipeline
 
 The renderer writes view position, view normal, and albedo to a three-target
-G-buffer. SSAO is evaluated at half resolution with a 24-sample rotated
+G-buffer: the terrain first, then the plants (after their cull pass), then the
+grass. The plants also draw their four shadow cascades. SSAO is evaluated at half resolution with a 24-sample rotated
 hemisphere kernel, followed by a depth/normal-aware bilateral blur. A separate
 half-resolution atmosphere pass supplies combined fog/cloud scattering and
-transmittance to the lighting composite, which also evaluates terrain and cloud
-shadows and the celestial sky. A cloud sky probe supplies reflection directions
+transmittance to the lighting composite, which also evaluates terrain, cloud
+and plant shadows and the celestial sky. A cloud sky probe supplies reflection directions
 outside the current view.
 The water surface then samples the opaque scene for refraction and raymarched
 reflections, followed by underwater effects where applicable. FXAA smooths the

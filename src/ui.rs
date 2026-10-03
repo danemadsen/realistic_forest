@@ -91,6 +91,7 @@ pub fn draw_diagnostics_ui(
     players: Query<&Player>,
     automation: Res<AutomationSettings>,
     mut rerun: ResMut<RerunErosion>,
+    vegetation: Option<Res<crate::vegetation::VegetationField>>,
 ) -> Result {
     let Ok(player) = players.single() else {
         return Ok(());
@@ -138,6 +139,7 @@ pub fn draw_diagnostics_ui(
             &cache,
             player,
             &mut rerun,
+            vegetation.as_deref(),
         );
     }
 
@@ -282,6 +284,7 @@ fn draw_diagnostics_window(
     cache: &ErosionCache,
     player: &Player,
     rerun: &mut RerunErosion,
+    vegetation: Option<&crate::vegetation::VegetationField>,
 ) {
     // ImGui's background alpha is a multiplier on the theme's window colour.
     let style = ctx.style_of(ctx.theme());
@@ -534,6 +537,28 @@ fn draw_diagnostics_window(
                     .text("Snow sparkle")
                     .fixed_decimals(2),
             );
+
+            separator_text(ui, "Vegetation");
+            ui.checkbox(&mut settings.vegetation_enabled, "Trees, shrubs and flowers");
+            ui.checkbox(&mut settings.vegetation_shadows, "Plant shadows");
+            ui.add(
+                egui::Slider::new(&mut settings.vegetation_detail, 0.4..=2.5)
+                    .text("Plant detail distance")
+                    .fixed_decimals(2),
+            );
+            match vegetation {
+                Some(field) if field.enabled() => {
+                    ui.label(format!(
+                        "{} plants in {} chunks, {} levels generating",
+                        field.plant_count(),
+                        field.chunk_count(),
+                        field.pending_count()
+                    ));
+                }
+                _ => {
+                    ui.label("Scatter disabled (--no-vegetation) or library missing");
+                }
+            }
 
             separator_text(ui, "Terrain textures");
             ui.add(

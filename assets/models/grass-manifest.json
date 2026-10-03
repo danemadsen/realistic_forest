@@ -4,11 +4,11 @@
   "modifications": "Separate variants; bake orientation/scale; remove display translations; move mesh base to Y=0; share external textures; BLEND to MASK at 0.5.",
   "materials": [
     {
-      "name": "grass-pack-2",
+      "name": "grass",
       "textures": {
-        "base-color": "textures/grass/grass-pack-2-base-color.png",
-        "orm": "textures/grass/grass-pack-2-orm.png",
-        "normal": "textures/grass/grass-pack-2-normal.png"
+        "base-color": "textures/grass/grass-base-color.png",
+        "orm": "textures/grass/grass-orm.png",
+        "normal": "textures/grass/grass-normal.png"
       },
       "normal_scale": 0.7212925562608193,
       "alpha_cutoff": 0.5
@@ -16,12 +16,12 @@
   ],
   "models": [
     {
-      "file": "models/grass-pack-2-large-1.glb",
-      "name": "grass-pack-2-large-1",
+      "file": "models/grass-large-1.glb",
+      "name": "grass-large-1",
       "source_pack": 2,
       "source_mesh": 0,
       "source_name": "Grass large 1",
-      "material": "grass-pack-2",
+      "material": "grass",
       "vertices": 24,
       "triangles": 12,
       "bounds": {
@@ -40,12 +40,12 @@
       "radius": 0.4730669
     },
     {
-      "file": "models/grass-pack-2-large-2.glb",
-      "name": "grass-pack-2-large-2",
+      "file": "models/grass-large-2.glb",
+      "name": "grass-large-2",
       "source_pack": 2,
       "source_mesh": 1,
       "source_name": "Grass large 2",
-      "material": "grass-pack-2",
+      "material": "grass",
       "vertices": 24,
       "triangles": 12,
       "bounds": {
@@ -64,12 +64,12 @@
       "radius": 0.4568918
     },
     {
-      "file": "models/grass-pack-2-large-3.glb",
-      "name": "grass-pack-2-large-3",
+      "file": "models/grass-large-3.glb",
+      "name": "grass-large-3",
       "source_pack": 2,
       "source_mesh": 2,
       "source_name": "Grass large 3",
-      "material": "grass-pack-2",
+      "material": "grass",
       "vertices": 36,
       "triangles": 18,
       "bounds": {
@@ -88,12 +88,12 @@
       "radius": 0.4752447
     },
     {
-      "file": "models/grass-pack-2-medium-1.glb",
-      "name": "grass-pack-2-medium-1",
+      "file": "models/grass-medium-1.glb",
+      "name": "grass-medium-1",
       "source_pack": 2,
       "source_mesh": 3,
       "source_name": "Grass medium 1",
-      "material": "grass-pack-2",
+      "material": "grass",
       "vertices": 16,
       "triangles": 8,
       "bounds": {
@@ -112,12 +112,12 @@
       "radius": 0.2115609
     },
     {
-      "file": "models/grass-pack-2-medium-2.glb",
-      "name": "grass-pack-2-medium-2",
+      "file": "models/grass-medium-2.glb",
+      "name": "grass-medium-2",
       "source_pack": 2,
       "source_mesh": 4,
       "source_name": "Grass medium 2",
-      "material": "grass-pack-2",
+      "material": "grass",
       "vertices": 20,
       "triangles": 10,
       "bounds": {
@@ -136,12 +136,12 @@
       "radius": 0.1949167
     },
     {
-      "file": "models/grass-pack-2-medium-3.glb",
-      "name": "grass-pack-2-medium-3",
+      "file": "models/grass-medium-3.glb",
+      "name": "grass-medium-3",
       "source_pack": 2,
       "source_mesh": 5,
       "source_name": "Grass medium 3",
-      "material": "grass-pack-2",
+      "material": "grass",
       "vertices": 24,
       "triangles": 12,
       "bounds": {
@@ -160,12 +160,12 @@
       "radius": 0.198268
     },
     {
-      "file": "models/grass-pack-2-small-1.glb",
-      "name": "grass-pack-2-small-1",
+      "file": "models/grass-small-1.glb",
+      "name": "grass-small-1",
       "source_pack": 2,
       "source_mesh": 6,
       "source_name": "Grass small 1",
-      "material": "grass-pack-2",
+      "material": "grass",
       "vertices": 12,
       "triangles": 6,
       "bounds": {
@@ -184,12 +184,12 @@
       "radius": 0.1609067
     },
     {
-      "file": "models/grass-pack-2-small-2.glb",
-      "name": "grass-pack-2-small-2",
+      "file": "models/grass-small-2.glb",
+      "name": "grass-small-2",
       "source_pack": 2,
       "source_mesh": 7,
       "source_name": "Grass small 2",
-      "material": "grass-pack-2",
+      "material": "grass",
       "vertices": 12,
       "triangles": 6,
       "bounds": {
@@ -208,12 +208,12 @@
       "radius": 0.1703013
     },
     {
-      "file": "models/grass-pack-2-small-3.glb",
-      "name": "grass-pack-2-small-3",
+      "file": "models/grass-small-3.glb",
+      "name": "grass-small-3",
       "source_pack": 2,
       "source_mesh": 8,
       "source_name": "Grass small 3",
-      "material": "grass-pack-2",
+      "material": "grass",
       "vertices": 16,
       "triangles": 8,
       "bounds": {

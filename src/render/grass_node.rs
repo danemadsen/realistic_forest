@@ -192,13 +192,12 @@ fn prepare_grass(
             anisotropy_clamp: 8,
             ..Default::default()
         });
-    // Keep both source packs in the reusable asset library; pack 2 supplies
-    // the active nine short models for this dense meadow.
+    // The nine short grass models supply this dense meadow.
     let active_models: Vec<_> = assets
         .0
         .models
         .iter()
-        .filter(|model| model.name.starts_with("grass-pack-2-"))
+        .filter(|model| model.name.starts_with("grass-"))
         .collect();
     let textures: Vec<_> = assets
         .0

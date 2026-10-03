@@ -219,6 +219,12 @@ pub struct AppSettings {
     pub exposure: f32,
     /// Loudness of thunder, 0 silent to 1 full.
     pub thunder_volume: f32,
+    /// Draw the scattered trees, shrubs and flowers.
+    pub vegetation_enabled: bool,
+    /// Multiplies every plant LOD switch distance (1 = default detail).
+    pub vegetation_detail: f32,
+    /// Plants cast sun (and moon) shadows through cascaded shadow maps.
+    pub vegetation_shadows: bool,
 }
 
 impl Default for AppSettings {
@@ -263,6 +269,9 @@ impl Default for AppSettings {
             // protects highlights.
             exposure: 1.0,
             thunder_volume: 0.8,
+            vegetation_enabled: true,
+            vegetation_detail: 1.0,
+            vegetation_shadows: true,
         }
     }
 }

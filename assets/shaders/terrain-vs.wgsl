@@ -118,6 +118,14 @@ struct StageUniforms {
 @group(1) @binding(4) var tex4: texture_2d<f32>;   // texture4: Raylib square-gradient tile blend mask.
 @group(1) @binding(12) var tex4_sampler: sampler;  // linear on the Rust side
 
+// BEGIN SHARED TERRAIN HEIGHT
+// The streamed landform: base noise relief plus the four-pass erosion delta,
+// faded with distance from the player. terrain-vs.wgsl draws the clipmap and
+// the lighting heightfield from it, and vegetation-cull.wgsl seats every
+// plant's root on it; a test keeps the pasted copies identical, so a trunk
+// stands exactly on the ground the terrain pass draws. Requires StageUniforms
+// as `stage` and the base noise, surface atlas, tile lookup and blend mask as
+// tex0, tex1, tex3 and tex4 with their samplers.
 fn smoothHermite(edge0: f32, edge1: f32, value: f32) -> f32
 {
     let t = clamp((value - edge0)/max(edge1 - edge0, 0.0001), 0.0, 1.0);
@@ -367,6 +375,7 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
     // stays well inside the region where every required lookup record exists.
     return baseHeight(worldXZ) + erosionDelta(worldXZ)*erosionVisibility(worldXZ);
 }
+// END SHARED TERRAIN HEIGHT
 
 // The clipmap mesh stores planar grid coordinates in vertexPosition.xz.
 // uClipOrigin is the world-space centre of the current clipmap level and

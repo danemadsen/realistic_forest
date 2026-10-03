@@ -38,6 +38,9 @@ use bevy::prelude::Resource;
 /// `--measure-overlap [--overlap-tile x,z]` simulates one adjacent tile pair,
 /// prints the per-metre height disagreement across their shared overlap as
 /// CSV, and exits — the seam regression check for the erosion boundaries.
+/// `--no-vegetation` skips the plant library and scatter; `--vegetation-map
+/// path [--map-centre x,z] [--map-extent m]` renders the scatter from above,
+/// prints its statistics and exits.
 /// A discharge requested on the command line, see the module docs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ForcedLightning {
@@ -58,6 +61,13 @@ pub struct AutomationSettings {
     pub shot_path: Option<String>,
     pub wait_frames: i32,
     pub probe: bool,
+    /// `--vegetation-map path.png`: chart the plant scatter and exit.
+    pub vegetation_map: Option<String>,
+    /// `--map-centre x,z` and `--map-extent metres` frame that chart.
+    pub map_centre: [f64; 2],
+    pub map_extent: f64,
+    /// `--no-vegetation`: scatter and draw no plants, to price them.
+    pub no_vegetation: bool,
     pub width: i32,
     pub height: i32,
     pub probe_extent: f32,
@@ -100,6 +110,10 @@ impl Default for AutomationSettings {
             shot_path: None,
             wait_frames: 600,
             probe: false,
+            vegetation_map: None,
+            map_centre: [0.0, 0.0],
+            map_extent: 1024.0,
+            no_vegetation: false,
             width: 1600,
             height: 900,
             probe_extent: 4096.0,
@@ -229,6 +243,30 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                 }
             }
             "--probe" => automation.probe = true,
+            "--no-vegetation" => automation.no_vegetation = true,
+            "--vegetation-map" => {
+                if let Some(next) = next {
+                    index += 1;
+                    automation.vegetation_map = Some(next.clone());
+                }
+            }
+            "--map-centre" | "--map-center" => {
+                if let Some(next) = next {
+                    index += 1;
+                    match parse_floats(next, 2) {
+                        Some(v) => automation.map_centre = [v[0] as f64, v[1] as f64],
+                        None => println!("WARNING: {flag} expects x,z"),
+                    }
+                }
+            }
+            "--map-extent" => {
+                if let Some(next) = next {
+                    index += 1;
+                    if let Ok(value) = next.parse::<f64>() {
+                        automation.map_extent = value.clamp(16.0, 16384.0);
+                    }
+                }
+            }
             "--measure-overlap" => automation.measure_overlap = true,
             "--overlap-tile" => {
                 if let Some(next) = next {

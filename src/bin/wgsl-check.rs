@@ -63,6 +63,17 @@ fn main() {
                 EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_particle".into() },
                 EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_particle".into() },
             ]
+        } else if path.file_name().is_some_and(|name| name == "vegetation-cull.wgsl") {
+            vec![EntryPoint { stage: naga::ShaderStage::Compute, name: "cull_plants".into() }]
+        } else if path.file_name().is_some_and(|name| name == "vegetation.wgsl") {
+            vec![
+                EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_main".into() },
+                EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_main".into() },
+                EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_shadow".into() },
+                EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_shadow".into() },
+                EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_canopy".into() },
+                EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_canopy".into() },
+            ]
         } else if path.file_name().is_some_and(|name| name == "lightning.wgsl") {
             vec![
                 EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_blit".into() },

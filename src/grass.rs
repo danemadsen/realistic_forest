@@ -84,7 +84,8 @@ pub struct SharedGrassAssets(pub Arc<GrassAssets>);
 
 impl GrassAssets {
     /// Load the extracted, normalized single-primitive GLBs in stable name order.
-    /// Restricting discovery to pack 2 excludes archived or unrelated assets.
+    /// Restricting discovery to the `grass-` prefix excludes the trees, bushes,
+    /// rocks and other models that share the directory.
     pub fn load(models_directory: impl AsRef<Path>) -> Result<Self, String> {
         let directory = models_directory.as_ref();
         let mut paths = std::fs::read_dir(directory)
@@ -97,7 +98,7 @@ impl GrassAssets {
                 && path
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("grass-pack-2-"))
+                    .is_some_and(|name| name.starts_with("grass-"))
         });
         paths.sort();
         if paths.is_empty() {
@@ -308,7 +309,7 @@ fn load_texture(
     })
 }
 
-fn generate_tangents(
+pub(crate) fn generate_tangents(
     positions: &[[f32; 3]],
     normals: &[[f32; 3]],
     uvs: &[[f32; 2]],
@@ -608,7 +609,7 @@ fn select_model(key: u64, model_count: usize, layer: u32) -> usize {
     if model_count != 9 {
         return (mix64(key ^ 0x678a_d119_af77) % model_count as u64) as usize;
     }
-    // Grass pack 2's sorted order is large, medium, small (three variants
+    // The grass models' sorted order is large, medium, small (three variants
     // each). Larger clumps make the sparse far field legible; root-level
     // carpet favours short groups so the foreground still looks like a meadow.
     let choice = random(key, 11);
