@@ -550,8 +550,8 @@ fn build_library(
                 add_draws(&mut draws, lod_index, lod);
         }
         let last = model.lods.len().min(LOD_SLOTS as usize).saturating_sub(1);
-        for cascade in 0..(profile.shadow_cascades as usize).min(SHADOW_CASCADES) {
-            let Some(lod) = model.lods.get(SHADOW_LOD[cascade].min(last)) else {
+        for (cascade, &shadow_lod) in SHADOW_LOD.iter().enumerate().take(profile.shadow_cascades as usize) {
+            let Some(lod) = model.lods.get(shadow_lod.min(last)) else {
                 break;
             };
             (model_params.shadow_word[cascade], model_params.shadow_count[cascade]) =

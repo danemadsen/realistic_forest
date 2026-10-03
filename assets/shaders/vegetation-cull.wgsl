@@ -426,6 +426,9 @@ const EDGE_FADE_BAND: f32 = 0.12;
 const ARGS_WORDS: u32 = 5u;
 /// Output regions before the first shadow cascade's: one per LOD.
 const LOD_SLOTS: u32 = 4u;
+/// Least grass suitability a small plant roots in, from the habitat capture;
+/// the grass's own clumps take root from 0.02.
+const SMALL_PLANT_ROOT: f32 = 0.06;
 
 fn sphereVisible(centre: vec3<f32>, radius: f32) -> bool {
     for (var i = 0; i < 4; i++) {
@@ -537,7 +540,9 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
         if (any(uv < vec2<f32>(0.02)) || any(uv > vec2<f32>(0.98))) {
             return;
         }
-        if (habitatAllowed(xz) < 0.25) {
+        // Wherever the grass itself would root: turf, even with soil showing
+        // through it, never sand, rock, gravel, snow, a furrow or a cliff.
+        if (habitatAllowed(xz) < SMALL_PLANT_ROOT) {
             return;
         }
         let footprint = max(0.12, model.crown_radius * plant.scale * 0.5);
@@ -545,7 +550,7 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
                              habitatAllowed(xz - vec2<f32>(footprint, 0.0))),
                          min(habitatAllowed(xz + vec2<f32>(0.0, footprint)),
                              habitatAllowed(xz - vec2<f32>(0.0, footprint))));
-        if (around < 0.1) {
+        if (around < 0.5 * SMALL_PLANT_ROOT) {
             return;
         }
         ground = textureSampleLevel(habitat, habitat_sampler, uv, 0.0).r - 0.02;

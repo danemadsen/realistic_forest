@@ -7,11 +7,11 @@
 //! eroded surface and drops the few that land in a channel (see
 //! vegetation-cull.wgsl). The fields are deliberately smooth at the scale of
 //! a stand and only add small-scale noise where nature does (glades, thicket
-//! patches, lavender drifts), so neighbouring plants see nearly the same
-//! environment and plant communities form patches instead of confetti.
+//! patches, the lavender's abundance), so neighbouring plants see nearly the
+//! same environment and plant communities form patches instead of confetti.
 
 use crate::constants::SEA_LEVEL;
-use crate::noise::{NoiseField, base_height};
+use crate::noise::{NoiseField, base_height, grass_line_height};
 
 // ---------------------------------------------------------------------------
 // Hashing and noise
@@ -123,7 +123,21 @@ pub struct Site {
     pub hollow: f32,
     /// Mean height of a 90 m ring minus the point: + in valleys, - on ridges.
     pub valley: f32,
+    /// The terrain shader's grass line height here, metres above sea level:
+    /// turf takes over from the beach's sand where it passes `TURF_LINE`.
+    pub turf: f32,
+    /// Horizontal distance down the fall line to the sea, metres;
+    /// `SHORE_SEARCH` where the sea is not that close (or the point is high).
+    pub shore: f32,
 }
+
+/// Where the terrain shader's turf dominates the beach's sand: its grass
+/// line height (`Site::turf`) at which the grass habitat admits roots.
+pub const TURF_LINE: f32 = 3.4;
+/// How far down the fall line a point looks for the sea, metres, and the
+/// highest ground that looks at all.
+pub const SHORE_SEARCH: f32 = 150.0;
+const SHORE_HEIGHT: f32 = 20.0;
 
 /// Bilinear base-height grids around one scatter region. The landform is
 /// expensive (a dozen noise fetches per height); every candidate of every
@@ -131,6 +145,8 @@ pub struct Site {
 pub struct SiteSampler {
     fine: HeightGrid,
     coarse: HeightGrid,
+    /// The terrain shader's grass line height on the fine lattice.
+    turf: HeightGrid,
 }
 
 struct HeightGrid {
@@ -190,20 +206,31 @@ impl SiteSampler {
     /// Grids covering every point a caller will ask about, plus the stencils.
     pub fn new(noise: &NoiseField, minimum: [f64; 2], maximum: [f64; 2]) -> Self {
         let fine_margin = HOLLOW_RADIUS + 8.0;
-        let coarse_margin = VALLEY_RADIUS + 16.0;
+        let coarse_margin = VALLEY_RADIUS.max(SHORE_SEARCH as f64) + 16.0;
+        let fine = HeightGrid::build(
+            noise,
+            [minimum[0] - fine_margin, minimum[1] - fine_margin],
+            [maximum[0] + fine_margin, maximum[1] + fine_margin],
+            4.0,
+        );
+        let mut turf = HeightGrid {
+            heights: Vec::with_capacity(fine.heights.len()),
+            ..fine
+        };
+        for (index, &height) in fine.heights.iter().enumerate() {
+            let x = fine.origin[0] + (index % fine.width) as f64 * fine.spacing;
+            let z = fine.origin[1] + (index / fine.width) as f64 * fine.spacing;
+            turf.heights.push(grass_line_height(noise, x as f32, z as f32, height));
+        }
         Self {
-            fine: HeightGrid::build(
-                noise,
-                [minimum[0] - fine_margin, minimum[1] - fine_margin],
-                [maximum[0] + fine_margin, maximum[1] + fine_margin],
-                4.0,
-            ),
+            fine,
             coarse: HeightGrid::build(
                 noise,
                 [minimum[0] - coarse_margin, minimum[1] - coarse_margin],
                 [maximum[0] + coarse_margin, maximum[1] + coarse_margin],
                 16.0,
             ),
+            turf,
         }
     }
 
@@ -237,7 +264,36 @@ impl SiteSampler {
             insolation,
             hollow: ring(&self.fine, HOLLOW_RADIUS) - height,
             valley: ring(&self.coarse, VALLEY_RADIUS) - self.coarse.sample(x, z),
+            turf: self.turf.sample(x, z) - SEA_LEVEL,
+            shore: self.shore_distance(x, z, height - SEA_LEVEL),
         }
+    }
+
+    /// Walks down the coarse fall line, which ignores the small bumps that
+    /// would turn a local gradient inland, until the ground drops below the
+    /// sea; low ground that drains to a hollow instead is no shore.
+    fn shore_distance(&self, x: f64, z: f64, height: f32) -> f32 {
+        if height > SHORE_HEIGHT {
+            return SHORE_SEARCH;
+        }
+        let step = 16.0;
+        let gx = self.coarse.sample(x + step, z) - self.coarse.sample(x - step, z);
+        let gz = self.coarse.sample(x, z + step) - self.coarse.sample(x, z - step);
+        let fall = gx.hypot(gz);
+        if fall < 1e-4 {
+            return SHORE_SEARCH;
+        }
+        let (dx, dz) = ((-gx / fall) as f64, (-gz / fall) as f64);
+        let mut previous = (0.0f32, height);
+        for distance in [6.0f32, 12.0, 20.0, 30.0, 44.0, 62.0, 84.0, 110.0, SHORE_SEARCH] {
+            let below = self.coarse.sample(x + dx * distance as f64, z + dz * distance as f64) - SEA_LEVEL;
+            if below <= 0.0 {
+                let (near, above) = previous;
+                return near + (distance - near) * (above / (above - below).max(1e-3)).clamp(0.0, 1.0);
+            }
+            previous = (distance, below);
+        }
+        SHORE_SEARCH
     }
 }
 
@@ -264,8 +320,10 @@ mod seed {
     pub const THICKET: u32 = 61;
     pub const LILAC: u32 = 62;
     pub const HERB: u32 = 71;
+    pub const SHORE: u32 = 72;
     pub const LAVENDER: u32 = 81;
     pub const LAVENDER_DETAIL: u32 = 82;
+    pub const LAVENDER_PATCH: u32 = 83;
 }
 
 /// Everything the scatter needs to know about a point.
@@ -299,15 +357,27 @@ pub struct Habitat {
     pub shrubs: f32,
     /// Probability a shrub is a lilac rather than a common bush.
     pub lilac: f32,
-    /// Broadleaf herbs per square metre.
+    /// Broadleaf plants per square metre: colonies lining the shore.
     pub herbs: f32,
-    /// Lavender clumps per square metre.
+    /// Lavender tufts per square metre, after the scatter's spacing.
     pub lavender: f32,
 }
 
 /// Centre of the pine stands' threshold on their history field. Raising it
 /// shrinks and thins the pine stands; it sets the fir to pine ratio.
 pub const PINE_THRESHOLD: f32 = 0.612;
+
+/// Broadleaf plants per square metre at the heart of a shore colony, about
+/// one every four square metres.
+const SHORE_HERB_PEAK: f32 = 0.25;
+
+/// Lavender tufts per square metre where the abundance is fullest (the
+/// tufts' spacing caps it near one every two square metres); the abundance
+/// at which it gets there; and how steeply the density falls away below it
+/// (each 0.1 of abundance halves it).
+const LAVENDER_PEAK: f32 = 0.6;
+const LAVENDER_FULL: f32 = 0.58;
+const LAVENDER_SPREAD: f32 = 7.0;
 
 /// Rough limit of tree growth above sea level, before regional and aspect
 /// variation. The terrain shader thins turf into alpine rubble from 80 m and
@@ -327,9 +397,10 @@ pub fn habitat(sampler: &SiteSampler, x: f64, z: f64) -> Habitat {
     habitat_at(site, [x, z])
 }
 
-/// Ground lower than this above the sea carries nothing: the waterline,
-/// wave wash and the beach.
-const DRY_LAND: f32 = 2.5;
+/// Ground lower than this above the sea carries nothing: the waterline and
+/// the wave wash. Beaches are left to the grass habitat, which keeps every
+/// small plant on turf, and to the coastal fields below.
+const DRY_LAND: f32 = 1.5;
 
 pub fn habitat_at(site: Site, p: [f64; 2]) -> Habitat {
     let h = site.height;
@@ -444,24 +515,39 @@ pub fn habitat_at(site: Site, p: [f64; 2]) -> Habitat {
         - 0.15 * smoothstep(40.0, 80.0, h))
         * (0.4 + 1.2 * smoothstep(0.35, 0.75, noise(q, 220.0, seed::LILAC)));
 
-    // Broadleaf herbs carpet moist, shaded forest floor in clonal patches.
-    let herb_patch = smoothstep(0.50, 0.68, noise2(q, 55.0, seed::HERB));
-    let herbs = 0.45 * herb_patch * forest * smoothstep(0.35, 0.75, moisture)
-        + 0.08 * herb_patch * edge;
+    // Broadleaf plants: the herbs of the backshore, in the strip of turf the
+    // beach gives way to. The strip follows the terrain shader's own grass
+    // line, so it starts where the sand ends on wide beaches and in narrow
+    // coves alike, and runs some 25 m inland on any slope (its height span
+    // is the slope times that width), its inland side wandering. Across it,
+    // a few pioneers stand at the sand's edge, the plants thicken a few
+    // metres in and thin out into the meadow; along it they gather in loose
+    // colonies with open turf between, and the scatter keeps them apart.
+    let width = (site.steepness * 26.0).clamp(0.7, 8.0);
+    let reach = width * (0.85 + 0.5 * (noise(q, 90.0, seed::SHORE) - 0.5));
+    let across = (site.turf - TURF_LINE) / reach;
+    let strip = smoothstep(-0.12, 0.35, across) * (1.0 - smoothstep(0.55, 1.0, across));
+    let near_sea = 1.0 - smoothstep(0.6 * SHORE_SEARCH, SHORE_SEARCH, site.shore);
+    let colony = smoothstep(0.38, 0.64, noise2(q, 40.0, seed::HERB));
+    let herbs = SHORE_HERB_PEAK * strip * near_sea * (0.15 + 0.85 * colony) * (1.0 - 0.8 * forest);
 
-    // Lavender: drifts in sunny, dry, well-drained clearings below the
-    // subalpine belt.
-    let drift = smoothstep(0.56, 0.66, noise2(q, 80.0, seed::LAVENDER));
-    let texture = 0.55 + 0.45 * smoothstep(0.30, 0.70, noise(q, 11.0, seed::LAVENDER_DETAIL));
-    let lavender = 1.25
-        * (1.0 - forest).powi(2)
-        * drift
-        * texture
+    // Lavender: single tufts through sunny, dry, well-drained open ground
+    // below the subalpine belt, kept apart by the scatter. How many varies
+    // smoothly and widely, as wild lavender does: a regional, a stand and a
+    // patch scale combine into a log-normal abundance, from a tuft every
+    // hundred square metres or so to one every two or three, so no clearing
+    // is quite like the next and none is a solid carpet.
+    let sunny_open = (1.0 - forest).powi(2)
         * smoothstep(-0.20, 0.12, site.insolation)
         * (1.0 - smoothstep(0.55, 0.85, moisture))
         * (1.0 - smoothstep(55.0, 80.0, h))
         * smoothstep(5.0, 10.0, h)
         * (1.0 - smoothstep(0.30, 0.55, site.steepness));
+    let abundance = 0.50 * noise(q, 260.0, seed::LAVENDER)
+        + 0.32 * noise(q, 70.0, seed::LAVENDER_PATCH)
+        + 0.18 * noise(q, 18.0, seed::LAVENDER_DETAIL);
+    let lavender =
+        LAVENDER_PEAK * sunny_open * (LAVENDER_SPREAD * (abundance - LAVENDER_FULL)).exp().min(1.0);
 
     Habitat {
         site,

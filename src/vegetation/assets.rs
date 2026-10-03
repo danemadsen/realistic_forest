@@ -344,7 +344,7 @@ impl Loader {
                     || normals.len() != positions.len()
                     || uvs.len() != positions.len()
                     || indices.is_empty()
-                    || indices.len() % 3 != 0
+                    || !indices.len().is_multiple_of(3)
                     || indices.iter().any(|&i| i as usize >= positions.len())
                 {
                     return Err("invalid vertex or triangle data".into());
@@ -880,15 +880,15 @@ fn downsample_linear(level: &Level) -> Level {
             for sy in y0..y1 {
                 for sx in x0..x1 {
                     let offset = ((sy * level.width + sx) * 4) as usize;
-                    for channel in 0..4 {
-                        sum[channel] += level.rgba[offset + channel] as u32;
+                    for (total, &value) in sum.iter_mut().zip(&level.rgba[offset..offset + 4]) {
+                        *total += value as u32;
                     }
                     count += 1;
                 }
             }
             let offset = ((y * width + x) * 4) as usize;
-            for channel in 0..4 {
-                rgba[offset + channel] = ((sum[channel] + count / 2) / count) as u8;
+            for (texel, total) in rgba[offset..offset + 4].iter_mut().zip(sum) {
+                *texel = ((total + count / 2) / count) as u8;
             }
         }
     }

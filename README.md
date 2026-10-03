@@ -376,26 +376,38 @@ smooth fields describe the forest:
 - **Lilac and common bushes** form a thin understory, dense belts along the
   forest edge and thickets in clearings. They outnumber oak and maple and are
   far fewer than the conifers.
-- **Broadleaf plants** carpet moist, shaded forest floor in clonal patches.
-- **Lavender** grows in drifts in sunny, dry, well-drained clearings.
+- **Broadleaf plants** grow along the shore, in the strip of turf where the
+  beach's sand gives way to vegetation: knee-high plants, never touching, in
+  loose colonies with open turf between. A few pioneers stand at the sand's
+  edge; the plants are thickest a few metres in and thin out into the
+  meadow. The strip follows the terrain shader's own wandering grass line
+  and runs some 25 metres inland on gentle and steep coasts alike, wherever
+  the sea lies close down the fall line.
+- **Lavender** is scattered as single tufts, 0.6 to 0.95 m tall, through
+  sunny, dry, well-drained open ground, never touching, at a density that
+  varies smoothly and widely across a regional, a stand and a patch scale:
+  from a tuft every hundred square metres or so to one every two or three
+  (about one every five in a typical lowland clearing), so clearings range
+  from a few flowers to purple swathes without any becoming a solid carpet.
 
-Plants are placed in layers, each a Matérn hard-core point process, the model
-forest ecology uses for competition between trees. Candidates are thinned by
-the local stocking, and a survivor keeps its place only if no taller candidate
-stands within the sum of their crown reaches. Closed forest comes out evenly
-spaced at about 190 stems per hectare (one tree per 52 m²), while open
-woodland keeps a clumpier pattern. Saplings and poles fill the gaps along
-edges and in open stands, then shrubs grow around the trees, and herbs and
-lavender fill what remains of the ground. Height grows with the stand's age
+Plants are placed in layers. The trees, shrubs, shore plants and lavender
+each form a Matérn hard-core point process, the model forest ecology uses for
+competition between trees: candidates are thinned by the local density, and
+a survivor keeps its place only if no stronger candidate stands within the
+sum of their crown reaches. Closed forest comes out evenly spaced at about
+190 stems per hectare (one tree per 52 m²), while open woodland keeps a
+clumpier pattern. Saplings and poles fill the gaps along edges and in open
+stands, then shrubs grow around the trees, and the broadleaf plants and
+lavender take what remains of the ground. Height grows with the stand's age
 and vigour, so old stands are tall and the trees shrink toward the treeline,
 the coast and thin soil. Each tree picks its size class and model from that
 height and gets its own scale, rotation, lean and tint.
 
-Chunks are generated at three detail levels: trees out to about 2 km, shrubs to
-1 km, and herbs and lavender to 270 m. Each level runs on the async compute
-pool, nearest first, so the forest fills in around the player within a few
-seconds and is not regenerated when the player walks back and forth across a
-boundary.
+Chunks are generated at three detail levels: trees out to about 2 km, shrubs
+to 1 km, and the broadleaf plants and lavender to 270 m. Each level runs on
+the async compute pool, nearest first, so the forest fills in around the
+player within a few seconds and is not regenerated when the player walks back
+and forth across a boundary.
 
 `--vegetation-map path.png` renders the scatter from above without opening a
 window and prints its statistics. `--map-centre x,z` and `--map-extent metres`
@@ -424,9 +436,9 @@ meshes to about 6.5 heights and billboards beyond 23. Every switch
 cross-fades through a screen-door dither, each plant at a slightly different
 distance, so no ring of popping trees follows the camera. Trees are drawn to
 2 km, bushes and lilacs to between 160 and 900 metres depending on their size,
-herbs to 110 m and lavender to 230 m, each dissolving out at its edge. Wind
-from the weather bends every stem from its root, with gusts sweeping across
-the canopy and leaves fluttering at the crown's rim.
+broadleaf plants to 170 m and lavender to 230 m, each dissolving out at its
+edge. Wind from the weather bends every stem from its root, with gusts
+sweeping across the canopy and leaves fluttering at the crown's rim.
 
 Plants are lit by the same composite as the ground, with terrain, cloud and
 volumetric lighting. Foliage shades as one rounded crown rather than a stack
