@@ -7,17 +7,8 @@ on:
   pull_request:
     paths-ignore: ["**/*.md"]
   workflow_dispatch:
-    inputs:
-      bundle_assets:
-        description: Include the assets directory in the archives (about 550 MB each)
-        type: boolean
-        default: false
-  # Called by release.yml, which always bundles the assets.
+  # Called by release.yml.
   workflow_call:
-    inputs:
-      bundle_assets:
-        type: boolean
-        default: false
 
 concurrency:
   group: build-${{ github.ref }}
@@ -78,12 +69,10 @@ jobs:
 
       # The binary finds its shaders and textures in an `assets` folder next to
       # it (or in the working directory), so a runnable archive carries both.
-      # Push and PR builds skip the assets to stay quick; release.yml bundles them.
       - name: Package
         id: package
         shell: bash
         env:
-          BUNDLE_ASSETS: ${{ inputs.bundle_assets }}
           PLATFORM: ${{ matrix.platform }}
           EXE_SUFFIX: ${{ matrix.exe_suffix }}
           ARCHIVE_EXT: ${{ matrix.archive_ext }}
@@ -94,9 +83,7 @@ jobs:
           mkdir -p "dist/${name}"
           cp "target/release/realistic_forest${EXE_SUFFIX}" "dist/${name}/"
           cp README.md "dist/${name}/"
-          if [ "${BUNDLE_ASSETS}" = "true" ]; then
-            cp -R assets "dist/${name}/assets"
-          fi
+          cp -R assets "dist/${name}/assets"
 
           cd dist
           if [ "${ARCHIVE_EXT}" = "zip" ]; then

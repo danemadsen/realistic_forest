@@ -348,7 +348,9 @@ fn main() {
 /// `cargo run`) or the executable's directory (an installed binary), so accept
 /// whichever candidate actually holds the shaders and fall back to bevy's
 /// default. This keeps `./target/release/realistic_forest` working from the
-/// project root the way `./build/forest` does.
+/// project root the way `./build/forest` does, and a packaged build working
+/// from any directory. Every runtime file read under `assets/` goes through
+/// here; a bare `"assets/..."` path only works from the project root.
 fn resolve_asset_root() -> String {
     let candidates = [
         std::env::current_dir().ok().map(|dir| dir.join("assets")),

@@ -34,8 +34,6 @@ jobs:
   build:
     needs: verify
     uses: ./.github/workflows/build.yml
-    with:
-      bundle_assets: true
 
   publish:
     name: publish release
@@ -59,7 +57,7 @@ jobs:
           cat > notes.md <<'EOF'
           ## Running
 
-          Extract the archive and run `realistic_forest` from inside the extracted folder. It loads shaders and textures from the `assets` folder next to it. A Vulkan, Metal or D3D12 capable GPU is required.
+          Extract the archive and run `realistic_forest`. It loads shaders, textures and models from the `assets` folder next to it, so keep the two together. A Vulkan, Metal or D3D12 capable GPU is required.
 
           - **macOS**: the build is not signed. Clear the download quarantine flag once with `xattr -dr com.apple.quarantine <extracted folder>`.
           - **Linux**: needs Vulkan drivers plus the ALSA, udev and X11 or Wayland libraries.

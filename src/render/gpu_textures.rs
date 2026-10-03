@@ -15,7 +15,7 @@ use std::path::PathBuf;
 // ---------------------------------------------------------------------------
 
 fn asset_path(relative: &str) -> PathBuf {
-    std::path::Path::new("assets").join(relative)
+    PathBuf::from(crate::resolve_asset_root()).join(relative)
 }
 
 fn load_image_rgba(path: &PathBuf) -> Option<(Vec<u8>, usize)> {

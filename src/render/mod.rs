@@ -496,8 +496,10 @@ impl Plugin for ForestRenderPlugin {
         // borrowed below.
         water_node::register_water_main_world(app);
 
-        let grass_assets = crate::grass::GrassAssets::load("assets/models")
-            .map(|assets| crate::grass::SharedGrassAssets(std::sync::Arc::new(assets)));
+        let grass_assets = crate::grass::GrassAssets::load(
+            std::path::PathBuf::from(crate::resolve_asset_root()).join("models"),
+        )
+        .map(|assets| crate::grass::SharedGrassAssets(std::sync::Arc::new(assets)));
         if let Err(error) = &grass_assets {
             error!("Grass assets could not be loaded: {error}");
         }
