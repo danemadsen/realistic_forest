@@ -20,6 +20,16 @@ pub struct Player {
     pub flying: bool,
     pub mouse_captured: bool,
     pub mouse_warmup_frames: u32,
+    /// Horizontal velocity of the body over the ground, m/s. On dry land it
+    /// is whatever the player walks; in a river it is what the current and
+    /// the player's footing leave of it.
+    pub velocity: Vec2,
+    /// How deep the water the player stands in is, metres (0 on dry land).
+    pub wading_depth: f32,
+    /// The river's current at the player, m/s, world XZ.
+    pub current: Vec2,
+    /// True while the current has taken the player's feet from under them.
+    pub swept: bool,
 }
 
 impl Default for Player {
@@ -33,6 +43,10 @@ impl Default for Player {
             flying: false,
             mouse_captured: true,
             mouse_warmup_frames: 3,
+            velocity: Vec2::ZERO,
+            wading_depth: 0.0,
+            current: Vec2::ZERO,
+            swept: false,
         }
     }
 }
@@ -135,7 +149,11 @@ pub fn update_player_system(
     }
     let boosted = !ui_wants_input && keys.pressed(KeyCode::ControlLeft);
     let speed = if player.flying { 38.0 } else { 10.0 } * if boosted { 2.5 } else { 1.0 };
+    let walk = Vec2::new(movement.x, movement.z) * speed;
     let mut candidate = player.position + movement * (speed * dt);
+    player.wading_depth = 0.0;
+    player.current = Vec2::ZERO;
+    player.swept = false;
 
     if player.flying {
         let vertical = if !ui_wants_input {
@@ -146,6 +164,30 @@ pub fn update_player_system(
         candidate.y += vertical * speed * dt;
     } else {
         let visibility_center = Vec2::new(player.position.x, player.position.z);
+        // Flowing water: the body moves at the velocity the current's drag
+        // and the player's footing settle on, not at the walking speed.
+        let envelope = erosion
+            .rivers
+            .as_ref()
+            .map_or(crate::rivers::carve::Envelope::NONE, |network| {
+                network.envelope(player.position.x, player.position.z)
+            });
+        let here = erosion::sample_eroded_height(
+            &erosion, &noise, player.position.x, player.position.z,
+            visibility_center.to_array());
+        let depth = if envelope.bank_distance < 0.5 { envelope.water - here } else { 0.0 };
+        if depth > 0.02 {
+            let current = Vec2::from(envelope.velocity);
+            let wading = wade(player.velocity, walk, current, depth, envelope.turbulence, dt);
+            player.velocity = wading.velocity;
+            player.swept = wading.swept;
+            player.wading_depth = depth;
+            player.current = current;
+        } else {
+            player.velocity = walk;
+        }
+        candidate.x = player.position.x + player.velocity.x * dt;
+        candidate.z = player.position.z + player.velocity.y * dt;
         let old_ground = erosion::sample_eroded_height(
             &erosion, &noise, player.position.x, player.position.z,
             visibility_center.to_array());
@@ -156,9 +198,13 @@ pub fn update_player_system(
             candidate.x = player.position.x;
             candidate.z = player.position.z;
         }
-        let ground = erosion::sample_eroded_height(
+        let mut ground = erosion::sample_eroded_height(
             &erosion, &noise, candidate.x, candidate.z,
             visibility_center.to_array()) + EYE_HEIGHT;
+        // Water too deep to stand in floats the player, head out.
+        if depth > EYE_HEIGHT - SWIM_FREEBOARD {
+            ground = ground.max(envelope.water + SWIM_FREEBOARD);
+        }
         if keys.just_pressed(KeyCode::Space)
             && player.position.y <= ground + 0.03
             && !ui_wants_input
@@ -173,6 +219,64 @@ pub fn update_player_system(
         }
     }
     player.position = candidate;
+}
+
+/// How far the eye floats above the water when it is too deep to stand in.
+const SWIM_FREEBOARD: f32 = 0.25;
+
+pub struct Wading {
+    pub velocity: Vec2,
+    /// The current overpowers the player's footing.
+    pub swept: bool,
+}
+
+/// One step of a body standing (or swimming) in flowing water.
+///
+/// The water drags on what of the body it covers, `½ ρ Cd A u²`, with `A`
+/// the legs below the knee and then the hips and torso as it deepens.
+/// Against it the feet hold with at most the friction their weight allows,
+/// and buoyancy takes weight off them, so the deeper the water the less the
+/// footing and the more the drag. While the drag is a small part of the
+/// footing the player stands firm; as it grows the current carries the body
+/// more and more, and once it outweighs the footing it sweeps the player
+/// off their feet. Wading itself is slow: pushing legs through water costs
+/// more the deeper it is, and walking upstream is slower than walking down.
+/// Water too deep to stand in floats the player with the current, swimming
+/// weakly.
+pub fn wade(body: Vec2, walk: Vec2, current: Vec2, depth: f32, turbulence: f32, dt: f32) -> Wading {
+    const MASS: f32 = 75.0;
+    const WATER_DENSITY: f32 = 1000.0;
+    const DRAG_COEFFICIENT: f32 = 1.0;
+    const BODY_VOLUME: f32 = 0.075;
+    let gravity = crate::rivers::network::GRAVITY;
+    let submerged = depth.clamp(0.0, EYE_HEIGHT + 0.1);
+    let area = 0.30 * submerged.min(0.55) + 0.45 * (submerged - 0.55).max(0.0);
+    let speed = current.length();
+    let drag = 0.5 * WATER_DENSITY * DRAG_COEFFICIENT * area * speed * speed;
+    let buoyancy = WATER_DENSITY * gravity * BODY_VOLUME * (submerged / (EYE_HEIGHT + 0.1)).powf(1.3);
+    // Wet, rounded stones under whitewater grip less than a gravel bed.
+    let grip = 0.6 - 0.2 * turbulence.clamp(0.0, 1.0);
+    let footing = grip * (MASS * gravity - buoyancy).max(0.0);
+    let floating = depth > EYE_HEIGHT - SWIM_FREEBOARD;
+    let load = drag / footing.max(1.0);
+    let swept = floating || load > 1.0;
+    // How much of the current the body takes on.
+    let carried = if floating { 1.0 } else { ((load - 0.3) / 1.2).clamp(0.0, 1.0) };
+    // Walking through water: slower the deeper it is, and hardly at all once
+    // the feet are gone.
+    let stride = 1.0 / (1.0 + 2.5 * submerged);
+    let control = if floating {
+        0.12
+    } else if swept {
+        0.25 * stride
+    } else {
+        stride
+    };
+    let target = walk * control + current * carried;
+    // The body follows over a fraction of a second: water is heavy.
+    let response = if swept { 2.5 } else { 6.0 };
+    let velocity = body + (target - body) * (1.0 - (-response * dt).exp());
+    Wading { velocity, swept }
 }
 
 /// Set each frame before update_player runs: true when the diagnostics panel
@@ -197,5 +301,55 @@ pub fn sync_player_camera_transform(
         if let Projection::Perspective(perspective) = &mut *projection {
             perspective.fov = camera.fov_y.to_radians();
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run the wading model until it settles.
+    fn settle(walk: Vec2, current: Vec2, depth: f32) -> Wading {
+        let mut state = Wading { velocity: Vec2::ZERO, swept: false };
+        for _ in 0..600 {
+            state = wade(state.velocity, walk, current, depth, 0.0, 1.0 / 120.0);
+        }
+        state
+    }
+
+    #[test]
+    fn ankle_deep_water_barely_slows_a_walk() {
+        let state = settle(Vec2::new(10.0, 0.0), Vec2::new(0.0, 0.8), 0.12);
+        assert!(state.velocity.x > 7.0, "{:?}", state.velocity);
+        assert!(state.velocity.y.abs() < 0.05, "{:?}", state.velocity);
+        assert!(!state.swept);
+    }
+
+    #[test]
+    fn standing_in_a_gentle_current_holds_but_drifts_nothing() {
+        let state = settle(Vec2::ZERO, Vec2::new(1.0, 0.0), 0.5);
+        assert!(state.velocity.length() < 0.01, "{:?}", state.velocity);
+        assert!(!state.swept);
+    }
+
+    #[test]
+    fn wading_upstream_is_slower_than_downstream() {
+        let current = Vec2::new(1.4, 0.0);
+        let upstream = settle(Vec2::new(-4.0, 0.0), current, 0.7);
+        let downstream = settle(Vec2::new(4.0, 0.0), current, 0.7);
+        assert!(-upstream.velocity.x < downstream.velocity.x, "{:?} {:?}", upstream.velocity, downstream.velocity);
+        assert!(-upstream.velocity.x > 0.5, "the current must not stop a wade upstream");
+    }
+
+    #[test]
+    fn a_strong_waist_deep_current_sweeps_the_player_away() {
+        let state = settle(Vec2::ZERO, Vec2::new(2.5, 0.0), 1.1);
+        assert!(state.swept);
+        assert!(state.velocity.x > 1.0, "{:?}", state.velocity);
+    }
+
+    #[test]
+    fn deep_water_carries_a_swimmer_with_the_current() {
+        let state = settle(Vec2::ZERO, Vec2::new(1.0, 0.5), 2.5);
+        assert!((state.velocity - Vec2::new(1.0, 0.5)).length() < 0.1, "{:?}", state.velocity);
     }
 }

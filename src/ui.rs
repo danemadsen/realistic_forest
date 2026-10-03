@@ -92,6 +92,7 @@ pub fn draw_diagnostics_ui(
     automation: Res<AutomationSettings>,
     mut rerun: ResMut<RerunErosion>,
     vegetation: Option<Res<crate::vegetation::VegetationField>>,
+    rivers: Option<Res<crate::rivers::RiverField>>,
 ) -> Result {
     let Ok(player) = players.single() else {
         return Ok(());
@@ -140,6 +141,7 @@ pub fn draw_diagnostics_ui(
             player,
             &mut rerun,
             vegetation.as_deref(),
+            rivers.as_deref(),
         );
     }
 
@@ -285,6 +287,7 @@ fn draw_diagnostics_window(
     player: &Player,
     rerun: &mut RerunErosion,
     vegetation: Option<&crate::vegetation::VegetationField>,
+    rivers: Option<&crate::rivers::RiverField>,
 ) {
     // ImGui's background alpha is a multiplier on the theme's window colour.
     let style = ctx.style_of(ctx.theme());
@@ -557,6 +560,43 @@ fn draw_diagnostics_window(
                 }
                 _ => {
                     ui.label("Scatter disabled (--no-vegetation) or library missing");
+                }
+            }
+
+            separator_text(ui, "Rivers");
+            ui.checkbox(&mut settings.rivers_visible, "River and waterfall surfaces");
+            match rivers.and_then(|field| field.network()) {
+                Some(network) => {
+                    ui.label(format!(
+                        "{} rivers, {:.1} km of channel, {} falls over 1.5 m, {} rocks (region built in {:.2} s)",
+                        network.rivers.len(),
+                        network.total_length_km(),
+                        network.waterfall_count(),
+                        network.rocks.len(),
+                        network.build_seconds
+                    ));
+                    let here = network.envelope(player.position.x, player.position.z);
+                    if here.is_none() {
+                        ui.label("No river within reach of the player");
+                    } else {
+                        ui.label(format!(
+                            "Nearest channel: {:.1} m wide, water at {:.1} m, {:.1} m past its bank",
+                            here.half_width * 2.0,
+                            here.water,
+                            here.bank_distance
+                        ));
+                    }
+                    if player.wading_depth > 0.0 {
+                        ui.label(format!(
+                            "Wading {:.2} m deep in a {:.2} m/s current{}",
+                            player.wading_depth,
+                            player.current.length(),
+                            if player.swept { ", swept off your feet" } else { "" }
+                        ));
+                    }
+                }
+                None => {
+                    ui.label("Rivers disabled (--no-rivers)");
                 }
             }
 

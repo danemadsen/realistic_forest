@@ -1104,7 +1104,7 @@ fn reflectionDepth(uv: vec2<f32>) -> vec4<f32>
 // texel across the sea: it leaves the analytic sky visible instead. Exponential
 // world-distance steps retain nearby detail while reaching distant headlands.
 fn marchWaterReflection(world_origin: vec3<f32>, world_normal: vec3<f32>,
-                         direction: vec3<f32>, roughness: f32) -> vec4<f32>
+                         direction: vec3<f32>, roughness: f32, surface_level: f32) -> vec4<f32>
 {
     if (globals.raymarch.z < 0.5)
     {
@@ -1174,8 +1174,8 @@ fn marchWaterReflection(world_origin: vec3<f32>, world_normal: vec3<f32>,
                           + vec3<f32>(dot(globals.view[0].xyz, hit.xyz),
                                       dot(globals.view[1].xyz, hit.xyz),
                                       dot(globals.view[2].xyz, hit.xyz));
-            let above_surface = globals.camera_position.y < stage.params.z
-                             || world_hit.y >= stage.params.z - 0.25;
+            let above_surface = globals.camera_position.y < surface_level
+                             || world_hit.y >= surface_level - 0.25;
             if (hit.a >= 0.5 && high > max(0.5, near_step)
                 && depth_error >= 0.0 && depth_error < thickness && above_surface)
             {
@@ -1476,14 +1476,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     let refracted_background = textureSample(scene_texture, scene_sampler, refracted_uv);
     let refracted_packed = textureSample(gbuffer_position, gbuffer_sampler, refracted_uv);
 
-    // Hidden-surface test. The forward pass has no depth attachment, so this
-    // stands in for one: the scene is in front when its view-space z is
-    // greater. The epsilon absorbs the difference between a rasterized water
-    // vertex and the same surface reconstructed from the G-buffer.
-    if (!scene_sky && packed.z > water_view.z + 0.05)
-    {
-        discard;
-    }
+    // Hidden surfaces never get here: the pass depth-tests against the
+    // G-buffer's depth in hardware, ahead of this shader, so there is no
+    // discard to defeat the early test.
 
     // The refracted tap is only trustworthy when it is sky or genuinely behind
     // the water; otherwise it reached over a nearer surface and would smear
@@ -1626,7 +1621,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     let moon_specular = dGGX(max(dot(normal, moon_half), 0.0), alpha)
                       * vSmithGGX(moon_dot_l, n_dot_v, alpha)*moon_dot_l*0.35;
     let terrain_reflection = marchWaterReflection(in.world_position, normal,
-                                                   reflection_direction, alpha);
+                                                   reflection_direction, alpha, stage.params.z);
     let reflected = mix(reflected_sky, terrain_reflection.rgb, terrain_reflection.a);
 
     // A lightning strike is a short-lived local source. Its cool reflection
@@ -1692,5 +1687,472 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
     let fog = integrateAtmosphere(-to_view, view_distance);
     lit = lit*fog.transmittance + fog.scattering;
 
+    return vec4<f32>(pow(acesFilm(lit*globals.params.z), vec3<f32>(1.0/2.2)), 1.0);
+}
+
+// ===========================================================================
+// Rivers and creeks
+// ===========================================================================
+//
+// The same water as the sea, flowing. Each river's surface is a ribbon at
+// its water level (src/rivers/surface.rs) whose vertices carry the current;
+// waterfalls are sheets falling along the jet's parabola. The surface is
+// shaded with the sea's optics (Fresnel, sky and screen-space reflections,
+// Beer-Lambert body and refraction, sun glitter, rain rings, fog) and three
+// things the sea does not have:
+//
+// - Flow-mapped ripples. Two phases of procedural ripple noise are carried
+//   downstream by the local current and cross-faded, so the texture streams
+//   with the water at its own speed, stretched along the flow where it runs
+//   fast and choppy where the bed is rough.
+// - Boulders. Every rock near a point is looked up through the river grid.
+//   Water parts around one that breaks the surface as potential flow around
+//   a cylinder, heaps into a pillow against its upstream face (the
+//   stagnation head, v^2/2g), and leaves a slow, churning, foamy wake. A
+//   rock just under the surface lifts a standing hump, and where the water
+//   pours over it fast enough it breaks into a foaming hole downstream.
+// - Whitewater. Cascades, plunge pools below falls, eddy lines along fast
+//   banks and the wakes above all carry advected foam; the falling sheets
+//   are aerated water, streaked and torn at their edges.
+
+// A boulder as the water sees it. Mirrors `RockObstacle` in
+// src/rivers/carve.rs (16 bytes).
+struct RiverRock
+{
+    position: vec2<f32>,
+    radius: f32,
+    top: f32,
+};
+
+// The river lookup grid (see river-functions.wgslinc for its layout): each
+// cell lists, after its carve segments, the rocks whose wakes reach it.
+@group(2) @binding(1) var<storage, read> river_rocks: array<RiverRock>;
+@group(2) @binding(2) var<storage, read> river_grid: array<u32>;
+
+// The plants' shadow cascades, as the composite reads them, so a creek under
+// the forest lies in the same shade as its banks. Mirrors
+// `VegetationShadows` in composite.wgsl.
+struct VegetationShadows {
+    view_projection: array<mat4x4<f32>, 4>,
+    splits: vec4<f32>,
+    texel: vec4<f32>,
+    light: vec4<f32>,
+    params: vec4<f32>,
+};
+@group(2) @binding(3) var vegetation_shadow_map: texture_depth_2d_array;
+@group(2) @binding(4) var<uniform> vegetation_shadows: VegetationShadows;
+@group(2) @binding(5) var vegetation_shadow_sampler: sampler_comparison;
+
+// Light reaching a water point through the plants: the cascade covering its
+// view depth, with a 2x2 grid of bilinear comparisons (the composite's
+// 4x4 tent is more than a rippling surface needs).
+fn riverPlantShadow(world_position: vec3<f32>, view_depth: f32) -> f32 {
+    if (vegetation_shadows.light.w < 0.5 || view_depth >= vegetation_shadows.splits.w) {
+        return 1.0;
+    }
+    var cascade = 3u;
+    for (var c = 0u; c < 3u; c++) {
+        if (view_depth < vegetation_shadows.splits[c]) {
+            cascade = c;
+            break;
+        }
+    }
+    let texel = vegetation_shadows.texel[cascade];
+    let lookup = world_position + vec3<f32>(0.0, texel*1.5, 0.0) - vegetation_shadows.light.xyz*texel*1.5;
+    let clip = vegetation_shadows.view_projection[cascade]*vec4<f32>(lookup, 1.0);
+    let uv = vec2<f32>(0.5 + 0.5*clip.x, 0.5 - 0.5*clip.y);
+    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || clip.z > 1.0) {
+        return 1.0;
+    }
+    let step = 1.0/vegetation_shadows.params.z;
+    var lit = 0.0;
+    for (var y = 0; y < 2; y++) {
+        for (var x = 0; x < 2; x++) {
+            let offset = vec2<f32>(f32(x) - 0.5, f32(y) - 0.5)*step*1.5;
+            lit += textureSampleCompareLevel(vegetation_shadow_map, vegetation_shadow_sampler,
+                                             uv + offset, i32(cascade), clip.z);
+        }
+    }
+    let far_fade = smoothstepf(vegetation_shadows.splits.w*0.85, vegetation_shadows.splits.w, view_depth);
+    return mix(1.0, mix(lit*0.25, 1.0, far_fade), vegetation_shadows.params.y);
+}
+
+const RIVER_GRAVITY: f32 = 9.81;
+// Clear, slightly green river water: red is absorbed within a couple of
+// metres, the bed shows through a shallow riffle and a pool goes bottle green.
+const RIVER_EXTINCTION: vec3<f32> = vec3<f32>(0.38, 0.12, 0.10);
+const RIVER_SCATTER: vec3<f32> = vec3<f32>(0.030, 0.052, 0.040);
+// Rocks a fragment considers at most.
+const RIVER_MAX_ROCKS: u32 = 24u;
+
+struct RiverVertexOutput
+{
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) world_position: vec3<f32>,
+    @location(1) velocity: vec2<f32>,
+    // x across the channel (-1..1 between the waterlines), y metres along
+    // the river, z thalweg depth, w whitewater.
+    @location(2) channel: vec4<f32>,
+    // x half width, y fall progress (-1 on a flat surface), z fall height
+    // (a plunge's strength on a surface), w the surface's own height.
+    @location(3) sheet: vec4<f32>,
+};
+
+@vertex
+fn vs_river(
+    @location(0) position: vec3<f32>,
+    @location(1) velocity: vec2<f32>,
+    @location(2) across: f32,
+    @location(3) along: f32,
+    @location(4) depth: f32,
+    @location(5) turbulence: f32,
+    @location(6) half_width: f32,
+    @location(7) fall: f32,
+    @location(8) drop: f32,
+) -> RiverVertexOutput
+{
+    // A distant channel is narrower than the clipmap's triangles there,
+    // which round its banks off above the water. Lift a distant surface by
+    // about the bank those triangles leave (their spacing grows with
+    // distance, a metre per 110 m), so a river still shows from a ridge.
+    let flat_distance = length(position.xz - globals.camera_position.xz);
+    let spacing = max(1.0, flat_distance/110.0);
+    let lift = smoothstepf(150.0, 650.0, flat_distance)*min(spacing*0.45, 12.0);
+    let world = vec3<f32>(position.x, position.y + lift, position.z);
+    var out: RiverVertexOutput;
+    out.clip_position = globals.projection*globals.view*vec4<f32>(world, 1.0);
+    out.world_position = world;
+    out.velocity = velocity;
+    out.channel = vec4<f32>(across, along, depth, turbulence);
+    out.sheet = vec4<f32>(half_width, fall, drop, position.y);
+    return out;
+}
+
+// Value noise with its analytic gradient (x value, yz d/dp), quintic.
+fn riverNoise(p: vec2<f32>) -> vec3<f32>
+{
+    let i = floor(p);
+    let f = p - i;
+    let u = f*f*f*(f*(f*6.0 - 15.0) + 10.0);
+    let du = 30.0*f*f*(f*(f - 2.0) + 1.0);
+    let a = hash21(i);
+    let b = hash21(i + vec2<f32>(1.0, 0.0));
+    let c = hash21(i + vec2<f32>(0.0, 1.0));
+    let d = hash21(i + vec2<f32>(1.0, 1.0));
+    let k = a - b - c + d;
+    let value = a + (b - a)*u.x + (c - a)*u.y + k*u.x*u.y;
+    let gradient = du*vec2<f32>(b - a + k*u.y, c - a + k*u.x);
+    return vec3<f32>(value, gradient);
+}
+
+struct RiverFlow
+{
+    velocity: vec2<f32>,
+    // Surface gradient from the humps the rocks raise.
+    slope: vec2<f32>,
+    foam: f32,
+    // Extra roughness: wakes and holes churn the surface.
+    churn: f32,
+};
+
+// What the boulders near a point do to the water there.
+fn riverRockFlow(p: vec2<f32>, base: vec2<f32>, surface: f32) -> RiverFlow
+{
+    var result = RiverFlow(base, vec2<f32>(0.0), 0.0, 0.0);
+    let resolution = river_grid[3];
+    if (resolution == 0u) { return result; }
+    let origin = vec2<f32>(bitcast<f32>(river_grid[0]), bitcast<f32>(river_grid[1]));
+    let cell = floor((p - origin)/bitcast<f32>(river_grid[2]));
+    if (any(cell < vec2<f32>(0.0)) || any(cell >= vec2<f32>(f32(resolution)))) { return result; }
+    let speed = length(base);
+    if (speed < 0.03) { return result; }
+    let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*2u;
+    let offset = river_grid[entry];
+    let packed = river_grid[entry + 1u];
+    let first_rock = offset + (packed & 0xffffu);
+    let rock_count = min(packed >> 16u, RIVER_MAX_ROCKS);
+    let e = base/speed;
+    let n = vec2<f32>(-e.y, e.x);
+    let head = speed*speed/(2.0*RIVER_GRAVITY);
+    var deflection = vec2<f32>(0.0);
+    for (var k = 0u; k < rock_count; k += 1u)
+    {
+        let rock = river_rocks[river_grid[first_rock + k]];
+        let r = p - rock.position;
+        let reach = rock.radius*7.0;
+        if (dot(r, r) > reach*reach) { continue; }
+        let x = dot(r, e);
+        let y = dot(r, n);
+        let emergence = rock.top - surface;
+        if (emergence > 0.0)
+        {
+            // Radius where the rounded block meets the water.
+            let radius = rock.radius*clamp(0.6 + emergence/(rock.radius*0.9), 0.6, 1.0);
+            let r2 = max(x*x + y*y, radius*radius);
+            let ratio = radius*radius/(r2*r2);
+            // Potential flow past a cylinder: the stream parts around the
+            // rock, slows ahead of it and speeds past its flanks.
+            let around = e*(-speed*ratio*(x*x - y*y)) + n*(-speed*2.0*ratio*x*y);
+            // Behind it the flow separates: a slack, churning wake.
+            let wake_width = radius*(1.0 + 0.2*max(x, 0.0)/radius);
+            let wake = select(0.0,
+                              exp(-(y*y)/(wake_width*wake_width))
+                              *exp(-max(x - 0.5*radius, 0.0)/(5.0*radius)),
+                              x > -0.2*radius);
+            deflection += around*(1.0 - wake) - base*wake*0.7;
+            // The pillow against the upstream face, and its gradient.
+            let pillow_centre = vec2<f32>(-1.05*radius, 0.0);
+            let q = vec2<f32>(x, y) - pillow_centre;
+            let spread = 0.45*radius + 0.06;
+            let pillow = head*exp(-dot(q, q)/(spread*spread));
+            let local_slope = -2.0*pillow*q/(spread*spread);
+            result.slope += e*local_slope.x + n*local_slope.y;
+            // Foam where the water piles on the rock, and down its wake.
+            let rim = exp(-pow((sqrt(x*x + y*y) - radius)/(0.15*radius + 0.05), 2.0));
+            result.foam = max(result.foam, rim*smoothstep(0.15, 1.0, speed)*0.85);
+            result.foam = max(result.foam, wake*smoothstep(0.3, 1.4, speed)*0.75);
+            result.churn += wake*smoothstep(0.2, 1.0, speed);
+        }
+        else
+        {
+            // Under the surface: the water rises over the rock in a standing
+            // hump, highest when it only just covers it, and breaks into a
+            // hole behind it once it pours over fast (a Froude number over
+            // about one).
+            let cover = -emergence;
+            let froude = speed*speed/(RIVER_GRAVITY*max(cover, 0.02));
+            let height = min(head, 0.3*rock.radius)*exp(-cover/(0.5*rock.radius + 0.08));
+            let q = vec2<f32>(x - 0.35*rock.radius, y);
+            let spread = 1.1*rock.radius + 0.05;
+            let hump = height*exp(-dot(q, q)/(spread*spread));
+            let local_slope = -2.0*hump*q/(spread*spread);
+            result.slope += e*local_slope.x + n*local_slope.y;
+            let hole_q = vec2<f32>((x - 1.4*rock.radius)/(0.7*rock.radius + 0.05),
+                                   y/(0.9*rock.radius + 0.05));
+            let hole = exp(-dot(hole_q, hole_q))*smoothstep(0.5, 2.5, froude)
+                     *exp(-cover/(rock.radius + 0.1));
+            result.foam = max(result.foam, hole*0.9);
+            result.churn += hole + hump*4.0;
+            // The current speeds over the crest and slackens behind it.
+            deflection += base*(hump/max(cover + 0.1, 0.1) - 0.4*hole);
+        }
+    }
+    result.velocity = base + deflection;
+    return result;
+}
+
+// Ripples carried by the current: (height gradient xz, subpixel slope
+// variance). Two phases of noise advect downstream and cross-fade, each
+// restarting from a fresh offset while invisible.
+fn riverRipples(p: vec2<f32>, velocity: vec2<f32>, time: f32, roughness: f32,
+                footprint: f32) -> vec3<f32>
+{
+    let speed = length(velocity);
+    let e = select(vec2<f32>(1.0, 0.0), velocity/max(speed, 1e-4), speed > 1e-4);
+    let n = vec2<f32>(-e.y, e.x);
+    let period = 1.6;
+    var slope = vec2<f32>(0.0);
+    var unresolved = 0.0;
+    for (var layer = 0u; layer < 2u; layer += 1u)
+    {
+        let cycle_time = time/period + f32(layer)*0.5;
+        let phase = fract(cycle_time);
+        let cycle = floor(cycle_time);
+        let weight = 1.0 - abs(2.0*phase - 1.0);
+        let jitter = vec2<f32>(hash21(vec2<f32>(cycle, f32(layer)*17.3)),
+                               hash21(vec2<f32>(f32(layer)*5.1, cycle)))*31.0;
+        let advected = p - velocity*(phase*period);
+        // Fast water draws its ripples out into streaks along the flow;
+        // riffles and wakes chop them short.
+        let stretch = 1.0 + 1.6*smoothstep(0.4, 2.0, speed)*(1.0 - 0.6*roughness);
+        for (var octave = 0u; octave < 3u; octave += 1u)
+        {
+            let wavelength = select(select(0.85, 0.32, octave == 1u), 0.12, octave == 2u);
+            let amplitude = wavelength*(0.010 + 0.035*roughness + 0.006*min(speed, 3.0))
+                          *select(1.0, 0.8, octave == 2u);
+            let along_scale = wavelength*stretch;
+            let q = vec2<f32>(dot(advected, e)/along_scale, dot(advected, n)/wavelength)
+                  + jitter + vec2<f32>(f32(octave)*7.7);
+            let noise = riverNoise(q);
+            // Filter what the pixel cannot resolve into roughness.
+            let resolved = 1.0 - smoothstepf(wavelength*0.18, wavelength*0.6, footprint);
+            let gradient = e*(noise.y/along_scale) + n*(noise.z/wavelength);
+            slope += gradient*amplitude*weight*resolved;
+            unresolved += pow(amplitude*6.2831853/wavelength, 2.0)*weight*(1.0 - resolved)*0.5;
+        }
+    }
+    return vec3<f32>(slope, unresolved);
+}
+
+// Foam texture streaming with the current, 0..1.
+fn riverFoamPattern(p: vec2<f32>, velocity: vec2<f32>, time: f32, footprint: f32) -> f32
+{
+    let period = 2.2;
+    var pattern = 0.0;
+    for (var layer = 0u; layer < 2u; layer += 1u)
+    {
+        let cycle_time = time/period + f32(layer)*0.5;
+        let phase = fract(cycle_time);
+        let weight = 1.0 - abs(2.0*phase - 1.0);
+        let jitter = vec2<f32>(hash21(vec2<f32>(floor(cycle_time), f32(layer) + 3.0)))*23.0;
+        let q = p - velocity*(phase*period) + jitter;
+        let coarse = mix(valueNoise(q*2.1), 0.5, smoothstepf(0.25, 0.75, footprint*2.1));
+        let bubbles = mix(valueNoise(q*7.3 + vec2<f32>(13.1, 4.7)), 0.5,
+                          smoothstepf(0.25, 0.75, footprint*7.3));
+        pattern += (coarse*0.62 + bubbles*0.38)*weight;
+    }
+    return pattern;
+}
+
+@fragment
+fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
+{
+    let uv = in.clip_position.xy*globals.viewport.zw;
+    let camera_position = globals.camera_position.xyz;
+    let to_camera = camera_position - in.world_position;
+    let view_distance = length(to_camera);
+    let to_view = to_camera/max(view_distance, 1e-3);
+    let time = stage.params.x;
+    let across = in.channel.x;
+    let turbulence = in.channel.w;
+    let half_width = in.sheet.x;
+    let fall = in.sheet.y;
+    let drop = in.sheet.z;
+    let falling = fall >= 0.0;
+    let surface_level = in.sheet.w;
+    // Derivatives first, in uniform control flow.
+    let pixel_dx = dpdx(in.world_position);
+    let pixel_dy = dpdy(in.world_position);
+    let footprint = max(length(pixel_dx.xz), length(pixel_dy.xz));
+    let geometric = normalize(cross(pixel_dx, pixel_dy));
+
+    let precipitation = weatherPrecipitation(in.world_position);
+    let water_view = (globals.view*vec4<f32>(in.world_position, 1.0)).xyz;
+    let packed = reflectionDepth(uv);
+    let scene_sky = packed.a < 0.5;
+    var optical_path = PATH_LENGTH_MAX;
+    if (!scene_sky)
+    {
+        optical_path = min(distance(packed.xyz, water_view), PATH_LENGTH_MAX);
+    }
+
+    let to_sun = normalize(-globals.sun_direction.xyz);
+    let to_moon = normalize(-globals.moon_direction.xyz);
+    let above_water = smoothstepf(-0.08, 0.12, camera_position.y - in.world_position.y);
+
+    // --- The current, the rocks and the surface ------------------------------
+    let flow = riverRockFlow(in.world_position.xz, in.velocity, surface_level);
+    let speed = length(flow.velocity);
+    let roughness = clamp(turbulence*0.8 + flow.churn*0.6 + smoothstepf(0.6, 3.0, speed)*0.25
+                          + drop*0.15, 0.0, 1.0);
+    let ripples = riverRipples(in.world_position.xz, flow.velocity, time, roughness, footprint);
+    let impacts = waterImpacts(in.world_position.xz, globals.storm.z, footprint,
+                               view_distance, precipitation.x, precipitation.y, precipitation.w);
+    let slope = ripples.xy + flow.slope + impacts.slope;
+    var normal = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
+    if (falling)
+    {
+        // A falling sheet: its own facing, rippled by the streaks.
+        let streak = riverNoise(vec2<f32>(across*half_width*5.0, (in.channel.y - time*3.0)*0.7));
+        normal = normalize(geometric + vec3<f32>(streak.y, 0.0, streak.z)*0.08);
+    }
+    if (dot(normal, to_view) < 0.0)
+    {
+        normal = -normal;
+    }
+
+    // --- Refraction and the body of the water ---------------------------------
+    let refracted_uv = clamp(uv + normal.xz*(0.35*clamp(optical_path, 0.0, 1.0)
+                             /max(view_distance, 1.0)), vec2<f32>(0.0), vec2<f32>(1.0));
+    let flat_background = textureSampleLevel(scene_texture, scene_sampler, uv, 0.0).rgb;
+    let refracted_background = textureSampleLevel(scene_texture, scene_sampler, refracted_uv, 0.0).rgb;
+    let refracted_packed = reflectionDepth(refracted_uv);
+    let accept_refraction = refracted_packed.a < 0.5 || refracted_packed.z <= water_view.z;
+    let scene_linear = sceneRadiance(select(flat_background, refracted_background, accept_refraction));
+
+    // Trees shade the water as they shade its banks: by the sun's cascades
+    // by day, the moon's by night.
+    let plant_shadow = riverPlantShadow(in.world_position, -water_view.z);
+    let sun_plants = select(1.0, plant_shadow, vegetation_shadows.light.w < 1.5);
+    let moon_plants = select(1.0, plant_shadow, vegetation_shadows.light.w > 1.5);
+    let sun_visibility = terrainShadow(in.world_position, normal, to_sun)
+                       *cloudShadow(in.world_position, to_sun)*sun_plants;
+    let severity = weatherSeverity(in.world_position.xz);
+    let sun_colour = globals.sun_colour.rgb*globals.settings_a.x
+                     *weatherSunMultiplier(severity)*mix(1.0, 0.11, precipitation.z)*sun_visibility;
+    let moon_colour = vec3<f32>(0.63, 0.74, 1.0)*globals.atmosphere.y
+                      *weatherSunMultiplier(severity)*mix(1.0, 0.42, precipitation.z)*moon_plants;
+    let sky_light = skyAmbient(vec3<f32>(0.0, 1.0, 0.0), in.world_position);
+    // Aerated water scatters far more: whitewater is milky even unfoamed.
+    let aeration = clamp(turbulence*0.6 + flow.churn*0.3 + drop*0.2, 0.0, 1.0);
+    let sigma_t = RIVER_EXTINCTION*(1.0 + 2.0*aeration);
+    let transmittance = exp(-sigma_t*optical_path);
+    let in_scatter = (RIVER_SCATTER*(1.0 + 4.0*aeration))
+                   *(sun_colour*0.08 + moon_colour*0.08 + sky_light*0.35)
+                   *(1.0 - transmittance)/max(sigma_t, vec3<f32>(1e-3));
+    var body = scene_linear*transmittance + in_scatter;
+
+    // --- Reflection and glitter -------------------------------------------
+    let n_dot_v = max(dot(normal, to_view), 0.0);
+    let alpha = clamp(sqrt(pow(mix(0.03, 0.16, roughness), 2.0) + ripples.z
+                           + impacts.slope_variance), 0.02, 1.0);
+    let reflection_direction = reflect(-to_view, normal);
+    let reflected_sky = cloudSkyRadiance(reflection_direction)*mix(0.8, 0.68, precipitation.z);
+    let terrain_reflection = marchWaterReflection(in.world_position, normal,
+                                                  reflection_direction, alpha, surface_level);
+    let reflected = mix(reflected_sky, terrain_reflection.rgb, terrain_reflection.a);
+    let half_vector = normalize(to_sun + to_view);
+    let n_dot_l = max(dot(normal, to_sun), 0.0);
+    let specular = dGGX(max(dot(normal, half_vector), 0.0), alpha)
+                 *vSmithGGX(n_dot_l, n_dot_v, alpha)*n_dot_l*0.35;
+    let moon_half = normalize(to_moon + to_view);
+    let moon_dot_l = max(dot(normal, to_moon), 0.0);
+    let moon_specular = dGGX(max(dot(normal, moon_half), 0.0), alpha)
+                      *vSmithGGX(moon_dot_l, n_dot_v, alpha)*moon_dot_l*0.35;
+    let fresnel = clamp(godotFresnel(n_dot_v, stage.surface.x, stage.surface.y), 0.0, 1.0);
+    var lit = mix(body, reflected, fresnel) + specular*sun_colour + moon_specular*moon_colour;
+
+    // --- Whitewater ---------------------------------------------------------
+    let foam_colour = vec3<f32>(0.90, 0.93, 0.94)
+                    *((sun_colour*max(dot(normal, to_sun), 0.0)
+                       + moon_colour*max(dot(normal, to_moon), 0.0))*0.06
+                      + skyAmbient(normal, in.world_position)*0.8);
+    let pattern = riverFoamPattern(in.world_position.xz, flow.velocity, time, footprint);
+    // Eddy lines along the banks of fast water; cascades; plunge pools.
+    let eddy_line = smoothstepf(0.62, 0.98, abs(across))*smoothstepf(0.7, 2.2, speed)*0.45;
+    let cascade = smoothstepf(0.25, 0.85, turbulence)*0.85;
+    let plunge = smoothstepf(0.05, 0.9, drop)*0.95;
+    let amount = clamp(max(max(cascade, plunge), max(flow.foam, eddy_line))
+                       + 0.06*smoothstepf(0.2, 1.0, speed), 0.0, 1.0);
+    // Foam gathers in patches and streaks the pattern carries downstream.
+    var foam = smoothstepf(1.05 - amount, 1.3 - amount*0.6, pattern)*amount
+             + impacts.splash*0.2 + impacts.snow_fleck*0.06;
+    if (falling)
+    {
+        // The sheet is aerated water falling in strands: they stream down
+        // at the speed of the fall, the sheet is thin and glassy at the lip
+        // and turns white as it breaks up, torn at its edges, and a thin
+        // creek's veil shows the wet rock through it.
+        let world_y = in.world_position.y;
+        let fall_speed = 2.0 + sqrt(2.0*RIVER_GRAVITY*max(drop*fall, 0.05));
+        let strands = valueNoise(vec2<f32>(across*half_width*6.0, world_y*1.4 + time*fall_speed*1.4));
+        let fine = valueNoise(vec2<f32>(across*half_width*17.0 + 3.7, world_y*3.1 + time*fall_speed*3.1));
+        let strand = smoothstepf(0.30, 0.85, strands*0.65 + fine*0.35);
+        let edge = 1.0 - smoothstepf(0.5, 1.0, abs(across));
+        let body = 0.2 + 0.45*smoothstepf(0.1, 0.6, in.channel.z);
+        let aerated = smoothstepf(0.0, 0.7, fall);
+        foam = clamp(strand*(0.45 + 0.55*aerated) + 0.25*aerated, 0.0, 1.0);
+        let veil = clamp((body + 0.5*strand)*mix(0.3, 1.0, edge) + 0.3*aerated*edge, 0.0, 0.96);
+        lit = mix(scene_linear*0.85, mix(lit, foam_colour, foam), veil);
+    }
+    else
+    {
+        lit = mix(lit, foam_colour, clamp(foam, 0.0, 1.0)*above_water);
+        // Resolve the last centimetres into the bank instead of a hard edge.
+        lit = mix(scene_linear, lit, smoothstepf(0.0, 0.05, optical_path));
+    }
+
+    let fog = integrateAtmosphere(-to_view, view_distance);
+    lit = lit*fog.transmittance + fog.scattering;
     return vec4<f32>(pow(acesFilm(lit*globals.params.z), vec3<f32>(1.0/2.2)), 1.0);
 }

@@ -40,10 +40,12 @@ pub enum Species {
     Bush,
     Broadleaf,
     Lavender,
+    /// River boulders: not grown by the scatter but placed by the rivers.
+    Rock,
 }
 
 impl Species {
-    pub const ALL: [Species; 8] = [
+    pub const ALL: [Species; 9] = [
         Species::Fir,
         Species::Pine,
         Species::Oak,
@@ -52,6 +54,7 @@ impl Species {
         Species::Bush,
         Species::Broadleaf,
         Species::Lavender,
+        Species::Rock,
     ];
 
     /// The file-name prefix. `lilac-bush` must be tried before `bush`.
@@ -65,6 +68,7 @@ impl Species {
             Species::Bush => "bush",
             Species::Broadleaf => "broadleaf-plant",
             Species::Lavender => "lavender",
+            Species::Rock => "rock",
         }
     }
 
@@ -78,6 +82,7 @@ impl Species {
             Species::Bush => "bush",
             Species::Broadleaf => "broadleaf plant",
             Species::Lavender => "lavender",
+            Species::Rock => "rock",
         }
     }
 }
@@ -186,7 +191,7 @@ pub struct ModelName {
 }
 
 /// Parse `fir-large-2-lod-1`, `lilac-bush-3-lod-0`, `broadleaf-plant-5-lod-2`
-/// or `lavender`. Rocks, grass and anything unrecognised return `None`.
+/// `lavender` or `rock-7`. Grass and anything unrecognised return `None`.
 pub fn parse_model_name(stem: &str) -> Option<ModelName> {
     let (body, lod) = match stem.rsplit_once("-lod-") {
         Some((body, lod)) => (body, Some(lod.parse::<u32>().ok()?)),
@@ -496,7 +501,7 @@ fn normalize_path(path: &Path) -> PathBuf {
 }
 
 impl VegetationAssets {
-    /// Load every plant model in `models_directory`. Rocks and grass are
+    /// Load every plant and rock model in `models_directory`. Grass is
     /// skipped. Fails if no plant model is found or any file is malformed.
     pub fn load(models_directory: impl AsRef<Path>) -> Result<Self, String> {
         Self::load_inner(models_directory.as_ref(), true)
@@ -554,7 +559,7 @@ impl VegetationAssets {
                 "" => format!("{}-{}", name.species.file_prefix(), name.variant),
                 form => format!("{}-{}-{}", name.species.file_prefix(), form, name.variant),
             };
-            let model_name = if name.lod.is_none() {
+            let model_name = if name.lod.is_none() && name.species != Species::Rock {
                 name.species.file_prefix().to_string()
             } else {
                 model_name
@@ -1051,7 +1056,10 @@ mod tests {
         assert_eq!((broadleaf.species, broadleaf.form.as_str(), broadleaf.variant), (Species::Broadleaf, "", 5));
         let lavender = parse("lavender");
         assert_eq!((lavender.species, lavender.lod), (Species::Lavender, None));
-        assert!(parse_model_name("rock-12").is_none());
+        assert_eq!(
+            parse_model_name("rock-12"),
+            Some(ModelName { species: Species::Rock, form: String::new(), variant: 12, lod: None })
+        );
         assert!(parse_model_name("grass-large-1").is_none());
         assert!(parse_model_name("fir-large-x-lod-0").is_none());
     }

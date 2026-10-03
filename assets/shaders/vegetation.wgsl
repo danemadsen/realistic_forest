@@ -129,7 +129,9 @@ fn placeVertex(model: ModelParams, position: vec3<f32>, normal: vec3<f32>, root:
     // Every plant leans a little its own way, more with height, as trees
     // that grew toward light or settled on soft ground do.
     let lean_direction = fract(seed * 91.7) * 6.2831853;
-    let lean = 0.006 + 0.03 * fract(seed * 37.1);
+    let rock = model.habitat == 2u;
+    // A boulder rests tipped on the bed however it came to rest.
+    let lean = (0.006 + 0.03 * fract(seed * 37.1)) * select(1.0, 7.0, rock);
     var local = position;
     local.x += cos(lean_direction) * lean * max(position.y, 0.0);
     local.z += sin(lean_direction) * lean * max(position.y, 0.0);
@@ -141,7 +143,7 @@ fn placeVertex(model: ModelParams, position: vec3<f32>, normal: vec3<f32>, root:
     // together; each stem then sways at a rate set by its height (tall trees
     // are slow) and bends from the root, roughly quadratically with height.
     let t = frame.wind.z;
-    let strength = frame.wind.w;
+    let strength = select(frame.wind.w, 0.0, rock);
     let downwind = vec3<f32>(frame.wind.x, 0.0, frame.wind.y);
     let gust_phase = dot(root.xz, frame.wind.xy) * 0.021 - t * 0.85;
     let gust = 0.6 + 0.4 * sin(gust_phase) * sin(gust_phase * 0.41 + 1.3);

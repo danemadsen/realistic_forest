@@ -724,6 +724,7 @@ impl ErosionSim {
         init_key: TileKey,
         base_height: &[f32],
         drainage_area: &[f32],
+        river: &[f32],
         sim_min: [f32; 2],
         queue: &RenderQueue,
         context: &mut RenderContext<'_, '_>,
@@ -732,12 +733,14 @@ impl ErosionSim {
         if base_height.len() == SIM_PIXELS {
             // The C++ uploads R32; the port uploads Rgba32Float because R32Float
             // is not filterable on every backend, and carries the CPU-routed
-            // drainage area in G for the `uMode` 2 stamp. One row is
-            // 480 * 16 = 7680 bytes, already 256-byte aligned.
+            // drainage area in G for the `uMode` 2 stamp, and the river
+            // cells in B. One row is 480 * 16 = 7680 bytes, already 256-byte
+            // aligned.
             let mut pixels = Vec::with_capacity(SIM_PIXELS * 4);
             for (index, height) in base_height.iter().enumerate() {
                 let area = drainage_area.get(index).copied().unwrap_or(1.0);
-                pixels.extend_from_slice(&[*height, area, 0.0, 1.0]);
+                let river = river.get(index).copied().unwrap_or(0.0);
+                pixels.extend_from_slice(&[*height, area, river, 1.0]);
             }
             queue.write_texture(
                 self.base_texture.as_image_copy(),
@@ -1003,6 +1006,7 @@ impl ErosionSim {
                 init.key,
                 &init.base_height,
                 &init.drainage_area,
+                &init.river,
                 commands.sim_min,
                 queue,
                 context,

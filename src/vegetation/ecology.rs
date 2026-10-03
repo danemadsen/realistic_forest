@@ -129,7 +129,13 @@ pub struct Site {
     /// Horizontal distance down the fall line to the sea, metres;
     /// `SHORE_SEARCH` where the sea is not that close (or the point is high).
     pub shore: f32,
+    /// Metres past the nearest river's waterline (negative in the channel);
+    /// `RIVER_SEARCH` where no river is near.
+    pub river: f32,
 }
+
+/// How far from a river's waterline its banks shape the plants.
+pub const RIVER_SEARCH: f32 = 40.0;
 
 /// Where the terrain shader's turf dominates the beach's sand: its grass
 /// line height (`Site::turf`) at which the grass habitat admits roots.
@@ -147,6 +153,8 @@ pub struct SiteSampler {
     coarse: HeightGrid,
     /// The terrain shader's grass line height on the fine lattice.
     turf: HeightGrid,
+    /// Distance past the nearest river's waterline on a 2 m lattice.
+    river: Option<HeightGrid>,
 }
 
 struct HeightGrid {
@@ -231,7 +239,50 @@ impl SiteSampler {
                 16.0,
             ),
             turf,
+            river: None,
         }
+    }
+
+    /// Learn where the rivers run over the sampled region.
+    pub fn with_rivers(mut self, rivers: Option<&crate::rivers::network::RiverNetwork>) -> Self {
+        let Some(network) = rivers else {
+            return self;
+        };
+        let spacing = 2.0;
+        let origin = self.fine.origin;
+        let extent = [
+            (self.fine.width - 1) as f64 * self.fine.spacing,
+            (self.fine.depth - 1) as f64 * self.fine.spacing,
+        ];
+        let width = (extent[0] / spacing).ceil() as usize + 1;
+        let depth = (extent[1] / spacing).ceil() as usize + 1;
+        let mut heights = Vec::with_capacity(width * depth);
+        let mut any = false;
+        for z in 0..depth {
+            for x in 0..width {
+                let bank = network
+                    .envelope((origin[0] + x as f64 * spacing) as f32, (origin[1] + z as f64 * spacing) as f32)
+                    .bank_distance
+                    .min(RIVER_SEARCH);
+                any |= bank < RIVER_SEARCH;
+                heights.push(bank);
+            }
+        }
+        if any {
+            self.river = Some(HeightGrid {
+                origin,
+                spacing,
+                width,
+                depth,
+                heights,
+            });
+        }
+        self
+    }
+
+    /// Metres past the nearest river's waterline, `RIVER_SEARCH` at most.
+    pub fn river_bank(&self, x: f64, z: f64) -> f32 {
+        self.river.as_ref().map_or(RIVER_SEARCH, |grid| grid.sample(x, z))
     }
 
     pub fn height(&self, x: f64, z: f64) -> f32 {
@@ -266,6 +317,7 @@ impl SiteSampler {
             valley: ring(&self.coarse, VALLEY_RADIUS) - self.coarse.sample(x, z),
             turf: self.turf.sample(x, z) - SEA_LEVEL,
             shore: self.shore_distance(x, z, height - SEA_LEVEL),
+            river: self.river_bank(x, z),
         }
     }
 
@@ -324,6 +376,7 @@ mod seed {
     pub const LAVENDER: u32 = 81;
     pub const LAVENDER_DETAIL: u32 = 82;
     pub const LAVENDER_PATCH: u32 = 83;
+    pub const RIVER_HERB: u32 = 91;
 }
 
 /// Everything the scatter needs to know about a point.
@@ -370,6 +423,8 @@ pub const PINE_THRESHOLD: f32 = 0.612;
 /// Broadleaf plants per square metre at the heart of a shore colony, about
 /// one every four square metres.
 const SHORE_HERB_PEAK: f32 = 0.25;
+/// The same along a riverbank.
+const RIVER_HERB_PEAK: f32 = 0.3;
 
 /// Lavender tufts per square metre where the abundance is fullest (the
 /// tufts' spacing caps it near one every two square metres); the abundance
@@ -413,12 +468,14 @@ pub fn habitat_at(site: Site, p: [f64; 2]) -> Habitat {
     let q = warped(p);
 
     // Moisture: valley floors and hollows are wet, crests and sun-facing
-    // slopes dry out.
+    // slopes dry out, and a river keeps its banks damp.
+    let riverside = 1.0 - smoothstep(1.0, 22.0, site.river);
     let moisture = (0.45
         + 0.30 * smoothstep(-4.0, 10.0, site.valley)
         + 0.25 * smoothstep(-0.5, 1.2, site.hollow)
         - 0.35 * smoothstep(0.0, 0.25, site.insolation)
         - 0.25 * smoothstep(-3.0, -12.0, site.valley)
+        + 0.35 * riverside
         - 0.20)
         .clamp(0.0, 1.0);
 
@@ -529,7 +586,17 @@ pub fn habitat_at(site: Site, p: [f64; 2]) -> Habitat {
     let strip = smoothstep(-0.12, 0.35, across) * (1.0 - smoothstep(0.55, 1.0, across));
     let near_sea = 1.0 - smoothstep(0.6 * SHORE_SEARCH, SHORE_SEARCH, site.shore);
     let colony = smoothstep(0.38, 0.64, noise2(q, 40.0, seed::HERB));
-    let herbs = SHORE_HERB_PEAK * strip * near_sea * (0.15 + 0.85 * colony) * (1.0 - 0.8 * forest);
+    let shore_herbs = SHORE_HERB_PEAK * strip * near_sea * (0.15 + 0.85 * colony) * (1.0 - 0.8 * forest);
+    // And along rivers and creeks: the damp strip of bank above the water,
+    // thickest a metre or two up and thinning out a few metres back, in
+    // colonies that leave stretches of open bank. They tolerate the shade of
+    // a gallery forest better than the light-hungry shore plants.
+    let bank_reach = 4.5 + 2.0 * noise(q, 60.0, seed::RIVER_HERB);
+    let bank_across = (site.river - 0.4) / bank_reach;
+    let bank_strip = smoothstep(-0.05, 0.22, bank_across) * (1.0 - smoothstep(0.5, 1.0, bank_across));
+    let bank_colony = smoothstep(0.30, 0.58, noise2(q, 28.0, seed::RIVER_HERB + 1));
+    let river_herbs = RIVER_HERB_PEAK * bank_strip * (0.2 + 0.8 * bank_colony) * (1.0 - 0.45 * forest);
+    let herbs = shore_herbs.max(river_herbs);
 
     // Lavender: single tufts through sunny, dry, well-drained open ground
     // below the subalpine belt, kept apart by the scatter. How many varies

@@ -233,18 +233,35 @@ pub fn grass_line_height(noise: &NoiseField, x: f32, z: f32, height: f32) -> f32
 }
 
 /// The 480x480 base height map one erosion tile simulates, sampled at cell
-/// centres (mirrors `CreateBaseHeightMap`).
-pub fn create_base_height_map(noise: &NoiseField, tile: crate::erosion::TileKey) -> Vec<f32> {
+/// centres (mirrors `CreateBaseHeightMap`), with the rivers carved into it.
+/// The second map flags the cells a river's water covers: the simulation
+/// holds them fixed and lets them drain what reaches them, since the river
+/// carries it away.
+pub fn create_base_height_map(
+    noise: &NoiseField,
+    tile: crate::erosion::TileKey,
+    rivers: Option<&crate::rivers::network::RiverNetwork>,
+) -> (Vec<f32>, Vec<f32>) {
     let world_minimum = crate::erosion::tile_simulation_minimum(tile);
     let mut height = vec![0.0f32; EROSION_RESOLUTION * EROSION_RESOLUTION];
+    let mut river = vec![0.0f32; EROSION_RESOLUTION * EROSION_RESOLUTION];
     for z in 0..EROSION_RESOLUTION {
         let wz = world_minimum[1] + (z as f32 + 0.5) * EROSION_CELL_SIZE;
         for x in 0..EROSION_RESOLUTION {
             let wx = world_minimum[0] + (x as f32 + 0.5) * EROSION_CELL_SIZE;
-            height[z * EROSION_RESOLUTION + x] = base_height(noise, wx, wz);
+            let index = z * EROSION_RESOLUTION + x;
+            height[index] = base_height(noise, wx, wz);
+            if let Some(network) = rivers {
+                let envelope = network.envelope(wx, wz);
+                height[index] = envelope.clamp(height[index]);
+                // A cell whose middle the water covers belongs to the river.
+                if envelope.bank_distance < 0.0 && height[index] < envelope.water {
+                    river[index] = 1.0;
+                }
+            }
         }
     }
-    height
+    (height, river)
 }
 
 /// The separable Hermite blend mask applied to each tile's retained

@@ -414,6 +414,13 @@ pub struct GpuWorldTextures {
     pub normal_rough_array_view: wgpu::TextureView,
     /// Rgba8Unorm 4x4 rotation noise (point, repeat).
     pub ssao_noise_view: wgpu::TextureView,
+    /// The river network's lookup grid, carve segments and rocks, as
+    /// river-functions.wgslinc and the water shader read them. Fixed
+    /// capacity, so the bind groups built over them never go stale; a new
+    /// network is written over the old (see `river_node::upload_rivers`).
+    pub river_grid: wgpu::Buffer,
+    pub river_segments: wgpu::Buffer,
+    pub river_rocks: wgpu::Buffer,
 }
 
 pub const SSAO_NOISE_WIDTH: u32 = 4;
@@ -851,6 +858,24 @@ pub fn prepare_gpu_textures(
     );
     let ssao_noise_view = ssao_noise_texture.create_view(&Default::default());
 
+    let river_buffer = |label: &str, bytes: usize| {
+        device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: bytes as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    };
+    let river_grid = river_buffer("river_grid", crate::rivers::GPU_GRID_WORDS * 4);
+    let river_segments = river_buffer(
+        "river_segments",
+        crate::rivers::GPU_SEGMENTS * std::mem::size_of::<crate::rivers::carve::RiverSegment>(),
+    );
+    let river_rocks = river_buffer(
+        "river_rocks",
+        crate::rivers::GPU_ROCKS * std::mem::size_of::<crate::rivers::carve::RockObstacle>(),
+    );
+
     option.0 = Some(Box::new(GpuWorldTextures {
         revision: TerrainRevision::default(),
         noise_texture,
@@ -868,6 +893,9 @@ pub fn prepare_gpu_textures(
         albedo_array_view,
         normal_rough_array_view,
         ssao_noise_view,
+        river_grid,
+        river_segments,
+        river_rocks,
     }));
 }
 

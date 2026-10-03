@@ -864,8 +864,24 @@ fn terrain_texture_layout() -> BindGroupLayoutDescriptor {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            river_storage_entry(15), // river lookup grid
+            river_storage_entry(16), // river carve segments
         ],
     )
+}
+
+/// A read-only river storage buffer, read where the ground height is.
+fn river_storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
 }
 
 /// Input to the local terrain-colour averaging pass.
@@ -1065,6 +1081,14 @@ fn terrain_texture_bind_group(
         wgpu::BindGroupEntry {
             binding: 14,
             resource: wgpu::BindingResource::Sampler(&samplers.normal_rough_array),
+        },
+        wgpu::BindGroupEntry {
+            binding: 15,
+            resource: textures.river_grid.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 16,
+            resource: textures.river_segments.as_entire_binding(),
         },
     ];
     super::bind_group(device, cache, "forest_terrain_textures", layout, &entries)

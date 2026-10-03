@@ -1,8 +1,8 @@
 # Forest
 
 Forest is a Rust 2024 prototype for an infinite procedural landscape. It renders
-mountains, plains, beaches, ocean, and biome colours with an indexed geometry
-clipmap. Procedural terrain can be evaluated at any world coordinate, and
+mountains, plains, beaches, ocean, rivers and creeks, and biome colours with an
+indexed geometry clipmap. Procedural terrain can be evaluated at any world coordinate, and
 overlapping GPU hydraulic-erosion tiles are generated and cached around the
 player as the world streams. Walking and flight are not clamped to a simulation
 domain: there is no world border.
@@ -153,8 +153,10 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--cloud-base M` | Cloud base altitude in `[100, 6000]` metres; default `1300` |
 | `--cloud-thickness M` | Layer thickness in `[100, 4000]` metres; default `1200` |
 | `--no-vegetation` | Skip loading and scattering the trees, shrubs and flowers |
+| `--no-rivers` | Generate, carve and draw no rivers |
+| `--river-map path.png` | Render the river network from above, print its statistics and the rivers and waterfalls nearest `--map-centre`, then exit |
 | `--vegetation-map path.png` | Render the plant scatter from above, print its statistics, then exit |
-| `--map-centre x,z`, `--map-extent M` | Area of the vegetation map: its centre (default `0,0`) and side in metres (default `1024`) |
+| `--map-centre x,z`, `--map-extent M` | Area of the vegetation or river map: its centre (default `0,0`) and side in metres (default `1024`, or `8192` for the river map) |
 
 Screenshot runs freeze the celestial clock, weather fronts, and cloud wind automatically, so
 erosion warm-up does not change the selected weather or lighting. Keep the same
@@ -397,7 +399,8 @@ smooth fields describe the forest:
   edge; the plants are thickest a few metres in and thin out into the
   meadow. The strip follows the terrain shader's own wandering grass line
   and runs some 25 metres inland on gentle and steep coasts alike, wherever
-  the sea lies close down the fall line.
+  the sea lies close down the fall line. They line the banks of rivers and
+  creeks the same way, on the damp ground just above the water.
 - **Lavender** is scattered as single tufts, 0.6 to 0.95 m tall, through
   sunny, dry, well-drained open ground, never touching, at a density that
   varies smoothly and widely across a regional, a stand and a patch scale:
@@ -611,9 +614,10 @@ sediment is not treated as deposited soil. Contributing area separates
 permanent channels from rills and hillslopes, and shallow water velocities are
 gated when estimating transport strength.
 
-The flow output
-remains available for later river geometry. Press F1 and enable **Flow visualization** to inspect it on the
-terrain, or expand **Flow output** to inspect the cached target. Erosion
+The rivers (see below) are routed separately over the uneroded heights, and
+the erosion treats their channels as fixed drains. Press F1 and enable
+**Flow visualization** to inspect the erosion flow output on the terrain, or
+expand **Flow output** to inspect the cached target. Erosion
 parameters can be edited from the same panel and applied with **Regenerate
 erosion cache**; besides the runoff controls they include stream power,
 channel incision, alluvial deposition, maximum incision, talus slide and
@@ -621,6 +625,161 @@ rockfall rates. The panel also reports maximum incision, deposited height,
 small-scale detail within actively eroded ground, flow-axis bias, the largest
 contributing area, the share of bare bedrock and the mean loose cover for the
 most recently completed tile.
+
+## Rivers and creeks
+
+Rivers and creeks run from the mountains to the sea. They are generated in
+`src/rivers` for a 16 km region around the player, carved into the terrain,
+lined with boulders and bank plants, and drawn with their own flowing-water
+shader; their current pushes the player about.
+
+### Where they run
+
+The base landform is sampled on a world-aligned 32 m grid over the region and
+a 2 km margin. A priority flood from the sea and the grid's edge gives every
+cell a downhill receiver, so closed hollows drain over their lowest saddle the
+way a lake would spill, and contributing area accumulates down that tree.
+Each cell counts by its own rainfall: the uplands wring up to three and a
+half times as much water from the weather as the coast, so mountain-fed
+streams carry more than their catchment alone would. A channel begins where
+about a third of a square kilometre of that weighted catchment gathers on
+level ground, and with progressively less on steep ground, as real channel
+heads do; once begun it runs on to the sea. At a confluence the larger
+branch keeps its course and the smaller one ends on it.
+
+The grid path is then made into a river. It is smoothed and pulled onto the
+actual valley floor (the grid is coarser than a mountain valley) and given
+meanders: a Kinoshita curve, the shape of real meander bends with their
+skewed, flattened loops, whose wavelength follows the channel's width and
+whose sinuosity grows as the valley flattens, lengthening and tightening from
+bend to bend so no two are alike. The loops are scaled to the room the valley
+floor leaves between its sides, so a lowland creek swings across its
+floodplain while a mountain stream only wanders down its V. A tributary that
+runs beside its parent down the same valley joins it where it first comes
+close instead of weaving through the parent's bends.
+
+The water surface follows the valley floor below its banks and only ever
+falls downstream: where a meander swings into a spur, or a channel breaches
+the saddle a lake would spill over, it is carved through rather than made to
+climb. Where the surface falls more steeply than about 3 % it breaks into a
+staircase of pools and drops, the step-pool form of real mountain creeks:
+steps every two or three channel widths, low on a steep creek, growing into
+cascades and waterfalls several to fifteen metres high where the stream
+falls off a mountainside. Each pool lies level with its lip, and the water
+below a fall scours a deeper plunge pool.
+
+Hydraulics follow from the catchment. Bankfull discharge grows with it,
+width follows downstream hydraulic geometry (a creek of a metre or two to
+rivers several metres wide on these islands), and depth and speed come from
+Manning's equation with a roughness that grows from a gravel bed to a
+boulder-choked step-pool, so a steep creek runs shallow and fast and a
+lowland reach deeper and slower. The thalweg hugs the outside of every bend.
+
+Every choice is keyed by world position or by a river's head cell, so two
+regions that both see a whole catchment agree on it; when the player moves
+on, the next region is built on the async compute pool (about a second) and
+swapped in. The first region is built before anything streams.
+
+`--river-map path.png` charts a region from above (shaded relief, channels,
+falls in red) and prints its statistics and the nearest rivers and
+waterfalls to `--map-centre`; `--map-extent` defaults to 8 km here. The spawn
+region holds some 385 rivers and 160 km of channel.
+
+### How they shape the ground
+
+A river is a chain of short carve segments, each bounding the ground above
+and below near its centreline. Inside the wetted width the bed follows a
+parabola below the water, skewed toward the outer bank of a bend; past the
+waterline a bank cone rises, steep on a cut bank and gentle on a point bar,
+and ground standing above it is cut back into a bank; just beyond the
+waterline the ground is held a little above the water, so the channel always
+contains its river. Bounds combine across segments (minimum above, maximum
+below), so confluences open into each other. A segment has a flat start and a
+round end, which keeps a waterfall's lip a clean vertical face.
+
+The same arithmetic runs on the CPU (`src/rivers/carve.rs`) and in the shared
+`assets/shaders/river-functions.wgslinc`, over the same uploaded segments and
+a 32 m lookup grid, so the drawn ground, the player's footing, the seated
+plants and boulders, the lighting heightfield and the erosion all see one
+channel; tests hold the shader copies identical and the GPU result to the
+CPU's. The erosion tiles simulate over the carved base, and cells under a
+river's water are fixed drains there, like the sea: the river carries away
+what reaches it, so tributary gullies grade to it and nothing fills or
+trenches the channel.
+
+The terrain material shader reads the river at every vertex: the bed sorts
+by the power of the water over it, sand in slow pools and on point bars,
+gravel in riffles and runs, bedrock under cascades and falls; a strip of bank
+just above the water is damp soil and gravel the turf has not closed over,
+wet and glossy at the waterline; and running water never holds snow.
+
+### Rocks and plants
+
+Boulders come from `rock-1.glb` to `rock-40.glb`, placed by walking each
+river with a density that follows its stream power: one stone per 250 m² of a
+lowland bed (gathered toward the banks), one per 14 m² of a cascade's, sized
+the same way. Every waterfall's lip carries a ledge of flat blocks with gaps
+for the water, with more tumbled into its plunge pool, and steep reaches have
+boulders lodged in their banks. They are drawn through the plant pipeline,
+settled a third of their height into the bed, never moved by the wind, and
+cast shadows.
+
+No plant stands in a river: the scatter keeps each layer's stems a set
+distance past the waterline (trees lean their crowns over the water from the
+bank; lavender, which wants dry ground, keeps well back), the GPU cull
+refuses any root it seats in a channel, and the grass habitat refuses roots
+on the wet bank. Riverbanks are damp ground in the ecology, and broadleaf
+plants line them the way they line the shore: in colonies along the strip of
+bank just above the water, thickest a metre or two up, thinning a few metres
+back, and tolerant of a gallery forest's shade.
+
+### The water
+
+Each river's surface is a ribbon across its channel at the water level,
+reaching under both banks so the waterline is wherever the carved bank rises
+through the water. Each waterfall is a sheet that leaves its lip at the speed
+the water arrived with and falls along the jet's parabola into the plunge
+pool. Rivers are drawn to 3.2 km in 256 m chunks culled against the view;
+beyond a few hundred metres, where the clipmap's triangles are wider than a
+creek, a surface is lifted by about the bank those triangles leave so it
+still shows from a ridge.
+
+The river shader (`vs_river`/`fs_river` in `water-surface.wgsl`) shades the
+water with the sea's own optics, sky and screen-space reflections, sun
+glitter, Beer-Lambert body and refraction, rain rings and fog, and the
+plants' shadow cascades, plus what flowing water does:
+
+- **Flow-mapped ripples.** Two phases of procedural ripple noise are carried
+  downstream by the local current and cross-faded, so the surface streams at
+  the water's own speed, drawn out into streaks where it runs fast and
+  chopped short over a rough bed; what a pixel cannot resolve becomes
+  roughness instead of shimmer.
+- **Boulders.** Every rock near a point is found through the lookup grid.
+  Water parts around one that breaks the surface as potential flow around a
+  cylinder, heaps into a pillow against its upstream face (the stagnation
+  head, v²/2g), and leaves a slack, churning, foamy wake behind it. A rock
+  just under the surface lifts a standing hump, and where the water pours over
+  it fast enough (a Froude number over about one) it breaks into a foaming
+  hole downstream.
+- **Whitewater.** Cascades, plunge pools, eddy lines along the banks of fast
+  water and the rocks' wakes carry foam that the current advects downstream.
+  Aerated water is milkier as well as whiter. Falling sheets are strands of
+  water streaming down at the speed of the fall, glassy at the lip and white
+  as they break up, torn at their edges, thin enough on a small creek to show
+  the wet rock behind.
+
+### Wading
+
+Flowing water pushes the player. The current's drag on the submerged body,
+½ρC_dAu² over the legs and then the torso as the water deepens, is set
+against the friction the feet can hold with, which buoyancy and a whitewater
+bed reduce. Knee-deep water slows a wade, more so walking upstream; a gentle
+current is stood against; a strong one carries the body along more and more,
+and once its drag outweighs the footing it sweeps the player off their feet
+and away downstream, over a fall if one is coming. Water too deep to stand in
+floats the player with the current. The F1 panel's **Rivers** section
+reports the network, the nearest channel and the current the player stands
+in, and can hide the water surfaces.
 
 ## Day/night lighting and atmosphere
 
@@ -706,7 +865,10 @@ transmittance to the lighting composite, which also evaluates terrain, cloud
 and plant shadows and the celestial sky. A cloud sky probe supplies reflection directions
 outside the current view.
 The water surface then samples the opaque scene for refraction and raymarched
-reflections, followed by underwater effects where applicable. FXAA smooths the
+reflections, followed by underwater effects where applicable. The sea and the
+rivers depth-test against the G-buffer's own depth buffer in hardware, ahead
+of their shaders, so water hidden behind terrain or plants is never shaded;
+they write that depth too, so a river never paints over a nearer wave. FXAA smooths the
 completed scene, and the diagnostics panel draws on top. The G-buffer, AO and
 atmosphere targets follow window resize and HiDPI render-size changes.
 

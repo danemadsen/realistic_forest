@@ -28,7 +28,7 @@ pub fn scatter_region(noise: &NoiseField, catalog: &Catalog, minimum: [f64; 2], 
                 let Some(&(chunk, level)) = jobs.get(index) else {
                     break;
                 };
-                let plants = scatter::generate_level(noise, catalog, chunk, level);
+                let plants = scatter::generate_level(noise, catalog, None, chunk, level);
                 results.lock().unwrap().extend(plants);
             });
         }
@@ -58,6 +58,7 @@ fn species_colour(species: Species) -> [u8; 3] {
         Species::Bush => [75, 120, 60],
         Species::Broadleaf => [40, 190, 170],
         Species::Lavender => [150, 70, 230],
+        Species::Rock => [120, 120, 120],
     }
 }
 
@@ -442,14 +443,14 @@ mod tests {
     fn chunks_are_deterministic_and_seamless() {
         let noise = NoiseField::new();
         let catalog = catalog();
-        let a = scatter::generate_level(&noise, &catalog, [-1, 0], scatter::LEVEL_TREES);
-        assert_eq!(a, scatter::generate_level(&noise, &catalog, [-1, 0], scatter::LEVEL_TREES));
+        let a = scatter::generate_level(&noise, &catalog, None, [-1, 0], scatter::LEVEL_TREES);
+        assert_eq!(a, scatter::generate_level(&noise, &catalog, None, [-1, 0], scatter::LEVEL_TREES));
         // A 2x2 block of independently generated chunks must still keep the
         // canopy's hard-core spacing across every shared border.
         let mut canopy = Vec::new();
         for chunk in [[-1, -1], [0, -1], [-1, 0], [0, 0]] {
             canopy.extend(
-                scatter::generate_level(&noise, &catalog, chunk, scatter::LEVEL_TREES)
+                scatter::generate_level(&noise, &catalog, None, chunk, scatter::LEVEL_TREES)
                     .into_iter()
                     .filter(|p| p.layer == Layer::Canopy as u32),
             );
@@ -481,7 +482,7 @@ mod tests {
         let mut tufts = Vec::new();
         for chunk in [[-3, 2], [-2, 2], [-3, 3], [-2, 3]] {
             tufts.extend(
-                scatter::generate_level(&noise, &catalog, chunk, scatter::LEVEL_GROUND)
+                scatter::generate_level(&noise, &catalog, None, chunk, scatter::LEVEL_GROUND)
                     .into_iter()
                     .filter(|p| p.layer == Layer::Lavender as u32),
             );

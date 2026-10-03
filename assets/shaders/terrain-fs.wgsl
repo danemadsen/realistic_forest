@@ -155,6 +155,9 @@ struct FsInput {
     @location(3) frag_world_normal: vec3<f32>,    // fragWorldNormal
     @location(4) frag_erosion_delta: f32,         // fragErosionDelta
     @location(5) frag_material_normal: vec3<f32>, // fixed-scale world slope
+    // The nearest river: metres past its waterline (negative in the
+    // channel), water surface above this ground, whitewater, flow speed.
+    @location(6) frag_river: vec4<f32>,
 };
 
 // G-buffer outputs, locations preserved from the GLSL layout qualifiers.
@@ -1107,15 +1110,36 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                         * snowHold * flowDomain * 0.85;
     fSnow = 1.0 - (1.0 - fSnow) * (1.0 - avalancheTongue);
 
-    let groundCover = (1.0 - fSand) * (1.0 - fGravel) * (1.0 - fRock) * (1.0 - fSnow);
-    let wSand = fSand * (1.0 - fGravel) * (1.0 - fRock) * (1.0 - fSnow);
-    let wGrass = groundCover * (1.0 - grassSoilBlend);
-    let wDirt = groundCover * grassSoilBlend;
+    // Rivers and creeks (src/rivers): the bed under the water and the strip
+    // of bank its floods keep bare. The bed sorts by the power of the water
+    // over it: slow lowland pools and point bars drop sand, riffles and runs
+    // keep a gravel bed, and cascades and the faces of falls are scoured to
+    // bedrock. The bank just past the waterline is damp soil and gravel the
+    // turf has not closed over; running water never holds snow.
+    let riverBank = input.frag_river.x;
+    let riverTurbulence = input.frag_river.z;
+    let riverPower = input.frag_river.w*(1.0 + 1.5*riverTurbulence);
+    let inRiver = 1.0 - smoothHermite(-0.35, 0.20, riverBank);
+    let riverFringe = (1.0 - smoothHermite(0.15, 1.1 + 0.9*soilEdge, riverBank))*(1.0 - inRiver);
+    let riverRock = smoothHermite(0.45, 0.85, riverTurbulence);
+    let riverSand = (1.0 - smoothHermite(0.35, 0.95, riverPower))*(1.0 - riverRock);
+    let riverGravel = clamp(1.0 - riverRock - riverSand, 0.0, 1.0);
+    let fSandRiver = max(fSand, (inRiver + riverFringe*0.55)*riverSand);
+    let fGravelRiver = max(fGravel, (inRiver + riverFringe*0.45)*riverGravel
+                                    + riverFringe*riverRock*0.6);
+    let fRockRiver = max(fRock, inRiver*riverRock);
+    let fSnowRiver = fSnow*(1.0 - max(inRiver, riverFringe*0.7));
+    let grassSoilRiver = max(grassSoilBlend, riverFringe);
+
+    let groundCover = (1.0 - fSandRiver) * (1.0 - fGravelRiver) * (1.0 - fRockRiver) * (1.0 - fSnowRiver);
+    let wSand = fSandRiver * (1.0 - fGravelRiver) * (1.0 - fRockRiver) * (1.0 - fSnowRiver);
+    let wGrass = groundCover * (1.0 - grassSoilRiver);
+    let wDirt = groundCover * grassSoilRiver;
     // Loose debris and channel beds lie on top of the bedrock they came from,
     // so talus aprons and gravel bars cover rock rather than the reverse.
-    let wRock = fRock * (1.0 - fGravel) * (1.0 - fSnow);
-    let wGravel = fGravel * (1.0 - fSnow);
-    let wSnow = fSnow;
+    let wRock = fRockRiver * (1.0 - fGravelRiver) * (1.0 - fSnowRiver);
+    let wGravel = fGravelRiver * (1.0 - fSnowRiver);
+    let wSnow = fSnowRiver;
 
     // Ground103 leads the soil, with a little Ground106 variation.
     let nDirt = 0.25 * filteredGroundNoise(
@@ -1359,7 +1383,9 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         // Do not root upright clumps on cliff triangles even if a small
         // interpolated material patch happens to meet the turf threshold.
         let stableSlope = smoothHermite(0.70, 0.86, normalWorld.y);
-        let suitability = clamp(turf * dryShore * intactRoots * stableSlope, 0.0, 1.0);
+        // Nothing roots in a river or on the bank its water laps.
+        let dryBank = smoothHermite(0.25, 0.75, input.frag_river.x);
+        let suitability = clamp(turf * dryShore * intactRoots * stableSlope * dryBank, 0.0, 1.0);
         (*habitat_data) = vec4<f32>(height, suitability, normalWorld.x, normalWorld.z);
     }
 
@@ -2031,7 +2057,12 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                                             stage.sea_level + 1.15 + (soilLarge - 0.5) * 0.45,
                                             height);
         let shoreWet = waterline * (gSand + gGravel + gRock);
-        let moisture = clamp(waterAmount * 0.52 + channel * 0.25 + shoreWet * 0.65, 0.0, 0.72)
+        // A river wets its bed and the bank a hand's breadth above the
+        // water, splashed higher beside whitewater.
+        let riverWet = 1.0 - smoothHermite(0.0, 0.35 + 0.9*input.frag_river.z,
+                                           input.frag_river.x);
+        let moisture = clamp(waterAmount * 0.52 + channel * 0.25 + shoreWet * 0.65
+                             + riverWet * 0.72, 0.0, 0.72)
                      * (1.0 - gSnow);
         let damp = albedo * vec3<f32>(0.55, 0.57, 0.56);
         albedo = mix(albedo, damp, moisture);
@@ -2043,7 +2074,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         // reads as polish rather than as water.
         let wetness = moisture / 0.72;
         let stony = clamp(gGravel + gRock, 0.0, 1.0);
-        let glaze = wetness * mix(1.0, waterline, stony);
+        let glaze = wetness * mix(1.0, max(waterline, riverWet), stony);
         let wetRoughness = mix(0.70, 0.42, waterAmount);
         outRough = mix(outRough, min(outRough, wetRoughness), glaze);
     }

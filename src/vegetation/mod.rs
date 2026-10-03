@@ -104,6 +104,14 @@ pub fn render_profile(species: Species, form: &str) -> RenderProfile {
             translucency: 0.65,
             shadow_cascades: 1,
         },
+        // Boulders break a river's surface well into the distance.
+        Species::Rock => RenderProfile {
+            max_distance: 520.0,
+            lod_end: [f32::INFINITY; 3],
+            ground_habitat: false,
+            translucency: 0.0,
+            shadow_cascades: 2,
+        },
     }
 }
 
@@ -143,6 +151,10 @@ pub struct VegetationField {
     /// Whether every wanted level around the player was present at the last
     /// update, with nothing in flight.
     settled: bool,
+    /// The river network's boulders, as plants of the rock models, and the
+    /// network generation they came from.
+    rocks: Arc<Vec<PlantInstance>>,
+    rock_generation: u64,
 }
 
 impl VegetationField {
@@ -180,6 +192,8 @@ impl VegetationField {
             since_publish: 0.0,
             uploaded: Arc::new(AtomicU64::new(0)),
             settled: !enabled,
+            rocks: Arc::new(Vec::new()),
+            rock_generation: 0,
         }
     }
 
@@ -226,6 +240,7 @@ impl VegetationField {
                 plants.extend_from_slice(level);
             }
         }
+        plants.extend_from_slice(&self.rocks);
         self.snapshot = Arc::new(VegetationSnapshot {
             generation: self.snapshot.generation + 1,
             plants,
@@ -243,8 +258,37 @@ fn chunk_distance(chunk: [i64; 2], x: f64, z: f64) -> f64 {
     dx.hypot(dz)
 }
 
+/// The river network's boulders as instances of the rock models.
+fn river_rocks(assets: &VegetationAssets, network: &crate::rivers::network::RiverNetwork) -> Vec<PlantInstance> {
+    let models: Vec<Option<u32>> = (0..crate::rivers::rocks::ROCK_MODELS.len())
+        .map(|k| {
+            let name = format!("rock-{}", k + 1);
+            assets.models.iter().position(|m| m.name == name).map(|i| i as u32)
+        })
+        .collect();
+    network
+        .rocks
+        .iter()
+        .filter_map(|rock| {
+            Some(PlantInstance {
+                position: [rock.position[0], rock.bed, rock.position[1]],
+                scale: rock.scale,
+                yaw: rock.yaw,
+                seed: rock.seed,
+                model: models.get(rock.model as usize).copied().flatten()?,
+                layer: scatter::Layer::Rock as u32,
+            })
+        })
+        .collect()
+}
+
 /// Stream chunk levels around the player and publish snapshots.
-pub fn stream_vegetation(mut field: ResMut<VegetationField>, players: Query<&Player>, time: Res<Time>) {
+pub fn stream_vegetation(
+    mut field: ResMut<VegetationField>,
+    rivers: Res<crate::rivers::RiverField>,
+    players: Query<&Player>,
+    time: Res<Time>,
+) {
     if !field.enabled {
         return;
     }
@@ -270,6 +314,14 @@ pub fn stream_vegetation(mut field: ResMut<VegetationField>, players: Query<&Pla
     let Some(catalog) = field.catalog.clone() else {
         return;
     };
+    if field.rock_generation != rivers.generation() {
+        field.rock_generation = rivers.generation();
+        field.rocks = Arc::new(match (field.assets.as_ref(), rivers.network()) {
+            (Some(assets), Some(network)) => river_rocks(assets, network),
+            _ => Vec::new(),
+        });
+        field.dirty = true;
+    }
     let Ok(player) = players.single() else {
         return;
     };
@@ -336,7 +388,8 @@ pub fn stream_vegetation(mut field: ResMut<VegetationField>, players: Query<&Pla
     for &(_, chunk, level) in wanted.iter().take(MAX_IN_FLIGHT.saturating_sub(field.tasks.len())) {
         let noise = field.noise.clone();
         let catalog = catalog.clone();
-        let task = pool.spawn(async move { scatter::generate_level(&noise, &catalog, chunk, level) });
+        let network = rivers.network().cloned();
+        let task = pool.spawn(async move { scatter::generate_level(&noise, &catalog, network.as_deref(), chunk, level) });
         field.tasks.insert((chunk, level), task);
     }
     field.settled = wanted.is_empty() && field.tasks.is_empty();

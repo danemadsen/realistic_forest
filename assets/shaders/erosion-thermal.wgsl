@@ -115,8 +115,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
     let size = gridSize();
     let center = textureLoad(texture0, coord, 0);
     // Ocean beds are immutable; the sea carries off anything shed into it,
-    // so coastal faces exchange nothing with them.
-    if (center.b < stage.sea_level)
+    // so coastal faces exchange nothing with them. River beds likewise.
+    if (center.b < stage.sea_level || textureLoad(uDrainage, coord, 0).a > 0.5)
     {
         return center;
     }
@@ -138,7 +138,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
         // edge cell with itself or double-count a real neighbour.
         if (any(neighbour_coord < vec2<i32>(0)) || any(neighbour_coord >= size)) { continue; }
         let neighbour = textureLoad(texture0, neighbour_coord, 0);
-        if (neighbour.b < stage.sea_level) { continue; }
+        if (neighbour.b < stage.sea_level || textureLoad(uDrainage, neighbour_coord, 0).a > 0.5) { continue; }
 
         let diagonal = offset.x != 0 && offset.y != 0;
         let distance = cell_size * select(1.0, 1.41421356, diagonal);
