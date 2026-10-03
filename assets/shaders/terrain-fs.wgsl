@@ -1015,15 +1015,18 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // that value says water may lie within a triangle's span, look it up
     // exactly. Elsewhere (nearly everywhere) the cheap value stands.
     var river = input.frag_river;
-    if (river.x < 2.0 + 1.5*max(stage.spacing, stage.next_spacing))
+    let exactReach = 4.0 + 1.5*max(stage.spacing, stage.next_spacing);
+    if (river.x < exactReach)
     {
         let exact = riverEnvelope(worldXZ);
         let bank = riverBankAt(exact, frag_world_position.y);
         let still = bank < exact.bank_distance;
-        river = vec4<f32>(clamp(bank, -40.0, 40.0),
-                          select(exact.bend, 0.0, still),
-                          select(exact.turbulence, 0.0, still),
-                          select(length(exact.velocity), 0.0, still));
+        let looked = vec4<f32>(clamp(bank, -40.0, 40.0),
+                               select(exact.bend, 0.0, still),
+                               select(exact.turbulence, 0.0, still),
+                               select(length(exact.velocity), 0.0, still));
+        // Hand over to the vertices' value without a seam.
+        river = mix(looked, river, smoothHermite(exactReach - 3.0, exactReach, river.x));
     }
     // Evaluate derivatives before any material gates. Explicit gradients keep
     // the mirrored patch fields filtered without seams at their folds.
@@ -1335,9 +1338,12 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let riverTurbulence = river.z;
     let riverPower = river.w*(1.0 + 1.5*riverTurbulence);
     let inRiver = 1.0 - smoothHermite(-0.30, 0.05, riverBank);
+    // Where the water all but stands (a pool, a lake) it settles silt and
+    // mud; runs and riffles keep a gravel bed; whitewater scours to cobble
+    // and bedrock.
     let riverRock = smoothHermite(0.45, 0.85, riverTurbulence);
-    let riverSand = (1.0 - smoothHermite(0.12, 0.45, riverPower + (soilSmall - 0.5)*0.3))*(1.0 - riverRock);
-    let riverGravel = clamp(1.0 - riverRock - riverSand, 0.0, 1.0);
+    let riverSilt = (1.0 - smoothHermite(0.12, 0.45, riverPower + (soilSmall - 0.5)*0.3))*(1.0 - riverRock);
+    let riverGravel = clamp(1.0 - riverRock - riverSilt, 0.0, 1.0);
     // The local bank: how steeply this very ground rises from the water.
     let bankSteep = smoothHermite(0.10, 0.35, 1.0 - normalWorld.y);
     let cutBank = bankSteep*(0.45 + 0.55*smoothHermite(0.0, 0.35, riverBend))
@@ -1356,13 +1362,13 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                   * (1.0 - riverRock)*(1.0 - inRiver);
     let bankEarth = riverside*bankSteep
                   * smoothHermite(0.40, 0.70, soilSmall + (soilEdge - 0.5)*0.5);
-    let fSandRiver = max(max(1.0 - fGrass, sedimentSand*(1.0 - riverside)),
-                         inRiver*riverSand + pointBar*(0.35 + 0.5*riverSand));
-    let fGravelRiver = max(fGravel*(1.0 - 0.9*riverside),
-                           inRiver*riverGravel + pointBar*(0.65 - 0.5*riverSand) + stoneBank*0.5);
+    let fSandRiver = max(1.0 - fGrass, sedimentSand*(1.0 - riverside)*(1.0 - inRiver));
+    let fGravelRiver = max(fGravel*(1.0 - 0.9*riverside)*(1.0 - inRiver*riverSilt),
+                           inRiver*riverGravel + pointBar*0.8 + stoneBank*0.5);
     let fRockRiver = max(fRock*(1.0 - 0.9*riverside), inRiver*riverRock + stoneBank*0.6);
     let fSnowRiver = fSnow*(1.0 - max(inRiver, max(pointBar, stoneBank)*0.7));
-    let grassSoilRiver = max(grassSoilBlend*(1.0 - 0.6*riverside), max(cutBank, bankEarth));
+    let grassSoilRiver = max(max(grassSoilBlend*(1.0 - 0.6*riverside), max(cutBank, bankEarth)),
+                             inRiver*riverSilt);
 
     let groundCover = (1.0 - fSandRiver) * (1.0 - fGravelRiver) * (1.0 - fRockRiver) * (1.0 - fSnowRiver);
     let wSand = fSandRiver * (1.0 - fGravelRiver) * (1.0 - fRockRiver) * (1.0 - fSnowRiver);
