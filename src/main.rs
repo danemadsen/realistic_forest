@@ -10,6 +10,7 @@ mod constants;
 mod day_night;
 mod erosion;
 mod grass;
+mod grass_cull;
 mod lightning;
 mod matrices;
 mod noise;

@@ -16,6 +16,10 @@ struct GrassFrame {
     mapping: vec4<f32>, // centre XZ, span, metres per texel
     wind: vec4<f32>,    // wind direction XZ, time, strength
     range: vec4<f32>,   // full density distance, draw radius, unused
+    // Distance at which layers 1..3 (far middle, close middle, carpet) fade to
+    // nothing. The CPU culls whole chunks by the same numbers, so they come
+    // from one place: grass.rs LAYER_END.
+    layer_end: vec4<f32>,
 };
 @group(1) @binding(0) var habitat: texture_2d<f32>;
 @group(1) @binding(1) var habitat_sampler: sampler;
@@ -83,9 +87,9 @@ fn vs_main(
     // Two gradually thinning middle tiers keep the valley planted without
     // sending foreground-level card counts into the far field. Candidate
     // rings extend past their zero-growth edges across camera-anchor moves.
-    let far_medium = 1.0 - smoothstep(170.0, 200.0, distance);
-    let near_medium = 1.0 - smoothstep(110.0, 140.0, distance);
-    let carpet = 1.0 - smoothstep(25.0, 33.0, distance);
+    let far_medium = 1.0 - smoothstep(frame.layer_end.x - 30.0, frame.layer_end.x, distance);
+    let near_medium = 1.0 - smoothstep(frame.layer_end.y - 30.0, frame.layer_end.y, distance);
+    let carpet = 1.0 - smoothstep(frame.layer_end.z - 8.0, frame.layer_end.z, distance);
     let layer = select(1.0,
                        select(far_medium,
                               select(near_medium, carpet, scatter_data.y > 2.5),
