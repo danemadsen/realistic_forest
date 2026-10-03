@@ -644,9 +644,11 @@ Each cell counts by its own rainfall: the uplands wring up to three and a
 half times as much water from the weather as the coast, so mountain-fed
 streams carry more than their catchment alone would. A channel begins where
 about a third of a square kilometre of that weighted catchment gathers on
-level ground, and with progressively less on steep ground, as real channel
-heads do; once begun it runs on to the sea. At a confluence the larger
-branch keeps its course and the smaller one ends on it.
+level ground, and with a little less on steeper ground; once begun it runs on
+to the sea. At a confluence the larger branch keeps its course and the
+smaller one ends on it. A creek on a mountainside is drawn only from where
+the land along it first eases below a slope of 0.22: the steep slope above is
+seeps and sheet wash, not a channel.
 
 The coarse grid decides the network, which catchments drain where and how
 much water each river carries, but not the course: a 32 m cell is wider than
@@ -661,37 +663,43 @@ stair-steps are smoothed out and the path settled back onto the lowest ground
 across it. Its bends are the land's own, so a lowland creek wanders over its
 floodplain while a mountain stream keeps to the bottom of its V. A tributary
 runs until it reaches its parent's channel, wherever the ground brings it
-there.
+there; its corridor reaches the parent's actual course. Where water seems held
+in a basin it could in fact leave, the corridor was too narrow to show its
+way: a basin that drains to the sea through a gap the coarse grid missed
+sends its river out through that gap, and any other is routed again through
+a wider corridor.
 
-The water surface follows the channel's ground below its banks and only ever
-falls downstream. A hollow the water would stand less than 2.5 m deep in is
-crossed in a cut through its rim, as a river incises the sill it spills over.
-A deeper basin holds a lake: the whole basin (found by flood fill beyond the
-corridor) fills to just under the rim it spills over, every river that
-reaches it shares it, the reaches above it are backed up to its level, and
-the river leaves it at its outlet. Where the surface falls more steeply than
-about 3 % it breaks into a staircase of pools and drops, the step-pool form of
-real mountain creeks: steps every two or three channel widths, low on a steep
-creek, growing into cascades and waterfalls several to fifteen metres high
-where the stream falls off a mountainside. Each pool lies level with its lip,
-and the water below a fall scours a deeper plunge pool.
+The water surface follows the channel's ground a little below its banks and
+only ever falls downstream. A hollow the water would stand less than 1.2 m
+deep in is crossed in a cut through its rim, as a river incises the sill it
+spills over. A deeper basin holds a lake or pond: the whole basin (found by
+flood fill beyond the corridor) fills to just under the rim it spills over,
+every river that reaches it shares it (a basin holding a smaller lake drowns
+it), the reaches above it are backed up to its level, and the river leaves it
+at its outlet. Water runs down a slope, however steep, as rapids and
+cascades; a waterfall forms only where the land itself has a ledge, a drop
+steeper than about 42 degrees on average and 1.2 to 8 m tall, from the
+surface above it to the surface at its foot, and the water below scours a
+deeper plunge pool. Falls are rare: about five over 1.5 m around spawn.
 
 Hydraulics follow from the catchment and the slope. Bankfull discharge grows
 with the catchment, and the channel follows downstream hydraulic geometry,
 the power laws real rivers are fitted with, plus the slope's own terms: width
-grows as the square root of the discharge and shrinks with the slope
-(as S^-0.35), depth grows as Q^0.35 and a little with the slope, and the
-speed is whatever carries the discharge through that section. A mountain
-stream is held in a narrow, deep slot in boulders and bedrock; on the
-flat the same water spreads wide and shallow over its own gravel and silt.
-Around spawn, reaches draining over half a square kilometre average 7.5 m
-wide, 0.43 m deep and 0.6 m/s on the lowland, 2.7 m, 0.58 m and 1.3 m/s on
-moderate slopes, and 1.5 m, 0.85 m and 1.7 m/s on steep ones; a confluence
-widens the river below it. No reach keeps one width: the channel swells
-through its pools and narrows, running faster, over its riffles every few
-widths, a plunge pool is scoured out deeper and wider than the stream that
+grows as the square root of the discharge and shrinks with the slope of the
+valley over some 40 m (as S^-0.25), depth grows as Q^0.35 and a little with
+the slope, and the speed is whatever carries the discharge through that
+section. A mountain stream is held in a narrower, deeper channel in boulders
+and bedrock; on the flat the same water spreads wide and shallow over its own
+gravel and silt. Around spawn, reaches draining over half a square kilometre
+average 9.7 m wide on the lowland, 6.9 m on moderate slopes and 5.0 m on steep
+ones, and no creek is narrower than 1.6 m. A river widens below a confluence
+and narrows into a steeper reach gradually, never by more than 2.5 cm per
+metre along it; it swells a little through its pools and narrows over its
+riffles, a plunge pool is scoured out deeper and wider than the stream that
 feeds it, and a river's head starts as a seep that gathers into a channel.
-The thalweg hugs the outside of every bend.
+Where it meets still water (a lake it runs into or out of, or the sea) it
+spreads half as wide again and slows into it, as a mouth does. The thalweg
+hugs the outside of every bend.
 
 Every choice is keyed by world position or by a river's head cell, so two
 regions that both see a whole catchment agree on it; when the player moves
@@ -703,9 +711,10 @@ lakes, falls in red) and prints its statistics, how well the channels fit the
 land (how much of their length is trenched through a rise, held in by an
 embankment, or running along a slope above its valley's floor), and the
 rivers, waterfalls and lakes nearest `--map-centre`; `--map-extent` defaults
-to 8 km here. The spawn region holds some 350 rivers, 140 km of channel and
-150 lakes; under 5 % of the gentle reaches are trenched more than 3 m into
-the natural ground.
+to 8 km here. The spawn region holds some 160 rivers, 86 km of channel and
+250 lakes and ponds; on gentle reaches the water stands 0.6 m under the
+natural ground on average, and 0.1 % of their length is trenched more than
+3 m into it.
 
 ### How they shape the ground
 
@@ -714,7 +723,8 @@ and below near its centreline. Inside the wetted width the bed follows a
 parabola below the water, skewed toward the outer bank of a bend; past the
 waterline a bank cone rises, steep on a cut bank and gentle on a point bar,
 and ground standing above it is cut back into a bank; just beyond the
-waterline the ground is held a little above the water, so the channel always
+waterline the ground is held a little above the water and falls gently away
+from it, the broad, low natural levee a river builds, so the channel always
 contains its river. Bounds combine across segments (minimum above, maximum
 below), so confluences open into each other. A segment has a flat start and a
 round end, which keeps a waterfall's lip a clean vertical face.
@@ -739,10 +749,10 @@ The terrain material shader reads the river or lake at every vertex, and
 exactly at every pixel where water may lie within a triangle's span (beyond
 the first ring the clipmap's triangles are wider than a creek, and would
 smear its bed across them): the bed
-sorts by the power of the water over it, sand where the water all but stands
-(still pools, lake beds), gravel through every run and riffle, bedrock under
-cascades and falls, and under the water it is darkened by its film of algae
-and settled silt. Out of the
+sorts by the power of the water over it, silt and mud where the water all
+but stands (still pools, lake beds), gravel through every run and riffle,
+bedrock under cascades and falls, and under the water it is darkened by its
+film of algae and settled silt. Out of the
 water the turf runs to the waterline, darkened and glossy where it is wet,
 except where the bank says otherwise: the outside of a bend is undercut into a
 steep bank of bare soil, the inside keeps a bar of sand and gravel standing
