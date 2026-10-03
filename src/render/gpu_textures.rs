@@ -9,6 +9,7 @@ use bevy::prelude::*;
 use bevy::render::renderer::{RenderDevice, RenderQueue};
 use bevy::render::{ExtractSchedule, MainWorld};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // CPU loading (main world)
@@ -110,6 +111,28 @@ fn downscale_tile_wrapping(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terrain_revision_moves_only_when_the_data_does() {
+        let revision = TerrainRevision::default();
+        let records = vec![0.0f32; 484];
+        revision.note_lookup(&records);
+        let first = revision.current();
+        // The lookup is rewritten every frame; unchanged records are no change.
+        for _ in 0..5 {
+            revision.note_lookup(&records);
+        }
+        assert_eq!(revision.current(), first);
+        let mut revealed = records.clone();
+        revealed[2] = 0.25;
+        revision.note_lookup(&revealed);
+        assert_eq!(revision.current(), first + 1);
+        revision.note_atlas_upload();
+        assert_eq!(revision.current(), first + 2);
+        // Going back to earlier records is still a change from the latest ones.
+        revision.note_lookup(&records);
+        assert_eq!(revision.current(), first + 3);
+    }
 
     #[test]
     fn downscale_averages_whole_blocks() {
@@ -327,9 +350,44 @@ pub fn register_main_texture_systems(app: &mut bevy::app::App) {
 
 pub const SIM_TEXTURE_SIZE: u32 = EROSION_RESOLUTION as u32;
 
+/// A change counter for the erosion data the terrain shaders read: the tile
+/// lookup records and the height and flow atlases. Whoever caches something
+/// derived from the terrain (the grass habitat capture) keeps the value it saw
+/// and redoes the work when this moves.
+#[derive(Default)]
+pub struct TerrainRevision {
+    counter: AtomicU64,
+    lookup_hash: AtomicU64,
+}
+
+impl TerrainRevision {
+    pub fn current(&self) -> u64 {
+        self.counter.load(Ordering::Relaxed)
+    }
+
+    /// The lookup records are rewritten every frame; only a different set of
+    /// records (a tile appearing, a slot moving, a reveal advancing) counts.
+    pub fn note_lookup(&self, records: &[f32]) {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for value in records {
+            hash = (hash ^ u64::from(value.to_bits())).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        if self.lookup_hash.swap(hash, Ordering::Relaxed) != hash {
+            self.counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// An atlas patch was written into the height and flow atlases.
+    pub fn note_atlas_upload(&self) {
+        self.counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// All world textures held by the render passes; created once by
 /// `prepare_gpu_textures` after CPU data extraction.
 pub struct GpuWorldTextures {
+    /// Moves whenever the lookup or an atlas changes; see [`TerrainRevision`].
+    pub revision: TerrainRevision,
     /// R32 1024², 11 mips, trilinear + repeat (base noise). Held so the
     /// texture outlives the view the samplers bind.
     #[allow(dead_code)]
@@ -794,6 +852,7 @@ pub fn prepare_gpu_textures(
     let ssao_noise_view = ssao_noise_texture.create_view(&Default::default());
 
     option.0 = Some(Box::new(GpuWorldTextures {
+        revision: TerrainRevision::default(),
         noise_texture,
         noise_view,
         height_atlas_view,

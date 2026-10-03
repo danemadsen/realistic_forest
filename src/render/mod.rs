@@ -198,6 +198,15 @@ pub struct TerrainStageUniforms {
 const _: () = assert!(std::mem::size_of::<TerrainStageUniforms>() == 288);
 
 impl TerrainStageUniforms {
+    /// The world XZ every clipmap level centres on: the player's, snapped to
+    /// the coarsest level's grid so each level's vertices stay on its lattice.
+    pub fn clip_origin(player_position: [f32; 3]) -> [f32; 2] {
+        [
+            (player_position[0] / CLIP_ANCHOR_SPACING + 0.5).floor() * CLIP_ANCHOR_SPACING,
+            (player_position[2] / CLIP_ANCHOR_SPACING + 0.5).floor() * CLIP_ANCHOR_SPACING,
+        ]
+    }
+
     /// Per-level uniforms from `DrawClipmap` + the shared block from
     /// `SetTerrainSharedUniforms`. One instance per clipmap level.
     ///
@@ -211,11 +220,7 @@ impl TerrainStageUniforms {
         lookup_minimum: (i64, i64),
         visibility_center: [f32; 2],
     ) -> Self {
-        let anchor_spacing = CLIP_ANCHOR_SPACING;
-        let clip_origin = [
-            (player_position[0] / anchor_spacing + 0.5).floor() * anchor_spacing,
-            (player_position[2] / anchor_spacing + 0.5).floor() * anchor_spacing,
-        ];
+        let clip_origin = Self::clip_origin(player_position);
         let spacing = (1u32 << level) as f32;
         let has_coarser_level = level + 1 < CLIP_LEVELS as u32;
         Self {

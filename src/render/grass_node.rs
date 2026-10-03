@@ -423,7 +423,7 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
     // Storm gusts thrash the grass well beyond the steady breeze.
     let gust = 1.0 + 1.6 * conditions.gust_strength;
     let frame = GrassFrame {
-        mapping: terrain_node::grass_habitat_mapping(view.player_position),
+        mapping: gbuffer.grass_habitat_mapping,
         wind: [
             direction.cos(),
             direction.sin(),

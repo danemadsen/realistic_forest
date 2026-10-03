@@ -315,10 +315,17 @@ the nearby carpet places up to 64 candidates per square metre, thinning to
 eight through 110 metres, then three through 170 metres, and finally a sparse
 field of larger clumps. Each tier fades over distance rather than ending at a
 hard ring. Grass fades beyond 213 metres and reaches its draw limit at 235 metres.
-The medium and small clumps dominate the carpet. The GPU captures
-a 512-metre local map of terrain height, grass suitability and ground colour
-every frame, using the terrain's actual snow, sand, soil, rock, gravel and
-erosion material weights. Roots are admitted where grass dominates the visible
+The medium and small clumps dominate the carpet.
+
+The GPU captures a 512-metre local map of terrain height, grass suitability and
+ground colour, using the terrain's actual snow, sand, soil, rock, gravel and
+erosion material weights. The map depends only on its 8-metre window, the
+clipmap's centre, the streamed erosion data and a few material settings, so it
+is kept until one of those changes (the player entering the next window, an
+erosion tile arriving or revealing) and standing still costs nothing. It is
+rendered as though the camera stood in the middle of its window, so the
+player's exact position does not enter it. Roots are admitted where grass
+dominates the visible
 blend, even if some dirt or sand shows through, above the ocean crest
 and away from snow, rock, gravel, and incised drainage furrows.
 The erosion solver's water is working runoff rather than a visible inland
@@ -326,12 +333,12 @@ water body; it does not remove otherwise healthy valley grass. Each
 clump checks its root footprint, rather than only its centre. The capture
 retains sub-metre root precision while covering the distant field.
 
-The grass's grayscale blade texture supplies light and dark detail. Each frame the
-GPU averages nearby unlit terrain colours, and every clump samples that local
-average at its root for colour. The atlas's visible-pixel average normalises
-its grayscale detail; a canopy brightness factor compensates for the lower
-light received by upright cards. Small per-clump brightness variation keeps
-the carpet from looking uniform.
+The grass's grayscale blade texture supplies light and dark detail. With each
+new capture the GPU averages nearby unlit terrain colours, and every clump
+samples that local average at its root for colour. The atlas's visible-pixel
+average normalises its grayscale detail; a canopy brightness factor
+compensates for the lower light received by upright cards. Small per-clump
+brightness variation keeps the carpet from looking uniform.
 
 The imported alpha-tested meshes join the terrain G-buffer before SSAO, so the
 lighting composite applies the same raymarched terrain and cloud shadows,
