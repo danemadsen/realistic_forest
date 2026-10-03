@@ -396,10 +396,11 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
 //
 // river_grid holds an eight-word header (origin XZ and cell size as f32
 // bits, resolution, segment count), then three words per cell, then the
-// segment lists the cells point into. A cell's words are the offset of its
-// list, the list's length, and the level of any lake reaching into the cell
-// as f32 bits (RIVER_NO_LAKE if none). A zero resolution means there are no
-// rivers.
+// segment lists the cells point into, then the lake records. A cell's words
+// are the offset of its list, the list's length, and the offset of its lake
+// record (RIVER_NO_LAKE_RECORD if no lake reaches it): the lake's level as
+// f32 bits and a 64-bit mask of which of the cell's 8 x 8 lake cells lie
+// under the lake or its shore. A zero resolution means there are no rivers.
 //
 // A lake has no channel: ground below its level near it lies under its
 // water, and riverBankAt measures the shore in a river bank's terms.
@@ -442,6 +443,8 @@ struct RiverEnvelope {
 const RIVER_NONE: f32 = 1.0e30;
 const RIVER_NO_LAKE: f32 = -1.0e30;
 const RIVER_GRID_CELL_WORDS: u32 = 3u;
+const RIVER_NO_LAKE_RECORD: u32 = 0xffffffffu;
+const RIVER_LAKE_CELLS_ACROSS: u32 = 8u;
 // Metres of shore per metre of rise above a lake's water.
 const RIVER_LAKE_SHORE_RUN: f32 = 6.0;
 const RIVER_BANK_REACH: f32 = 12.0;
@@ -548,7 +551,17 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
     {
         riverCombine(&total, riverSegmentEnvelope(river_segments[river_grid[offset + i]], p));
     }
-    total.lake = bitcast<f32>(river_grid[entry + 2u]);
+    let record = river_grid[entry + 2u];
+    if (record != RIVER_NO_LAKE_RECORD)
+    {
+        let fine = floor((p - origin)/(bitcast<f32>(river_grid[2])/f32(RIVER_LAKE_CELLS_ACROSS)));
+        let local = vec2<u32>(fine - cell*f32(RIVER_LAKE_CELLS_ACROSS));
+        let bit = local.y*RIVER_LAKE_CELLS_ACROSS + local.x;
+        if (((river_grid[record + 1u + bit/32u] >> (bit % 32u)) & 1u) == 1u)
+        {
+            total.lake = bitcast<f32>(river_grid[record]);
+        }
+    }
     return total;
 }
 

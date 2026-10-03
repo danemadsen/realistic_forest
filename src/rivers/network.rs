@@ -641,8 +641,9 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
 // Flow paths
 // ---------------------------------------------------------------------------
 
-/// Cell of the fine flow grids, metres.
+/// Cell of the fine flow grids, metres: the lookup grid's lake cells.
 pub const FLOW_CELL: f64 = 4.0;
+const _: () = assert!(FLOW_CELL as f32 * super::carve::LAKE_CELLS_ACROSS as f32 == GRID_CELL);
 /// How far either side of its coarse path a river's water may find its way.
 pub const FLOW_CORRIDOR: f64 = 72.0;
 /// Rise per metre the flood adds across a filled hollow, so water crossing
@@ -1464,9 +1465,6 @@ fn build_nodes(noise: &NoiseField, centreline: Vec<PathPoint>, end_level: Option
         node.turbulence = (0.15 * smoothstep(0.004, 0.02, node.slope) + 0.6 * cascade
             + plunge * smoothstep(0.1, 1.2, last_drop))
             .min(1.0);
-        if node.fall > 0.0 {
-            node.turbulence = node.turbulence.max(0.8);
-        }
         // Lowland banks are low and grassy; mountain channels cut steep
         // banks into stony ground.
         node.bank = 0.55 + 0.9 * smoothstep(0.003, 0.08, node.slope);
@@ -1781,7 +1779,9 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
     let mut grid = SegmentGrid::build(grid_origin, resolution, &segments);
     let lakes = lakes.lakes;
     for lake in &lakes {
-        grid.add_lake(lake.level, &lake.cells, FLOW_CELL as f32);
+        // The water's cells and the shore its sheet reaches over.
+        let cells: Vec<[i32; 2]> = lake.cells.iter().chain(&lake.shore).copied().collect();
+        grid.add_lake(lake.level, &cells, FLOW_CELL as f32);
     }
     let surface = super::surface::build(&finished, &lakes);
     RiverNetwork {

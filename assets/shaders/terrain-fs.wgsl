@@ -592,10 +592,11 @@ fn rockWeathering(p: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec3<f32>
 //
 // river_grid holds an eight-word header (origin XZ and cell size as f32
 // bits, resolution, segment count), then three words per cell, then the
-// segment lists the cells point into. A cell's words are the offset of its
-// list, the list's length, and the level of any lake reaching into the cell
-// as f32 bits (RIVER_NO_LAKE if none). A zero resolution means there are no
-// rivers.
+// segment lists the cells point into, then the lake records. A cell's words
+// are the offset of its list, the list's length, and the offset of its lake
+// record (RIVER_NO_LAKE_RECORD if no lake reaches it): the lake's level as
+// f32 bits and a 64-bit mask of which of the cell's 8 x 8 lake cells lie
+// under the lake or its shore. A zero resolution means there are no rivers.
 //
 // A lake has no channel: ground below its level near it lies under its
 // water, and riverBankAt measures the shore in a river bank's terms.
@@ -638,6 +639,8 @@ struct RiverEnvelope {
 const RIVER_NONE: f32 = 1.0e30;
 const RIVER_NO_LAKE: f32 = -1.0e30;
 const RIVER_GRID_CELL_WORDS: u32 = 3u;
+const RIVER_NO_LAKE_RECORD: u32 = 0xffffffffu;
+const RIVER_LAKE_CELLS_ACROSS: u32 = 8u;
 // Metres of shore per metre of rise above a lake's water.
 const RIVER_LAKE_SHORE_RUN: f32 = 6.0;
 const RIVER_BANK_REACH: f32 = 12.0;
@@ -744,7 +747,17 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
     {
         riverCombine(&total, riverSegmentEnvelope(river_segments[river_grid[offset + i]], p));
     }
-    total.lake = bitcast<f32>(river_grid[entry + 2u]);
+    let record = river_grid[entry + 2u];
+    if (record != RIVER_NO_LAKE_RECORD)
+    {
+        let fine = floor((p - origin)/(bitcast<f32>(river_grid[2])/f32(RIVER_LAKE_CELLS_ACROSS)));
+        let local = vec2<u32>(fine - cell*f32(RIVER_LAKE_CELLS_ACROSS));
+        let bit = local.y*RIVER_LAKE_CELLS_ACROSS + local.x;
+        if (((river_grid[record + 1u + bit/32u] >> (bit % 32u)) & 1u) == 1u)
+        {
+            total.lake = bitcast<f32>(river_grid[record]);
+        }
+    }
     return total;
 }
 
@@ -996,6 +1009,22 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let materialNormal = normalize(input.frag_material_normal);
     let slope = 1.0 - clamp(materialNormal.y, 0.0, 1.0);
     let worldXZ = frag_world_position.xz;
+    // The river or lake here. The vertex stage's value is interpolated
+    // across the clipmap's triangles, which beyond the first ring are wider
+    // than a creek and would smear its bed and banks across them; wherever
+    // that value says water may lie within a triangle's span, look it up
+    // exactly. Elsewhere (nearly everywhere) the cheap value stands.
+    var river = input.frag_river;
+    if (river.x < 2.0 + 1.5*max(stage.spacing, stage.next_spacing))
+    {
+        let exact = riverEnvelope(worldXZ);
+        let bank = riverBankAt(exact, frag_world_position.y);
+        let still = bank < exact.bank_distance;
+        river = vec4<f32>(clamp(bank, -40.0, 40.0),
+                          select(exact.bend, 0.0, still),
+                          select(exact.turbulence, 0.0, still),
+                          select(length(exact.velocity), 0.0, still));
+    }
     // Evaluate derivatives before any material gates. Explicit gradients keep
     // the mirrored patch fields filtered without seams at their folds.
     let worldStepX = dpdx(worldXZ);
@@ -1301,10 +1330,10 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // soil and roots, on the inside it leaves a bar of sand and gravel
     // standing out of the water, and beside whitewater the banks are stone.
     // Every edge wanders, so no waterline runs parallel to its channel.
-    let riverBank = input.frag_river.x + (soilEdge - 0.5)*0.35 + (soilSmall - 0.5)*0.25;
-    let riverBend = input.frag_river.y;
-    let riverTurbulence = input.frag_river.z;
-    let riverPower = input.frag_river.w*(1.0 + 1.5*riverTurbulence);
+    let riverBank = river.x + (soilEdge - 0.5)*0.35 + (soilSmall - 0.5)*0.25;
+    let riverBend = river.y;
+    let riverTurbulence = river.z;
+    let riverPower = river.w*(1.0 + 1.5*riverTurbulence);
     let inRiver = 1.0 - smoothHermite(-0.30, 0.05, riverBank);
     let riverRock = smoothHermite(0.45, 0.85, riverTurbulence);
     let riverSand = (1.0 - smoothHermite(0.12, 0.45, riverPower + (soilSmall - 0.5)*0.3))*(1.0 - riverRock);
@@ -2270,8 +2299,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         let shoreWet = waterline * (gSand + gGravel + gRock);
         // A river wets its bed and the bank a hand's breadth above the
         // water, splashed higher beside whitewater.
-        let riverWet = 1.0 - smoothHermite(0.0, 0.35 + 0.9*input.frag_river.z,
-                                           input.frag_river.x);
+        let riverWet = 1.0 - smoothHermite(0.0, 0.35 + 0.9*river.z, river.x);
         // A bar the river last covered, and the stones beside whitewater,
         // stay damp and stained.
         let moisture = clamp(waterAmount * 0.52 + channel * 0.25 + shoreWet * 0.65
@@ -2280,7 +2308,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         let damp = albedo * vec3<f32>(0.55, 0.57, 0.56);
         albedo = mix(albedo, damp, moisture);
         // Under the water the bed is filmed with algae and settled silt.
-        let submergedBed = (1.0 - smoothHermite(-0.35, 0.0, input.frag_river.x)) * (1.0 - gSnow);
+        let submergedBed = (1.0 - smoothHermite(-0.35, 0.0, river.x)) * (1.0 - gSnow);
         albedo = mix(albedo, albedo * vec3<f32>(0.50, 0.55, 0.36), submergedBed);
         // Damp earth stays rough; only pooled water approaches a low
         // roughness. Write the final value used by the G-buffer (snow glints

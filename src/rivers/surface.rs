@@ -10,8 +10,12 @@
 //!
 //! At a fall the water leaves the lip at the speed it arrived with and drops
 //! under gravity, so the sheet follows the jet's parabola out from the lip
-//! and lands in the plunge pool a little downstream. The pool's own surface
-//! starts beneath it.
+//! and lands in the plunge pool a little downstream, ending just under the
+//! pool's surface, which starts beneath it. The sheet hangs from the
+//! ribbon's own lip row, so surface and fall are one mesh, and `fall` runs
+//! on without a break: -1 on the river, rising to 0 over the last stretch
+//! to the lip (where the shader smooths and speeds the water), then 0 to 1
+//! down the sheet.
 //!
 //! A lake is a flat sheet at its level over its basin and the shore cells
 //! around it, so the shoreline is wherever the ground rises through it, but
@@ -41,8 +45,9 @@ pub struct SurfaceVertex {
     /// Whitewater, 0..1.
     pub turbulence: f32,
     pub half_width: f32,
-    /// On a falling sheet, how far down it the vertex is (0 at the lip, 1 at
-    /// the pool); -1 on a river's surface, [`LAKE_SURFACE`] on a lake's.
+    /// On a falling sheet, the share of its fall time the water has fallen
+    /// for (0 at the lip, 1 at the pool); -1 on a river's surface, 0 on its
+    /// lip row, [`LAKE_SURFACE`] on a lake's.
     pub fall: f32,
     /// On a falling sheet, the height it falls; on a surface, the height of
     /// the last fall upstream within reach of its plunge, else 0.
@@ -163,7 +168,7 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
                     depth: node.depth,
                     turbulence: node.turbulence,
                     half_width,
-                    fall: -1.0,
+                    fall: if node.fall > 0.0 && i < end { 0.0 } else { -1.0 },
                     drop,
                 });
             }
@@ -185,14 +190,16 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
                 let lip_speed = node.speed.max((GRAVITY * node.depth.max(0.1) * 0.5).sqrt()).max(0.6);
                 let duration = (2.0 * height / GRAVITY).sqrt();
                 let rows = ((height / 0.35).ceil() as usize).clamp(3, 12);
-                let mut sheet_previous: Option<u32> = None;
-                for r in 0..=rows {
+                let mut sheet_previous = Some(row);
+                for r in 1..=rows {
                     let t = r as f32 / rows as f32 * duration;
                     let out = lip_speed * t;
-                    let y = node.water - 0.5 * GRAVITY * t * t;
+                    // The last row dips just under the pool's surface, so the
+                    // two meet without a gap.
+                    let y = node.water - 0.5 * GRAVITY * t * t - if r == rows { 0.08 } else { 0.0 };
                     let fall = r as f32 / rows as f32;
                     // A sheet gathers a little as it falls.
-                    let gather = 0.95 - 0.12 * fall;
+                    let gather = 1.0 - 0.15 * fall;
                     let base = vertices.len() as u32;
                     for &across in offsets {
                         let across = across.clamp(-1.0, 1.0) * gather;

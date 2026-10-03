@@ -1906,7 +1906,16 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     let half_width = in.sheet.x;
     let fall = in.sheet.y;
     let drop = in.sheet.z;
-    let falling = fall >= 0.0;
+    let falling = fall > 0.0;
+    // Over the last stretch to a lip (`fall` rising from -1 to 0) the water
+    // draws down and speeds up, and its surface smooths into a glassy tongue.
+    let approach = smoothstepf(0.35, 1.0, clamp(fall + 1.0, 0.0, 1.0));
+    // On a sheet: how long the water takes to fall, how long this water has
+    // been falling, and so the moment it left the lip. Anything keyed to
+    // that moment moves with the water, accelerating and stretching as it
+    // falls, without a flow map.
+    let fall_time = sqrt(2.0*max(drop, 0.05)/RIVER_GRAVITY);
+    let launched = time - max(fall, 0.0)*fall_time;
     let surface_level = in.sheet.w;
     // Derivatives first, in uniform control flow.
     let pixel_dx = dpdx(in.world_position);
@@ -1929,19 +1938,22 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     let above_water = smoothstepf(-0.08, 0.12, camera_position.y - in.world_position.y);
 
     // --- The current, the rocks and the surface ------------------------------
-    let velocity = in.velocity;
+    let velocity = in.velocity*(1.0 + 1.5*approach);
     let speed = length(velocity);
-    let roughness = clamp(turbulence*0.8 + smoothstepf(0.6, 3.0, speed)*0.25 + drop*0.15, 0.0, 1.0);
-    let ripples = riverRipples(in.world_position.xz, velocity, time, roughness, footprint);
+    let roughness = clamp(turbulence*0.8 + smoothstepf(0.6, 3.0, speed)*0.25 + drop*0.15, 0.0, 1.0)
+                  *(1.0 - 0.85*approach);
+    let ripples = riverRipples(in.world_position.xz, velocity, time, roughness, footprint)
+                * vec3<f32>(vec2<f32>(1.0 - 0.7*approach), 1.0 - 0.85*approach);
     let impacts = waterImpacts(in.world_position.xz, globals.storm.z, footprint,
                                view_distance, precipitation.x, precipitation.y, precipitation.w);
     let slope = ripples.xy + impacts.slope;
     var normal = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
     if (falling)
     {
-        // A falling sheet: its own facing, rippled by the streaks.
-        let streak = riverNoise(vec2<f32>(across*half_width*5.0, (in.channel.y - time*3.0)*0.7));
-        normal = normalize(geometric + vec3<f32>(streak.y, 0.0, streak.z)*0.08);
+        // A falling sheet: its own facing, corrugated by the strands that
+        // fall with it.
+        let streak = riverNoise(vec2<f32>(across*half_width*4.0, launched*6.0));
+        normal = normalize(geometric + vec3<f32>(streak.y, 0.0, streak.z)*0.07);
     }
     if (dot(normal, to_view) < 0.0)
     {
@@ -2013,28 +2025,37 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     let eddy_line = smoothstepf(0.62, 0.98, abs(across))*smoothstepf(0.7, 2.2, speed)*0.45;
     let cascade = smoothstepf(0.25, 0.85, turbulence)*0.85;
     let plunge = smoothstepf(0.05, 0.9, drop)*0.95;
+    // The tongue sliding over a lip is smooth, unbroken water.
     let amount = clamp(max(max(cascade, plunge), eddy_line)
-                       + 0.06*smoothstepf(0.2, 1.0, speed), 0.0, 1.0);
+                       + 0.06*smoothstepf(0.2, 1.0, speed), 0.0, 1.0)*(1.0 - approach);
     // Foam gathers in patches and streaks the pattern carries downstream.
     var foam = smoothstepf(1.05 - amount, 1.3 - amount*0.6, pattern)*amount
              + impacts.splash*0.2 + impacts.snow_fleck*0.06;
     if (falling)
     {
-        // The sheet is aerated water falling in strands: they stream down
-        // at the speed of the fall, the sheet is thin and glassy at the lip
-        // and turns white as it breaks up, torn at its edges, and a thin
-        // creek's veil shows the wet rock through it.
-        let world_y = in.world_position.y;
-        let fall_speed = 2.0 + sqrt(2.0*RIVER_GRAVITY*max(drop*fall, 0.05));
-        let strands = valueNoise(vec2<f32>(across*half_width*6.0, world_y*1.4 + time*fall_speed*1.4));
-        let fine = valueNoise(vec2<f32>(across*half_width*17.0 + 3.7, world_y*3.1 + time*fall_speed*3.1));
-        let strand = smoothstepf(0.30, 0.85, strands*0.65 + fine*0.35);
-        let edge = 1.0 - smoothstepf(0.5, 1.0, abs(across));
-        let body = 0.2 + 0.45*smoothstepf(0.1, 0.6, in.channel.z);
-        let aerated = smoothstepf(0.0, 0.7, fall);
-        foam = clamp(strand*(0.45 + 0.55*aerated) + 0.25*aerated, 0.0, 1.0);
-        let veil = clamp((body + 0.5*strand)*mix(0.3, 1.0, edge) + 0.3*aerated*edge, 0.0, 0.96);
-        lit = mix(scene_linear*0.85, mix(lit, foam_colour, foam), veil);
+        // The sheet leaves the lip as a clear, glassy tongue and breaks up
+        // as it falls into strands of aerated, white water: soon on a tall
+        // fall, at once on a thin veil. Its strands fall with the water
+        // (keyed to the moment it left the lip), and it frays and thins
+        // toward its torn sides.
+        let u = across*half_width;
+        let strand = valueNoise(vec2<f32>(u*3.2, launched*4.0))*0.6
+                   + valueNoise(vec2<f32>(u*9.0 + 3.7, launched*11.0))*0.4;
+        let breakup = smoothstepf(0.0, 0.6, fall*(0.55 + 0.2*min(drop, 6.0))
+                                            + 0.25*(1.0 - smoothstepf(0.1, 0.5, in.channel.z)));
+        let white = clamp(smoothstepf(0.66 - 0.42*breakup, 0.86, strand)*(0.3 + 0.7*breakup)
+                          + 0.4*breakup*breakup, 0.0, 1.0);
+        let fray = valueNoise(vec2<f32>(u*6.0 + 11.0, launched*7.0));
+        let sides = smoothstepf(1.0, 0.5 + 0.3*fray, abs(across));
+        // Clear water a few centimetres thick: what lies behind shows
+        // through, tinted and bent, under the reflections; aerated water
+        // scatters light like foam and glows when the sun is behind it.
+        let thickness = clamp(in.channel.z*0.5, 0.04, 0.5);
+        let glass = mix(scene_linear*exp(-RIVER_EXTINCTION*thickness), reflected, fresnel)
+                  + specular*sun_colour + moon_specular*moon_colour;
+        let backlight = sun_colour*0.1*pow(max(dot(-to_view, to_sun), 0.0), 4.0);
+        let sheet = mix(glass, foam_colour + backlight*(1.0 - 0.5*white), white);
+        lit = mix(scene_linear, sheet, sides);
     }
     else
     {

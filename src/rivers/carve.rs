@@ -246,9 +246,12 @@ pub fn combine(total: &mut Envelope, next: &Envelope) {
 }
 
 /// A uniform grid of segment lists over the network's whole domain, with
-/// the level of any lake reaching into each cell. Uploaded to the GPU as one
-/// `u32` array: an eight-word header, then `(offset, segment count, lake
-/// level bits)` per cell, then the index lists those point into.
+/// the lakes reaching into each cell. Uploaded to the GPU as one `u32` array:
+/// an eight-word header, then `(offset, segment count, lake)` per cell, then
+/// the index lists the offsets point into, then the lake records. A cell's
+/// lake word is `NO_LAKE_RECORD` or the offset of its record: the lake's
+/// level (f32 bits) and a 64-bit mask of which of the cell's 8 x 8 lake
+/// cells (`GRID_CELL / 8`) lie under the lake or its shore.
 #[derive(Clone, Debug, Default)]
 pub struct SegmentGrid {
     pub origin: [f32; 2],
@@ -256,13 +259,16 @@ pub struct SegmentGrid {
     /// Per cell: offset into `indices` and segment count.
     pub cells: Vec<[u32; 2]>,
     pub indices: Vec<u32>,
-    /// Per cell, the highest lake level reaching into it; empty when there
-    /// are no lakes.
-    pub lakes: Vec<f32>,
+    /// The cells lakes reach into: (level, mask of lake cells), by cell.
+    pub lakes: std::collections::BTreeMap<u32, (f32, u64)>,
 }
 
 /// The "no lake" level on the GPU, where infinities are best avoided.
 pub const NO_LAKE: f32 = -1.0e30;
+/// A cell's lake word when no lake reaches it.
+pub const NO_LAKE_RECORD: u32 = u32::MAX;
+/// Lake cells across a grid cell.
+pub const LAKE_CELLS_ACROSS: usize = 8;
 /// Words per cell in the GPU grid.
 pub const GRID_CELL_WORDS: usize = 3;
 
@@ -304,7 +310,7 @@ impl SegmentGrid {
             resolution,
             cells,
             indices,
-            lakes: Vec::new(),
+            lakes: Default::default(),
         }
     }
 
@@ -321,34 +327,37 @@ impl SegmentGrid {
         self.cell_index(p).map(|index| self.cells[index])
     }
 
-    /// Mark the grid cells a lake's water may reach: every cell holding one
-    /// of its flow-grid cells (`cell_size` metres) or touching one.
+    /// Mark a lake's cells (`cell_size` = GRID_CELL / LAKE_CELLS_ACROSS
+    /// metres, aligned with this grid) in the cells that hold them.
     pub fn add_lake(&mut self, level: f32, cells: &[[i32; 2]], cell_size: f32) {
-        if self.lakes.is_empty() {
-            self.lakes = vec![NO_LAKE; self.cells.len()];
-        }
         for cell in cells {
-            let x0 = cell[0] as f32 * cell_size;
-            let z0 = cell[1] as f32 * cell_size;
-            // The flow cell grown by one on every side, in grid cells.
-            let first = self.cell_index([x0 - cell_size, z0 - cell_size]);
-            let last = self.cell_index([x0 + 2.0 * cell_size, z0 + 2.0 * cell_size]);
-            let (Some(first), Some(last)) = (first, last) else {
+            let centre = [(cell[0] as f32 + 0.5) * cell_size, (cell[1] as f32 + 0.5) * cell_size];
+            let Some(index) = self.cell_index(centre) else {
                 continue;
             };
-            for z in first / self.resolution..=last / self.resolution {
-                for x in first % self.resolution..=last % self.resolution {
-                    let slot = &mut self.lakes[z * self.resolution + x];
-                    *slot = slot.max(level);
-                }
-            }
+            let bit = self.lake_bit(centre);
+            let entry = self.lakes.entry(index as u32).or_insert((level, 0));
+            entry.0 = entry.0.max(level);
+            entry.1 |= 1u64 << bit;
         }
     }
 
-    /// The level of a lake reaching `p`, or `NO_LAKE`.
+    /// Which of its cell's lake cells `p` lies in, 0..64.
+    fn lake_bit(&self, p: [f32; 2]) -> u32 {
+        let fine = GRID_CELL / LAKE_CELLS_ACROSS as f32;
+        let x = ((p[0] - self.origin[0]) / fine).floor() as i64;
+        let z = ((p[1] - self.origin[1]) / fine).floor() as i64;
+        let across = LAKE_CELLS_ACROSS as i64;
+        (z.rem_euclid(across) * across + x.rem_euclid(across)) as u32
+    }
+
+    /// The level of the lake `p` lies in or on the shore of, or `NO_LAKE`.
     pub fn lake(&self, p: [f32; 2]) -> f32 {
-        match self.cell_index(p) {
-            Some(index) if !self.lakes.is_empty() => self.lakes[index],
+        let Some(index) = self.cell_index(p) else {
+            return NO_LAKE;
+        };
+        match self.lakes.get(&(index as u32)) {
+            Some(&(level, mask)) if (mask >> self.lake_bit(p)) & 1 == 1 => level,
             _ => NO_LAKE,
         }
     }
@@ -361,7 +370,7 @@ impl SegmentGrid {
         }
     }
 
-    /// The GPU layout: header, cell table, index lists.
+    /// The GPU layout: header, cell table, index lists, lake records.
     pub fn gpu_words(&self, segment_count: usize) -> Vec<u32> {
         let mut words = Vec::with_capacity(GRID_HEADER_WORDS + self.cells.len() * GRID_CELL_WORDS + self.indices.len());
         words.push(self.origin[0].to_bits());
@@ -371,13 +380,26 @@ impl SegmentGrid {
         words.push(segment_count as u32);
         words.extend_from_slice(&[0, 0, 0]);
         let base = (GRID_HEADER_WORDS + self.cells.len() * GRID_CELL_WORDS) as u32;
+        let records = base + self.indices.len() as u32;
+        let mut record = 0;
         for (index, cell) in self.cells.iter().enumerate() {
             // Offsets are into the whole word array.
             words.push(cell[0] + base);
             words.push(cell[1]);
-            words.push(self.lakes.get(index).copied().unwrap_or(NO_LAKE).to_bits());
+            if self.lakes.contains_key(&(index as u32)) {
+                words.push(records + 3 * record);
+                record += 1;
+            } else {
+                words.push(NO_LAKE_RECORD);
+            }
         }
         words.extend_from_slice(&self.indices);
+        // In cell order, as the offsets above were handed out.
+        for &(level, mask) in self.lakes.values() {
+            words.push(level.to_bits());
+            words.push(mask as u32);
+            words.push((mask >> 32) as u32);
+        }
         words
     }
 }
