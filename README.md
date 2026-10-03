@@ -729,12 +729,16 @@ river's water are fixed drains there, like the sea: the river carries away
 what reaches it, so tributary gullies grade to it and nothing fills or
 trenches the channel.
 
-Lakes carve nothing. The lookup grid carries the level of any lake reaching
-into each cell, and ground below it lies under the lake: plants keep out of
+Lakes carve nothing. Each lookup-grid cell a lake reaches carries the lake's
+level and a 64-bit mask of which of its 4 m cells hold the lake or its
+shore, and ground below the level there lies under the lake: plants keep out of
 it, the terrain shades its bed and shore, the erosion leaves it as a drain,
 and the player wades and swims in it.
 
-The terrain material shader reads the river or lake at every vertex: the bed
+The terrain material shader reads the river or lake at every vertex, and
+exactly at every pixel where water may lie within a triangle's span (beyond
+the first ring the clipmap's triangles are wider than a creek, and would
+smear its bed across them): the bed
 sorts by the power of the water over it, sand where the water all but stands
 (still pools, lake beds), gravel through every run and riffle, bedrock under
 cascades and falls, and under the water it is darkened by its film of algae
@@ -769,13 +773,15 @@ forest's shade.
 
 Each river's surface is a ribbon across its channel at the water level,
 reaching under both banks so the waterline is wherever the carved bank rises
-through the water. Each waterfall is a sheet that leaves its lip at the speed
-the water arrived with and falls along the jet's parabola into the plunge
-pool. A lake is a flat sheet at its level over its basin, in 4 m cells, and
-over the shore cells around it whose ground rises through the water on every
-side, so its shoreline is wherever the ground meets the water; it never
-reaches past its outlet, where the ground falls away below its level. A
-river's ribbon stops where it enters and starts again at the outlet. Water is
+through the water. Each waterfall is a sheet hung from the ribbon's own lip
+row, so river and fall are one surface: it leaves the lip at the speed the
+water arrived with, falls along the jet's parabola and ends just under the
+plunge pool's surface. A lake is a flat sheet at its level over its basin,
+in 4 m cells, and over the shore cells around it whose ground rises through
+the water on every side, so its shoreline is wherever the ground meets the
+water; it never reaches past its outlet, where the ground falls away below
+its level. A river's ribbon stops where it enters and starts again at the
+outlet. Water is
 drawn to 3.2 km in 256 m chunks culled against the view; beyond a few
 hundred metres, where the clipmap's triangles are wider than a creek, a
 river's surface is lifted by about the bank those triangles leave so it still
@@ -797,10 +803,15 @@ water does:
   roughness instead of shimmer.
 - **Whitewater.** Cascades, plunge pools and eddy lines along the banks of
   fast water carry foam that the current advects downstream.
-  Aerated water is milkier as well as whiter. Falling sheets are strands of
-  water streaming down at the speed of the fall, glassy at the lip and white
-  as they break up, torn at their edges, thin enough on a small creek to show
-  the wet rock behind.
+  Aerated water is milkier as well as whiter.
+- **Waterfalls.** Over the last stretch to a lip the water draws down,
+  speeds up and smooths into a glassy tongue. Down the sheet, everything is
+  keyed to the moment its water left the lip, so the strands fall at the
+  water's own accelerating speed and stretch as they go. It leaves the lip
+  clear (what lies behind shows through, tinted and bent), breaks up into
+  white, sunlit strands, sooner on a tall fall or a thin veil, frays at its
+  torn sides and glows when the sun is behind it, and lands in a plunge pool
+  that boils with foam the current carries off downstream.
 
 ### Wading
 
