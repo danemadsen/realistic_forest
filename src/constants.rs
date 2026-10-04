@@ -164,19 +164,19 @@ impl Default for ErosionSettings {
     fn default() -> Self {
         Self {
             iterations: 140,
-            rain: 0.01,
+            rain: 0.018,
             evaporation: 0.12,
-            erosion_rate: 0.08,
+            erosion_rate: 0.18,
             deposition_rate: 0.40,
-            sediment_capacity: 3.5,
-            transport_rate: 0.80,
-            maximum_erosion: 3.5,
-            fluvial_capacity: 0.035,
-            fluvial_erosion: 0.12,
+            sediment_capacity: 5.0,
+            transport_rate: 1.0,
+            maximum_erosion: 5.5,
+            fluvial_capacity: 0.050,
+            fluvial_erosion: 0.18,
             fluvial_deposition: 0.30,
-            maximum_incision: 9.0,
+            maximum_incision: 12.0,
             talus_rate: 0.05,
-            rockfall_rate: 0.005,
+            rockfall_rate: 0.0075,
         }
     }
 }
