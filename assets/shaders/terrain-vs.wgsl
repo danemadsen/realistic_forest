@@ -377,6 +377,40 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
 }
 // END SHARED TERRAIN HEIGHT
 
+// BEGIN SHARED SNOW COVERAGE
+// A continuous pack above the climate snowline. Aspect moves only the broad
+// transition, while steep walls shed snow. Geometry and material use this
+// same field so the raised snow surface always matches its white coverage.
+fn snowCoverage(height: f32, normal: vec3<f32>) -> f32
+{
+    let meltSun = normalize(vec3<f32>(-0.22, 0.62, -0.76));
+    let aspectShift = (0.62 - max(dot(normal, meltSun), 0.0)) * 12.0;
+    let snowLine = smoothHermite(stage.snowline_altitude - 13.0,
+                                 stage.snowline_altitude + 13.0,
+                                 height - stage.sea_level + aspectShift);
+    let steepness = length(normal.xz) / max(normal.y, 0.001);
+    return snowLine * (1.0 - smoothHermite(0.80, 1.45, steepness));
+}
+// END SHARED SNOW COVERAGE
+
+@group(1) @binding(7) var snow_compression: texture_2d<f32>;
+@group(1) @binding(15) var snow_sampler: sampler;
+struct SnowUniforms {
+    mapping: vec4<f32>, // world minimum XZ, texel size, untouched depth
+};
+@group(1) @binding(16) var<uniform> snow: SnowUniforms;
+
+fn snowCompression(worldXZ: vec2<f32>) -> f32 {
+    let span = vec2<f32>(textureDimensions(snow_compression)) * snow.mapping.z;
+    let uv = (worldXZ - snow.mapping.xy) / max(span, vec2<f32>(0.001));
+    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0))) { return 0.0; }
+    return textureSampleLevel(snow_compression, snow_sampler, uv, 0.0).r;
+}
+
+fn snowLift(worldXZ: vec2<f32>, height: f32, materialNormal: vec3<f32>) -> f32 {
+    return snowCoverage(height, materialNormal) * snow.mapping.w * (1.0 - snowCompression(worldXZ));
+}
+
 // The clipmap mesh stores planar grid coordinates in vertexPosition.xz.
 // uClipOrigin is the world-space centre of the current clipmap level and
 // uSpacing is the distance between two vertices at this level.
@@ -388,10 +422,11 @@ struct VsOutput {
     @location(3) fragWorldNormal: vec3<f32>,    // fragWorldNormal
     @location(4) fragErosionDelta: f32,         // fragErosionDelta
     @location(5) frag_material_normal: vec3<f32>, // Distance-prefiltered slope/aspect for material placement.
+    @location(6) frag_base_height: f32,
+    @location(7) frag_snow_compaction: f32,
 };
 
-@vertex
-fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput
+fn terrainVertex(vertexPosition: vec3<f32>, deformSnow: bool) -> VsOutput
 {
     let localXZ = vertexPosition.xz*stage.spacing;
     let fineXZ = stage.clip_origin + localXZ;
@@ -409,20 +444,22 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput
     // overlay. Compute it once here instead of calling terrainHeight() so the
     // delta is not evaluated twice for the primary vertex.
     let erosionContribution = erosionDelta(worldXZ)*erosionVisibility(worldXZ);
-    let height = baseHeight(worldXZ) + erosionContribution;
+    var height = baseHeight(worldXZ) + erosionContribution;
     var output: VsOutput;
     output.fragErosionDelta = erosionContribution;
+    output.frag_base_height = height;
+    output.frag_snow_compaction = 0.0;
 
     // Evaluate normals at a world-space interval appropriate to this LOD. This
     // avoids the high-frequency shimmer produced by differentiating the mesh.
     // Follow the same LOD blend as position so lighting does not reveal a seam
     // where the fine geometry has already morphed onto the coarse lattice.
-    let normalStep = max(1.0, mix(stage.spacing, stage.next_spacing, morph));
+    let normalStep = max(0.25, mix(stage.spacing, stage.next_spacing, morph));
     let heightLeft = terrainHeight(worldXZ - vec2<f32>(normalStep, 0.0));
     let heightRight = terrainHeight(worldXZ + vec2<f32>(normalStep, 0.0));
     let heightBack = terrainHeight(worldXZ - vec2<f32>(0.0, normalStep));
     let heightFront = terrainHeight(worldXZ + vec2<f32>(0.0, normalStep));
-    let localNormal = normalize(vec3<f32>(heightLeft - heightRight,
+    var localNormal = normalize(vec3<f32>(heightLeft - heightRight,
                                           2.0*normalStep,
                                           heightBack - heightFront));
 
@@ -451,6 +488,19 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput
                                              materialBack - materialFront));
     }
 
+    if (deformSnow) {
+        // Placement reads the underlying terrain, so the sides of a trail
+        // remain snow-covered. Only the geometry and lighting normals deform.
+        let compression = snowCompression(worldXZ);
+        output.frag_snow_compaction = compression;
+        height += snowCoverage(height, materialNormal) * snow.mapping.w * (1.0 - compression);
+        let left = heightLeft + snowLift(worldXZ - vec2<f32>(normalStep, 0.0), heightLeft, materialNormal);
+        let right = heightRight + snowLift(worldXZ + vec2<f32>(normalStep, 0.0), heightRight, materialNormal);
+        let back = heightBack + snowLift(worldXZ - vec2<f32>(0.0, normalStep), heightBack, materialNormal);
+        let front = heightFront + snowLift(worldXZ + vec2<f32>(0.0, normalStep), heightFront, materialNormal);
+        localNormal = normalize(vec3<f32>(left - right, 2.0 * normalStep, back - front));
+    }
+
     let worldPosition4 = stage.model*vec4<f32>(worldXZ.x, height, worldXZ.y, 1.0);
     // GLSL computed transpose(inverse(mat3(matModel))); stage.inverse_model is
     // inverse(matModel) supplied by the CPU because WGSL has no inverse().
@@ -469,6 +519,18 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput
 
     output.position = globals.projection*viewPosition4;
     return output;
+}
+
+// Grass roots use baseline terrain. That capture is cached independently of
+// moving snow tracks, while the visible terrain uses the displaced surface.
+@vertex
+fn vs_habitat(@location(0) vertexPosition: vec3<f32>) -> VsOutput {
+    return terrainVertex(vertexPosition, false);
+}
+
+@vertex
+fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput {
+    return terrainVertex(vertexPosition, true);
 }
 
 // STAGE UNIFORMS:

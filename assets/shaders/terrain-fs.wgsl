@@ -45,8 +45,8 @@
 //    uCameraPosition, view = matView) or into StageUniforms (see its
 //    provenance comment and the STAGE UNIFORMS block at the file end).
 // 8. Material placement now uses world-anchored terrain exposure for an
-//    overlapping ground cover and rock exposure. Snow combines regional climate
-//    variation with terrain retention instead of a fixed contour on rock.
+//    overlapping ground cover and rock exposure. Snow forms a continuous pack
+//    above its climate line and sheds from steep rock faces.
 
 // Shared global uniforms — the spec preamble, verbatim.
 struct GlobalUniforms {
@@ -155,6 +155,8 @@ struct FsInput {
     @location(3) frag_world_normal: vec3<f32>,    // fragWorldNormal
     @location(4) frag_erosion_delta: f32,         // fragErosionDelta
     @location(5) frag_material_normal: vec3<f32>, // fixed-scale world slope
+    @location(6) frag_base_height: f32, // placement stays fixed when snow compacts
+    @location(7) frag_snow_compaction: f32,
 };
 
 // G-buffer outputs, locations preserved from the GLSL layout qualifiers.
@@ -174,6 +176,22 @@ fn smoothHermite(edge0: f32, edge1: f32, value: f32) -> f32
     let t = clamp((value - edge0) / max(edge1 - edge0, 0.0001), 0.0, 1.0);
     return t * t * (3.0 - 2.0 * t);
 }
+
+// BEGIN SHARED SNOW COVERAGE
+// A continuous pack above the climate snowline. Aspect moves only the broad
+// transition, while steep walls shed snow. Geometry and material use this
+// same field so the raised snow surface always matches its white coverage.
+fn snowCoverage(height: f32, normal: vec3<f32>) -> f32
+{
+    let meltSun = normalize(vec3<f32>(-0.22, 0.62, -0.76));
+    let aspectShift = (0.62 - max(dot(normal, meltSun), 0.0)) * 12.0;
+    let snowLine = smoothHermite(stage.snowline_altitude - 13.0,
+                                 stage.snowline_altitude + 13.0,
+                                 height - stage.sea_level + aspectShift);
+    let steepness = length(normal.xz) / max(normal.y, 0.001);
+    return snowLine * (1.0 - smoothHermite(0.80, 1.45, steepness));
+}
+// END SHARED SNOW COVERAGE
 
 // Mirror-tile a coordinate pair so a non-periodic field can be re-tiled by
 // reflection: C0-continuous across every wrap (period 2 in p units), unlike a
@@ -768,6 +786,12 @@ fn accumulateGroup(base: i32, group_weight: f32, plane_coord: vec2<f32>,
     }
 
     var sampled_albedo = albedo_ao_sample.rgb;
+    if (base == SNOW_BASE)
+    {
+        // Fresh powder has a consistent white body. Keep a little scan grain
+        // for close lighting without repeating its broad grey patches.
+        sampled_albedo = mix(vec3<f32>(0.67), sampled_albedo, 0.12);
+    }
     sampled_albedo = mix(sampled_albedo,
                          vec3<f32>(dot(sampled_albedo, vec3<f32>(0.299, 0.587, 0.114))), albedo_desat);
     if (base == ROCK_BASE)
@@ -807,7 +831,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let frag_position_view = (globals.view * vec4<f32>(frag_world_position, 1.0)).xyz;
 
     var normalWorld = normalize(input.frag_world_normal);
-    let height = frag_world_position.y;
+    let height = input.frag_base_height;
     let materialNormal = normalize(input.frag_material_normal);
     let slope = 1.0 - clamp(materialNormal.y, 0.0, 1.0);
     let worldXZ = frag_world_position.xz;
@@ -1028,84 +1052,11 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let grassSoilBlend = clamp(1.0 - (1.0 - backgroundSoil) * (1.0 - disturbedSoil)
                                    * (1.0 - thinSoil * 0.55) * (1.0 - alpine * 0.30)
                                    * (1.0 - rockFringe * 0.90), 0.0, 1.0);
-    let resistantBed = bedrockResistance;
-
-    // Snow lies where the ground stays cold through the melt season. The
-    // regional snowline wanders with broad climate cells; shaded (poleward)
-    // slopes hold snow tens of metres lower than flat ground and sun-facing
-    // slopes lose it higher; sheltered hollows and lee slopes keep a deeper
-    // pack and wind-scoured crests and windward faces a thinner one. Snow does
-    // not flow downhill: a gully below the line melts out like any other low
-    // ground, so cover never reaches warm valleys. Only shaded avalanche
-    // gullies just under the line keep a short tongue of old debris snow.
-    // Every term is a world-space field; only the slope they read is
-    // prefiltered with distance (see the vertex stage), so cover stays put as
-    // the camera moves and only sub-vertex detail softens far away.
-    let snowRegion = filteredGroundNoise(
-        rotateUV(groundDomain * 0.0017, 0.63) + vec2<f32>(91.7, -53.2));
-    let snowDrift = filteredGroundNoise(
-        rotateUV(groundDomain * 0.013, 1.19) + vec2<f32>(-23.8, 67.4));
-    let snowDriftFine = filteredGroundNoise(
-        rotateUV(groundDomain * 0.05, 0.41) + vec2<f32>(37.1, 12.6));
-    let snowDriftMicro = filteredGroundNoise(
-        rotateUV(groundDomain * 0.15, 1.87) + vec2<f32>(-61.3, -42.9));
-    // Melt-season insolation relative to level ground. The spring sun stands
-    // lower than the summer climate sun, so aspect matters more: a steep
-    // shaded face holds snow ~20 m lower than a meadow at the same height,
-    // and a sun-facing slope loses it ~9 m higher. The melt sun stands only a
-    // little west of south: poleward against sunward aspect dominates, and
-    // the east and west flanks of one spur stay nearly alike instead of
-    // alternating white and bare down every rib of a mountainside.
-    let meltSun = normalize(vec3<f32>(-0.22, 0.62, -0.76));
-    let meltExposure = max(dot(materialNormal, meltSun), 0.0);
-    let aspectShift = (meltSun.y - meltExposure) * 34.0;
-    // Wind: prevailing south-westerlies scour windward aspects and crests
-    // and load lee slopes; the aspect term is slope-gated so flat snowfields
-    // (degenerate aspect) are left alone.
-    let aspectN = normalize(materialNormal.xz + vec2<f32>(1e-4, 0.0));
-    let windAlignment = dot(aspectN, normalize(vec2<f32>(0.70, 0.42)));
-    let windGate = smoothHermite(0.08, 0.30, slope);
-    let scour = smoothHermite(0.15, 0.60, -windAlignment) * windGate;
-    let leeLoad = smoothHermite(0.20, 0.70, windAlignment) * windGate;
-    let snowHeight = height + (snowRegion - 0.5) * 48.0
-                            + (snowDrift - 0.5) * 16.0
-                            + (snowDriftFine - 0.5) * 6.0
-                            + (snowDriftMicro - 0.5) * 2.5
-                            + aspectShift
-                            + hollow * 7.0 - ridge * 9.0
-                            + leeLoad * 6.0 - scour * 8.0;
-    let snowLine = smoothHermite(stage.snowline_altitude - 13.0, stage.snowline_altitude + 13.0,
-                                 snowHeight - stage.sea_level);
-    // Snow cannot cling to walls: it thins past ~39 degrees, where sluffs keep
-    // clearing it, and sheds by ~55, so steep faces stay dark rock cut
-    // through the white.
-    let snowHold = 1.0 - smoothHermite(0.80, 1.45, steepness);
-    var fSnow = snowLine * snowHold;
-
-    // Thin pack opens first over convex noses, steep, sun-facing and freshly
-    // cut ground, at every viewing distance.
-    let marginBand = snowLine * (1.0 - snowLine) * 4.0;
-    let marginShed = clamp(0.9 * ridge + smoothHermite(0.45, 0.95, steepness)
-                         + 0.8 * smoothHermite(0.75, 0.95, meltExposure)
-                         + 0.5 * incision, 0.0, 1.0);
-    fSnow = fSnow * (1.0 - 0.70 * marginBand * marginShed);
-
-    // Meltwater runs under and through the pack: permanent streams open dark
-    // ribbons, while small rills stay buried. Resistant beds melt clear;
-    // soft, debris-choked beds keep a thin skin.
-    let meltChannel = channel * smoothHermite(0.25, 0.75, dischargeAmount);
-    fSnow = fSnow * (1.0 - meltChannel * mix(0.55, 0.90, resistantBed));
-
-    // Avalanche debris: shaded gullies collect snow sliding off the steep
-    // ground above them and keep it a little below the line, as long as the
-    // ground stays cold. The tongue is short (it ends ~18 m under the local
-    // line) and sun-facing gullies get none.
-    let shade = 1.0 - smoothHermite(0.30, 0.65, meltExposure);
-    let avalancheTongue = smoothHermite(stage.snowline_altitude - 18.0, stage.snowline_altitude - 4.0,
-                                        snowHeight - stage.sea_level)
-                        * hollow * smoothHermite(0.15, 0.60, dischargeAmount) * shade
-                        * snowHold * flowDomain * 0.85;
-    fSnow = 1.0 - (1.0 - fSnow) * (1.0 - avalancheTongue);
+    // Keep the pack continuous across cold ground. Coverage follows the same
+    // climate and slope field as the raised snow geometry; erosion, drift
+    // noise and melt channels no longer punch isolated holes into it.
+    let fSnow = snowCoverage(height, materialNormal);
+    let snowLine = fSnow;
 
     let groundCover = (1.0 - fSand) * (1.0 - fGravel) * (1.0 - fRock) * (1.0 - fSnow);
     let wSand = fSand * (1.0 - fGravel) * (1.0 - fRock) * (1.0 - fSnow);
@@ -1139,7 +1090,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                   * mix(0.94, 1.06, groundGrowth);
     // Neutralise the powder scan's blue cast while leaving headroom for its
     // grain and wind relief in sunlight. Shadow colour comes from sky lighting.
-    let snowTint = vec3<f32>(1.08, 1.03, 0.99);
+    let snowTint = vec3<f32>(1.03, 1.02, 1.00);
 
     var albedo = vec3<f32>(0.0);
     var worldDetail = vec3<f32>(0.0);
@@ -1216,16 +1167,12 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // ~0.89-0.93, alongside the soil's 0.88.
     var roughLifts = array<f32, 6>(0.0, 0.0, 0.0,
                                    0.0, 0.80, 0.73);
-    // aoRetain (cavity contrast, see accumulateGroup): the AO map's darks
-    // are what make scanned surfaces read as relief — blade gaps, thatch
-    // shadows, snow pore shadows. Flattening them past ~25% turns a meadow
-    // into felt and powder into smudge, so both biomes keep most of their
-    // cavity structure and rely on SSAO for the landscape-scale darkening
-    // instead (the maps' deep soles still ease so folds never double-darken
-    // to mud).
-    var aoRetains = array<f32, 6>(0.75, 0.85, 1.0,
+    // Grass keeps its scanned blade gaps and thatch shadows. Snow retains
+    // only shallow pore contrast so undisturbed powder stays uniformly white;
+    // mesh relief and SSAO supply the shadows around compressed trails.
+    var aoRetains = array<f32, 6>(0.12, 0.85, 1.0,
                                   0.90, 1.0, 1.0);
-    var normalMuls = array<f32, 6>(1.0, 1.0, 1.0,
+    var normalMuls = array<f32, 6>(0.35, 1.0, 1.0,
                                    0.85, 1.0, 0.48);
     // Resolve each material's three projections first, then blend whole
     // surfaces. Scan cavities approximate local relief at the contact edge:
@@ -1283,7 +1230,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         surfaceDetail[g] = detail * invProjection;
         surfaceRough[g] = roughness * invProjection;
         surfaceAO[g] = cavity * invProjection;
-        let relief = (surfaceAO[g] - 0.65) * 0.22 * contactDetail;
+        let relief = (surfaceAO[g] - 0.65) * select(0.22, 0.04, g == 0) * contactDetail;
         scores[g] = groupWeights[g] + relief * 4.0 * groupWeights[g] * (1.0 - groupWeights[g]);
         if (scores[g] > highestScore) {
             highestScore = scores[g];
@@ -1318,6 +1265,12 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let gDirt = groupWeights[3] / denom;
     let gGravel = groupWeights[4] / denom;
     let gRock = groupWeights[5] / denom;
+
+    // Packed snow has less airy scattering and a smoother surface. A small
+    // tonal change helps the geometric depression read in diffuse light.
+    let packedSnow = clamp(input.frag_snow_compaction, 0.0, 1.0) * gSnow;
+    albedo *= mix(1.0, 0.92, packedSnow);
+    rough = mix(rough, max(0.55, rough - 0.10), packedSnow);
 
     if (habitat)
     {
@@ -1477,6 +1430,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         // ones, in patches that thin toward the summits.
         let lichen = smoothHermite(0.55, 0.80, soilSmall * 0.6 + soilEdge * 0.4)
                    * (1.0 - 0.5 * alpine);
+        let meltExposure = max(dot(materialNormal, normalize(vec3<f32>(-0.22, 0.62, -0.76))), 0.0);
         let dampFace = 1.0 - smoothHermite(0.35, 0.80, meltExposure);
         albedo = mix(albedo, albedo * vec3<f32>(0.90, 0.98, 0.84), gRock * lichen * dampFace * 0.55);
         albedo = mix(albedo, albedo * vec3<f32>(1.10, 0.97, 0.80),
@@ -1545,10 +1499,10 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     if (!habitat && gSnow > 0.02)
     {
         let kMacroDriftFreq = 0.004;    // ~22 m wavelength
-        let kMacroDriftHeight = 9.0;    // noise-height multiplier
+        let kMacroDriftHeight = 0.8;    // noise-height multiplier
         let kMacroDriftStep = 2.5;      // gradient tap separation, m
         let kMacroSastrugiFreq = 0.011; // ~8 m wavelength
-        let kMacroSastrugiHeight = 3.5;
+        let kMacroSastrugiHeight = 0.3;
         let kMacroSastrugiStep = 1.0;
         // Domains rotated, and mutually decorrelated: the base noise field
         // is axis-aligned, so unrotated drift/sastrugi contours ran parallel
@@ -1611,13 +1565,9 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         perturbedWorld = normalize(perturbedWorld
                                  + vec3<f32>(-macroGradient.x, 0.0, -macroGradient.y) * gSnow);
 
-        // Near-field wind grain. The scans' own normal detail magnifies to
-        // soft nothing at the camera's feet, yet photographic snow is at its
-        // most textured up close: centimetre-scale crust facets tilt 15-30
-        // degrees and read as granular micro-shadow. A ~3 cm noise octave
-        // tilts the normal where the pixel footprint can still resolve it,
-        // fading out as the grain approaches pixel size (the noise texture's
-        // mip chain keeps the octave itself from aliasing on the way out).
+        // Soft near-field wind grain adds shallow crust lighting while the
+        // white body remains even. It fades as its features approach pixel
+        // size, with the mip chain filtering the field along the way.
         // Fade window widened (0.03 -> 0.08): with the 3 px tap below the
         // octave's pixel-scale salt is gone, so the ~19 cm crust texture
         // stays resolvable through the mid band instead of handing the
@@ -1629,7 +1579,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                                      // (the noise texture spans ~8.7
                                      // base-octave wavelengths, so
                                      // features sit at ~0.09/m metres)
-            let kGrainSlope = 0.9;
+            let kGrainSlope = 0.25;
             let grainUV = rotateUV(worldXZ * kGrainFreq, 0.44) + vec2<f32>(0.11, 0.71);
             // Screen-derivative sampling, not LOD 0 (see the crystal block
             // below for the aliasing that forced the change).
@@ -1693,7 +1643,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
             // chain, feeding the nearest-crop salt; coarser clusters also
             // sit closer to the 4-8 px boot-range grain photography shows.
             let kCrystalFreq = 3.2;     // ~2.8 cm crystal clusters
-            let kCrystalSlope = 1.4;
+            let kCrystalSlope = 0.4;
             let crystalUV = rotateUV(worldXZ * kCrystalFreq, 0.97) + vec2<f32>(0.53, 0.09);
             // Screen-derivative sampling. LOD 0 served these near-field
             // octaves badly: at boot range one pixel covers 10-30 texels
@@ -1967,7 +1917,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         let driftSun = -dot(normalize(macroGradient + vec2<f32>(1e-5, 0.0)), toSunXZ);
         let driftForm = smoothHermite(0.02, 0.10, length(macroGradient));
         let mottleForm = clamp(0.5 + 0.5 * driftSun * driftForm, 0.0, 1.0);
-        albedo = albedo * (1.0 + (mix(mottle, mottleForm, 0.6) - 0.5) * 0.30 * gSnow * mottleFade);
+        albedo = albedo * (1.0 + (mix(mottle, mottleForm, 0.6) - 0.5) * 0.035 * gSnow * mottleFade);
         let grainFade = 1.0 - smoothHermite(0.003, 0.08, footprint);
         // Inner fade: the grain domain's texel is ~2 mm, so below ~6 mm/px
         // the fetch sits near LOD 0 and the octave's own texel noise rides
@@ -1976,14 +1926,14 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         // The crystal octave (texel 0.3 mm, deep in its mip chain at that
         // range) owns the boot-range albedo instead.
         let grainInner = smoothHermite(0.0015, 0.006, footprint);
-        albedo = albedo * (1.0 + (snowGrainValue - 0.5) * 0.32 * gSnow * grainFade * grainInner);
+        albedo = albedo * (1.0 + (snowGrainValue - 0.5) * 0.055 * gSnow * grainFade * grainInner);
         // Crystal albedo: boot-range snow varies at the cluster scale —
         // shadowed interstices between hoar clusters read darker than the
         // cluster faces, so the crystal octave swings albedo as well as
         // tilting the normal (its fade is recomputed rather than reused
         // because it lives in this block's scope).
         let crystalFade = 1.0 - smoothHermite(0.0015, 0.02, footprint);
-        albedo = albedo * (1.0 + (snowCrystalValue - 0.5) * 0.26 * gSnow * crystalFade);
+        albedo = albedo * (1.0 + (snowCrystalValue - 0.5) * 0.05 * gSnow * crystalFade);
 
         // The snow-to-grass biome crossfade interpolates the two albedos
         // straight through an olive half-mix; a real snowline melts through
@@ -1991,7 +1941,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         // luminance with a faintly earthen tint.
         let fringe = clamp(min(gSnow, gGrass + gDirt) * 1.8, 0.0, 1.0);
         let fringeLum = dot(albedo, vec3<f32>(0.299, 0.587, 0.114));
-        albedo = mix(albedo, vec3<f32>(fringeLum) * vec3<f32>(1.04, 0.99, 0.92), fringe * 0.5);
+        albedo = mix(albedo, vec3<f32>(fringeLum) * vec3<f32>(1.04, 0.99, 0.92), fringe * 0.12);
 
         // Silt stains the thinning pack around its local climate margin.
         // Use coverage rather than another altitude band so the stain tracks
@@ -2006,7 +1956,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                          * smoothHermite(0.15, 0.60, gSnow)
                          * (1.0 - sedimentClearance);
         sedimentLoad = clamp(sedimentLoad, 0.0, 1.0);
-        albedo = mix(albedo, albedo * vec3<f32>(0.52, 0.37, 0.29), 0.85 * sedimentLoad);
+        albedo = mix(albedo, albedo * vec3<f32>(0.52, 0.37, 0.29), 0.12 * sedimentLoad);
     }
 
     let waterAmount = smoothHermite(0.04, 0.35, max(flow.r, 0.0));

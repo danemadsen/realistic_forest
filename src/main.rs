@@ -21,6 +21,7 @@ mod ui;
 mod vegetation;
 mod water;
 mod weather;
+mod snow;
 
 use crate::automation::AutomationSettings;
 use crate::constants::*;
@@ -288,6 +289,7 @@ fn main() {
             weather
         })
         .init_resource::<ErosionCache>()
+        .init_resource::<snow::SnowState>()
         .insert_resource(ErosionSettings::default())
         .insert_resource(AppliedErosionSettings(ErosionSettings::default()))
         .insert_resource(RerunErosion::default())
@@ -410,6 +412,7 @@ fn setup_cursor_and_player(
     noise: Res<NoiseField>,
     mut player: Query<&mut Player>,
     mut windows: Query<(&mut bevy::window::CursorOptions,), With<PrimaryWindow>>,
+    mut snow: ResMut<snow::SnowState>,
 ) {
     if *local {
         return;
@@ -429,6 +432,15 @@ fn setup_cursor_and_player(
         return;
     };
     *local = true;
+    let snow_center = if automation.has_camera {
+        bevy::math::Vec2::new(automation.position[0], automation.position[2])
+    } else {
+        bevy::math::Vec2::ZERO
+    };
+    snow.recenter(snow_center);
+    if let Some([x0, z0, x1, z1]) = automation.snow_trail {
+        snow.stamp_segment(bevy::math::Vec2::new(x0, z0), bevy::math::Vec2::new(x1, z1));
+    }
     // Ground-level spawn, matching the C++ pre-loop player placement.
     if !automation.has_camera {
         player.position.y = erosion::sample_eroded_height(

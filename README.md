@@ -129,6 +129,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | --- | --- |
 | `--camera x,y,z,yawDeg,pitchDeg` | Pin the camera pose and fly, for reproducible shots; with `--shot`, mouse and keyboard input cannot move it |
 | `--shot path.png` | Render, save a screenshot, then exit; the log reports average, p95 and maximum frame time over the `--wait` window, split into frames while erosion tiles stream and settled frames |
+| `--snow-trail x,z,x,z` | Seed one compressed snow segment between the two world XZ positions for reproducible screenshots |
 | `--wait n` | Frames to render before the screenshot, counted once the prewarmed erosion tiles are ready |
 | `--erosion-prewarm N` | Simulate the `N` nearest erosion tiles at full budget before streaming (default `4`, the quartet around the player); raise it so a capture shows erosion beyond the player's own lattice cell |
 | `--size W,H` | Window size in points (comma-separated, as the C++'s `sscanf`) |
@@ -193,7 +194,7 @@ Only a small area immediately around spawn
 is gently stabilised.
 
 The terrain uses one indexed 224×224-quad centre mesh and one reusable ring
-mesh. Seven levels use vertex spacing from 1 to 64 metres, reaching 7168 metres
+mesh. Nine levels use vertex spacing from 0.25 to 64 metres, reaching 7168 metres
 from the clipmap anchor. All levels share a stable 64-metre world lattice. The
 outer part of each level morphs onto the next coarser global lattice, including
 its normal sampling interval, which prevents cracks and greatly reduces LOD
@@ -248,21 +249,22 @@ near the camera; farther out the interval widens continuously with distance,
 tracking the clipmap's vertex spacing, so distant coverage is prefiltered
 instead of aliasing into rows of triangles along snow and rock margins.
 
-Snow006 lies where the ground stays cold through the melt season. A regional
-snowline (`SNOWLINE_ALTITUDE`, 112 metres) wanders with broad climate cells.
-Against the low spring sun, shaded poleward slopes hold snow about 20 metres
-lower than level ground at the same height and sun-facing slopes lose it about
-9 metres higher; sheltered hollows and lee slopes keep a deeper pack, while
-wind-scoured crests and windward faces lose theirs. Snow thins past about 39
-degrees and sheds by 55, so steep faces stay dark rock. It does not flow
-downhill: a gully below the line melts out like any other low ground, and only
-shaded avalanche gullies just under the line keep a short tongue of debris
-snow. Permanent streams open dark meltwater ribbons through the pack, and its
-thinning margin picks up a grey-brown sediment stain. Every term is a
-world-space field; only the slope it reads is prefiltered with distance, so
-cover stays put as the camera moves. These are
-material-placement rules derived from the erosion results and terrain aspect,
-not a snowmelt simulation.
+Snow006 forms a uniform white pack above the climate snowline
+(`SNOWLINE_ALTITUDE`, 112 metres). A broad altitude transition and modest
+spring-sun aspect shift keep the edge smooth. Snow thins past about 39 degrees
+and sheds by 55, leaving steep rock faces exposed. Scan contrast and wind
+relief are restrained, while fine grain, roughness and glints still respond
+to the light; only the thinning fringe keeps a faint sediment stain.
+
+Fully covered snow rises 32 centimetres above the underlying terrain. Walking
+compresses that raised layer back to the terrain surface, leaving a continuous
+trail with an 80-centimetre fully compressed core and smooth shoulders over a
+total width of 1.3 metres. Jumping and flying do not create walking trails.
+The player stands on the remaining snow depth, so the surface underfoot lowers
+as it compresses. A high-resolution, 128-metre compression map moves with the
+player, while sparse world storage preserves tracks outside that window and
+restores them when the player returns. Trails persist for the current session
+and are cleared when the game restarts.
 
 World-anchored, warped fields vary patch size and density across broad regions;
 fine breakup filters away with distance. Grass shifts between green and dry

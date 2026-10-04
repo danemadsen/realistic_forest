@@ -115,6 +115,9 @@ pub struct ExtractedForestView {
     pub bolt: crate::lightning::ActiveBolt,
     pub draw_ocean: bool,
     pub lookup_minimum: (i64, i64),
+    pub snow_mapping: [f32; 4],
+    pub snow_pixels: std::sync::Arc<[u8]>,
+    pub snow_revision: u64,
     pub frame: u64,
 }
 
@@ -232,7 +235,7 @@ impl TerrainStageUniforms {
         visibility_center: [f32; 2],
     ) -> Self {
         let clip_origin = Self::clip_origin(player_position);
-        let spacing = (1u32 << level) as f32;
+        let spacing = CLIP_FINEST_SPACING * (1u32 << level) as f32;
         let has_coarser_level = level + 1 < CLIP_LEVELS as u32;
         Self {
             mat_model,
@@ -633,6 +636,10 @@ fn extract_forest_view(
     view.draw_ocean = world.resource::<WorldOptions>().draw_ocean;
     let cache = world.resource::<ErosionCache>();
     view.lookup_minimum = (cache.lookup_minimum.x, cache.lookup_minimum.z);
+    let snow = world.resource::<crate::snow::SnowState>();
+    view.snow_mapping = snow.mapping();
+    view.snow_pixels = snow.pixels();
+    view.snow_revision = snow.revision();
     view.frame += 1;
 }
 
@@ -812,6 +819,30 @@ pub fn bind_group<'a>(
 #[cfg(test)]
 mod tests {
     use super::GlobalUniformsGpu;
+
+    #[test]
+    fn snow_geometry_and_material_share_the_same_coverage() {
+        let common = include_str!("../../assets/shaders/snow-functions.wgslinc").trim();
+        for source in [
+            include_str!("../../assets/shaders/terrain-vs.wgsl"),
+            include_str!("../../assets/shaders/terrain-fs.wgsl"),
+        ] {
+            assert!(source.contains(common), "snow geometry and colour placement diverged");
+        }
+    }
+
+    #[test]
+    fn snow_detail_preserves_the_clipmap_horizon_and_anchor() {
+        use crate::constants::*;
+        use super::TerrainStageUniforms;
+        let stage = |level| TerrainStageUniforms::build(
+            bevy::math::Mat4::IDENTITY.to_cols_array(), level, [0.0; 3], (0, 0), [0.0; 2]);
+        assert_eq!(stage(0).spacing, 0.25);
+        assert_eq!(stage(1).spacing, 0.5);
+        assert_eq!(stage(CLIP_LEVELS as u32 - 1).spacing, 64.0);
+        assert_eq!(CLIP_ANCHOR_SPACING, 64.0);
+        assert_eq!(stage(CLIP_LEVELS as u32 - 1).spacing * CLIP_CELLS as f32 / 2.0, 7168.0);
+    }
 
     #[test]
     fn water_and_visible_sky_share_the_same_atmosphere() {

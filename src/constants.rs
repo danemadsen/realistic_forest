@@ -106,15 +106,16 @@ pub const TERRAIN_ATLAS_SLOTS: usize = 8;
 pub const EROSION_REVEAL_SECONDS: f32 = 0.9;
 pub const SEA_LEVEL: f32 = 0.0;
 // Centre of the persistent (late-season) snowline, metres above sea level.
-// The terrain material shader shifts it locally by climate cells, aspect,
-// shelter and wind; falling precipitation turns to snow from ~80 m upward
+// A smooth altitude band and climate aspect place a uniform pack;
+// falling precipitation turns to snow from ~80 m upward
 // (precipitation-functions.wgslinc), so fresh snow can fall a little below
 // the ground that keeps it.
 pub const SNOWLINE_ALTITUDE: f32 = 112.0;
 
 pub const CLIP_CELLS: usize = 224;
-pub const CLIP_LEVELS: usize = 7;
-pub const CLIP_ANCHOR_SPACING: f32 = (1u32 << (CLIP_LEVELS - 1)) as f32;
+pub const CLIP_LEVELS: usize = 9;
+pub const CLIP_FINEST_SPACING: f32 = 0.25;
+pub const CLIP_ANCHOR_SPACING: f32 = CLIP_FINEST_SPACING * (1u32 << (CLIP_LEVELS - 1)) as f32;
 pub const EYE_HEIGHT: f32 = 1.75;
 pub const NEAR_PLANE: f32 = 0.1;
 pub const FAR_PLANE: f32 = 5800.0;

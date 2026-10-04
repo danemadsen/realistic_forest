@@ -95,6 +95,8 @@ pub struct AutomationSettings {
     pub cloud_thickness_override: bool,
     pub overlap_tile: TileKey,
     pub lightning: Option<ForcedLightning>,
+    /// Seed a compacted snow segment for reproducible deformation screenshots.
+    pub snow_trail: Option<[f32; 4]>,
     /// Tiles simulated at the full iteration budget before streaming starts.
     pub erosion_prewarm: u32,
 }
@@ -140,6 +142,7 @@ impl Default for AutomationSettings {
             cloud_thickness_override: false,
             overlap_tile: TileKey { x: 0, z: 0 },
             lightning: None,
+            snow_trail: None,
             erosion_prewarm: DEFAULT_EROSION_PREWARM,
         }
     }
@@ -292,6 +295,17 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                     index += 1;
                 } else {
                     eprintln!("WARNING: --lightning expects AGE[,DIST[,BEARING[,ground|crawler|cloud]]]");
+                    if next.is_some_and(|value| !value.starts_with("--")) {
+                        index += 1;
+                    }
+                }
+            }
+            "--snow-trail" => {
+                if let Some(values) = next.and_then(|value| parse_floats(value, 4)) {
+                    automation.snow_trail = Some([values[0], values[1], values[2], values[3]]);
+                    index += 1;
+                } else {
+                    eprintln!("WARNING: --snow-trail expects startX,startZ,endX,endZ");
                     if next.is_some_and(|value| !value.starts_with("--")) {
                         index += 1;
                     }

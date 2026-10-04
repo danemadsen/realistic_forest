@@ -316,6 +316,9 @@ struct TerrainResources {
     globals: BindGroup,
     /// group(1): the world textures.
     terrain_textures: BindGroup,
+    snow_texture: wgpu::Texture,
+    snow_uniform: Buffer,
+    snow_revision: AtomicU64,
     terrain_pipeline: CachedRenderPipelineId,
     heightfield_pipeline: CachedRenderPipelineId,
     /// Reduces the lighting heightfield to its highest texel.
@@ -375,6 +378,27 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
     let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
         return;
     };
+
+    // The texture object stays bound while its world window moves. Sparse CPU
+    // storage restores old tracks when the player returns to a snowy area.
+    if resources.snow_revision.load(Ordering::Relaxed) != view.snow_revision {
+        queue.write_buffer(&resources.snow_uniform, 0, bytemuck::bytes_of(&view.snow_mapping));
+        queue.write_texture(
+            resources.snow_texture.as_image_copy(),
+            &view.snow_pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(crate::snow::SNOW_MAP_SIZE as u32),
+                rows_per_image: Some(crate::snow::SNOW_MAP_SIZE as u32),
+            },
+            wgpu::Extent3d {
+                width: crate::snow::SNOW_MAP_SIZE as u32,
+                height: crate::snow::SNOW_MAP_SIZE as u32,
+                depth_or_array_layers: 1,
+            },
+        );
+        resources.snow_revision.store(view.snow_revision, Ordering::Relaxed);
+    }
 
     // DrawClipmap: uErosionVisibilityCenter is the player's XZ and every
     // level shares it (SetTerrainSharedUniforms runs once per frame).
@@ -571,9 +595,10 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         pass.set_render_pipeline(pipeline);
         pass.set_bind_group(0, &resources.habitat_globals.bind_group, &[]);
         pass.set_bind_group(1, &resources.terrain_textures, &[]);
-        // Three levels cover the complete 512 m capture, even at the largest
-        // clipmap anchor offset. Their triangles exactly match the main pass.
-        for (level, stage) in resources.levels.iter().take(3).enumerate() {
+        // Five levels include the two new sub-metre grids and still cover
+        // the complete 512 m capture. The habitat vertex entry reads the
+        // underlying terrain so snow tracks do not invalidate the grass map.
+        for (level, stage) in resources.levels.iter().take(5).enumerate() {
             let mesh = if level == 0 { &resources.center_mesh } else { &resources.ring_mesh };
             pass.set_bind_group(2, &stage.bind_group, &[]);
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
@@ -917,6 +942,32 @@ fn terrain_texture_layout() -> BindGroupLayoutDescriptor {
                 ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 7,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 15,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 16,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: std::num::NonZeroU64::new(16),
+                },
+                count: None,
+            },
         ],
     )
 }
@@ -974,6 +1025,7 @@ struct TerrainSamplers {
     blend_mask: wgpu::Sampler,
     albedo_array: wgpu::Sampler,
     normal_rough_array: wgpu::Sampler,
+    snow: wgpu::Sampler,
 }
 
 /// The C++ asks GL for `min(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, 16)`. wgpu has
@@ -1051,6 +1103,7 @@ fn build_terrain_samplers(device: &RenderDevice) -> TerrainSamplers {
             device, "forest_albedo_array_sampler", linear, repeat),
         normal_rough_array: make_anisotropic_sampler(
             device, "forest_normal_rough_array_sampler", linear, repeat),
+        snow: make_sampler(device, "forest_snow_sampler", linear, clamp),
     }
 }
 
@@ -1061,6 +1114,8 @@ fn terrain_texture_bind_group(
     layout: &BindGroupLayoutDescriptor,
     textures: &GpuWorldTextures,
     samplers: &TerrainSamplers,
+    snow_view: &wgpu::TextureView,
+    snow_uniform: &Buffer,
 ) -> BindGroup {
     let entries = [
         wgpu::BindGroupEntry {
@@ -1118,6 +1173,18 @@ fn terrain_texture_bind_group(
         wgpu::BindGroupEntry {
             binding: 14,
             resource: wgpu::BindingResource::Sampler(&samplers.normal_rough_array),
+        },
+        wgpu::BindGroupEntry {
+            binding: 7,
+            resource: wgpu::BindingResource::TextureView(snow_view),
+        },
+        wgpu::BindGroupEntry {
+            binding: 15,
+            resource: wgpu::BindingResource::Sampler(&samplers.snow),
+        },
+        wgpu::BindGroupEntry {
+            binding: 16,
+            resource: snow_uniform.as_entire_binding(),
         },
     ];
     super::bind_group(device, cache, "forest_terrain_textures", layout, &entries)
@@ -1255,12 +1322,35 @@ fn prepare_terrain(
     // group(1): the world textures; group(2): the per-draw stage blocks.
     let terrain_textures_layout = terrain_texture_layout();
     let samplers = build_terrain_samplers(device);
+    let snow_texture = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+        label: Some("forest_snow_compression"),
+        size: wgpu::Extent3d {
+            width: crate::snow::SNOW_MAP_SIZE as u32,
+            height: crate::snow::SNOW_MAP_SIZE as u32,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let snow_view = snow_texture.create_view(&Default::default());
+    let snow_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("forest_snow_mapping"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     let terrain_textures = terrain_texture_bind_group(
         device,
         &pipeline_cache,
         &terrain_textures_layout,
         textures,
         &samplers,
+        &snow_view,
+        &snow_uniform,
     );
     let terrain_stage_layout = stage_uniform_layout(
         "forest_terrain_stage_layout",
@@ -1293,7 +1383,7 @@ fn prepare_terrain(
         vertex: VertexState {
             shader: shaders.terrain_vs.clone(),
             shader_defs: vec![],
-            entry_point: Some("vs_main".into()),
+            entry_point: Some("vs_habitat".into()),
             buffers: vec![VertexBufferLayout {
                 array_stride: TERRAIN_VERTEX_STRIDE,
                 step_mode: wgpu::VertexStepMode::Vertex,
@@ -1429,6 +1519,9 @@ fn prepare_terrain(
     *resources = Some(TerrainResources {
         globals: globals_bind_group,
         terrain_textures,
+        snow_texture,
+        snow_uniform,
+        snow_revision: AtomicU64::new(u64::MAX),
         terrain_pipeline,
         heightfield_pipeline,
         highest_pipeline,

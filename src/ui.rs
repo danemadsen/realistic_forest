@@ -323,7 +323,7 @@ fn draw_diagnostics_window(
             ));
             ui.label(format!(
                 "Clipmap reach: {:.0} m",
-                (CLIP_CELLS as f32 * 0.5) * 2.0f32.powi(CLIP_LEVELS as i32 - 1)
+                (CLIP_CELLS as f32 * 0.5) * CLIP_FINEST_SPACING * 2.0f32.powi(CLIP_LEVELS as i32 - 1)
             ));
             let ready_tiles = cache
                 .tiles

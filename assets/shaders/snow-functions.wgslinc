@@ -1,0 +1,15 @@
+// BEGIN SHARED SNOW COVERAGE
+// A continuous pack above the climate snowline. Aspect moves only the broad
+// transition, while steep walls shed snow. Geometry and material use this
+// same field so the raised snow surface always matches its white coverage.
+fn snowCoverage(height: f32, normal: vec3<f32>) -> f32
+{
+    let meltSun = normalize(vec3<f32>(-0.22, 0.62, -0.76));
+    let aspectShift = (0.62 - max(dot(normal, meltSun), 0.0)) * 12.0;
+    let snowLine = smoothHermite(stage.snowline_altitude - 13.0,
+                                 stage.snowline_altitude + 13.0,
+                                 height - stage.sea_level + aspectShift);
+    let steepness = length(normal.xz) / max(normal.y, 0.001);
+    return snowLine * (1.0 - smoothHermite(0.80, 1.45, steepness));
+}
+// END SHARED SNOW COVERAGE
