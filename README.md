@@ -1,8 +1,8 @@
 # Forest
 
 Forest is a Rust 2024 prototype for an infinite procedural landscape. It renders
-mountains, plains, beaches, ocean, and biome colours with an indexed geometry
-clipmap. Procedural terrain can be evaluated at any world coordinate, and
+mountains, plains, beaches, ocean, rivers and creeks, and biome colours with an
+indexed geometry clipmap. Procedural terrain can be evaluated at any world coordinate, and
 overlapping GPU hydraulic-erosion tiles are generated and cached around the
 player as the world streams. Walking and flight are not clamped to a simulation
 domain: there is no world border.
@@ -165,8 +165,10 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--cloud-base M` | Cloud base altitude in `[100, 6000]` metres; default `1300` |
 | `--cloud-thickness M` | Layer thickness in `[100, 4000]` metres; default `1200` |
 | `--no-vegetation` | Skip loading and scattering the trees, shrubs and flowers |
+| `--no-rivers` | Generate, carve and draw no rivers |
+| `--river-map path.png` | Render the river network from above, print its statistics and the rivers and lakes nearest `--map-centre`, then exit |
 | `--vegetation-map path.png` | Render the plant scatter from above, print its statistics, then exit |
-| `--map-centre x,z`, `--map-extent M` | Area of the vegetation map: its centre (default `0,0`) and side in metres (default `1024`) |
+| `--map-centre x,z`, `--map-extent M` | Area of the vegetation or river map: its centre (default `0,0`) and side in metres (default `1024`, or `8192` for the river map) |
 
 Screenshot runs freeze the celestial clock, weather fronts, and cloud wind automatically, so
 erosion warm-up does not change the selected weather or lighting. Keep the same
@@ -410,7 +412,8 @@ smooth fields describe the forest:
   edge; the plants are thickest a few metres in and thin out into the
   meadow. The strip follows the terrain shader's own wandering grass line
   and runs some 25 metres inland on gentle and steep coasts alike, wherever
-  the sea lies close down the fall line.
+  the sea lies close down the fall line. They line the banks of rivers and
+  creeks the same way, on the damp ground just above the water.
 - **Lavender** is scattered as single tufts, 0.6 to 0.95 m tall, through
   sunny, dry, well-drained open ground, never touching, at a density that
   varies smoothly and widely across a regional, a stand and a patch scale:
@@ -628,10 +631,11 @@ sediment is not treated as deposited soil. Contributing area separates
 permanent channels from rills and hillslopes, and shallow water velocities are
 gated when estimating transport strength.
 
-The flow output
-remains available for later river geometry. Open the developer menu with 2,
-click **Advanced controls**, and enable **Flow visualization** to inspect
-it on the terrain, or expand **Flow output** to inspect the cached target. Erosion
+The rivers (see below) are routed separately over the uneroded heights, and
+the erosion treats their channels as fixed drains. Open the developer menu
+with 2, click **Advanced controls**, and enable **Flow visualization** to
+inspect the erosion flow output on the terrain, or expand **Flow output** to
+inspect the cached target. Erosion
 parameters can be edited from the same panel and applied with **Regenerate
 erosion cache**; besides the runoff controls they include stream power,
 channel incision, alluvial deposition, maximum incision, talus slide and
@@ -639,6 +643,280 @@ rockfall rates. The panel also reports maximum incision, deposited height,
 small-scale detail within actively eroded ground, flow-axis bias, the largest
 contributing area, the share of bare bedrock and the mean loose cover for the
 most recently completed tile.
+
+## Rivers and creeks
+
+Rivers and creeks run from the mountains to the sea, through lakes where
+their water fills a basin. They are generated in `src/rivers` for a 16 km
+region around the player, follow the land the way its water would, are cut
+into the terrain, lined with bank plants, and drawn with their
+own flowing-water shader; their current pushes the player about.
+
+### Where they run
+
+The base landform is sampled on a world-aligned 32 m grid over the region and
+a 2 km margin. A priority flood from the sea and the grid's edge gives every
+cell a downhill receiver, so closed hollows drain over their lowest saddle the
+way a lake would spill, and contributing area accumulates down that tree.
+Each cell counts by its own rainfall: the uplands wring up to three and a
+half times as much water from the weather as the coast, so mountain-fed
+streams carry more than their catchment alone would. A channel begins where
+about a third of a square kilometre of that weighted catchment gathers on
+level ground, and with a little less on steeper ground; once begun it runs on
+to the sea. At a confluence the larger branch keeps its course and the
+smaller one ends on it. A creek on a mountainside is drawn only from where
+the land along it first eases below a slope of 0.22: the steep slope above is
+seeps and sheet wash, not a channel.
+
+The coarse grid decides the network, which catchments drain where and how
+much water each river carries, but not the course: a 32 m cell is wider than
+many valleys. Each river's course is traced the way its water would find it,
+over a 4 m grid of the natural ground in a corridor 72 m either side of the
+coarse path. A priority flood from where the river leaves the corridor (the
+sea, the channel of the river it joins, or the edge of the domain) fills
+every hollow to the level it spills at, and the water runs down the steepest
+descent of that filled surface: along the valley floor, around every spur
+and knoll, across a filled hollow by the shortest way to its spill. The grid's
+stair-steps are smoothed out and the path settled back onto the lowest ground
+across it. Its bends are the land's own, so a lowland creek wanders over its
+floodplain while a mountain stream keeps to the bottom of its V. A tributary
+runs until it reaches its parent's channel, wherever the ground brings it
+there; its corridor reaches the parent's actual course. Where water seems held
+in a basin it could in fact leave, the corridor was too narrow to show its
+way: a basin that drains to the sea through a gap the coarse grid missed
+sends its river out through that gap, and any other is routed again through
+a wider corridor.
+
+The water surface follows the channel's ground a hand or two below its banks
+(0.1 m plus a seventh of its depth) and only ever falls downstream: the
+surface is the falling profile that best fits the ground along the river (a
+least-squares, never-rising fit), so where the ground rises over a bump and
+falls again the river neither cuts the whole bump away nor floods the hollow
+behind it, but meets them halfway, never standing above the natural ground.
+A hollow
+the water would stand less than 2 m deep in at its deepest, or less than
+0.6 m on average (a flooded flat), is crossed in a cut through its rim, as a
+river incises the sill it spills over. A deeper basin holds a lake or pond:
+the whole basin (found by flood fill beyond the corridor) fills to just under
+the rim it spills over, every river that reaches it shares it (a basin
+holding a smaller lake drowns it), the reaches above it are backed up to its
+level, and the river leaves it at its outlet over a sill: for its first 25 m
+the water draws down gently from the lake's level and always stands a little
+under the ground beside it, so the outlet has banks from the start. A river
+crossing a lake is in it from where its course enters the lake's cells to
+where it leaves them; a short stretch where its course strays over a bar or
+a ragged edge of the lake counts as the lake's, and a brush with its shore
+opens no mouth. Water runs down every slope, however steep, as rapids; there
+are no waterfalls.
+
+A river to the sea runs out into open water: the sea is only what joins
+water a metre deep (on the coarse routing grid and again on the fine one,
+through water at least 0.3 m deep), so a hollow on a beach that dips just
+below the sea's level fills and spills like any basin instead of swallowing
+the river. Where the land drops to the sea down a beach's face the river is
+graded down to it along a chord from its surface 120 m above the shore,
+cutting a notch at most 3 m deep through the beach and the dune behind it;
+from where its water reaches the sea's level, the sea fills its channel out
+to the open water. Nothing holds the ground up beside a river's last stretch
+to the sea, or beside it where it runs into or out of a lake, so no levee
+raises a bar across its own mouth between its water and the still water it
+meets.
+
+Hydraulics follow from the catchment and the slope. Bankfull discharge grows
+with the catchment, and the channel follows downstream hydraulic geometry,
+the power laws real rivers are fitted with, plus the slope's own terms: width
+grows as the square root of the discharge and shrinks with the slope of the
+valley over some 40 m (as S^-0.25), and depth grows as Q^0.4 (Leopold &
+Maddock) and a little with the slope, so a creek carrying a cubic metre a
+second is about 0.95 m deep over its thalweg and seven to ten times as wide
+as it is deep. Its bed is a flat-bottomed bowl, deep right up to the banks
+rather than shoaling over a broad parabola. The water runs at Manning's speed
+for a gravel and boulder bed (Jarrett's roughness): around 0.7 m/s on the
+lowland, up to about 2 m/s down rapids. A mountain stream is held in a
+narrower, deeper channel in boulders and bedrock; on the flat the same water
+spreads wide and shallow over its own gravel and silt. Around spawn, reaches
+draining over half a square kilometre average 9.3 m wide and 1.06 m deep on
+the lowland, 6.7 m and 1.16 m on moderate slopes and 5.0 m and 1.0 m on steep
+ones, and no creek is narrower than 1.6 m. A river widens below a confluence
+and narrows into a steeper reach gradually, never by more than 2.5 cm per
+metre along it; it swells a little and narrows again, its bed runs through a
+pool every five to seven widths and at every tight bend (a third deeper and
+slow) with a shallow riffle between (a quarter shallower, quick and broken
+into small standing waves), it churns white down its rapids, and a river's
+head starts as a seep that gathers into a channel. Where it runs into a lake
+or the sea it spreads and slows into it, as a mouth does, and an estuary is
+scoured a little deeper; where it leaves a lake over its sill it widens only
+a little and keeps its pace. The thalweg hugs the outside of every bend.
+
+Every choice is keyed by world position or by a river's head cell, so two
+regions that both see a whole catchment agree on it; when the player moves
+on, the next region is built on the async compute pool (about a second) and
+swapped in. The first region is built before anything streams.
+
+`--river-map path.png` charts a region from above (shaded relief, channels
+and lakes) and prints its statistics, how well the channels fit the land (how
+much of their length is trenched through a rise, held in by an embankment,
+or running along a slope above its valley's floor), how much of the lakes'
+sheet edges would stand over lower ground, how cleanly the rivers meet still
+water (rivers darting out of a lake and back, how far outlets fall below
+their lakes, river mouths cut off from the open sea, how far sheets dip
+under a river where they meet), and the rivers and lakes nearest
+`--map-centre`, with each lake's inlets and outlets; `--map-extent` defaults
+to 8 km here. The spawn region holds some 160 rivers, 88 km of channel and
+170 lakes and ponds covering 280 ha; on gentle reaches the water stands about
+0.8 m under the natural ground on average (half of it under 0.55 m), under
+1 % of their length is trenched more than 3 m into it, and one of 131 river mouths does not reach
+open sea (a creek down a sea cliff).
+
+### How they shape the ground
+
+A river is a chain of short carve segments, each bounding the ground above
+and below near its centreline. Inside the wetted width the bed follows a
+parabola below the water, skewed toward the outer bank of a bend; past the
+waterline a bank cone rises, steep on a cut bank and gentle on a point bar,
+and ground standing above it is cut back into a bank; just beyond the
+waterline the ground is held a little above the water and falls gently away
+from it, the broad, low natural levee a river builds, so the channel always
+contains its river. Bounds combine across segments (minimum above, maximum
+below), so confluences open into each other, and where the carve meets the
+natural ground its creases are rounded (a smooth minimum and maximum over
+0.8 m of height), so a bank's top curves over into the land above it rather
+than breaking at an edge the terrain's triangles would draw as a saw-tooth.
+A bank's slope varies only over many widths along the river, so its top does
+not jog in and out from one segment to the next. A segment has a flat start and a
+round end, so it never reaches back up the channel over ground the segments
+above it shape.
+
+The same arithmetic runs on the CPU (`src/rivers/carve.rs`) and in the shared
+`assets/shaders/river-functions.wgslinc`, over the same uploaded segments and
+a 32 m lookup grid, so the drawn ground, the player's footing, the seated
+plants, the lighting heightfield and the erosion all see one
+channel; tests hold the shader copies identical and the GPU result to the
+CPU's. The erosion tiles simulate over the carved base, and cells under a
+river's water are fixed drains there, like the sea: the river carries away
+what reaches it, so tributary gullies grade to it and nothing fills or
+trenches the channel.
+
+Lakes carve nothing. Each lookup-grid cell a lake reaches carries the lake's
+level and a 64-bit mask of which of its 4 m cells hold the lake or its
+shore, and ground below the level there lies under the lake: plants keep out of
+it, the terrain shades its bed and shore, and the player wades and swims in
+it. The erosion leaves the lake and its shore as they are, a drain for what
+runs into it, so no gully cuts down below the water at its edge.
+
+The terrain material shader reads the river or lake at every vertex, and
+exactly at every pixel where water may lie within a triangle's span (beyond
+the first ring the clipmap's triangles are wider than a creek, and would
+smear its bed across them). The bed sorts by the power of the water over it
+(Hjulström's thresholds at the water's Manning speed): silt and mud where the
+current stays under about 0.3 m/s (lake beds, pools and the slack water along
+the banks), gravel through runs and riffles, bedrock under rapids. Under the
+water it is darkened by its film of algae and settled silt, and it is matte:
+the water's surface carries the reflections.
+
+Out of the water every river and lake is edged with bare earth, as the sea is
+with its beach. The band is measured up the shore (`river-shore.wgslinc`,
+shared by both terrain stages): horizontally on a gentle shore and six metres
+per metre of rise on a steep one, in the water's own size, so it spreads over
+a floodplain or a flat pond margin, narrows to a strip on a cut bank, and is
+narrower beside a creek than beside a river or a pond. From the water up it
+is dark, glistening mud where the water laps, damp earth, then pale dry silt,
+and turf closes over it within a few metres through tufts, bays and tongues
+that wander at the beach's own scales; past it the turf grows lush and dark
+on the moist soil. The bank adds its own story: the outside of a bend is
+undercut into a face of bare soil to its lip, the inside keeps a bar (gravel
+where the stream runs quick, silt where it is slow), and beside whitewater
+the banks are stone, splashed wet. Along calm water the rules that bare a
+hillside of the same steepness to scree, or leave the erosion's furrows
+gravelly, give way to the band; inland, sand is the sea's alone. The grass
+habitat looks the water up exactly at every texel of its capture, so no
+blade roots in a creek however narrow or far off, nor on the bare band. Every
+edge wanders, so no waterline runs parallel to its channel, and running water
+never holds snow.
+
+### Plants
+
+No plant stands in a river or a lake, nor on the margin its floods scour:
+trees and shrubs keep at least four metres back from the waterline (more for
+a tall tree), ground plants a metre and a half, and lavender, which wants dry
+ground, three. The scatter keeps each layer's stems to its margin, the GPU
+cull refuses any root it would seat closer to a channel or a lake's
+shoreline, and the grass habitat refuses roots in the water and on the wet
+margin, as well as on bare cut banks and gravel bars. Riverbanks are damp
+ground in the ecology, and broadleaf plants line them the way they line the
+shore: in colonies along the strip of bank behind the open margin, thickest a
+few metres back from the water and thinning beyond, tolerant of a gallery
+forest's shade.
+
+### The water
+
+Each river's surface is a ribbon across its channel at the water level,
+reaching under both banks so the waterline is wherever the carved bank rises
+through the water. A lake is a flat sheet at its level over its basin, in
+4 m cells: over the basin, the hollows beside it and a few cells up the
+shore around them, so its shoreline is wherever the ground meets the water.
+It never reaches past its outlet or over a narrow rim, where the ground falls
+away below its level, nor over a river's channel, and wherever the ground
+under its outer edge still lies lower than the water, that edge sinks just
+under the ground, so the sheet never ends in the air. Where a river meets a
+lake, coming in or going out, the two surfaces cross inside the sheet's last
+cell: the sheet's edge slips just under the river's water, and the river's
+ribbon runs on just under the sheet, a little deeper the further in, until it
+is hidden for good. They never share a plane, so nothing flickers, and the
+river's current runs on into the sheet where they meet. At the sea, water
+standing at the sea's level is the sea's, and the ribbon sinks under it.
+Water is drawn to 3.2 km in 256 m chunks culled against the view; beyond a
+few hundred metres, where the clipmap's triangles are wider than a creek, a
+river's surface is lifted by about the bank those triangles leave so it still
+shows from a ridge (a lake, wide enough for any triangles, never is, and nor
+is a river near the still water it meets, so the two still meet from afar).
+
+The river shader (`vs_river`/`fs_river` in `water-surface.wgsl`) shades the
+water with the sea's own optics, sky and screen-space reflections, sun
+glitter, refraction, rain rings and fog, and the plants' shadow cascades. Sun
+and moon glints are a normalised GGX lobe weighted by the water's own Fresnel
+at each facet (the sea's glints use the same), so water mirrors the sun only
+where its facets line up, as sparkles and a soft path, never as a white
+sheet. On top of that:
+
+- **Brown, tannin-stained water.** The forest's dissolved organic matter
+  absorbs blue most, so a riffle shows a golden bed, a pool an amber one and
+  deep water goes dark brown; lakes are darker still, and rapids are milky
+  with bubbles. The eye's path is bent down into the water and the light
+  scattered back out of it is dimmed with depth, so depth reads.
+- **What the water mirrors.** Where the screen cannot show a reflection, the
+  shader walks out along the reflected ray's bearing over the ground and the
+  canopy (the shore map near the camera, the lighting map beyond, and the
+  share of open sky the tree crowns leave) and finds the horizon the banks
+  and crowns raise: below it the water mirrors dark banks and foliage, above
+  it the sky. A creek in its cut under the trees is dark but for a strip of
+  sky down its corridor; a pond in a clearing keeps its sky.
+- **The stream's own frame.** Ripples live in metres down and across the
+  channel, so they follow every bend. Two advected phases stream at the
+  water's own speed, drawn out along fast water; standing waves stand still
+  over riffles, fixed to the bed, while ripples and foam stream through
+  them; boils swell glassy on runs and pools; gusts dull open water in cat's
+  paws. What a pixel cannot resolve becomes roughness by its true slope
+  variance, per axis of the flow, so distant water does not turn white.
+- **Foam that follows the flow.** Rapids churn white; foam they make drifts
+  downstream for some fifteen seconds as lace gathered on the seams by the
+  banks, on a tongue down the current and as scum in slack water, and an
+  inlet carries it out into the pond. It is cream, stained like the water,
+  and in the shade of the crowns it is lit only by the sky they leave.
+
+### Wading
+
+Flowing water pushes the player. The current's drag on the submerged body,
+½ρC_dAu² over the legs and then the torso as the water deepens, is set
+against the friction the feet can hold with, which buoyancy and a whitewater
+bed reduce. Knee-deep water slows a wade, more so walking upstream; a gentle
+current is stood against; a strong one carries the body along more and more,
+and once its drag outweighs the footing it sweeps the player off their feet
+and away downstream, over a fall if one is coming. Water too deep to stand in
+floats the player with the current; a lake's still water only floats them.
+The F1 panel's **Rivers** section
+reports the network, the nearest channel and the current the player stands
+in, and can hide the water surfaces.
 
 ## Day/night lighting and atmosphere
 
@@ -741,7 +1019,10 @@ and plant shadows and the celestial sky. A cloud sky probe supplies reflection d
 outside the current view, and the cloud shadow map supplies sunlight
 occlusion for fog in the atmosphere and water passes.
 The water surface then samples the opaque scene for refraction and raymarched
-reflections, followed by underwater effects where applicable. FXAA smooths the
+reflections, followed by underwater effects where applicable. The sea and the
+rivers depth-test against the G-buffer's own depth buffer in hardware, ahead
+of their shaders, so water hidden behind terrain or plants is never shaded;
+they write that depth too, so a river never paints over a nearer wave. FXAA smooths the
 completed scene, and the diagnostics panel draws on top. The G-buffer, AO and
 atmosphere targets follow window resize and HiDPI render-size changes.
 

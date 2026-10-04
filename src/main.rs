@@ -16,6 +16,7 @@ mod matrices;
 mod noise;
 mod player;
 mod render;
+mod rivers;
 mod thunder;
 mod ui;
 mod vegetation;
@@ -168,6 +169,13 @@ fn main() {
 
     let noise_field = NoiseField::new();
 
+    // --river-map charts the river network and exits with no window.
+    if let Some(path) = &automation.river_map {
+        let extent = if automation.map_extent_set { automation.map_extent } else { 8192.0 };
+        rivers::map::run_map(&noise_field, path, automation.map_centre, extent);
+        return;
+    }
+
     let startup_settings = {
         let mut settings = AppSettings::default();
         if automation.lattice {
@@ -188,6 +196,26 @@ fn main() {
         settings.cloud_thickness = automation.cloud_thickness;
         settings.raymarch_quality = automation.raymarch_quality;
         settings
+    };
+
+    // The rivers of the region around spawn are built before anything
+    // streams: the first erosion tiles, the plants and the player's footing
+    // all carve and avoid their channels.
+    let river_field = {
+        let mut field = rivers::RiverField::new(std::sync::Arc::new(noise_field.clone()), !automation.no_rivers);
+        let spawn = if automation.has_camera { automation.position } else { [0.0, 0.0, 0.0] };
+        field.build_blocking(spawn[0], spawn[2]);
+        // Bevy's logger does not exist yet; the summary goes straight out.
+        if let Some(network) = field.network() {
+            println!(
+                "RIVERS: {} rivers, {:.1} km of channel, {} lakes, built in {:.2} s",
+                network.rivers.len(),
+                network.total_length_km(),
+                network.lakes.len(),
+                network.build_seconds
+            );
+        }
+        field
     };
 
     // The size raylib would have handed to glfwCreateWindow, clamped to the
@@ -295,7 +323,11 @@ fn main() {
             };
             weather
         })
-        .init_resource::<ErosionCache>()
+        .insert_resource(ErosionCache {
+            rivers: river_field.network().cloned(),
+            ..Default::default()
+        })
+        .insert_resource(river_field)
         .init_resource::<snow::SnowState>()
         .insert_resource(ErosionSettings::default())
         .insert_resource(AppliedErosionSettings(ErosionSettings::default()))
@@ -338,6 +370,7 @@ fn main() {
                 thunder::queue_thunder,
                 thunder::play_thunder,
                 ui::ui_wants_input_system,
+                rivers::stream_rivers,
                 // --measure-overlap replaces normal streaming with its own
                 // driver, mirroring the C++ short-circuit in main().
                 erosion_stream_system.run_if(not_in_measure_mode),
@@ -599,12 +632,17 @@ fn erosion_stream_system(
     mut prewarm: ResMut<PrewarmRemaining>,
     mut preparation: ResMut<erosion::TilePreparation>,
     automation: Res<AutomationSettings>,
+    rivers: Res<rivers::RiverField>,
     player: Query<&Player>,
     time: Res<Time>,
 ) {
     let Ok(player) = player.single() else {
         return;
     };
+    // Tiles begun from now on carve the network in force.
+    if cache.rivers.as_ref().map(std::sync::Arc::as_ptr) != rivers.network().map(std::sync::Arc::as_ptr) {
+        cache.rivers = rivers.network().cloned();
+    }
     erosion::apply_erosion_events(&mut cache, &bridge);
     // The C++ `rerunErosion` is a per-frame local; the resource persists, so
     // read it and clear it rather than moving it out.

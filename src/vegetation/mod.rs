@@ -244,7 +244,12 @@ fn chunk_distance(chunk: [i64; 2], x: f64, z: f64) -> f64 {
 }
 
 /// Stream chunk levels around the player and publish snapshots.
-pub fn stream_vegetation(mut field: ResMut<VegetationField>, players: Query<&Player>, time: Res<Time>) {
+pub fn stream_vegetation(
+    mut field: ResMut<VegetationField>,
+    rivers: Res<crate::rivers::RiverField>,
+    players: Query<&Player>,
+    time: Res<Time>,
+) {
     if !field.enabled {
         return;
     }
@@ -336,7 +341,8 @@ pub fn stream_vegetation(mut field: ResMut<VegetationField>, players: Query<&Pla
     for &(_, chunk, level) in wanted.iter().take(MAX_IN_FLIGHT.saturating_sub(field.tasks.len())) {
         let noise = field.noise.clone();
         let catalog = catalog.clone();
-        let task = pool.spawn(async move { scatter::generate_level(&noise, &catalog, chunk, level) });
+        let network = rivers.network().cloned();
+        let task = pool.spawn(async move { scatter::generate_level(&noise, &catalog, network.as_deref(), chunk, level) });
         field.tasks.insert((chunk, level), task);
     }
     field.settled = wanted.is_empty() && field.tasks.is_empty();

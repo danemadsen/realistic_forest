@@ -138,12 +138,18 @@ pub struct WaterStageUniforms {
     pub misc: [f32; 4], // 1440
     /// x flat-surface debug, y sea state amplitude, z wind radians, w wave fade end.
     pub flags: [f32; 4], // 1456
-    /// xy local seabed-map centre, z world span, w metres per texel.
+    /// xy local seabed-map centre, z world span, w metres per texel. All
+    /// zero while the map is not drawn (the sea is off), which is how the
+    /// rivers, which read it as their banks' ground, can tell.
     pub shore_map: [f32; 4], // 1472
+    /// The grass capture in the same layout: its alpha is the share of open
+    /// sky the tree crowns leave, which the rivers read as the forest they
+    /// mirror. All zero while there is no capture.
+    pub canopy_map: [f32; 4], // 1488
 }
 
 const _: () = assert!(std::mem::size_of::<GpuWave>() == 32);
-const _: () = assert!(std::mem::size_of::<WaterStageUniforms>() == 1488);
+const _: () = assert!(std::mem::size_of::<WaterStageUniforms>() == 1504);
 
 /// The submerged-camera medium block, group 2 binding 0 of the underwater
 /// pass.
@@ -175,6 +181,7 @@ impl Default for WaterStageUniforms {
             misc: [0.5, 1.0, 1.0, 0.0],
             flags: [0.0, 1.0, 0.0, rings::horizon_wave_fade_end()],
             shore_map: [0.0; 4],
+            canopy_map: [0.0; 4],
         }
     }
 }

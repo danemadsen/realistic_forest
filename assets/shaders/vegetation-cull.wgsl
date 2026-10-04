@@ -97,6 +97,9 @@ struct StageUniforms {
 @group(1) @binding(8) var habitat: texture_2d<f32>;   // grass habitat: height, suitability, normal XZ
 @group(1) @binding(9) var habitat_sampler: sampler;   // linear, clamp
 
+@group(1) @binding(10) var<storage, read> river_grid: array<u32>;      // river lookup grid
+@group(1) @binding(11) var<storage, read> river_segments: array<RiverSegment>; // river carve segments
+
 // BEGIN SHARED TERRAIN HEIGHT
 // The streamed landform: base noise relief plus the four-pass erosion delta,
 // faded with distance from the player. terrain-vs.wgsl draws the clipmap and
@@ -104,7 +107,8 @@ struct StageUniforms {
 // plant's root on it; a test keeps the pasted copies identical, so a trunk
 // stands exactly on the ground the terrain pass draws. Requires StageUniforms
 // as `stage` and the base noise, surface atlas, tile lookup and blend mask as
-// tex0, tex1, tex3 and tex4 with their samplers.
+// tex0, tex1, tex3 and tex4 with their samplers, and the shared river block
+// (river-functions.wgslinc) with its two storage buffers.
 fn smoothHermite(edge0: f32, edge1: f32, value: f32) -> f32
 {
     let t = clamp((value - edge0)/max(edge1 - edge0, 0.0001), 0.0, 1.0);
@@ -352,9 +356,227 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
 {
     // The four-pass result is already spatially normalized. The radial fade
     // stays well inside the region where every required lookup record exists.
-    return baseHeight(worldXZ) + erosionDelta(worldXZ)*erosionVisibility(worldXZ);
+    // Erosion was simulated over the river-carved base, so its delta goes on
+    // top of the carved base, and the channels are held once more over the
+    // result: a river keeps its bed and banks whatever the water did there.
+    let river = riverEnvelope(worldXZ);
+    return riverClamp(river, riverClamp(river, baseHeight(worldXZ))
+                             + erosionDelta(worldXZ)*erosionVisibility(worldXZ));
 }
 // END SHARED TERRAIN HEIGHT
+
+// BEGIN SHARED RIVERS
+// The river network's carve segments and the lookup grid over them, exactly
+// as src/rivers/carve.rs evaluates them on the CPU, so the drawn ground, the
+// player's footing, the seated plants and the erosion simulation all see one
+// channel. Every pass that pastes this block (a test keeps the copies
+// identical) declares `river_grid: array<u32>` and
+// `river_segments: array<RiverSegment>` as read-only storage.
+//
+// river_grid holds an eight-word header (origin XZ and cell size as f32
+// bits, resolution, segment count), then three words per cell, then the
+// segment lists the cells point into, then the lake records. A cell's words
+// are the offset of its list, the list's length, and the offset of its lake
+// record (RIVER_NO_LAKE_RECORD if no lake reaches it): the lake's level as
+// f32 bits and a 64-bit mask of which of the cell's 8 x 8 lake cells lie
+// under the lake or its shore. A zero resolution means there are no rivers.
+//
+// A lake has no channel: ground below its level near it lies under its
+// water, and riverBankAt measures the shore in a river bank's terms.
+//
+// Each segment bounds the ground from above (the channel bed, then a bank
+// cone that steepens away from the water) and from below (a low levee that
+// keeps the water in its channel). The upper bounds combine by minimum and
+// the lower ones by maximum, so confluences open into each other; a segment
+// has a flat start and a round end, so it never reaches back up the channel.
+struct RiverSegment {
+    a: vec2<f32>,
+    b: vec2<f32>,
+    water: vec2<f32>,
+    half_width: vec2<f32>,
+    depth: vec2<f32>,
+    speed: vec2<f32>,
+    bank: f32,
+    skew: f32,
+    turbulence: f32,
+    levee: f32,
+};
+
+struct RiverEnvelope {
+    upper: f32,
+    lower: f32,
+    // Metres past the nearest waterline; negative inside a channel.
+    bank_distance: f32,
+    water: f32,
+    velocity: vec2<f32>,
+    half_width: f32,
+    turbulence: f32,
+    // Which side of a bend the point lies on: toward +0.6 on the outside,
+    // where the current cuts a steep bank, toward -0.6 on the inside, where
+    // it drops its point bar.
+    bend: f32,
+    // The level of a lake reaching here, or RIVER_NO_LAKE.
+    lake: f32,
+};
+
+const RIVER_NONE: f32 = 1.0e30;
+const RIVER_NO_LAKE: f32 = -1.0e30;
+const RIVER_GRID_CELL_WORDS: u32 = 3u;
+const RIVER_NO_LAKE_RECORD: u32 = 0xffffffffu;
+const RIVER_LAKE_CELLS_ACROSS: u32 = 8u;
+// Metres of shore per metre of rise above a lake's water.
+const RIVER_LAKE_SHORE_RUN: f32 = 6.0;
+const RIVER_BANK_REACH: f32 = 12.0;
+const RIVER_BANK_CURVE: f32 = 0.16;
+const RIVER_LEVEE_OUTER_SLOPE: f32 = 0.15;
+// Height over which the carve's creases are rounded (CARVE_ROUNDING).
+const RIVER_CARVE_ROUNDING: f32 = 0.8;
+const RIVER_MAX_CANDIDATES: u32 = 64u;
+
+fn riverNone() -> RiverEnvelope
+{
+    return RiverEnvelope(RIVER_NONE, -RIVER_NONE, RIVER_NONE, -RIVER_NONE,
+                         vec2<f32>(0.0), 0.0, 0.0, 0.0, RIVER_NO_LAKE);
+}
+
+fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
+{
+    let ab = segment.b - segment.a;
+    let ap = p - segment.a;
+    let lengthSquared = max(dot(ab, ab), 1e-6);
+    let along = dot(ap, ab)/lengthSquared;
+    // Flat start: what lies behind the start belongs to the segment before.
+    if (along < 0.0) { return riverNone(); }
+    let t = min(along, 1.0);
+    let offset = ap - ab*t;
+    let centreDistance = length(offset);
+    let halfWidth = max(mix(segment.half_width.x, segment.half_width.y, t), 0.05);
+    let pastBank = centreDistance - halfWidth;
+    if (pastBank > RIVER_BANK_REACH) { return riverNone(); }
+    let water = mix(segment.water.x, segment.water.y, t);
+    let depth = mix(segment.depth.x, segment.depth.y, t);
+    let segmentLength = sqrt(lengthSquared);
+    // Signed distance to the centreline, + on the left of the flow. The skew
+    // fades out over the round end cap, where "left" stops meaning anything.
+    let crossValue = ab.x*ap.y - ab.y*ap.x;
+    let side = select(-1.0, 1.0, crossValue >= 0.0);
+    let beyond = max(along - 1.0, 0.0)*segmentLength;
+    let skew = segment.skew*(1.0 - smoothstep(0.0, halfWidth, beyond));
+    let speed = mix(segment.speed.x, segment.speed.y, t);
+    let direction = ab/segmentLength;
+    var envelope = RiverEnvelope(RIVER_NONE, -RIVER_NONE, pastBank, water,
+                                 direction*speed, halfWidth, segment.turbulence, skew*side,
+                                 RIVER_NO_LAKE);
+    if (pastBank < 0.0)
+    {
+        // A flat-bottomed bowl, skewed: zero at both banks, deep right up to
+        // them, and deepest toward the outer one.
+        let u = side*centreDistance/halfWidth;
+        let profile = (1.0 - u*u*u*u)*(1.0 + skew*u);
+        envelope.upper = water - depth*profile;
+        // The current runs fastest over the thalweg and stalls at the banks.
+        let lateral = pow(max(1.0 - u*u, 0.0), 0.35);
+        envelope.velocity = envelope.velocity*(lateral*1.25);
+    }
+    else
+    {
+        // Cut banks stand steep on the outside of a bend; point bars slope
+        // gently into the water on the inside.
+        let bank = segment.bank*max(1.0 + 0.75*skew*side, 0.3);
+        envelope.upper = water + bank*pastBank + RIVER_BANK_CURVE*pastBank*pastBank;
+        let freeboard = 0.1 + 0.25*depth;
+        let leveeWidth = 0.8 + 0.3*halfWidth;
+        envelope.lower = water + min(bank*pastBank, freeboard)
+                       - max(pastBank - leveeWidth, 0.0)*RIVER_LEVEE_OUTER_SLOPE
+                       - (1.0 - segment.levee)*1.0e4;
+        envelope.velocity = vec2<f32>(0.0);
+    }
+    return envelope;
+}
+
+fn riverScore(envelope: RiverEnvelope) -> f32
+{
+    return envelope.bank_distance/min(max(envelope.half_width, 0.5), 4.0);
+}
+
+fn riverCombine(total: ptr<function, RiverEnvelope>, next: RiverEnvelope)
+{
+    if (next.bank_distance >= RIVER_NONE) { return; }
+    (*total).upper = min((*total).upper, next.upper);
+    (*total).lower = max((*total).lower, next.lower);
+    // The water and its motion come from the channel whose waterline is
+    // nearest, in its own widths, so a creek hands over to the river it
+    // joins inside the larger channel.
+    if ((*total).bank_distance >= RIVER_NONE || riverScore(next) < riverScore(*total))
+    {
+        (*total).bank_distance = next.bank_distance;
+        (*total).water = next.water;
+        (*total).velocity = next.velocity;
+        (*total).half_width = next.half_width;
+        (*total).turbulence = next.turbulence;
+        (*total).bend = next.bend;
+    }
+}
+
+fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
+{
+    var total = riverNone();
+    let resolution = river_grid[3];
+    if (resolution == 0u) { return total; }
+    let origin = vec2<f32>(bitcast<f32>(river_grid[0]), bitcast<f32>(river_grid[1]));
+    let cell = floor((p - origin)/bitcast<f32>(river_grid[2]));
+    if (any(cell < vec2<f32>(0.0)) || any(cell >= vec2<f32>(f32(resolution)))) { return total; }
+    let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*RIVER_GRID_CELL_WORDS;
+    let offset = river_grid[entry];
+    let count = min(river_grid[entry + 1u], RIVER_MAX_CANDIDATES);
+    for (var i = 0u; i < count; i += 1u)
+    {
+        riverCombine(&total, riverSegmentEnvelope(river_segments[river_grid[offset + i]], p));
+    }
+    let record = river_grid[entry + 2u];
+    if (record != RIVER_NO_LAKE_RECORD)
+    {
+        let fine = floor((p - origin)/(bitcast<f32>(river_grid[2])/f32(RIVER_LAKE_CELLS_ACROSS)));
+        let local = vec2<u32>(fine - cell*f32(RIVER_LAKE_CELLS_ACROSS));
+        let bit = local.y*RIVER_LAKE_CELLS_ACROSS + local.x;
+        if (((river_grid[record + 1u + bit/32u] >> (bit % 32u)) & 1u) == 1u)
+        {
+            total.lake = bitcast<f32>(river_grid[record]);
+        }
+    }
+    return total;
+}
+
+// Metres past the nearest waterline, a river's or a lake's, for ground at
+// `height`: negative under water.
+fn riverBankAt(envelope: RiverEnvelope, height: f32) -> f32
+{
+    return min(envelope.bank_distance, (height - envelope.lake)*RIVER_LAKE_SHORE_RUN);
+}
+
+// Polynomial smooth minimum and maximum (smooth_min and smooth_max in
+// carve.rs): the corner rounded over a difference of `k`.
+fn riverSmoothMin(a: f32, b: f32, k: f32) -> f32
+{
+    let h = max(k - abs(a - b), 0.0)/k;
+    return min(a, b) - h*h*k*0.25;
+}
+
+fn riverSmoothMax(a: f32, b: f32, k: f32) -> f32
+{
+    let h = max(k - abs(a - b), 0.0)/k;
+    return max(a, b) + h*h*k*0.25;
+}
+
+// The ground with the channels cut into it and their banks held up, the
+// creases where the carve meets the natural ground rounded off: a bank's top
+// curves over into the land above it, and a levee's foot into the land below.
+fn riverClamp(envelope: RiverEnvelope, height: f32) -> f32
+{
+    return riverSmoothMin(riverSmoothMax(height, envelope.lower, RIVER_CARVE_ROUNDING),
+                          envelope.upper, RIVER_CARVE_ROUNDING);
+}
+// END SHARED RIVERS
 
 // One streamed plant, as the scatter wrote it. Mirrors `PlantInstance` in
 // src/vegetation/scatter.rs (32 bytes).
@@ -532,6 +754,20 @@ fn cull_plants(@builtin(global_invocation_id) id: vec3<u32>) {
     // Seat the root.
     let xz = plant.position.xz;
     var ground = 0.0;
+    // Nothing grows in a river or a lake, nor on the margin its floods
+    // scour: a tree or shrub stands back from the waterline by a few metres
+    // and its crown, a ground plant by a metre and a half.
+    let footing = select(4.0 + 0.06 * height,
+                         max(1.5, model.crown_radius * plant.scale + 1.0),
+                         model.habitat == 1u);
+    let river = riverEnvelope(xz);
+    var bank = river.bank_distance;
+    if (river.lake > RIVER_NO_LAKE) {
+        bank = riverBankAt(river, terrainHeight(xz));
+    }
+    if (bank < footing) {
+        return;
+    }
     if (model.habitat == 1u) {
         if (cull.counts.z == 0u) {
             return;

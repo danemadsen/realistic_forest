@@ -5,7 +5,8 @@
 // plant's root on it; a test keeps the pasted copies identical, so a trunk
 // stands exactly on the ground the terrain pass draws. Requires StageUniforms
 // as `stage` and the base noise, surface atlas, tile lookup and blend mask as
-// tex0, tex1, tex3 and tex4 with their samplers.
+// tex0, tex1, tex3 and tex4 with their samplers, and the shared river block
+// (river-functions.wgslinc) with its two storage buffers.
 fn smoothHermite(edge0: f32, edge1: f32, value: f32) -> f32
 {
     let t = clamp((value - edge0)/max(edge1 - edge0, 0.0001), 0.0, 1.0);
@@ -253,6 +254,11 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
 {
     // The four-pass result is already spatially normalized. The radial fade
     // stays well inside the region where every required lookup record exists.
-    return baseHeight(worldXZ) + erosionDelta(worldXZ)*erosionVisibility(worldXZ);
+    // Erosion was simulated over the river-carved base, so its delta goes on
+    // top of the carved base, and the channels are held once more over the
+    // result: a river keeps its bed and banks whatever the water did there.
+    let river = riverEnvelope(worldXZ);
+    return riverClamp(river, riverClamp(river, baseHeight(worldXZ))
+                             + erosionDelta(worldXZ)*erosionVisibility(worldXZ));
 }
 // END SHARED TERRAIN HEIGHT
