@@ -26,7 +26,7 @@ use super::network::{FLOW_CELL, Lake, River, RiverEnd};
 use crate::constants::SEA_LEVEL;
 use std::collections::HashMap;
 
-/// One water-surface vertex: 32 bytes, mirrored by the river vertex inputs
+/// One water-surface vertex: 48 bytes, mirrored by the river vertex inputs
 /// in water-surface.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -54,9 +54,14 @@ pub struct SurfaceVertex {
     pub half_width: f32,
     /// Foam made by whitewater here or upstream and still drifting, 0..1.
     pub foam: f32,
+    /// How far the water has turned to the sea's, 0..1: 1 where a river
+    /// meets the sea at its mouth, fading to 0 some `SEA_BLEND` metres up it.
+    /// The shader blends the river's tea-coloured water into the sea's
+    /// green over that reach, so the two meet in one colour.
+    pub sea: f32,
 }
 
-const _: () = assert!(std::mem::size_of::<SurfaceVertex>() == 44);
+const _: () = assert!(std::mem::size_of::<SurfaceVertex>() == 48);
 
 /// Side of a culling chunk, metres.
 pub const CHUNK: f32 = 256.0;
@@ -80,9 +85,11 @@ const HIDDEN_DEPTH: f32 = 9.0;
 const LIFT_FADE: f32 = 30.0;
 /// Seconds whitewater's foam lasts on the water as it drifts downstream.
 const FOAM_LIFETIME: f32 = 15.0;
-/// How far under the sea a river's surface lies where its water stands at the
-/// sea's level: the sea's own surface is drawn there.
-const UNDER_SEA: f32 = 0.28;
+/// How far under the sea a river's surface tucks where it ends at the coast:
+/// the sea's own surface is drawn on from there, in the same colour.
+const UNDER_SEA: f32 = 0.05;
+/// Metres up a river from the coast over which its water turns to the sea's.
+const SEA_BLEND: f32 = 90.0;
 
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
@@ -93,21 +100,48 @@ fn under_sheet(depth: f32) -> f32 {
     UNDER_SHEET + (UNDER_SHEET_DEEP - UNDER_SHEET) * smoothstep(SINK_START, HIDDEN_DEPTH, depth)
 }
 
-/// Every lake sheet's cells, with the level of the water over each.
+/// Every lake sheet's cells, with the level of the water over each, and the
+/// height of the sheets' corners (sunk at their edges), the highest where
+/// two sheets meet.
 struct Sheets {
     cells: HashMap<[i32; 2], f32>,
+    corners: HashMap<[i32; 2], f32>,
 }
 
 impl Sheets {
     fn new(lakes: &[Lake]) -> Self {
         let mut cells: HashMap<[i32; 2], f32> = HashMap::new();
+        let mut corners: HashMap<[i32; 2], f32> = HashMap::new();
         for lake in lakes {
+            let sunk: HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
             for &cell in lake.cells.iter().chain(&lake.shore) {
                 let level = cells.entry(cell).or_insert(lake.level);
                 *level = level.max(lake.level);
+                for corner in [cell, [cell[0] + 1, cell[1]], [cell[0], cell[1] + 1], [cell[0] + 1, cell[1] + 1]] {
+                    let height = sunk.get(&corner).map_or(lake.level, |&h| h.min(lake.level));
+                    let entry = corners.entry(corner).or_insert(height);
+                    *entry = entry.max(height);
+                }
             }
         }
-        Sheets { cells }
+        Sheets { cells, corners }
+    }
+
+    /// The drawn sheet's height over `p`, over the two triangles each cell
+    /// is drawn as (see `add_lake`), if a sheet is drawn there.
+    fn height(&self, p: [f32; 2]) -> Option<f32> {
+        let cell = Self::cell_of(p);
+        self.cells.get(&cell)?;
+        let corner = |dx: i32, dz: i32| self.corners.get(&[cell[0] + dx, cell[1] + dz]).copied();
+        let (u, v) = (p[0] / LAKE_CELL - cell[0] as f32, p[1] / LAKE_CELL - cell[1] as f32);
+        let (h00, h11) = (corner(0, 0)?, corner(1, 1)?);
+        Some(if v >= u {
+            let h01 = corner(0, 1)?;
+            h00 + (h11 - h01) * u + (h01 - h00) * v
+        } else {
+            let h10 = corner(1, 0)?;
+            h00 + (h10 - h00) * u + (h11 - h10) * v
+        })
     }
 
     fn cell_of(p: [f32; 2]) -> [i32; 2] {
@@ -196,11 +230,17 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
         // node into its parent's channel, and out past the shore under the
         // sea.
         let last = nodes.len().saturating_sub(1);
+        // Where a river's water comes down to the sea's level: the coast,
+        // from which the sea's own surface fills its mouth.
+        let coast = (river.end == RiverEnd::Sea)
+            .then(|| nodes.iter().position(|n| n.water <= SEA_LEVEL + 0.03))
+            .flatten()
+            .unwrap_or(river.surface_end)
+            .min(river.surface_end)
+            .max(1);
         let (end, sink) = match river.end {
-            // Two nodes on under the sea, whose water fills the mouth's
-            // channel from where the river's own surface meets it out to the
-            // open water.
-            RiverEnd::Sea => ((river.surface_end + 2).min(last), 0.3),
+            // One node on, tucked just under the sea.
+            RiverEnd::Sea => ((coast + 1).min(last), 0.0),
             RiverEnd::Confluence(..) => ((river.surface_end + 1).min(last), 0.12),
             RiverEnd::Edge => (river.surface_end.min(last), 0.0),
         };
@@ -294,21 +334,29 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
             // still water it meets (the sea, its parent); and water standing
             // at the sea's level is the sea's, drawn by the sea itself.
             let mut water = if i > river.surface_end { node.water - sink } else { node.water };
-            if node.water <= SEA_LEVEL + 0.03 {
-                water = water.min(SEA_LEVEL - UNDER_SEA);
-            }
+            let sea = if river.end == RiverEnd::Sea {
+                if i > coast {
+                    water = water.min(SEA_LEVEL - UNDER_SEA);
+                }
+                1.0 - smoothstep(0.0, SEA_BLEND, nodes[coast].along - node.along)
+            } else {
+                0.0
+            };
             let still = 1.0 - smoothstep(0.0, LIFT_FADE, from_still[i]);
             let row = vertices.len() as u32;
             let mut hidden = true;
             for (&across, &p) in offsets.iter().zip(&rows[i]) {
                 // Under the sheet of a lake whose level it stands at (running
                 // into it, out of it or through it), the ribbon runs on just
-                // beneath the sheet and deeper the further inside. The two
-                // never share a plane, and the ribbon's end is never in sight.
-                // Well inside, where the sheet hides it for good, it stops.
+                // beneath the sheet as drawn, its edge sunk and all, and
+                // deeper the further inside. The two never share a plane,
+                // the ribbon never shows over the lake's water, and its end
+                // is never in sight. Well inside, where the sheet hides it for
+                // good, it stops.
                 let (level, deep) = match sheets.under(p) {
                     Some((lake, depth)) if water <= lake + LEVEL_TIE && water >= lake - SHEET_BAND => {
-                        (water.min(lake) - under_sheet(depth), depth >= HIDDEN_DEPTH)
+                        let sheet = sheets.height(p).unwrap_or(lake).min(lake);
+                        (water.min(sheet) - under_sheet(depth), depth >= HIDDEN_DEPTH)
                     }
                     _ => (water, false),
                 };
@@ -323,6 +371,7 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
                     along: node.along,
                     half_width: node.half_width.max(0.25),
                     foam: foam[i],
+                    sea,
                 });
             }
             if let Some((previous, previous_hidden)) = previous_row
@@ -391,6 +440,7 @@ fn add_lake(
                 along: 0.0,
                 half_width: 0.0,
                 foam: 0.0,
+                sea: 0.0,
             });
             vertices.len() as u32 - 1
         })
@@ -504,5 +554,41 @@ mod tests {
         assert_eq!(row(7).half_width, 2.0);
         let sheet = mesh.vertices.last().unwrap();
         assert_eq!((sheet.along, sheet.half_width, sheet.foam), (0.0, 0.0, 0.0));
+    }
+
+    /// A river reaching the sea ends one row past the coast, tucked just
+    /// under the sea's surface, and its water turns to the sea's over its
+    /// last reach: none of it far upstream, all of it at the coast.
+    #[test]
+    fn a_river_ends_at_the_coast_in_the_seas_colour() {
+        // Water falling a centimetre a metre, down to the sea's level at
+        // x = 150 m, then on at the sea's level out to x = 200 m.
+        let water_at = |x: f32| (SEA_LEVEL + 0.01 * (150.0 - x)).max(SEA_LEVEL);
+        let nodes: Vec<RiverNode> = (0..=40)
+            .map(|k| RiverNode {
+                position: [5.0 * k as f32, 0.0],
+                water: water_at(5.0 * k as f32),
+                half_width: 2.0,
+                depth: 0.5,
+                speed: 0.8,
+                along: 5.0 * k as f32,
+                ..Default::default()
+            })
+            .collect();
+        let river = River { nodes, end: RiverEnd::Sea, surface_end: 38 };
+        let mesh = build(&[river], &[]);
+        // Five columns a row; the coast is the first node at the sea's level.
+        let coast = 30;
+        assert_eq!(mesh.vertices.len(), (coast + 2) * 5, "one row past the coast");
+        let row = |r: usize| &mesh.vertices[r * 5 + 2];
+        assert!((row(coast + 1).position[1] - (SEA_LEVEL - UNDER_SEA)).abs() < 1e-5);
+        assert!((row(coast).position[1] - water_at(150.0)).abs() < 1e-5);
+        assert_eq!(row(coast).sea, 1.0);
+        assert_eq!(row(coast + 1).sea, 1.0);
+        assert_eq!(row(10).sea, 0.0, "far upstream the water is the river's own");
+        for r in 13..=coast {
+            assert!(row(r).sea >= row(r - 1).sea, "{:?} {:?}", row(r - 1), row(r));
+        }
+        assert!(row(24).sea > 0.2 && row(24).sea < 0.9, "{:?}", row(24));
     }
 }

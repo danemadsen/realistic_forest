@@ -486,6 +486,207 @@ pub fn junction_fit(noise: &NoiseField, network: &RiverNetwork) -> Vec<String> {
     lines
 }
 
+/// The drawn water surfaces, bucketed for point queries: the highest
+/// river ribbon and the highest lake sheet over a point.
+pub struct SurfaceIndex<'a> {
+    mesh: &'a super::surface::SurfaceMesh,
+    /// Vertices from here on are the lakes' sheets.
+    first_lake: usize,
+    /// The first vertex of each lake's sheet after the first.
+    lake_starts: Vec<usize>,
+    buckets: std::collections::HashMap<[i32; 2], Vec<u32>>,
+}
+
+const SURFACE_BUCKET: f32 = 8.0;
+
+impl<'a> SurfaceIndex<'a> {
+    pub fn new(network: &'a RiverNetwork) -> Self {
+        let mesh = &network.surface;
+        let counts: Vec<usize> = network.lakes.iter().map(|lake| super::surface::build(&[], std::slice::from_ref(lake)).vertices.len()).collect();
+        let first_lake = mesh.vertices.len() - counts.iter().sum::<usize>();
+        let lake_starts: Vec<usize> = counts.iter().scan(first_lake, |start, &count| {
+            *start += count;
+            Some(*start)
+        }).collect();
+        let mut buckets: std::collections::HashMap<[i32; 2], Vec<u32>> = Default::default();
+        for (t, triangle) in mesh.indices.chunks(3).enumerate() {
+            let v: [[f32; 3]; 3] = [0, 1, 2].map(|k| mesh.vertices[triangle[k] as usize].position);
+            let bucket = |value: f32| (value / SURFACE_BUCKET).floor() as i32;
+            let (x0, x1) = (bucket(v.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min)), bucket(v.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max)));
+            let (z0, z1) = (bucket(v.iter().map(|p| p[2]).fold(f32::INFINITY, f32::min)), bucket(v.iter().map(|p| p[2]).fold(f32::NEG_INFINITY, f32::max)));
+            for z in z0..=z1 {
+                for x in x0..=x1 {
+                    buckets.entry([x, z]).or_default().push(t as u32);
+                }
+            }
+        }
+        Self { mesh, first_lake, lake_starts, buckets }
+    }
+
+    /// (ribbon, sheet): the highest of each over `p`, or -infinity.
+    pub fn at(&self, p: [f32; 2]) -> (f32, f32) {
+        let (ribbon, sheet, _) = self.owned(p);
+        (ribbon, sheet)
+    }
+
+    /// (ribbon, sheet, the sheet's lake): the highest of each over `p`.
+    pub fn owned(&self, p: [f32; 2]) -> (f32, f32, usize) {
+        let (mut ribbon, mut sheet, mut owner) = (f32::NEG_INFINITY, f32::NEG_INFINITY, usize::MAX);
+        let key = [(p[0] / SURFACE_BUCKET).floor() as i32, (p[1] / SURFACE_BUCKET).floor() as i32];
+        for &t in self.buckets.get(&key).map_or(&[][..], |list| &list[..]) {
+            let triangle = &self.mesh.indices[t as usize * 3..t as usize * 3 + 3];
+            let [a, b, c] = [0, 1, 2].map(|k| self.mesh.vertices[triangle[k] as usize].position);
+            let d = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2]);
+            if d.abs() < 1e-9 {
+                continue;
+            }
+            let l1 = ((b[2] - c[2]) * (p[0] - c[0]) + (c[0] - b[0]) * (p[1] - c[2])) / d;
+            let l2 = ((c[2] - a[2]) * (p[0] - c[0]) + (a[0] - c[0]) * (p[1] - c[2])) / d;
+            let l3 = 1.0 - l1 - l2;
+            if l1 < -1e-5 || l2 < -1e-5 || l3 < -1e-5 {
+                continue;
+            }
+            let h = l1 * a[1] + l2 * b[1] + l3 * c[1];
+            if triangle[0] as usize >= self.first_lake {
+                if h > sheet {
+                    sheet = h;
+                    owner = self.lake_starts.partition_point(|&start| start <= triangle[0] as usize);
+                }
+            } else {
+                ribbon = ribbon.max(h);
+            }
+        }
+        (ribbon, sheet, owner)
+    }
+}
+
+/// How the water looks around the lakes, sampled every metre over and
+/// around each:
+/// - shaded: ground the terrain shades as under water (below a lake's
+///   surface field, or a channel's water inside its banks) that no water
+///   surface covers;
+/// - tilted: a lake's sheet showing more than 10 cm under its level, where
+///   it dives under the ground or a river's ribbon and its slope shows;
+/// - walls: water showing over a sample more than 10 cm above the bare
+///   ground of the next sample, so it ends in the air there;
+/// - seams: neighbouring samples whose surface steps by more than 5 cm from
+///   a ribbon to a sheet.
+pub struct WaterHoles {
+    pub samples: usize,
+    pub shaded: usize,
+    pub tilted: usize,
+    pub walls: usize,
+    pub seams: usize,
+    /// (tilted and wall samples, the worst, where) by lake.
+    pub worst: Vec<(usize, f32, [f32; 2])>,
+}
+
+pub fn water_holes(noise: &NoiseField, network: &RiverNetwork) -> WaterHoles {
+    let index = SurfaceIndex::new(network);
+    let cell = network::FLOW_CELL as f32;
+    let mut holes = WaterHoles { samples: 0, shaded: 0, tilted: 0, walls: 0, seams: 0, worst: Vec::new() };
+    for (number, lake) in network.lakes.iter().enumerate() {
+        let (mut minimum, mut maximum) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+        for c in lake.cells.iter().chain(&lake.shore) {
+            for axis in 0..2 {
+                minimum[axis] = minimum[axis].min(c[axis] as f32 * cell - 16.0);
+                maximum[axis] = maximum[axis].max((c[axis] + 1) as f32 * cell + 16.0);
+            }
+        }
+        let width = (maximum[0] - minimum[0]).ceil() as usize;
+        let depth = (maximum[1] - minimum[1]).ceil() as usize;
+        // Per sample: the ground, and the water showing over it (or -inf),
+        // and whether that is a sheet's.
+        let mut ground = vec![0.0f32; width * depth];
+        let mut top = vec![f32::NEG_INFINITY; width * depth];
+        let mut sheet = vec![false; width * depth];
+        let (mut count, mut worst, mut at) = (0usize, 0.0f32, [0.0f32; 2]);
+        for zi in 0..depth {
+            for xi in 0..width {
+                let i = zi * width + xi;
+                let p = [minimum[0] + xi as f32 + 0.5, minimum[1] + zi as f32 + 0.5];
+                let (height, envelope) = carved_height(noise, network, p[0], p[1]);
+                let (ribbon, sheet_height, owner) = index.owned(p);
+                // The sea's surface lies over all ground below its level.
+                let surface = ribbon.max(sheet_height).max(SEA_LEVEL);
+                ground[i] = height;
+                holes.samples += 1;
+                if surface > height {
+                    top[i] = surface;
+                    sheet[i] = sheet_height >= ribbon && sheet_height > SEA_LEVEL;
+                    let dip = lake.level - sheet_height;
+                    if sheet[i] && owner == number && sheet_height > height + 0.01 && dip > 0.1 {
+                        holes.tilted += 1;
+                        count += 1;
+                        if dip > worst {
+                            worst = dip;
+                            at = p;
+                        }
+                    }
+                    continue;
+                }
+                let channel = envelope.bank_distance < 0.0;
+                let under_river = if channel { envelope.water - height } else { f32::NEG_INFINITY };
+                if (envelope.lake - height).max(under_river) > 0.03 {
+                    holes.shaded += 1;
+                }
+            }
+        }
+        for zi in 0..depth {
+            for xi in 0..width {
+                let i = zi * width + xi;
+                for j in [i + 1, i + width] {
+                    if (j == i + 1 && xi + 1 >= width) || j >= width * depth {
+                        continue;
+                    }
+                    let (wet, dry) = match (top[i] > f32::NEG_INFINITY, top[j] > f32::NEG_INFINITY) {
+                        (true, true) => {
+                            if sheet[i] != sheet[j] && (top[i] - top[j]).abs() > 0.05 {
+                                holes.seams += 1;
+                            }
+                            continue;
+                        }
+                        (true, false) => (i, j),
+                        (false, true) => (j, i),
+                        (false, false) => continue,
+                    };
+                    let wall = top[wet] - ground[dry];
+                    if wall > 0.1 {
+                        holes.walls += 1;
+                        count += 1;
+                        if wall > worst {
+                            worst = wall;
+                            at = [minimum[0] + (dry % width) as f32 + 0.5, minimum[1] + (dry / width) as f32 + 0.5];
+                        }
+                    }
+                }
+            }
+        }
+        if count > 0 {
+            holes.worst.push((count, worst, at));
+        }
+    }
+    holes.worst.sort_by_key(|w| std::cmp::Reverse(w.0));
+    holes
+}
+
+pub fn hole_fit(noise: &NoiseField, network: &RiverNetwork) -> Vec<String> {
+    let holes = water_holes(noise, network);
+    let mut lines = vec![format!(
+        "water around lakes: of {} samples, {} shaded as under water but bare, {} of sheet tilted under its level, {} water walls, {} ribbon/sheet seams ({} lakes tilted or walled)",
+        holes.samples,
+        holes.shaded,
+        holes.tilted,
+        holes.walls,
+        holes.seams,
+        holes.worst.len()
+    )];
+    for (count, worst, at) in holes.worst.iter().take(8) {
+        lines.push(format!("  {count} tilted or walled, worst {worst:.2} m at {:.1},{:.1}", at[0], at[1]));
+    }
+    lines
+}
+
 pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
     let region = network::region_of(centre[0], centre[1]);
     let network = network::generate(noise, region);
@@ -497,6 +698,9 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
         println!("{line}");
     }
     for line in junction_fit(noise, &network) {
+        println!("{line}");
+    }
+    for line in hole_fit(noise, &network) {
         println!("{line}");
     }
     // The nodes nearest the map's centre, for framing a camera on them: the
@@ -642,5 +846,69 @@ mod tests {
         assert!(j.mouths > 50);
         assert!(j.cut_off_mouths.len() * 20 <= j.mouths, "{:?}", j.cut_off_mouths);
         assert_eq!(j.flicker, 0);
+    }
+
+    /// The lakes' surface the terrain, the plants and the player measure
+    /// the water by is the drawn sheet itself wherever a sheet is drawn, and
+    /// where it gives out past a shore it has sunk far enough under the
+    /// ground that the shore band measured from it has faded out: it never
+    /// ends on an edge the terrain's shading would show.
+    #[test]
+    fn spawn_region_lake_surface_is_the_drawn_water() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, [0, 0]);
+        let index = SurfaceIndex::new(&network);
+        let cell = network::FLOW_CELL as f32;
+        let (mut samples, mut above) = (0usize, 0usize);
+        for lake in &network.lakes {
+            for c in lake.cells.iter().chain(&lake.shore).step_by(3) {
+                for (u, v) in [(0.25, 0.75), (0.8, 0.3), (0.5, 0.5), (0.05, 0.9)] {
+                    let p = [(c[0] as f32 + u) * cell, (c[1] as f32 + v) * cell];
+                    let (_, sheet) = index.at(p);
+                    let field = network.envelope(p[0], p[1]).lake;
+                    samples += 1;
+                    // The highest corners of any lakes meeting here: never
+                    // under the sheet, over it only where two lakes meet.
+                    assert!(field >= sheet - 2e-3, "field {field} under the sheet {sheet} at {p:?}");
+                    above += usize::from(field > sheet + 2e-3);
+                }
+            }
+        }
+        assert!(samples > 1000);
+        assert!(above * 200 <= samples, "{above} of {samples} samples over the sheet");
+        // Every corner on the edge of a record's field (next to one no lake
+        // reaches) lies far enough under the ground: a shore run of 11 m or
+        // more, past the band of bare earth and the damp turf beyond it.
+        let grid = &network.grid;
+        let across = super::super::carve::LAKE_CORNERS_ACROSS;
+        let fine = super::super::carve::GRID_CELL / super::super::carve::LAKE_CELLS_ACROSS as f32;
+        let mut edges = 0;
+        for (&index, record) in &grid.lakes {
+            let origin = [
+                grid.origin[0] + (index as usize % grid.resolution) as f32 * super::super::carve::GRID_CELL,
+                grid.origin[1] + (index as usize / grid.resolution) as f32 * super::super::carve::GRID_CELL,
+            ];
+            for z in 0..across {
+                for x in 0..across {
+                    let height = record.corner(z * across + x);
+                    if height <= super::super::carve::NO_LAKE {
+                        continue;
+                    }
+                    let open = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dz)| {
+                        let (nx, nz) = (x as i32 + dx, z as i32 + dz);
+                        (0..across as i32).contains(&nx)
+                            && (0..across as i32).contains(&nz)
+                            && record.corner(nz as usize * across + nx as usize) <= super::super::carve::NO_LAKE
+                    });
+                    if open {
+                        edges += 1;
+                        let p = [origin[0] + x as f32 * fine, origin[1] + z as f32 * fine];
+                        let (ground, _) = carved_height(&noise, &network, p[0], p[1]);
+                        assert!(ground - height >= 1.65, "the field ends {:.2} m under the ground at {p:?}", ground - height);
+                    }
+                }
+            }
+        }
+        assert!(edges > 100, "{edges}");
     }
 }

@@ -615,12 +615,19 @@ fn rockWeathering(p: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec3<f32>
 // bits, resolution, segment count), then three words per cell, then the
 // segment lists the cells point into, then the lake records. A cell's words
 // are the offset of its list, the list's length, and the offset of its lake
-// record (RIVER_NO_LAKE_RECORD if no lake reaches it): the lake's level as
-// f32 bits and a 64-bit mask of which of the cell's 8 x 8 lake cells lie
-// under the lake or its shore. A zero resolution means there are no rivers.
+// record (RIVER_NO_LAKE_RECORD if no lake reaches it). A record holds the
+// lakes' surface at the corners of the cell's 8 x 8 lake cells: the highest
+// corner's height as f32 bits, then each corner's depth under it in 2 mm
+// steps, two u16 to a word (0xffff where no lake reaches), 9 corners
+// to a row. Between corners the surface is interpolated over the two
+// triangles a lake's sheet draws each cell as, split from corner (0, 0) to
+// corner (1, 1) (carve.rs LakeRecord). A zero resolution means there are
+// no rivers.
 //
-// A lake has no channel: ground below its level near it lies under its
-// water, and riverBankAt measures the shore in a river bank's terms.
+// A lake has no channel: under its sheet the surface is the drawn water
+// itself, so ground below it lies under the water; past the sheet it runs on
+// under the ground and sinks away (network.rs lake_surface), and
+// riverBankAt measures the shore from it in a river bank's terms.
 //
 // Each segment bounds the ground from above (the channel bed, then a bank
 // cone that steepens away from the water) and from below (a low levee that
@@ -653,7 +660,7 @@ struct RiverEnvelope {
     // where the current cuts a steep bank, toward -0.6 on the inside, where
     // it drops its point bar.
     bend: f32,
-    // The level of a lake reaching here, or RIVER_NO_LAKE.
+    // The surface of a lake reaching here, or RIVER_NO_LAKE.
     lake: f32,
 };
 
@@ -662,6 +669,9 @@ const RIVER_NO_LAKE: f32 = -1.0e30;
 const RIVER_GRID_CELL_WORDS: u32 = 3u;
 const RIVER_NO_LAKE_RECORD: u32 = 0xffffffffu;
 const RIVER_LAKE_CELLS_ACROSS: u32 = 8u;
+const RIVER_LAKE_CORNERS_ACROSS: u32 = 9u;
+const RIVER_LAKE_DEPTH_UNIT: f32 = 0.002;
+const RIVER_LAKE_NO_CORNER: u32 = 0xffffu;
 // Metres of shore per metre of rise above a lake's water.
 const RIVER_LAKE_SHORE_RUN: f32 = 6.0;
 const RIVER_BANK_REACH: f32 = 12.0;
@@ -774,15 +784,43 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
     let record = river_grid[entry + 2u];
     if (record != RIVER_NO_LAKE_RECORD)
     {
-        let fine = floor((p - origin)/(bitcast<f32>(river_grid[2])/f32(RIVER_LAKE_CELLS_ACROSS)));
-        let local = vec2<u32>(fine - cell*f32(RIVER_LAKE_CELLS_ACROSS));
-        let bit = local.y*RIVER_LAKE_CELLS_ACROSS + local.x;
-        if (((river_grid[record + 1u + bit/32u] >> (bit % 32u)) & 1u) == 1u)
-        {
-            total.lake = bitcast<f32>(river_grid[record]);
-        }
+        let local = (p - origin)/(bitcast<f32>(river_grid[2])/f32(RIVER_LAKE_CELLS_ACROSS))
+                  - cell*f32(RIVER_LAKE_CELLS_ACROSS);
+        total.lake = riverLakeSurface(record, local);
     }
     return total;
+}
+
+// The surface at corner `k` of a lake record, or RIVER_NO_LAKE.
+fn riverLakeCorner(record: u32, k: u32) -> f32
+{
+    let depth = (river_grid[record + 1u + k/2u] >> (16u*(k % 2u))) & 0xffffu;
+    if (depth == RIVER_LAKE_NO_CORNER) { return RIVER_NO_LAKE; }
+    return bitcast<f32>(river_grid[record]) - f32(depth)*RIVER_LAKE_DEPTH_UNIT;
+}
+
+// A lake record's surface at `local`, in lake cells from the record's corner.
+fn riverLakeSurface(record: u32, local: vec2<f32>) -> f32
+{
+    let i = clamp(floor(local), vec2<f32>(0.0), vec2<f32>(f32(RIVER_LAKE_CELLS_ACROSS - 1u)));
+    let uv = local - i;
+    let k = u32(i.y)*RIVER_LAKE_CORNERS_ACROSS + u32(i.x);
+    let h00 = riverLakeCorner(record, k);
+    let h11 = riverLakeCorner(record, k + RIVER_LAKE_CORNERS_ACROSS + 1u);
+    var h = 0.0;
+    var other = 0.0;
+    if (uv.y >= uv.x)
+    {
+        other = riverLakeCorner(record, k + RIVER_LAKE_CORNERS_ACROSS);
+        h = h00 + (h11 - other)*uv.x + (other - h00)*uv.y;
+    }
+    else
+    {
+        other = riverLakeCorner(record, k + 1u);
+        h = h00 + (other - h00)*uv.x + (h11 - other)*uv.y;
+    }
+    if (min(min(h00, h11), other) <= RIVER_NO_LAKE) { return RIVER_NO_LAKE; }
+    return h;
 }
 
 // Metres past the nearest waterline, a river's or a lake's, for ground at
@@ -1394,13 +1432,16 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // climb steeply, and its stones line them a metre or so either way.
     let stoneBank = riverRock*(1.0 - smoothHermite(0.15, 0.9 + 0.6*soilEdge, riverBank))*(1.0 - inRiver);
     // Sand is the sea's: inland, beds and banks are silt, earth and stone.
+    // Where a river crosses the beach to the sea its bed is the beach's sand
+    // as the sea's is, so the two waters meet over one bed.
     let fSandRiver = 1.0 - fGrass;
+    let riverBed = inRiver*(1.0 - fSandRiver);
     // Along calm water the erosion's gravel and rock give way to the band (a
     // steep face still stands as rock); whitewater keeps its stony banks.
     let fGravelRiver = max(fGravel*(1.0 - 0.9*calmShore)*(1.0 - inRiver*riverSilt),
-                           inRiver*riverGravel + pointBar*barGravel*0.75 + stoneBank*0.5);
+                           riverBed*riverGravel + pointBar*barGravel*0.75 + stoneBank*0.5);
     let fRockRiver = max(fRock*(1.0 - 0.9*calmShore*(1.0 - steepFace)),
-                         inRiver*riverRock + stoneBank*0.6);
+                         riverBed*riverRock + stoneBank*0.6);
     let fSnowRiver = fSnow*(1.0 - max(inRiver, max(pointBar, stoneBank)*0.7));
     // Under the water whatever is not gravel or rock is silt (never turf); on
     // the shore the band's bare earth, a cut bank's face and a slow stream's
@@ -2366,8 +2407,10 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                      * (1.0 - gSnow);
         let damp = albedo * vec3<f32>(0.55, 0.57, 0.56);
         albedo = mix(albedo, damp, moisture);
-        // Under the water the bed is filmed with algae and settled silt.
-        let submergedBed = (1.0 - smoothHermite(-0.35, 0.0, river.x)) * (1.0 - gSnow);
+        // Under the water the bed is filmed with algae and settled silt; the
+        // beach's sand under a river's mouth is scoured clean, as the sea's is.
+        let submergedBed = (1.0 - smoothHermite(-0.35, 0.0, river.x)) * (1.0 - gSnow)
+                         * (1.0 - 0.85*gSand);
         // Saturated mud at the waterline is darker again than damp earth, and
         // greyer: water fills its pores and its iron is reduced.
         let lappedAbove = lapped * (1.0 - submergedBed) * (1.0 - gSnow);

@@ -256,9 +256,10 @@ pub fn create_base_height_map(
                 height[index] = envelope.clamp(height[index]);
                 // A cell whose middle the water covers belongs to the river,
                 // or to a lake: the erosion drains both and leaves their beds.
-                // A lake's shore under the edge of its sheet stays as it is
-                // too, so no gully cuts below the water there.
-                let on_lake = envelope.lake > crate::rivers::carve::NO_LAKE;
+                // A lake's shore up to 2.5 m over its surface stays as it
+                // is too, so no gully cuts below the water there, nor down
+                // through the surface its shore is measured from.
+                let on_lake = envelope.lake > height[index] - 2.5;
                 if on_lake || envelope.water_over(height[index]).is_some_and(|water| height[index] < water) {
                     river[index] = 1.0;
                 }

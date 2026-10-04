@@ -743,6 +743,14 @@ const TREE_CONTEXT: f64 = 24.0;
 /// holds the drawn plants to the same margin.
 const RIVER_CLEARANCE: [f32; 5] = [4.5, 4.0, 3.5, 1.5, 3.0];
 
+/// How far past the waterline a canopy tree of crown radius `reach` stands
+/// at least: back by most of its crown, so a broad tree leans over the water
+/// rather than spreading across a creek or a lake's outlet. The GPU cull
+/// holds the drawn trees to the same.
+pub fn crown_clearance(reach: f32) -> f32 {
+    0.75 * reach + 1.5
+}
+
 pub fn generate_level(
     noise: &NoiseField,
     catalog: &Catalog,
@@ -760,7 +768,8 @@ pub fn generate_level(
     // Canopy, accepted out to the tree context around the chunk.
     let (canopy_min, canopy_max) = grow(minimum, maximum, TREE_CONTEXT + canopy_margin);
     let canopy = CandidateGrid::build(&CANOPY, canopy_min, canopy_max, |x, z, key| {
-        canopy_candidate(catalog, &habitats, x, z, key).filter(|_| dry(x, z, Layer::Canopy))
+        canopy_candidate(catalog, &habitats, x, z, key)
+            .filter(|&(_, reach, _, _)| dry(x, z, Layer::Canopy) && sampler.river_bank(x, z) >= crown_clearance(reach))
     });
     let (context_min, context_max) = grow(minimum, maximum, TREE_CONTEXT);
     let canopy_trees = canopy.survivors(CANOPY.overlap, MAX_CANOPY_REACH, context_min, context_max);

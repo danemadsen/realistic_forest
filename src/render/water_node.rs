@@ -1011,6 +1011,7 @@ fn river_vertex_layout() -> Vec<VertexBufferLayout> {
             attribute(5, 32, VertexFormat::Float32),
             attribute(6, 36, VertexFormat::Float32),
             attribute(7, 40, VertexFormat::Float32),
+            attribute(8, 44, VertexFormat::Float32),
         ],
     }]
 }

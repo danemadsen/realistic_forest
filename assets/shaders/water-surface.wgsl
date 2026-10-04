@@ -1926,8 +1926,9 @@ struct RiverVertexOutput
     // z the surface's own height, w still water (1 on a lake).
     @location(2) channel: vec4<f32>,
     // x metres downstream from the river's head, y its half width (0 on a
-    // lake's sheet), z foam drifting down from whitewater upstream.
-    @location(3) stream: vec3<f32>,
+    // lake's sheet), z foam drifting down from whitewater upstream, w how far
+    // the water has turned to the sea's (1 where a river meets the sea).
+    @location(3) stream: vec4<f32>,
 };
 
 @vertex
@@ -1940,6 +1941,7 @@ fn vs_river(
     @location(5) along: f32,
     @location(6) half_width: f32,
     @location(7) foam: f32,
+    @location(8) sea: f32,
 ) -> RiverVertexOutput
 {
     // A distant channel is narrower than the clipmap's triangles there,
@@ -1958,7 +1960,7 @@ fn vs_river(
     out.world_position = world;
     out.velocity = velocity;
     out.channel = vec4<f32>(across, turbulence, position.y, still);
-    out.stream = vec3<f32>(along, half_width, foam);
+    out.stream = vec4<f32>(along, half_width, foam, sea);
     return out;
 }
 
@@ -2227,14 +2229,17 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     let to_view = to_camera/max(view_distance, 1e-3);
     let time = stage.params.x;
     let across = in.channel.x;
-    let turbulence = in.channel.y;
+    // Down its last reach a river spreads and slows into the sea's: its
+    // rapids and its foam give out as its water turns to the sea's.
+    let sea = clamp(in.stream.w, 0.0, 1.0);
+    let turbulence = in.channel.y*(1.0 - sea);
     let surface_level = in.channel.z;
     let stillness = clamp(in.channel.w, 0.0, 1.0);
     let along = in.stream.x;
     let half_width = in.stream.y;
     let river = half_width > 0.01;
     // Foam made by whitewater upstream and still drifting here.
-    let supply = clamp(in.stream.z*3.0, 0.0, 1.0);
+    let supply = clamp(in.stream.z*3.0, 0.0, 1.0)*(1.0 - sea);
     // Derivatives first, in uniform control flow.
     let pixel_dx = dpdx(in.world_position);
     let pixel_dy = dpdy(in.world_position);
@@ -2334,7 +2339,7 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     let extinction = mix(RIVER_EXTINCTION, LAKE_EXTINCTION, stillness);
     let backscatter = mix(RIVER_SCATTER, LAKE_SCATTER, stillness);
     // Rapids turn milky even where no foam lies on top.
-    let aeration = smoothstepf(0.3, 0.9, turbulence)*0.8;
+    let aeration = smoothstepf(0.3, 0.9, turbulence)*0.6;
     let sigma_t = extinction + vec3<f32>(BUBBLE_SCATTER*aeration);
     let sigma_s = backscatter + vec3<f32>(0.5*BUBBLE_SCATTER*aeration);
     // The eye's ray bends down into the water, so it crosses the column far
@@ -2355,6 +2360,23 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     let in_scatter = sigma_s*source*(1.0 - exp(-sigma_column*water_path))
                    /max(sigma_column, vec3<f32>(1e-3));
     var body = scene_linear*transmittance*downwelling + in_scatter;
+    // Toward the sea the water becomes the sea's, as fs_main shades it: the
+    // same green and the same light in it where the two meet.
+    if (sea > 0.0)
+    {
+        let sea_sigma_t = max(stage.extinction.xyz, vec3<f32>(1e-4));
+        let sea_sigma_s = min(sea_sigma_t, PARTICLE_SCATTER*stage.extinction.w*stage.scatter.xyz + RAYLEIGH);
+        let sea_transmittance = exp(-sea_sigma_t*optical_path);
+        let asymmetry = clamp(stage.scatter.w, -0.99, 0.99);
+        let sun_phase = mix(henyeyGreenstein(dot(to_view, -to_sun), asymmetry),
+                            phaseRayleigh(dot(to_view, -to_sun)), 0.5);
+        let moon_phase = mix(henyeyGreenstein(dot(to_view, -to_moon), asymmetry),
+                             phaseRayleigh(dot(to_view, -to_moon)), 0.5);
+        let sea_source = sun_colour*sun_phase + moon_colour*moon_phase + sky_light*(0.35/(4.0*PI));
+        let sea_body = scene_linear*sea_transmittance
+                     + sea_sigma_s*sea_source*(1.0 - sea_transmittance)/sea_sigma_t;
+        body = mix(body, sea_body, sea);
+    }
 
     // --- Reflection and glitter -------------------------------------------
     let reflected_sky = cloudSkyRadiance(reflection_direction)*mix(0.8, 0.68, precipitation.z);
@@ -2372,8 +2394,11 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     // --- Whitewater and foam ------------------------------------------------
     let foam_stretch = select(1.0, 1.0 + 2.5*smoothstepf(0.3, 1.5, speed), river);
     let pattern = riverFoamPattern(st, flow, foam_stretch, time, footprint);
-    // Whitewater where the bed breaks the surface: rapids and cascades.
-    let whitewater = smoothstepf(0.35, 0.85, turbulence)*0.9;
+    // Whitewater where the bed breaks the surface: over the steps and
+    // boulders of a rapid, with dark glassy tongues of water between them.
+    // The steps stay put as the water runs over them.
+    let steps = valueNoise(vec2<f32>(along/(2.5*max(half_width, 0.6)), across*1.7 + 3.1));
+    let whitewater = smoothstepf(0.35, 0.85, turbulence)*mix(0.2, 0.85, smoothstepf(0.25, 0.75, steps));
     // Flecks on the faces of a riffle's standing waves.
     let flecks = water_surface.crest*riffle*0.5;
     // Foam the whitewater upstream made drifts down as a thin lace, gathered

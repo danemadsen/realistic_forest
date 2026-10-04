@@ -270,12 +270,11 @@ pub fn combine(total: &mut Envelope, next: &Envelope) {
 }
 
 /// A uniform grid of segment lists over the network's whole domain, with
-/// the lakes reaching into each cell. Uploaded to the GPU as one `u32` array:
-/// an eight-word header, then `(offset, segment count, lake)` per cell, then
-/// the index lists the offsets point into, then the lake records. A cell's
-/// lake word is `NO_LAKE_RECORD` or the offset of its record: the lake's
-/// level (f32 bits) and a 64-bit mask of which of the cell's 8 x 8 lake
-/// cells (`GRID_CELL / 8`) lie under the lake or its shore.
+/// the lakes' surfaces over each cell they reach. Uploaded to the GPU as one
+/// `u32` array: an eight-word header, then `(offset, segment count, lake)`
+/// per cell, then the index lists the offsets point into, then the lake
+/// records. A cell's lake word is `NO_LAKE_RECORD` or the offset of its
+/// record (`LakeRecord`).
 #[derive(Clone, Debug, Default)]
 pub struct SegmentGrid {
     pub origin: [f32; 2],
@@ -283,8 +282,65 @@ pub struct SegmentGrid {
     /// Per cell: offset into `indices` and segment count.
     pub cells: Vec<[u32; 2]>,
     pub indices: Vec<u32>,
-    /// The cells lakes reach into: (level, mask of lake cells), by cell.
-    pub lakes: std::collections::BTreeMap<u32, (f32, u64)>,
+    /// The lakes' surfaces over the cells they reach, by cell.
+    pub lakes: std::collections::BTreeMap<u32, LakeRecord>,
+}
+
+/// A lake's surface over one grid cell: its height at the corners of the
+/// cell's 8 x 8 lake cells (`GRID_CELL / 8`, the flow grid's cells), as the
+/// highest corner's height and each corner's depth under it in
+/// `LAKE_DEPTH_UNIT`s.
+/// Under a lake's sheet the surface is the sheet itself, corner for corner,
+/// so ground below it is exactly the ground the drawn water covers; past the
+/// sheet it runs on under the ground and sinks away from the water, so a
+/// shore measured from it fades out smoothly (`network::lake_surface`).
+/// Between corners it is interpolated over the two triangles the sheet's
+/// quads are drawn as, split from corner (0, 0) to corner (1, 1).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LakeRecord {
+    pub top: f32,
+    pub depths: [u16; LAKE_CORNERS],
+}
+
+/// Corners across a lake record.
+pub const LAKE_CORNERS_ACROSS: usize = LAKE_CELLS_ACROSS + 1;
+pub const LAKE_CORNERS: usize = LAKE_CORNERS_ACROSS * LAKE_CORNERS_ACROSS;
+/// Words in a lake record: its top, then the corners' depths two to a word.
+pub const LAKE_RECORD_WORDS: usize = 1 + LAKE_CORNERS.div_ceil(2);
+/// Metres per unit of a corner's depth: 2 mm, for 131 m of range under a
+/// record's top.
+pub const LAKE_DEPTH_UNIT: f32 = 0.002;
+/// The depth of a corner no lake's surface reaches.
+pub const LAKE_NO_CORNER: u16 = u16::MAX;
+
+impl LakeRecord {
+    /// The surface at corner `k` (`z * LAKE_CORNERS_ACROSS + x`), or
+    /// `NO_LAKE`.
+    pub fn corner(&self, k: usize) -> f32 {
+        match self.depths[k] {
+            LAKE_NO_CORNER => NO_LAKE,
+            depth => self.top - depth as f32 * LAKE_DEPTH_UNIT,
+        }
+    }
+
+    /// The surface at `local`, the point in lake cells from the record's
+    /// corner (0..8 on each axis), or `NO_LAKE`.
+    pub fn at(&self, local: [f32; 2]) -> f32 {
+        let across = LAKE_CORNERS_ACROSS;
+        let i = [local[0].floor().clamp(0.0, (LAKE_CELLS_ACROSS - 1) as f32), local[1].floor().clamp(0.0, (LAKE_CELLS_ACROSS - 1) as f32)];
+        let (u, v) = (local[0] - i[0], local[1] - i[1]);
+        let k = i[1] as usize * across + i[0] as usize;
+        let h00 = self.corner(k);
+        let h11 = self.corner(k + across + 1);
+        let (h, other) = if v >= u {
+            let h01 = self.corner(k + across);
+            (h00 + (h11 - h01) * u + (h01 - h00) * v, h01)
+        } else {
+            let h10 = self.corner(k + 1);
+            (h00 + (h10 - h00) * u + (h11 - h10) * v, h10)
+        };
+        if h00.min(h11).min(other) <= NO_LAKE { NO_LAKE } else { h }
+    }
 }
 
 /// The "no lake" level on the GPU, where infinities are best avoided.
@@ -351,39 +407,61 @@ impl SegmentGrid {
         self.cell_index(p).map(|index| self.cells[index])
     }
 
-    /// Mark a lake's cells (`cell_size` = GRID_CELL / LAKE_CELLS_ACROSS
-    /// metres, aligned with this grid) in the cells that hold them.
-    pub fn add_lake(&mut self, level: f32, cells: &[[i32; 2]], cell_size: f32) {
-        for cell in cells {
-            let centre = [(cell[0] as f32 + 0.5) * cell_size, (cell[1] as f32 + 0.5) * cell_size];
-            let Some(index) = self.cell_index(centre) else {
-                continue;
-            };
-            let bit = self.lake_bit(centre);
-            let entry = self.lakes.entry(index as u32).or_insert((level, 0));
-            entry.0 = entry.0.max(level);
-            entry.1 |= 1u64 << bit;
-        }
-    }
-
-    /// Which of its cell's lake cells `p` lies in, 0..64.
-    fn lake_bit(&self, p: [f32; 2]) -> u32 {
-        let fine = GRID_CELL / LAKE_CELLS_ACROSS as f32;
-        let x = ((p[0] - self.origin[0]) / fine).floor() as i64;
-        let z = ((p[1] - self.origin[1]) / fine).floor() as i64;
+    /// Set the lakes' surfaces from the heights at flow-grid corners
+    /// (corner `c` at `c * cell_size` metres; `cell_size` is
+    /// GRID_CELL / LAKE_CELLS_ACROSS and the grid's origin lies on a corner).
+    /// A corner on a cell's border belongs to every cell sharing it.
+    pub fn set_lakes(&mut self, corners: &std::collections::HashMap<[i32; 2], f32>, cell_size: f32) {
         let across = LAKE_CELLS_ACROSS as i64;
-        (z.rem_euclid(across) * across + x.rem_euclid(across)) as u32
+        let mut heights: std::collections::BTreeMap<u32, [f32; LAKE_CORNERS]> = Default::default();
+        for (&corner, &height) in corners {
+            let g = [
+                ((corner[0] as f32 * cell_size - self.origin[0]) / cell_size).round() as i64,
+                ((corner[1] as f32 * cell_size - self.origin[1]) / cell_size).round() as i64,
+            ];
+            let cells = |g: i64| {
+                let cell = g.div_euclid(across);
+                if g.rem_euclid(across) == 0 { vec![cell, cell - 1] } else { vec![cell] }
+            };
+            for cz in cells(g[1]) {
+                for cx in cells(g[0]) {
+                    if cx < 0 || cz < 0 || cx >= self.resolution as i64 || cz >= self.resolution as i64 {
+                        continue;
+                    }
+                    let k = ((g[1] - cz * across) * LAKE_CORNERS_ACROSS as i64 + (g[0] - cx * across)) as usize;
+                    let entry = heights.entry((cz as usize * self.resolution + cx as usize) as u32).or_insert([NO_LAKE; LAKE_CORNERS]);
+                    entry[k] = entry[k].max(height);
+                }
+            }
+        }
+        self.lakes = heights
+            .into_iter()
+            .map(|(index, heights)| {
+                let top = heights.iter().copied().fold(NO_LAKE, f32::max);
+                let depths = heights.map(|h| {
+                    let depth = ((top - h) / LAKE_DEPTH_UNIT).round();
+                    if h <= NO_LAKE || depth >= LAKE_NO_CORNER as f32 { LAKE_NO_CORNER } else { depth as u16 }
+                });
+                (index, LakeRecord { top, depths })
+            })
+            .collect();
     }
 
-    /// The level of the lake `p` lies in or on the shore of, or `NO_LAKE`.
+    /// The surface of the lakes reaching `p`, or `NO_LAKE`.
     pub fn lake(&self, p: [f32; 2]) -> f32 {
         let Some(index) = self.cell_index(p) else {
             return NO_LAKE;
         };
-        match self.lakes.get(&(index as u32)) {
-            Some(&(level, mask)) if (mask >> self.lake_bit(p)) & 1 == 1 => level,
-            _ => NO_LAKE,
-        }
+        let Some(record) = self.lakes.get(&(index as u32)) else {
+            return NO_LAKE;
+        };
+        let fine = GRID_CELL / LAKE_CELLS_ACROSS as f32;
+        let cell = [(index % self.resolution) as f32, (index / self.resolution) as f32];
+        let local = [
+            (p[0] - self.origin[0]) / fine - cell[0] * LAKE_CELLS_ACROSS as f32,
+            (p[1] - self.origin[1]) / fine - cell[1] * LAKE_CELLS_ACROSS as f32,
+        ];
+        record.at(local)
     }
 
     /// The segment indices whose reach may cover `p`.
@@ -405,13 +483,13 @@ impl SegmentGrid {
         words.extend_from_slice(&[0, 0, 0]);
         let base = (GRID_HEADER_WORDS + self.cells.len() * GRID_CELL_WORDS) as u32;
         let records = base + self.indices.len() as u32;
-        let mut record = 0;
+        let mut record = 0u32;
         for (index, cell) in self.cells.iter().enumerate() {
             // Offsets are into the whole word array.
             words.push(cell[0] + base);
             words.push(cell[1]);
             if self.lakes.contains_key(&(index as u32)) {
-                words.push(records + 3 * record);
+                words.push(records + LAKE_RECORD_WORDS as u32 * record);
                 record += 1;
             } else {
                 words.push(NO_LAKE_RECORD);
@@ -419,10 +497,11 @@ impl SegmentGrid {
         }
         words.extend_from_slice(&self.indices);
         // In cell order, as the offsets above were handed out.
-        for &(level, mask) in self.lakes.values() {
-            words.push(level.to_bits());
-            words.push(mask as u32);
-            words.push((mask >> 32) as u32);
+        for lake in self.lakes.values() {
+            words.push(lake.top.to_bits());
+            for pair in lake.depths.chunks(2) {
+                words.push(pair[0] as u32 | (pair.get(1).copied().unwrap_or(LAKE_NO_CORNER) as u32) << 16);
+            }
         }
         words
     }
@@ -585,11 +664,17 @@ mod gpu_tests {
                 points.push([node.position[0] + offset, node.position[1] - offset * 0.5]);
             }
         }
-        // ...and over the lakes and their shores.
+        // ...and over the lakes, their shores and the surface past them,
+        // off the cells' corners and diagonals.
         let cell = crate::rivers::network::FLOW_CELL as f32;
         for lake in &network.lakes {
             for c in lake.cells.iter().step_by(37).take(20) {
                 points.push([(c[0] as f32 + 0.5) * cell, (c[1] as f32 + 0.5) * cell]);
+            }
+            for c in lake.shore.iter().step_by(11).take(40) {
+                for (u, v) in [(0.3, 0.7), (0.71, 0.29), (0.5, 0.5), (-2.4, 0.2), (3.1, -1.7)] {
+                    points.push([(c[0] as f32 + u) * cell, (c[1] as f32 + v) * cell]);
+                }
             }
         }
         let samples: Vec<[f32; 4]> = points.iter().map(|p| [p[0], p[1], 0.0, 0.0]).collect();
@@ -645,7 +730,10 @@ mod gpu_tests {
             let close = |a: f32, b: f32| (a.min(1e29) - b.min(1e29)).abs() <= 2e-3 * a.abs().clamp(1.0, 1e29);
             assert!(close(gpu[0], cpu.upper.min(1e30)), "upper at {p:?}: GPU {gpu:?} CPU {cpu:?}");
             assert!(close(-gpu[1], -cpu.lower.max(-1e30)), "lower at {p:?}: GPU {gpu:?} CPU {cpu:?}");
-            assert!(close(-gpu[3], -cpu.lake.max(NO_LAKE)), "lake at {p:?}: GPU {gpu:?} CPU {cpu:?}");
+            // A lake's surface to the millimetre: the ground under it is the
+            // ground the drawn water covers.
+            let lake_close = (gpu[3].max(NO_LAKE) - cpu.lake.max(NO_LAKE)).abs() <= 1e-3 + 1e-6 * cpu.lake.abs().min(1e6);
+            assert!(lake_close, "lake at {p:?}: GPU {gpu:?} CPU {cpu:?}");
             if cpu.bank_distance < 0.0 {
                 inside += 1;
             }

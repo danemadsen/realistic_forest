@@ -698,7 +698,9 @@ the water would stand less than 2 m deep in at its deepest, or less than
 0.6 m on average (a flooded flat), is crossed in a cut through its rim, as a
 river incises the sill it spills over. A deeper basin holds a lake or pond:
 the whole basin (found by flood fill beyond the corridor) fills to just under
-the rim it spills over, every river that reaches it shares it (a basin
+the rim it spills over (the fill sees each 4 m cell at its centre, so the rim
+is checked again metre by metre, and where it dips lower between centres the
+water stands no higher than that gap), every river that reaches it shares it (a basin
 holding a smaller lake drowns it), the reaches above it are backed up to its
 level, and the river leaves it at its outlet over a sill: for its first 25 m
 the water draws down gently from the lake's level and always stands a little
@@ -798,10 +800,18 @@ what reaches it, so tributary gullies grade to it and nothing fills or
 trenches the channel.
 
 Lakes carve nothing. Each lookup-grid cell a lake reaches carries the lake's
-level and a 64-bit mask of which of its 4 m cells hold the lake or its
-shore, and ground below the level there lies under the lake: plants keep out of
-it, the terrain shades its bed and shore, and the player wades and swims in
-it. The erosion leaves the lake and its shore as they are, a drain for what
+surface at the corners of its 4 m cells (in 2 mm steps under the cell's highest
+corner), drawn between them over the same two triangles as the lake's sheet.
+Under the sheet it is the sheet, sunk edges and all, so ground below it is
+exactly the ground the drawn water covers: plants keep out of it, the terrain
+shades its bed and shore, and the player wades and swims in it. Past the
+sheet the surface runs on under the ground, at the lake's level beneath a
+rising shore, so the shore is measured as if the water went on, and two
+metres under lower ground (beyond a rim, down an outlet), sinking away from
+the water as it goes, so that where it ends, 24 m out, any shore band
+measured from it has long faded: no band stops on a cell's edge. Where two
+lakes reach the same corner the higher surface counts. The erosion leaves
+the lake and its shore up to 2.5 m above it as they are, a drain for what
 runs into it, so no gully cuts down below the water at its edge.
 
 The terrain material shader reads the river or lake at every vertex, and
@@ -838,7 +848,9 @@ never holds snow.
 
 No plant stands in a river or a lake, nor on the margin its floods scour:
 trees and shrubs keep at least four metres back from the waterline (more for
-a tall tree), ground plants a metre and a half, and lavender, which wants dry
+a tall tree, and a broad one by three quarters of its crown's radius as well,
+so it leans over a creek or a pond's outlet rather than spreading across
+it), ground plants a metre and a half, and lavender, which wants dry
 ground, three. The scatter keeps each layer's stems to its margin, the GPU
 cull refuses any root it would seat closer to a channel or a lake's
 shoreline, and the grass habitat refuses roots in the water and on the wet
@@ -853,18 +865,24 @@ forest's shade.
 Each river's surface is a ribbon across its channel at the water level,
 reaching under both banks so the waterline is wherever the carved bank rises
 through the water. A lake is a flat sheet at its level over its basin, in
-4 m cells: over the basin, the hollows beside it and a few cells up the
-shore around them, so its shoreline is wherever the ground meets the water.
-It never reaches past its outlet or over a narrow rim, where the ground falls
-away below its level, nor over a river's channel, and wherever the ground
-under its outer edge still lies lower than the water, that edge sinks just
-under the ground, so the sheet never ends in the air. Where a river meets a
+4 m cells: over the basin, every metre of ground below its level joined to
+it that the cell-by-cell fill stepped past, the closed hollows beside it
+(which fill to its level, as a waterlogged hollow by a pond does) and a few
+cells up the shore around them, so its shoreline is wherever the ground
+meets the water. It never reaches past its outlet or over a narrow rim,
+where the ground falls away below its level (nor along an outlet's banks
+below the sill), nor over a river's channel, and wherever the ground under
+its outer edge still lies lower than the water, that edge sinks just under
+the ground, so the sheet never ends in the air. Where a river meets a
 lake, coming in or going out, the two surfaces cross inside the sheet's last
 cell: the sheet's edge slips just under the river's water, and the river's
 ribbon runs on just under the sheet, a little deeper the further in, until it
 is hidden for good. They never share a plane, so nothing flickers, and the
 river's current runs on into the sheet where they meet. At the sea, water
-standing at the sea's level is the sea's, and the ribbon sinks under it.
+standing at the sea's level is the sea's: the ribbon ends a node past the
+coast, tucked just under the sea's surface, and over its last 90 m the
+river's water turns to the sea's, its colour and clarity and the light in
+it, as its rapids and foam give out, so the two meet in one water.
 Water is drawn to 3.2 km in 256 m chunks culled against the view; beyond a
 few hundred metres, where the clipmap's triangles are wider than a creek, a
 river's surface is lifted by about the bank those triangles leave so it still
@@ -898,7 +916,8 @@ sheet. On top of that:
   them; boils swell glassy on runs and pools; gusts dull open water in cat's
   paws. What a pixel cannot resolve becomes roughness by its true slope
   variance, per axis of the flow, so distant water does not turn white.
-- **Foam that follows the flow.** Rapids churn white; foam they make drifts
+- **Foam that follows the flow.** Rapids churn white over the steps and
+  boulders of their bed, with dark glassy tongues of water between; foam they make drifts
   downstream for some fifteen seconds as lace gathered on the seams by the
   banks, on a tongue down the current and as scum in slack water, and an
   inlet carries it out into the pond. It is cream, stained like the water,

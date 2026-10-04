@@ -68,10 +68,19 @@ pub const LAKE_DEPTH: f32 = 2.0;
 /// A basin whose water would average less than this deep is a flooded flat,
 /// not a pond: the river cuts through its rim instead.
 const LAKE_MEAN_DEPTH: f32 = 0.6;
-/// How far a lake's sheet reaches up its shore, in flow cells, and how much
-/// farther the terrain reads the lake's level to shade its bank band.
+/// How far a lake's sheet reaches up its shore, in flow cells.
 const SHORE_CELLS: i64 = 3;
-const SHORE_TEXTURE_CELLS: i64 = 2;
+/// How far past its sheet a lake's surface field reaches (`lake_surface`),
+/// metres: far enough that a shore band measured from it has faded out.
+const LAKE_FIELD_REACH: f32 = 24.0;
+/// How far under the ground the field runs past the sheet where the ground
+/// lies below the lake's level, metres; over ground this much above the
+/// level or more it stays at the level, and between the two it blends.
+const LAKE_FIELD_SINK: f32 = 2.0;
+const LAKE_FIELD_RISE: f32 = 0.5;
+/// The field sinks this much per metre past this far from the sheet.
+const LAKE_FIELD_FADE: f32 = 0.15;
+const LAKE_FIELD_FADE_START: f32 = 4.0;
 /// A creek begins where the land along it first eases below this slope:
 /// the steep mountainside above is seeps and sheet wash, not a channel.
 const HEAD_SLOPE: f64 = 0.22;
@@ -1120,6 +1129,12 @@ impl Lakes {
     /// lake already holding the basin at about that level is the same lake;
     /// smaller, lower lakes inside the basin are drowned in the new one.
     fn fill(&mut self, noise: &NoiseField, corridor: &Corridor, start: [i64; 2], level: f32) -> Filled {
+        self.fill_below(noise, corridor, start, level, 3)
+    }
+
+    /// `fill`, lowering the level to where the water first runs out between
+    /// the cells' centres up to `tries` times.
+    fn fill_below(&mut self, noise: &NoiseField, corridor: &Corridor, start: [i64; 2], level: f32, tries: u32) -> Filled {
         if self.cells.contains_key(&start) {
             return Filled::Lake;
         }
@@ -1175,6 +1190,15 @@ impl Lakes {
                 }
             }
         }
+        // The fill saw each cell only at its centre: where the rim is lower
+        // between centres, the water runs out there, and stands no higher.
+        if let Some(spill) = spill(noise, &cells, level) {
+            return if tries > 0 {
+                self.fill_below(noise, corridor, start, spill - 0.05, tries - 1)
+            } else {
+                Filled::NotBasin
+            };
+        }
         // A basin shallow over most of its extent is a flooded flat.
         let deepest = cells.iter().map(|&cell| level - ground(cell)).fold(0.0f32, f32::max);
         let mean = cells.iter().map(|&cell| level - ground(cell)).sum::<f32>() / cells.len() as f32;
@@ -1200,6 +1224,67 @@ impl Lakes {
         });
         Filled::Lake
     }
+}
+
+/// Samples across a flow cell when a basin's rim is checked.
+const RIM_SAMPLES_PER_CELL: i64 = 4;
+/// How much ground under its level past a basin's cells water must reach,
+/// in samples, or how far, to have run out of it: more than any closed arm,
+/// bay or island the fill stepped past (one it joined through a gap
+/// narrower than its cells), which the water floods to its end instead.
+const RIM_AREA: usize = 20_000;
+const RIM_REACH: u32 = 256;
+
+/// Where water standing at `level` in `cells` runs out of them, metre by
+/// metre: through a gap in a rim the flood fill, which sees each cell at its
+/// centre, took for whole, onto more ground under the level than any closed
+/// arm of the basin holds (`RIM_AREA`, `RIM_REACH`). The height of the
+/// lowest such way's highest ground, or None if the basin holds its water.
+fn spill(noise: &NoiseField, cells: &[[i64; 2]], level: f32) -> Option<f32> {
+    let per = RIM_SAMPLES_PER_CELL;
+    let step = FLOW_CELL as f32 / per as f32;
+    let inside: std::collections::HashSet<[i64; 2]> = cells.iter().copied().collect();
+    let in_basin = |s: [i64; 2]| inside.contains(&[s[0].div_euclid(per), s[1].div_euclid(per)]);
+    let ground = |s: [i64; 2]| base_height(noise, (s[0] as f32 + 0.5) * step, (s[1] as f32 + 0.5) * step);
+    let key = |height: f32| (height * 1000.0).round() as i64;
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(i64, u32, [i64; 2])>> = Default::default();
+    let mut seen: std::collections::HashSet<[i64; 2]> = Default::default();
+    // From the samples of the basin's edge cells under the level.
+    for c in cells {
+        if NEIGHBOURS.iter().all(|&(dx, dz)| inside.contains(&[c[0] + dx, c[1] + dz])) {
+            continue;
+        }
+        for j in 0..per {
+            for i in 0..per {
+                let sample = [c[0] * per + i, c[1] * per + j];
+                let height = ground(sample);
+                if height < level {
+                    seen.insert(sample);
+                    heap.push(std::cmp::Reverse((key(height), 0, sample)));
+                }
+            }
+        }
+    }
+    let mut flooded = 0usize;
+    while let Some(std::cmp::Reverse((water, distance, sample))) = heap.pop() {
+        if distance > 0 {
+            flooded += 1;
+        }
+        if distance > RIM_REACH || flooded > RIM_AREA {
+            return Some(water as f32 / 1000.0);
+        }
+        for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let next = [sample[0] + dx, sample[1] + dz];
+            if in_basin(next) || !seen.insert(next) {
+                continue;
+            }
+            let height = ground(next);
+            if height < level {
+                heap.push(std::cmp::Reverse((key(height).max(water), distance + 1, next)));
+            }
+        }
+    }
+    None
 }
 
 /// What filling a basin came to.
@@ -1447,6 +1532,9 @@ fn fit_falling(raw: &[f32], ground: &[f32], s: &[f64]) -> Vec<f32> {
     fitted
 }
 
+/// The least a smoothed water surface keeps under the ground beside it.
+const SMOOTHING_FREEBOARD: f32 = 0.1;
+
 /// Water surface along a path: below the banks, never rising downstream.
 /// A river running to the sea (`sea`) grades down to it over its lowest
 /// reach.
@@ -1553,9 +1641,13 @@ fn water_profile(noise: &NoiseField, points: Vec<PathPoint>, end_level: Option<f
         }
     }
     // Smooth the surface; a positive kernel keeps it falling downstream.
+    // Smoothing rounds a steep drop off on both sides, lifting the water at
+    // its foot, but never above the ground there: water above its banks
+    // stood on an embankment over the slope a creek tumbles into a lake by.
     let smoothed = smooth_values(&water.iter().map(|&w| w as f64).collect::<Vec<_>>(), 1.5);
     for i in 1..n.saturating_sub(1) {
-        water[i] = (smoothed[i] as f32).max(water[n - 1]);
+        let cap = water[i].max(ground[i] - SMOOTHING_FREEBOARD);
+        water[i] = (smoothed[i] as f32).min(cap).max(water[n - 1]);
     }
     for i in 0..n {
         water[i] = if points[i].lake.is_finite() { points[i].lake as f32 } else { water[i].max(floor[i]) };
@@ -1696,6 +1788,7 @@ fn build_nodes(
     for ((node, &section), &speed) in nodes.iter_mut().zip(&reach_section).zip(&reach_speed) {
         node.speed = (speed * section / (node.half_width * node.depth).max(1e-3)).clamp(0.15, 4.0);
     }
+    still_lakes(&mut nodes);
     // Skew from the signed curvature: the thalweg hugs the outside of a bend.
     for (node, &k) in nodes.iter_mut().zip(&curvature) {
         let width = 2.0 * node.half_width as f64;
@@ -1703,6 +1796,51 @@ fn build_nodes(
         node.skew = (-k * width * 1.6).clamp(-0.6, 0.6) as f32;
     }
     nodes
+}
+
+/// A lake's water drifts at this speed between its inlets and outlets, m/s.
+const LAKE_DRIFT: f32 = 0.12;
+
+/// A lake's water is still. No rapids churn in it, whatever the slope of the
+/// valley it drowned, and it only drifts toward its outlet, quickening over
+/// the last few metres as it draws down to the sill; an inlet's jet runs on
+/// a little way into it and slows.
+fn still_lakes(nodes: &mut [RiverNode]) {
+    let n = nodes.len();
+    let mut next_exit = vec![None; n];
+    let mut exit: Option<usize> = None;
+    for i in (0..n).rev() {
+        if !nodes[i].lake {
+            exit = Some(i);
+        }
+        next_exit[i] = exit;
+    }
+    let mut last_entry: Option<usize> = None;
+    let mut entries = vec![None; n];
+    for i in 0..n {
+        if !nodes[i].lake {
+            last_entry = Some(i);
+        }
+        entries[i] = last_entry;
+    }
+    let speeds: Vec<f32> = nodes.iter().map(|node| node.speed).collect();
+    for i in 0..n {
+        if !nodes[i].lake {
+            continue;
+        }
+        let reach = (2.0 * nodes[i].half_width).max(4.0);
+        let mut speed = LAKE_DRIFT;
+        if let Some(e) = next_exit[i] {
+            let t = 1.0 - smoothstep(0.0, reach, nodes[e].along - nodes[i].along);
+            speed = speed.max(LAKE_DRIFT + (speeds[e] - LAKE_DRIFT) * t * t);
+        }
+        if let Some(e) = entries[i] {
+            let t = 1.0 - smoothstep(0.0, 2.0 * reach, nodes[i].along - nodes[e].along);
+            speed = speed.max(LAKE_DRIFT + (speeds[e] - LAKE_DRIFT) * t);
+        }
+        nodes[i].speed = speed.min(speeds[i].max(LAKE_DRIFT));
+        nodes[i].turbulence = 0.0;
+    }
 }
 
 /// Most a channel's half width may change per metre along it: a river
@@ -2107,34 +2245,35 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
     let resolution = ((REGION_SIZE + 2.0 * ROUTING_MARGIN) / GRID_CELL as f64).ceil() as usize;
     let grid_origin = [origin[0] as f32, origin[1] as f32];
     let mut grid = SegmentGrid::build(grid_origin, resolution, &segments);
-    let mut lakes = lakes.lakes;
-    let mut banks = Vec::with_capacity(lakes.len());
-    for lake in lakes.iter_mut() {
-        let (shore, bank) = shore_cells(noise, &segments, &grid, lake);
-        lake.shore = shore;
-        lake.edge = sheet_edge(noise, &segments, &grid, lake);
-        lake.current = sheet_current(&segments, &grid, lake);
-        banks.push(bank);
+    let lakes = lakes.lakes;
+    let lakes: Vec<Lake> = parallel_map(&lakes, |lake| {
+        let mut lake = lake.clone();
+        lake.shore = shore_cells(noise, &segments, &grid, &lake);
+        lake.edge = sheet_edge(noise, &segments, &grid, &lake);
+        lake.current = sheet_current(&segments, &grid, &lake);
+        lake
+    });
+    // The lakes' surfaces: a drawn sheet's corner wherever there is one (the
+    // highest sheet's where two meet), and past the sheets the highest field.
+    let surfaces = parallel_map(&lakes, |lake| lake_surface(noise, &segments, &grid, lake));
+    let mut corners: std::collections::HashMap<[i32; 2], f32> = Default::default();
+    let mut sheets: std::collections::HashSet<[i32; 2]> = Default::default();
+    for (sheet, _) in &surfaces {
+        for &(corner, height) in sheet {
+            sheets.insert(corner);
+            let entry = corners.entry(corner).or_insert(height);
+            *entry = entry.max(height);
+        }
     }
-    for (lake, bank) in lakes.iter().zip(&banks) {
-        // The water's cells, the shore its sheet reaches over and the bank
-        // above it the terrain shades by the lake's level. Not a cell whose
-        // sheet dips away at every corner under the ground or a river (at an
-        // outlet): no lake water stands there, so its ground is no lake bed.
-        // A cell the sheet still covers in part stays the lake's, so no tree
-        // takes root in its water.
-        let sunk: std::collections::HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
-        let dips = |corner: [i32; 2]| sunk.get(&corner).is_some_and(|&h| h < lake.level - 0.1);
-        let cells: Vec<[i32; 2]> = lake
-            .cells
-            .iter()
-            .chain(&lake.shore)
-            .chain(bank)
-            .copied()
-            .filter(|&[x, z]| [[x, z], [x + 1, z], [x, z + 1], [x + 1, z + 1]].iter().filter(|&&c| dips(c)).count() < 4)
-            .collect();
-        grid.add_lake(lake.level, &cells, FLOW_CELL as f32);
+    for (_, field) in &surfaces {
+        for &(corner, height) in field {
+            if !sheets.contains(&corner) {
+                let entry = corners.entry(corner).or_insert(height);
+                *entry = entry.max(height);
+            }
+        }
     }
+    grid.set_lakes(&corners, FLOW_CELL as f32);
     let surface = super::surface::build(&finished, &lakes);
     RiverNetwork {
         region,
@@ -2203,15 +2342,6 @@ impl<'a> LakeGround<'a> {
         })
     }
 
-    /// Ground the lake's water would cover: below its level, in the basin
-    /// rather than cut down beside a channel leaving it. A channel has its
-    /// own water: an inlet's surface stands level with the lake where it
-    /// enters, and the lake's sheet must not lie in the same plane.
-    fn wet(&mut self, cell: [i64; 2]) -> bool {
-        let ground = self.cell(cell);
-        ground.channel.is_none() && ground.carved < self.level && ground.natural < self.level
-    }
-
     fn in_channel(&mut self, cell: [i64; 2]) -> bool {
         self.cell(cell).channel.is_some()
     }
@@ -2227,47 +2357,165 @@ impl<'a> LakeGround<'a> {
     }
 }
 
-/// The cells around a lake its sheet reaches under: the hollows beside its
-/// basin the flood fill stepped past (it moves edge to edge), and up its
+/// Samples across a flow cell when a lake's basin is flooded metre by metre.
+const BASIN_SAMPLES_PER_CELL: i64 = 4;
+/// How far past its cells a lake's water may spread, in samples.
+const BASIN_SPREAD: usize = 40;
+/// The most samples a hollow beside a lake may hold for it to fill, and how
+/// far one is flooded at most to find out.
+const BASIN_HOLLOW: usize = 4000;
+const BASIN_HOLLOW_LIMIT: usize = 4 * BASIN_HOLLOW;
+/// How near a channel running away below a lake's level ground falls away
+/// with it, metres: the outlet's banks below the sill.
+const RUNAWAY_BANKS: f32 = 6.0;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Basin {
+    /// Below the lake's level.
+    Under,
+    /// Below it but falling away: down a channel running away below the
+    /// level, or on its banks.
+    Runaway,
+    /// At or above the level, or in a channel with its own water at it.
+    Above,
+}
+
+/// The metre samples outside a lake's cells (sample `s` centred at
+/// `(s + 0.5)` metres) its water covers: ground below its level joined to
+/// its cells, which the flood fill stepped past moving cell to cell, and the
+/// closed hollows beside it, which fill to the same level. Never ground in a
+/// channel, whose own water is drawn there, nor ground falling away down a
+/// channel running away below the level.
+fn basin_samples(noise: &NoiseField, segments: &[RiverSegment], grid: &SegmentGrid, lake: &Lake) -> std::collections::HashSet<[i64; 2]> {
+    const SIDES: [(i64, i64); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
+    let per = BASIN_SAMPLES_PER_CELL;
+    let step = FLOW_CELL as f32 / per as f32;
+    let cells: std::collections::HashSet<[i64; 2]> = lake.cells.iter().map(|c| [c[0] as i64, c[1] as i64]).collect();
+    let in_lake = |s: [i64; 2]| cells.contains(&[s[0].div_euclid(per), s[1].div_euclid(per)]);
+    let mut kinds: std::collections::HashMap<[i64; 2], Basin> = Default::default();
+    let mut classify = |s: [i64; 2]| -> Basin {
+        *kinds.entry(s).or_insert_with(|| {
+            let p = [(s[0] as f32 + 0.5) * step, (s[1] as f32 + 0.5) * step];
+            let envelope = super::carve::envelope_at(segments, grid, p);
+            let runaway = envelope.water < lake.level - 0.02;
+            if envelope.bank_distance < 0.0 {
+                return if runaway { Basin::Runaway } else { Basin::Above };
+            }
+            let ground = envelope.clamp(base_height(noise, p[0], p[1]));
+            match (ground < lake.level, runaway && envelope.bank_distance < RUNAWAY_BANKS) {
+                (false, _) => Basin::Above,
+                (true, true) => Basin::Runaway,
+                (true, false) => Basin::Under,
+            }
+        })
+    };
+    // Out from the samples of the lake's edge cells.
+    let mut edge: Vec<[i64; 2]> = Vec::new();
+    for c in &cells {
+        if NEIGHBOURS.iter().any(|&(dx, dz)| !cells.contains(&[c[0] + dx, c[1] + dz])) {
+            for j in 0..per {
+                for i in 0..per {
+                    edge.push([c[0] * per + i, c[1] * per + j]);
+                }
+            }
+        }
+    }
+    let mut wet: std::collections::HashSet<[i64; 2]> = Default::default();
+    let mut frontier = edge.clone();
+    for _ in 0..BASIN_SPREAD {
+        let mut next = Vec::new();
+        for s in frontier {
+            for (dx, dz) in SIDES {
+                let t = [s[0] + dx, s[1] + dz];
+                if !in_lake(t) && !wet.contains(&t) && classify(t) == Basin::Under {
+                    wet.insert(t);
+                    next.push(t);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    // Closed hollows within two metres of the water fill to its level: each
+    // a patch of ground below it that nowhere runs away and is not too big.
+    // Each is flooded whole; a patch found open marks all of it so, and any
+    // later patch that reaches it is open too.
+    let mut done: std::collections::HashSet<[i64; 2]> = Default::default();
+    let mut open_ground: std::collections::HashSet<[i64; 2]> = Default::default();
+    let shore: Vec<[i64; 2]> = edge.iter().chain(wet.iter()).copied().collect();
+    let mut filled = Vec::new();
+    for s in shore {
+        for dz in -2..=2 {
+            for dx in -2..=2 {
+                let start = [s[0] + dx, s[1] + dz];
+                if in_lake(start) || wet.contains(&start) || done.contains(&start) || classify(start) != Basin::Under {
+                    continue;
+                }
+                done.insert(start);
+                let mut hollow = vec![start];
+                let mut open = false;
+                let mut i = 0;
+                while i < hollow.len() && hollow.len() <= BASIN_HOLLOW_LIMIT {
+                    let h = hollow[i];
+                    i += 1;
+                    for (ex, ez) in SIDES {
+                        let t = [h[0] + ex, h[1] + ez];
+                        if in_lake(t) || wet.contains(&t) {
+                            continue;
+                        }
+                        if open_ground.contains(&t) {
+                            open = true;
+                            continue;
+                        }
+                        match classify(t) {
+                            Basin::Under => {
+                                if done.insert(t) {
+                                    hollow.push(t);
+                                }
+                            }
+                            Basin::Runaway => open = true,
+                            Basin::Above => {}
+                        }
+                    }
+                }
+                open |= hollow.len() > BASIN_HOLLOW;
+                if open {
+                    open_ground.extend(hollow);
+                } else {
+                    filled.extend(hollow);
+                }
+            }
+        }
+    }
+    wet.extend(filled);
+    wet
+}
+
+/// The cells around a lake its sheet reaches under: every cell its water
+/// covers past those the flood fill took (`basin_samples`), and up its
 /// shore for a few cells, over ground standing at or above the water, so
 /// the terrain itself draws the shoreline wherever it meets the water. Never
 /// a cell beside ground that falls below the water again beyond the rim,
 /// where the sheet would hang in the air, nor over a river's channel, whose
 /// own surface is drawn there.
-/// Also returns the next `SHORE_TEXTURE_CELLS` rings up the shore, by the
-/// same rules: the terrain shades its bank band by the lake's level there,
-/// though the sheet does not reach them.
-fn shore_cells(
-    noise: &NoiseField,
-    segments: &[RiverSegment],
-    grid: &SegmentGrid,
-    lake: &Lake,
-) -> (Vec<[i32; 2]>, Vec<[i32; 2]>) {
+fn shore_cells(noise: &NoiseField, segments: &[RiverSegment], grid: &SegmentGrid, lake: &Lake) -> Vec<[i32; 2]> {
     let mut ground = LakeGround::new(noise, segments, grid, lake.level);
     let mut wet: std::collections::HashSet<[i64; 2]> =
         lake.cells.iter().map(|c| [c[0] as i64, c[1] as i64]).collect();
     let mut shore = Vec::new();
-    // Hollows touching the basin corner to corner.
-    let mut frontier: Vec<[i64; 2]> = wet.iter().copied().collect();
-    for _ in 0..2 {
-        let mut next = Vec::new();
-        for cell in frontier {
-            for (dx, dz) in NEIGHBOURS {
-                let candidate = [cell[0] + dx, cell[1] + dz];
-                if !wet.contains(&candidate) && ground.wet(candidate) {
-                    wet.insert(candidate);
-                    shore.push([candidate[0] as i32, candidate[1] as i32]);
-                    next.push(candidate);
-                }
-            }
+    for sample in basin_samples(noise, segments, grid, lake) {
+        let per = BASIN_SAMPLES_PER_CELL;
+        let cell = [sample[0].div_euclid(per), sample[1].div_euclid(per)];
+        if wet.insert(cell) {
+            shore.push([cell[0] as i32, cell[1] as i32]);
         }
-        frontier = next;
     }
     // Up the shore.
     let mut seen = wet.clone();
     let mut frontier: Vec<[i64; 2]> = wet.iter().copied().collect();
-    let mut texture = Vec::new();
-    for ring in 0..SHORE_CELLS + SHORE_TEXTURE_CELLS {
+    for _ in 0..SHORE_CELLS {
         let mut next = Vec::new();
         for cell in frontier {
             for (dx, dz) in NEIGHBOURS {
@@ -2282,17 +2530,88 @@ fn shore_cells(
                 if faces_lower {
                     continue;
                 }
-                if ring < SHORE_CELLS {
-                    shore.push([candidate[0] as i32, candidate[1] as i32]);
-                } else {
-                    texture.push([candidate[0] as i32, candidate[1] as i32]);
-                }
+                shore.push([candidate[0] as i32, candidate[1] as i32]);
                 next.push(candidate);
             }
         }
         frontier = next;
     }
-    (shore, texture)
+    shore
+}
+
+/// A lake's surface at the flow-grid corners it reaches (corner `c` at
+/// `c * FLOW_CELL`), for the terrain, the plants and the player to measure
+/// the water and the shore by. Over the sheet it is the sheet, corner for
+/// corner, sunk edges and all, so ground under it is exactly the ground the
+/// drawn water covers. Past the sheet it runs on as far as
+/// `LAKE_FIELD_REACH`: at the lake's level over ground standing
+/// `LAKE_FIELD_RISE` above it or more, so a shore band measured from it
+/// carries on up the bank as though the sheet went on, never stepping where
+/// the sheet's cells end, but `LAKE_FIELD_SINK` under ground below the
+/// level, where no water stands (beyond the rim, down an outlet's channel),
+/// blending between, so it always lies half a metre or more under the
+/// ground; and it sinks away from the sheet past `LAKE_FIELD_FADE_START`,
+/// so the band has faded out wherever the field ends. Nowhere does it end on
+/// an edge.
+fn lake_surface(
+    noise: &NoiseField,
+    segments: &[RiverSegment],
+    grid: &SegmentGrid,
+    lake: &Lake,
+) -> (Vec<([i32; 2], f32)>, Vec<([i32; 2], f32)>) {
+    let cell = FLOW_CELL as f32;
+    let sunk: std::collections::HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
+    let mut surface: std::collections::HashMap<[i32; 2], f32> = Default::default();
+    for &[x, z] in lake.cells.iter().chain(&lake.shore) {
+        for corner in [[x, z], [x + 1, z], [x, z + 1], [x + 1, z + 1]] {
+            surface.insert(corner, sunk.get(&corner).map_or(lake.level, |&h| h.min(lake.level)));
+        }
+    }
+    // Out from the sheet ring by ring, each corner keeping the sheet corner
+    // nearest it, which it measures its distance from.
+    let reach = (LAKE_FIELD_REACH / cell).ceil() as i32 + 1;
+    let mut nearest: std::collections::HashMap<[i32; 2], [i32; 2]> = surface.keys().map(|&c| (c, c)).collect();
+    let mut frontier: Vec<[i32; 2]> = surface.keys().copied().collect();
+    let mut field = Vec::new();
+    for _ in 0..reach {
+        let mut next: std::collections::HashMap<[i32; 2], [i32; 2]> = Default::default();
+        for corner in &frontier {
+            let seed = nearest[corner];
+            for (dx, dz) in NEIGHBOURS {
+                let candidate = [corner[0] + dx as i32, corner[1] + dz as i32];
+                if nearest.contains_key(&candidate) {
+                    continue;
+                }
+                let distance = |s: [i32; 2]| ((candidate[0] - s[0]) as f32).hypot((candidate[1] - s[1]) as f32);
+                let entry = next.entry(candidate).or_insert(seed);
+                if distance(seed) < distance(*entry) {
+                    *entry = seed;
+                }
+            }
+        }
+        frontier = next.keys().copied().collect();
+        for (&corner, &seed) in &next {
+            nearest.insert(corner, seed);
+            let distance = ((corner[0] - seed[0]) as f32).hypot((corner[1] - seed[1]) as f32) * cell;
+            if distance > LAKE_FIELD_REACH {
+                continue;
+            }
+            let p = [corner[0] as f32 * cell, corner[1] as f32 * cell];
+            let envelope = super::carve::envelope_at(segments, grid, p);
+            let ground = envelope.clamp(base_height(noise, p[0], p[1]));
+            let low = 1.0 - smoothstep(lake.level, lake.level + LAKE_FIELD_RISE, ground);
+            let mut height = lake.level - (lake.level - ground + LAKE_FIELD_SINK) * low
+                - LAKE_FIELD_FADE * (distance - LAKE_FIELD_FADE_START).max(0.0);
+            // A channel running away below the level between this corner
+            // and the next (an outlet, cut down past its sill between raised
+            // banks) is no lake's: the field keeps well under its water.
+            if envelope.bank_distance < RUNAWAY_BANKS && envelope.water < lake.level - 0.02 {
+                height = height.min(envelope.water - LAKE_FIELD_SINK);
+            }
+            field.push((corner, height));
+        }
+    }
+    (surface.into_iter().collect(), field)
 }
 
 /// How far under the ground a lake sheet's sunk edge lies: enough that the
@@ -2447,6 +2766,32 @@ fn build_segments(rivers: &[River]) -> Vec<RiverSegment> {
                 skew: 0.5 * (a.skew + b.skew),
                 turbulence: a.turbulence.max(b.turbulence),
                 levee: smoothstep(SEA_LEVEL + 0.05, SEA_LEVEL + 0.6, a.water.min(b.water)) * shore,
+            });
+        }
+        // Where a river leaves a lake its channel opens out of the lake's
+        // bed a little before its first node: a segment's start is flat, and
+        // the outlet's first one would otherwise begin as a square cut across
+        // the flow, a wall at the lake's edge. This lead-in runs up out of
+        // the bed and meets that start with its round end.
+        for pair in river.nodes.windows(2) {
+            let (a, b) = (&pair[0], &pair[1]);
+            if !(a.lake && !b.lake) {
+                continue;
+            }
+            let d = [b.position[0] - a.position[0], b.position[1] - a.position[1]];
+            let l = d[0].hypot(d[1]).max(1e-3);
+            let reach = 3.0 * a.half_width;
+            segments.push(RiverSegment {
+                a: [a.position[0] - d[0] / l * reach, a.position[1] - d[1] / l * reach],
+                b: a.position,
+                water: [a.water, a.water],
+                half_width: [a.half_width * 1.3, a.half_width],
+                depth: [0.05, a.depth],
+                speed: [a.speed * 0.6, a.speed],
+                bank: a.bank * 0.5,
+                skew: 0.0,
+                turbulence: 0.0,
+                levee: 0.0,
             });
         }
         // A river's channel opens into the sea a little past its last node.
