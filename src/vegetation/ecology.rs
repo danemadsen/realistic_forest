@@ -262,11 +262,10 @@ impl SiteSampler {
             for x in 0..width {
                 let (wx, wz) = (origin[0] + x as f64 * spacing, origin[1] + z as f64 * spacing);
                 // A lake's shore counts as a bank, by how far the ground
-                // stands above its water.
-                let bank = network
-                    .envelope(wx as f32, wz as f32)
-                    .bank_at(self.fine.sample(wx, wz))
-                    .min(RIVER_SEARCH);
+                // stands above its water: the ground as the channels carve
+                // it, as the GPU cull measures it.
+                let envelope = network.envelope(wx as f32, wz as f32);
+                let bank = envelope.bank_at(envelope.clamp(self.fine.sample(wx, wz))).min(RIVER_SEARCH);
                 any |= bank < RIVER_SEARCH;
                 heights.push(bank);
             }

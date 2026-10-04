@@ -85,11 +85,14 @@ const HIDDEN_DEPTH: f32 = 9.0;
 const LIFT_FADE: f32 = 30.0;
 /// Seconds whitewater's foam lasts on the water as it drifts downstream.
 const FOAM_LIFETIME: f32 = 15.0;
-/// How far under the sea a river's surface tucks where it ends at the coast:
-/// the sea's own surface is drawn on from there, in the same colour.
-const UNDER_SEA: f32 = 0.05;
+/// How far under the sea a river's surface tucks where it ends at the coast,
+/// below the troughs of the waves running into its mouth: the sea's own
+/// surface is drawn on from there, in the same colour.
+const UNDER_SEA: f32 = 0.2;
 /// Metres up a river from the coast over which its water turns to the sea's.
 const SEA_BLEND: f32 = 90.0;
+/// How far under its spring's ground a stream's surface begins.
+const SPRING_SINK: f32 = 0.3;
 
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
@@ -224,7 +227,7 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
     };
     let sheets = Sheets::new(lakes);
     let seas = sea_blends(rivers);
-    for (river, &(sea_share, sea_along)) in rivers.iter().zip(&seas) {
+    for (river, &(sea_share, sea_along, sea_ramp)) in rivers.iter().zip(&seas) {
         let nodes = &river.nodes;
         // A river's surface runs on past where its own water ends, sunk
         // under the still water it meets, so it never ends in an edge: one
@@ -234,11 +237,11 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
         // Where a river's water comes down to the sea's level: the coast,
         // from which the sea's own surface fills its mouth.
         let coast = coast_of(river);
-        let (end, sink) = match river.end {
-            // One node on, tucked just under the sea.
-            RiverEnd::Sea => ((coast + 1).min(last), 0.0),
-            RiverEnd::Confluence(..) => ((river.surface_end + 1).min(last), 0.12),
-            RiverEnd::Edge => (river.surface_end.min(last), 0.0),
+        let (end, sink) = match (coast, river.end) {
+            // One node on past the coast, tucked under the sea.
+            (Some(coast), _) => ((coast + 1).min(last), 0.0),
+            (None, RiverEnd::Confluence(..)) => ((river.surface_end + 1).min(last), 0.12),
+            (None, _) => (river.surface_end.min(last), 0.0),
         };
         if end < 1 {
             continue;
@@ -261,13 +264,16 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
             let wide = if i > 0 && i < end { pick(i - 1, i + 1) } else { None };
             normalize(wide.or(after).or(before).unwrap_or([1.0, 0.0]))
         };
+        // A stream rising at a spring comes out of the ground: its first row
+        // narrows to a point and lies under the ground there.
+        let spring = !nodes[0].lake;
         // Each row's vertices across the channel.
         let rows: Vec<Vec<[f32; 2]>> = (0..=end)
             .map(|i| {
                 let node = &nodes[i];
                 let tangent = direction(i);
                 let normal = [-tangent[1], tangent[0]];
-                let half_width = node.half_width.max(0.25);
+                let half_width = if spring && i == 0 { 0.1 } else { node.half_width.max(0.25) };
                 offsets
                     .iter()
                     .map(|&across| {
@@ -330,10 +336,13 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
             // still water it meets (the sea, its parent); and water standing
             // at the sea's level is the sea's, drawn by the sea itself.
             let mut water = if i > river.surface_end { node.water - sink } else { node.water };
-            if river.end == RiverEnd::Sea && i > coast {
+            if spring && i == 0 {
+                water -= SPRING_SINK;
+            }
+            if coast.is_some_and(|coast| i > coast) {
                 water = water.min(SEA_LEVEL - UNDER_SEA);
             }
-            let sea = sea_share * (1.0 - smoothstep(0.0, SEA_BLEND, sea_along - node.along));
+            let sea = sea_share * (1.0 - smoothstep(0.0, sea_ramp, sea_along - node.along));
             let still = 1.0 - smoothstep(0.0, LIFT_FADE, from_still[i]);
             let row = vertices.len() as u32;
             let mut hidden = true;
@@ -406,37 +415,50 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
     }
 }
 
-/// Where a river to the sea comes down to the sea's level: the coast, from
-/// which the sea's own surface fills its mouth.
-fn coast_of(river: &River) -> usize {
-    (river.end == RiverEnd::Sea)
-        .then(|| river.nodes.iter().position(|n| n.water <= SEA_LEVEL + 0.03))
-        .flatten()
-        .unwrap_or(river.surface_end)
-        .min(river.surface_end)
-        .max(1)
+/// Where a river comes down to the sea's level, if it does: the coast, from
+/// which the sea's own surface fills its channel. A river to the sea always
+/// has one (its mouth at the latest); so does a tributary that joins a river
+/// in its estuary, at the sea's level.
+fn coast_of(river: &River) -> Option<usize> {
+    let reached = river.nodes.iter().position(|n| n.water <= SEA_LEVEL + 0.03);
+    match river.end {
+        RiverEnd::Sea => Some(reached.unwrap_or(river.surface_end).min(river.surface_end).max(1)),
+        _ => reached.filter(|&c| c <= river.surface_end).map(|c| c.max(1)),
+    }
 }
 
 /// How far each river's water has turned to the sea's at each node: all of
-/// it at a river's coast, fading over `SEA_BLEND` metres up it, and a
-/// tributary joining it there takes on what its parent has at the
-/// confluence, fading the same way up the tributary, so no seam of colour
-/// crosses the water where they meet. Per river: the share at its end
-/// (the coast, or the confluence), and how far along the river that is.
-fn sea_blends(rivers: &[River]) -> Vec<(f32, f32)> {
-    let mut ends: Vec<Option<(f32, f32)>> = vec![None; rivers.len()];
-    fn resolve(rivers: &[River], ends: &mut Vec<Option<(f32, f32)>>, index: usize, depth: usize) -> (f32, f32) {
+/// it at a river's coast, fading over `SEA_BLEND` metres up it (or less, to
+/// none where it leaves a coastal lagoon nearer the coast than that), and a
+/// tributary joining it takes on what its parent has at the confluence,
+/// fading the same way up the tributary, so no seam of colour crosses the
+/// water where they meet. Per river: the share at its end (the coast, or
+/// the confluence), how far along the river that is, and the ramp's length.
+fn sea_blends(rivers: &[River]) -> Vec<(f32, f32, f32)> {
+    let mut ends: Vec<Option<(f32, f32, f32)>> = vec![None; rivers.len()];
+    fn ramp_to(river: &River, end: usize) -> f32 {
+        // From the last lake above the end, where the water was still.
+        let along = river.nodes[end].along;
+        river.nodes[..=end]
+            .iter()
+            .rposition(|n| n.lake)
+            .map_or(SEA_BLEND, |k| (along - river.nodes[k].along).clamp(1.0, SEA_BLEND))
+    }
+    fn resolve(rivers: &[River], ends: &mut Vec<Option<(f32, f32, f32)>>, index: usize, depth: usize) -> (f32, f32, f32) {
         if let Some(end) = ends[index] {
             return end;
         }
         let river = &rivers[index];
         let Some(last) = river.nodes.last() else {
-            return (0.0, 0.0);
+            return (0.0, 0.0, SEA_BLEND);
         };
-        let end = match river.end {
-            RiverEnd::Sea => (1.0, river.nodes[coast_of(river).min(river.nodes.len() - 1)].along),
-            RiverEnd::Confluence(parent, _) if depth < 8 && parent < rivers.len() => {
-                let (share, along) = resolve(rivers, ends, parent, depth + 1);
+        let end = match (coast_of(river), river.end) {
+            (Some(coast), _) => {
+                let coast = coast.min(river.nodes.len() - 1);
+                (1.0, river.nodes[coast].along, ramp_to(river, coast))
+            }
+            (None, RiverEnd::Confluence(parent, _)) if depth < 8 && parent < rivers.len() => {
+                let (share, along, ramp) = resolve(rivers, ends, parent, depth + 1);
                 // The parent's node nearest where the tributary ends.
                 let here = rivers[parent]
                     .nodes
@@ -448,9 +470,10 @@ fn sea_blends(rivers: &[River]) -> Vec<(f32, f32)> {
                         d(a).total_cmp(&d(b))
                     })
                     .map_or(f32::NEG_INFINITY, |n| n.along);
-                (share * (1.0 - smoothstep(0.0, SEA_BLEND, along - here)), last.along)
+                let share = share * (1.0 - smoothstep(0.0, ramp, along - here));
+                (share, last.along, ramp_to(river, river.nodes.len() - 1))
             }
-            _ => (0.0, last.along),
+            _ => (0.0, last.along, SEA_BLEND),
         };
         ends[index] = Some(end);
         end
@@ -545,7 +568,11 @@ mod tests {
             let inside = (0.0..48.0).contains(&p[0]) && (-16.0..16.0).contains(&p[2]);
             inside.then(|| p[0].min(48.0 - p[0]).min(16.0 - p[2]).min(p[2] + 16.0))
         };
-        for v in &mesh.vertices[..ribbon] {
+        // The first row is the spring's, tucked under the ground at a point.
+        let spring = &mesh.vertices[..3];
+        assert!(spring.iter().all(|v| (v.position[1] - (water_at(-20.0) - SPRING_SINK)).abs() < 1e-4), "{spring:?}");
+        assert!((spring[0].position[2] - spring[2].position[2]).abs() < 0.3, "{spring:?}");
+        for v in &mesh.vertices[3..ribbon] {
             match depth(v.position) {
                 Some(d) => {
                     let under = level - v.position[1];

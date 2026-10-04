@@ -688,8 +688,11 @@ in a channel of its own. A tributary arrives at its parent's level, as real
 confluences do, its mouth drowned in the parent's water and calm: over its
 last metres it stands at that level and above them rises at most 3 cm per
 metre, its channel cut down for it (a gorge where it comes down a steep
-valley side, and no more than 2.5 m farther up, where any steeper water
-stays as rapids). Where water seems held
+valley side, and no more than 2.5 m farther up, fading to nothing 60 m up
+it, where any steeper water stays as rapids). A lake's water keeps its level:
+where a tributary leaves a pond too close above the confluence to fall at
+3 cm per metre, it runs down from the pond's level as one even rapid to where
+it meets its parent, rather than dropping off the pond's edge. Where water seems held
 in a basin it could in fact leave, the corridor was too narrow to show its
 way: a basin that drains to the sea through a gap the coarse grid missed
 sends its river out through that gap, and any other is routed again through
@@ -701,6 +704,14 @@ surface is the falling profile that best fits the ground along the river (a
 least-squares, never-rising fit), so where the ground rises over a bump and
 falls again the river neither cuts the whole bump away nor floods the hollow
 behind it, but meets them halfway, never standing above the natural ground.
+Down a steep reach that fit falls in steps, flat behind each little rise and
+steep between, which the channel and its banks would terrace into the
+hillside; there the surface is smoothed over a few channel widths (never
+lifted above the lowest ground it has passed in the last few widths, so it
+cannot trace the rises, though below a cliff the fit drops off it is lifted
+to round the drop into a rapid),
+and across a bench it keeps falling at no less than a third of the reach's
+slope, so a mountain stream runs evenly down its rapids.
 A hollow
 the water would stand less than 2 m deep in at its deepest, or less than
 0.6 m on average (a flooded flat), is crossed in a cut through its rim, as a
@@ -752,8 +763,14 @@ and narrows into a steeper reach gradually, never by more than 2.5 cm per
 metre along it; it swells a little and narrows again, its bed runs through a
 pool every five to seven widths and at every tight bend (a third deeper and
 slow) with a shallow riffle between (a quarter shallower, quick and broken
-into small standing waves), it churns white down its rapids, and a river's
-head starts as a seep that gathers into a channel. Where it runs into a lake
+into small standing waves), and it churns white down its rapids. A stream
+rising at a spring starts as a trickle a few hands wide, sunk in the ground
+rather than walled at its head, its little channel fading up the slope above
+it; over its first 40 m it gathers into a runnel and only then into broken
+water. A spring in a hollow lower than the lake, sea or river its water runs
+to rises where its water first lies under the ground, and the hollow above
+stays dry rather than holding a trickle over it. A river that rises in a
+lake is its outlet, full from the start. Where it runs into a lake
 or the sea it spreads and slows into it, as a mouth does, and an estuary is
 scoured a little deeper; where it leaves a lake over its sill it widens only
 a little and keeps its pace. The thalweg hugs the outside of every bend.
@@ -772,11 +789,11 @@ water (rivers darting out of a lake and back, how far outlets fall below
 their lakes, river mouths cut off from the open sea, how far sheets dip
 under a river where they meet), and the rivers and lakes nearest
 `--map-centre`, with each lake's inlets and outlets; `--map-extent` defaults
-to 8 km here. The spawn region holds some 160 rivers, 88 km of channel and
+to 8 km here. The spawn region holds some 160 rivers, 86 km of channel and
 170 lakes and ponds covering 280 ha; on gentle reaches the water stands about
-0.8 m under the natural ground on average (half of it under 0.55 m), under
-1 % of their length is trenched more than 3 m into it, and one of 131 river mouths does not reach
-open sea (a creek down a sea cliff).
+0.8 m under the natural ground on average (half of it under 0.56 m), under
+1 % of their length is trenched more than 3 m into it, and one of 127 river
+mouths does not reach open sea (a creek down a sea cliff).
 
 ### How they shape the ground
 
@@ -795,7 +812,10 @@ than breaking at an edge the terrain's triangles would draw as a saw-tooth.
 A bank's slope varies only over many widths along the river, so its top does
 not jog in and out from one segment to the next. A segment has a flat start and a
 round end, so it never reaches back up the channel over ground the segments
-above it shape.
+above it shape, and past its end its levee falls on as its water does: down
+a rapid steeper than the levee's outer slope, an end held up at its own water
+would stand over the next segment's lower levee, a ledge at every segment and
+a flight of steps down the bank.
 
 The same arithmetic runs on the CPU (`src/rivers/carve.rs`) and in the shared
 `assets/shaders/river-functions.wgslinc`, over the same uploaded segments and
@@ -939,8 +959,12 @@ against the friction the feet can hold with, which buoyancy and a whitewater
 bed reduce. Knee-deep water slows a wade, more so walking upstream; a gentle
 current is stood against; a strong one carries the body along more and more,
 and once its drag outweighs the footing it sweeps the player off their feet
-and away downstream, over a fall if one is coming. Water too deep to stand in
+and away downstream, down any rapids coming. Water too deep to stand in
 floats the player with the current; a lake's still water only floats them.
+Space kicks a swimmer up out of the water as it jumps a walker off the
+ground, onto a bank or over a ledge; a body in the air over the water keeps
+the motion it left the water with, so a hop neither shakes off the current
+nor stops a body it was carrying dead.
 The F1 panel's **Rivers** section
 reports the network, the nearest channel and the current the player stands
 in, and can hide the water surfaces.

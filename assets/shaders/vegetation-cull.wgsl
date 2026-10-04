@@ -496,7 +496,11 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
         envelope.upper = water + bank*pastBank + RIVER_BANK_CURVE*pastBank*pastBank;
         let freeboard = 0.1 + 0.25*depth;
         let leveeWidth = 0.8 + 0.3*halfWidth;
-        envelope.lower = water + min(bank*pastBank, freeboard)
+        // Past the segment's end (beyond a half width, the outside of a
+        // bend's waterline) its levee falls on as its water does, or down a
+        // rapid each end would hold a ledge up beside the next.
+        let fall = max(segment.water.x - segment.water.y, 0.0)/segmentLength*max(beyond - halfWidth, 0.0);
+        envelope.lower = water - fall + min(bank*pastBank, freeboard)
                        - max(pastBank - leveeWidth, 0.0)*RIVER_LEVEE_OUTER_SLOPE
                        - (1.0 - segment.levee)*1.0e4;
         envelope.velocity = vec2<f32>(0.0);

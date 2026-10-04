@@ -524,6 +524,7 @@ impl<'a> SurfaceIndex<'a> {
     }
 
     /// (ribbon, sheet): the highest of each over `p`, or -infinity.
+    #[cfg(test)]
     pub fn at(&self, p: [f32; 2]) -> (f32, f32) {
         let (ribbon, sheet, _) = self.owned(p);
         (ribbon, sheet)

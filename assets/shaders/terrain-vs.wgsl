@@ -551,7 +551,11 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
         envelope.upper = water + bank*pastBank + RIVER_BANK_CURVE*pastBank*pastBank;
         let freeboard = 0.1 + 0.25*depth;
         let leveeWidth = 0.8 + 0.3*halfWidth;
-        envelope.lower = water + min(bank*pastBank, freeboard)
+        // Past the segment's end (beyond a half width, the outside of a
+        // bend's waterline) its levee falls on as its water does, or down a
+        // rapid each end would hold a ledge up beside the next.
+        let fall = max(segment.water.x - segment.water.y, 0.0)/segmentLength*max(beyond - halfWidth, 0.0);
+        envelope.lower = water - fall + min(bank*pastBank, freeboard)
                        - max(pastBank - leveeWidth, 0.0)*RIVER_LEVEE_OUTER_SLOPE
                        - (1.0 - segment.levee)*1.0e4;
         envelope.velocity = vec2<f32>(0.0);
@@ -804,11 +808,15 @@ fn terrainVertex(vertexPosition: vec3<f32>, deformSnow: bool) -> VsOutput
         // remain snow-covered. Only the geometry and lighting normals deform.
         let compression = snowCompression(worldXZ);
         output.frag_snow_compaction = compression;
-        height += snowCoverage(height, materialNormal) * snow.mapping.w * (1.0 - compression);
-        let left = heightLeft + snowLift(worldXZ - vec2<f32>(normalStep, 0.0), heightLeft, materialNormal);
-        let right = heightRight + snowLift(worldXZ + vec2<f32>(normalStep, 0.0), heightRight, materialNormal);
-        let back = heightBack + snowLift(worldXZ - vec2<f32>(0.0, normalStep), heightBack, materialNormal);
-        let front = heightFront + snowLift(worldXZ + vec2<f32>(0.0, normalStep), heightFront, materialNormal);
+        // Snow lies on dry ground only: the pack thins to nothing at a
+        // river's or lake's waterline (snow.rs sample_surface likewise), so
+        // no bed stands above its own water.
+        let dry = smoothHermite(0.0, 1.0, bank);
+        height += dry * snowCoverage(height, materialNormal) * snow.mapping.w * (1.0 - compression);
+        let left = heightLeft + dry * snowLift(worldXZ - vec2<f32>(normalStep, 0.0), heightLeft, materialNormal);
+        let right = heightRight + dry * snowLift(worldXZ + vec2<f32>(normalStep, 0.0), heightRight, materialNormal);
+        let back = heightBack + dry * snowLift(worldXZ - vec2<f32>(0.0, normalStep), heightBack, materialNormal);
+        let front = heightFront + dry * snowLift(worldXZ + vec2<f32>(0.0, normalStep), heightFront, materialNormal);
         localNormal = normalize(vec3<f32>(left - right, 2.0 * normalStep, back - front));
     }
 

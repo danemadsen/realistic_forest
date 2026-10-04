@@ -239,7 +239,14 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
         envelope.upper = water + bank * past_bank + BANK_CURVE * past_bank * past_bank;
         let freeboard = 0.1 + 0.25 * depth;
         let levee_width = 0.8 + 0.3 * half_width;
-        envelope.lower = water + (bank * past_bank).min(freeboard)
+        // Past the segment's end its levee falls on as its water does: down
+        // a rapid steeper than the levee's outer slope, the end held up at
+        // its own water would outrank the next segment's lower levee beside
+        // it, a ledge at every node, a flight of steps down the bank. Within
+        // a half width of the end, the outside of a bend's waterline, it
+        // keeps its freeboard, or the water there would have no bank.
+        let fall = (segment.water[0] - segment.water[1]).max(0.0) / length * (beyond - half_width).max(0.0);
+        envelope.lower = water - fall + (bank * past_bank).min(freeboard)
             - (past_bank - levee_width).max(0.0) * LEVEE_OUTER_SLOPE
             - (1.0 - segment.levee) * 1.0e4;
         envelope.velocity = [0.0, 0.0];

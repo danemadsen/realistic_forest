@@ -734,7 +734,11 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
         envelope.upper = water + bank*pastBank + RIVER_BANK_CURVE*pastBank*pastBank;
         let freeboard = 0.1 + 0.25*depth;
         let leveeWidth = 0.8 + 0.3*halfWidth;
-        envelope.lower = water + min(bank*pastBank, freeboard)
+        // Past the segment's end (beyond a half width, the outside of a
+        // bend's waterline) its levee falls on as its water does, or down a
+        // rapid each end would hold a ledge up beside the next.
+        let fall = max(segment.water.x - segment.water.y, 0.0)/segmentLength*max(beyond - halfWidth, 0.0);
+        envelope.lower = water - fall + min(bank*pastBank, freeboard)
                        - max(pastBank - leveeWidth, 0.0)*RIVER_LEVEE_OUTER_SLOPE
                        - (1.0 - segment.levee)*1.0e4;
         envelope.velocity = vec2<f32>(0.0);
@@ -1135,12 +1139,16 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     var river = input.frag_river;
     // How far up its shore (riverShoreRun), for the bank band below.
     var shoreRun = input.frag_river_shore;
+    // The surface of the water nearest, where it is looked up exactly.
+    var waterLevel = 1.0e6;
     let exactReach = 4.0 + 1.5*max(stage.spacing, stage.next_spacing);
     if (river.x < exactReach)
     {
         let exact = riverEnvelope(worldXZ);
-        let bank = riverBankAt(exact, frag_world_position.y);
+        // Measured from the ground under any snow, as the vertex stage does.
+        let bank = riverBankAt(exact, height);
         let still = bank < exact.bank_distance;
+        waterLevel = select(exact.water, exact.lake, still);
         let looked = vec4<f32>(clamp(bank, -40.0, 40.0),
                                select(exact.bend, 0.0, still),
                                select(exact.turbulence, 0.0, still),
@@ -1150,7 +1158,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         // Past the first ring a triangle is wider than a creek and its height
         // is a chord across the carved groove; the carve's bounds put it back
         // on the bank (a no-op at the already-clamped vertices).
-        let shoreGround = riverClamp(exact, frag_world_position.y);
+        let shoreGround = riverClamp(exact, height);
         shoreRun = mix(riverShoreRun(exact, shoreGround, materialNormal), shoreRun, handover);
         river = mix(looked, river, handover);
     }
@@ -1432,9 +1440,11 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // climb steeply, and its stones line them a metre or so either way.
     let stoneBank = riverRock*(1.0 - smoothHermite(0.15, 0.9 + 0.6*soilEdge, riverBank))*(1.0 - inRiver);
     // Sand is the sea's: inland, beds and banks are silt, earth and stone.
-    // Where a river crosses the beach to the sea its bed is the beach's sand
-    // as the sea's is, so the two waters meet over one bed.
-    let fSandRiver = 1.0 - fGrass;
+    // Where a river crosses the beach to the sea, its water down at the sea's
+    // level, its bed is the beach's sand as the sea's is, so the two waters
+    // meet over one bed; a low river or pond inland keeps its own bed.
+    let estuary = 1.0 - smoothHermite(stage.sea_level + 0.1, stage.sea_level + 0.8, waterLevel);
+    let fSandRiver = (1.0 - fGrass)*(1.0 - inRiver*(1.0 - estuary));
     let riverBed = inRiver*(1.0 - fSandRiver);
     // Along calm water the erosion's gravel and rock give way to the band (a
     // steep face still stands as rock); whitewater keeps its stony banks.
@@ -2408,14 +2418,15 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         let damp = albedo * vec3<f32>(0.55, 0.57, 0.56);
         albedo = mix(albedo, damp, moisture);
         // Under the water the bed is filmed with algae and settled silt; the
-        // beach's sand under a river's mouth is scoured clean, as the sea's is.
-        let submergedBed = (1.0 - smoothHermite(-0.35, 0.0, river.x)) * (1.0 - gSnow)
-                         * (1.0 - 0.85*gSand);
+        // beach's sand under a river's mouth is scoured clean, as the sea's
+        // is, though just as matte under its water.
+        let submergedBed = (1.0 - smoothHermite(-0.35, 0.0, river.x)) * (1.0 - gSnow);
+        let algae = submergedBed * (1.0 - 0.85*gSand);
         // Saturated mud at the waterline is darker again than damp earth, and
         // greyer: water fills its pores and its iron is reduced.
         let lappedAbove = lapped * (1.0 - submergedBed) * (1.0 - gSnow);
         albedo = mix(albedo, albedo * vec3<f32>(0.66, 0.70, 0.78), lappedAbove * gDirt);
-        albedo = mix(albedo, albedo * vec3<f32>(0.50, 0.55, 0.36), submergedBed);
+        albedo = mix(albedo, albedo * vec3<f32>(0.50, 0.55, 0.36), algae);
         // Damp earth stays rough; only pooled water, and the film on mud and
         // stone where the water laps, approach a low roughness. Write the
         // final value used by the G-buffer (snow glints have already modified

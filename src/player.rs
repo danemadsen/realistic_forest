@@ -71,6 +71,7 @@ impl Player {
         }
         self.position = position;
         self.vertical_velocity = 0.0;
+        self.velocity = Vec2::ZERO;
         true
     }
 
@@ -201,6 +202,7 @@ pub fn update_player_system(
             0.0
         };
         candidate.y += vertical * speed * dt;
+        player.velocity = walk;
     } else {
         let visibility_center = Vec2::new(player.position.x, player.position.z);
         // Flowing water: the body moves at the velocity the current's drag
@@ -225,29 +227,41 @@ pub fn update_player_system(
             (None, None) => (here, false),
         };
         let depth = surface - here;
-        if depth > 0.02 {
+        // In the water only while the feet are: a leap over a creek or a fall
+        // onto a lake carries the body on through the air.
+        let in_water = player.position.y - EYE_HEIGHT < surface + 0.05;
+        if depth > 0.02 && in_water {
             let current = if flowing { Vec2::from(envelope.velocity) } else { Vec2::ZERO };
             let wading = wade(player.velocity, walk, current, depth, envelope.turbulence, dt);
             player.velocity = wading.velocity;
             player.swept = wading.swept;
             player.wading_depth = depth;
             player.current = current;
-        } else {
+        } else if depth <= 0.02 {
             player.velocity = walk;
         }
+        // Airborne over the water the body keeps the velocity it left the
+        // water with: a hop does not shake off the current, nor stop a body
+        // the current was carrying dead in mid-air.
         candidate.x = player.position.x + player.velocity.x * dt;
         candidate.z = player.position.z + player.velocity.y * dt;
+        // A swimmer kicks up out of the water as a walker jumps off the ground.
+        let floating = depth > EYE_HEIGHT - SWIM_FREEBOARD;
+        let jump = keys.just_pressed(KeyCode::Space) && !ui_wants_input;
+        if floating && jump && player.position.y <= surface + SWIM_FREEBOARD + 0.03 {
+            player.vertical_velocity = 7.4;
+        }
         update_walking_ground(
             &mut player,
             &mut candidate,
             &erosion,
             &noise,
             &mut snow,
-            keys.just_pressed(KeyCode::Space) && !ui_wants_input,
+            jump,
             dt,
         );
         // Water too deep to stand in floats the player, head out.
-        if depth > EYE_HEIGHT - SWIM_FREEBOARD && candidate.y < surface + SWIM_FREEBOARD {
+        if floating && candidate.y < surface + SWIM_FREEBOARD {
             candidate.y = surface + SWIM_FREEBOARD;
             player.vertical_velocity = player.vertical_velocity.max(0.0);
         }

@@ -1897,6 +1897,12 @@ fn riverPlantShadow(world_position: vec3<f32>, view_depth: f32) -> f32 {
 // deep is a dark brown. The silt's backscatter is nearly grey, so a deep
 // body keeps that dull amber-brown and never the sea's blue or a swimming
 // pool's green.
+// Metres between a rapid's steps, and over which the current's tongue
+// wanders across its channel. Constant, not in the channel's widths: the
+// half width varies along the ribbon, and dividing the distance from the
+// river's head by it would scramble the pattern's scale far downstream.
+const RIVER_STEP_SPACING: f32 = 4.0;
+const RIVER_TONGUE_WANDER: f32 = 18.0;
 const RIVER_EXTINCTION: vec3<f32> = vec3<f32>(0.40, 0.38, 1.05);
 const RIVER_SCATTER: vec3<f32> = vec3<f32>(0.012, 0.012, 0.010);
 // A pond gathers more of the forest's tannin and grows its own plankton:
@@ -2341,8 +2347,7 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     // Whitewater gathers where the bed steps: over the ledges and boulders
     // of a rapid, with dark glassy tongues of water running between them.
     // The steps stay put as the water runs over them.
-    let steps = smoothstepf(0.25, 0.75,
-                            valueNoise(vec2<f32>(along/(2.5*max(half_width, 0.6)), across*1.7 + 3.1)));
+    let steps = smoothstepf(0.25, 0.75, valueNoise(vec2<f32>(along/RIVER_STEP_SPACING, across*1.7 + 3.1)));
     // Rapids turn milky below each step, where the water plunges and fills
     // with bubbles, and run clear over the smooth tongues between.
     let aeration = smoothstepf(0.3, 0.9, turbulence)*mix(0.15, 0.7, steps);
@@ -2410,7 +2415,7 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     // into lines where the surface currents converge: the seams between the
     // fast core and the slack water by the banks, a tongue down the current
     // that wanders across the channel, and a scum in the slack edges of pools.
-    let wander = (valueNoise(vec2<f32>(along/(8.0*max(half_width, 0.5)), 5.3)) - 0.5)*0.8;
+    let wander = (valueNoise(vec2<f32>(along/RIVER_TONGUE_WANDER, 5.3)) - 0.5)*0.8;
     let off_tongue = (across - wander)*6.0;
     let tongue = exp(-off_tongue*off_tongue);
     let seam = smoothstepf(0.5, 0.75, abs(across))*(1.0 - smoothstepf(0.82, 0.97, abs(across)));
