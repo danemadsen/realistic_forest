@@ -39,7 +39,7 @@ use bevy::render::view::window::screenshot::{Screenshot, ScreenshotCaptured};
 use bevy::render::view::Msaa;
 use bevy::render::RenderPlugin;
 use bevy::window::{CursorOptions, PrimaryWindow, WindowResolution};
-use bevy_egui::{EguiPlugin, EguiPrimaryContextPass};
+use bevy_egui::{EguiPlugin, EguiPostUpdateSet, EguiPrimaryContextPass};
 use std::path::Path;
 
 /// Erosion parameters in force for the currently streaming cache; edited by
@@ -262,6 +262,12 @@ fn main() {
                 }),
         )
         .add_plugins(EguiPlugin::default())
+        // Developer teleports update the camera during the egui pass. Run
+        // that pass before propagation so visibility sees the same pose.
+        .configure_sets(
+            PostUpdate,
+            EguiPostUpdateSet::EndPass.before(bevy::transform::TransformSystems::Propagate),
+        )
         // Installs the render-world state the flow-atlas paint callback builds
         // its pipeline into (see FlowPreviewRenderState in src/ui.rs).
         .add_plugins(ui::UiRenderPlugin)
@@ -342,7 +348,10 @@ fn main() {
             )
                 .chain(),
         )
-        .add_systems(EguiPrimaryContextPass, ui::draw_diagnostics_ui)
+        .add_systems(
+            EguiPrimaryContextPass,
+            (ui::draw_diagnostics_ui, player::sync_player_camera_transform).chain(),
+        )
         .run();
 }
 
@@ -478,8 +487,7 @@ fn setup_cursor_and_player(
     );
 }
 
-/// Tab opens the compact trainer, F1 opens the full diagnostics panel, and
-/// either action releases the pointer so the controls can be used immediately.
+/// F2 toggles the trainer and pointer capture; F3 toggles passive debug text.
 /// F12 saves a timestamped screenshot.
 fn handle_global_keys(
     mut settings: ResMut<AppSettings>,
@@ -487,23 +495,31 @@ fn handle_global_keys(
     mut cursor_options: Query<(&mut CursorOptions,), With<PrimaryWindow>>,
     keyboard: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
+    automation: Option<Res<AutomationSettings>>,
 ) {
-    let mut opened_panel = false;
-    if keyboard.just_pressed(KeyCode::Tab) {
+    let trainer_was_open = settings.show_trainer;
+    if keyboard.just_pressed(KeyCode::F2) {
         settings.show_trainer = !settings.show_trainer;
-        opened_panel |= settings.show_trainer;
     }
-    if keyboard.just_pressed(KeyCode::F1) {
-        settings.show_ui = !settings.show_ui;
-        opened_panel |= settings.show_ui;
+    if keyboard.just_pressed(KeyCode::F3) {
+        settings.show_debug = !settings.show_debug;
     }
-    if opened_panel {
+    if settings.show_trainer != trainer_was_open {
+        // A pinned screenshot pose must keep ignoring gameplay input even if
+        // a function key happens to land on the unattended capture window.
+        let pinned_capture = automation
+            .as_ref()
+            .is_some_and(|automation| automation.has_camera && automation.shot_path.is_some());
+        let capture_mouse = !settings.show_trainer && !pinned_capture;
         if let Ok(mut player) = player.single_mut() {
-            player.mouse_captured = false;
-        }
-        if let Ok((mut cursor,)) = cursor_options.single_mut() {
-            cursor.grab_mode = bevy::window::CursorGrabMode::None;
-            cursor.visible = true;
+            if let Ok((mut cursor,)) = cursor_options.single_mut() {
+                player.set_mouse_capture(capture_mouse, &mut cursor);
+            } else {
+                player.mouse_captured = capture_mouse;
+                if capture_mouse {
+                    player.mouse_warmup_frames = 3;
+                }
+            }
         }
     }
     if keyboard.just_pressed(KeyCode::F12) {
@@ -829,4 +845,112 @@ fn shot_scheduling_system(
             // code rather than looking like a success.
             std::process::exit(if saved { 0 } else { 1 });
         });
+}
+
+#[cfg(test)]
+mod global_key_tests {
+    use super::*;
+    use bevy::window::CursorGrabMode;
+
+    fn input_app() -> (App, Entity, Entity) {
+        let mut app = App::new();
+        app.insert_resource(AppSettings::default())
+            .insert_resource(ButtonInput::<KeyCode>::default())
+            .add_systems(Update, handle_global_keys);
+        let player = app.world_mut().spawn(Player::default()).id();
+        let cursor = app
+            .world_mut()
+            .spawn((
+                PrimaryWindow,
+                CursorOptions {
+                    grab_mode: CursorGrabMode::Locked,
+                    visible: false,
+                    ..default()
+                },
+            ))
+            .id();
+        (app, player, cursor)
+    }
+
+    fn press(app: &mut App, key: KeyCode) {
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.reset_all();
+        keys.press(key);
+        drop(keys);
+        app.update();
+    }
+
+    #[test]
+    fn f2_releases_cursor_and_closing_recaptures_with_warmup() {
+        let (mut app, player, cursor) = input_app();
+        press(&mut app, KeyCode::F2);
+        assert!(app.world().resource::<AppSettings>().show_trainer);
+        assert!(!app.world().get::<Player>(player).unwrap().mouse_captured);
+        let cursor_options = app.world().get::<CursorOptions>(cursor).unwrap();
+        assert_eq!(cursor_options.grab_mode, CursorGrabMode::None);
+        assert!(cursor_options.visible);
+
+        app.world_mut().get_mut::<Player>(player).unwrap().mouse_warmup_frames = 0;
+        press(&mut app, KeyCode::F2);
+        assert!(!app.world().resource::<AppSettings>().show_trainer);
+        let player = app.world().get::<Player>(player).unwrap();
+        assert!(player.mouse_captured);
+        assert_eq!(player.mouse_warmup_frames, 3);
+        let cursor_options = app.world().get::<CursorOptions>(cursor).unwrap();
+        assert_eq!(cursor_options.grab_mode, CursorGrabMode::Locked);
+        assert!(!cursor_options.visible);
+    }
+
+    #[test]
+    fn f3_toggles_only_debug_text_and_tab_no_longer_opens_trainer() {
+        let (mut app, player, cursor) = input_app();
+        press(&mut app, KeyCode::F3);
+        let settings = app.world().resource::<AppSettings>();
+        assert!(settings.show_debug);
+        assert!(!settings.show_trainer);
+        assert!(!settings.show_ui);
+        assert!(app.world().get::<Player>(player).unwrap().mouse_captured);
+        assert_eq!(
+            app.world().get::<CursorOptions>(cursor).unwrap().grab_mode,
+            CursorGrabMode::Locked,
+        );
+        press(&mut app, KeyCode::F3);
+        assert!(!app.world().resource::<AppSettings>().show_debug);
+        press(&mut app, KeyCode::Tab);
+        assert!(!app.world().resource::<AppSettings>().show_trainer);
+    }
+
+    #[test]
+    fn f1_leaves_trainer_and_advanced_controls_unchanged() {
+        let (mut app, player, _) = input_app();
+        press(&mut app, KeyCode::F1);
+        let settings = app.world().resource::<AppSettings>();
+        assert!(!settings.show_ui);
+        assert!(!settings.show_trainer);
+        assert!(app.world().get::<Player>(player).unwrap().mouse_captured);
+        press(&mut app, KeyCode::F2);
+        app.world_mut().resource_mut::<AppSettings>().show_ui = true;
+        press(&mut app, KeyCode::F1);
+        let settings = app.world().resource::<AppSettings>();
+        assert!(settings.show_ui);
+        assert!(settings.show_trainer);
+        assert!(!app.world().get::<Player>(player).unwrap().mouse_captured);
+    }
+
+    #[test]
+    fn closing_trainer_does_not_capture_mouse_during_pinned_screenshot() {
+        let (mut app, player, cursor) = input_app();
+        app.insert_resource(AutomationSettings {
+            has_camera: true,
+            shot_path: Some("capture.png".into()),
+            ..default()
+        });
+        press(&mut app, KeyCode::F2);
+        press(&mut app, KeyCode::F2);
+        assert!(!app.world().get::<Player>(player).unwrap().mouse_captured);
+        assert_eq!(
+            app.world().get::<CursorOptions>(cursor).unwrap().grab_mode,
+            CursorGrabMode::None,
+        );
+    }
 }

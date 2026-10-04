@@ -186,8 +186,10 @@ pub struct AppSettings {
     pub ssao_enabled: bool,
     pub flow_debug: bool,
     pub erosion_debug: bool,
+    /// Expand advanced controls inside the developer menu.
     pub show_ui: bool,
     pub show_trainer: bool,
+    pub show_debug: bool,
     pub ao_radius: f32,
     pub ao_bias: f32,
     pub ao_power: f32,
@@ -236,6 +238,7 @@ impl Default for AppSettings {
             erosion_debug: false,
             show_ui: false,
             show_trainer: false,
+            show_debug: false,
             ao_radius: 2.1,
             ao_bias: 0.08,
             ao_power: 1.25,

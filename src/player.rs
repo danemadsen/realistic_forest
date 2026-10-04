@@ -19,6 +19,7 @@ pub struct Player {
     pub pitch: f32,
     pub vertical_velocity: f32,
     pub flying: bool,
+    pub movement_speed_multiplier: f32,
     pub mouse_captured: bool,
     pub mouse_warmup_frames: u32,
 }
@@ -32,9 +33,43 @@ impl Default for Player {
             pitch: -0.18,
             vertical_velocity: 0.0,
             flying: false,
+            movement_speed_multiplier: 1.0,
             mouse_captured: true,
             mouse_warmup_frames: 3,
         }
+    }
+}
+
+impl Player {
+    /// Unit direction of the player's view, shared by the camera and debug UI.
+    pub fn forward(&self) -> Vec3 {
+        Vec3::new(
+            self.yaw.sin() * self.pitch.cos(),
+            self.pitch.sin(),
+            -self.yaw.cos() * self.pitch.cos(),
+        )
+    }
+
+    /// Move to finite world coordinates and discard momentum from the old pose.
+    pub fn teleport(&mut self, position: Vec3) -> bool {
+        if !position.is_finite() {
+            return false;
+        }
+        self.position = position;
+        self.vertical_velocity = 0.0;
+        true
+    }
+
+    /// Keep cursor visibility, grab state and mouse-motion warmup consistent.
+    pub fn set_mouse_capture(&mut self, captured: bool, cursor: &mut CursorOptions) {
+        self.mouse_captured = captured;
+        if captured {
+            self.mouse_warmup_frames = 3;
+            cursor.grab_mode = CursorGrabMode::Locked;
+        } else {
+            cursor.grab_mode = CursorGrabMode::None;
+        }
+        cursor.visible = !captured;
     }
 }
 
@@ -47,22 +82,17 @@ pub struct PlayerCamera {
 
 impl PlayerCamera {
     pub fn from_player(player: &Player) -> Self {
-        let forward = Vec3::new(
-            player.yaw.sin() * player.pitch.cos(),
-            player.pitch.sin(),
-            -player.yaw.cos() * player.pitch.cos(),
-        );
         Self {
             position: player.position,
-            target: player.position + forward,
+            target: player.position + player.forward(),
             up: Vec3::Y,
             fov_y: 68.0,
         }
     }
 }
 
-/// Per-frame player update, mirroring `UpdatePlayer`. The diagnostics window
-/// suppresses gameplay input whenever the pointer or keyboard focus is on it.
+/// Per-frame player update, mirroring `UpdatePlayer`. The open developer menu
+/// suppresses gameplay input while the passive debug text leaves it active.
 #[allow(clippy::too_many_arguments)]
 pub fn update_player_system(
     mut player: Query<&mut Player>,
@@ -141,7 +171,9 @@ pub fn update_player_system(
         }
     }
     let boosted = !ui_wants_input && keys.pressed(KeyCode::ControlLeft);
-    let speed = if player.flying { 38.0 } else { 10.0 } * if boosted { 2.5 } else { 1.0 };
+    let speed = if player.flying { 38.0 } else { 10.0 }
+        * if boosted { 2.5 } else { 1.0 }
+        * player.movement_speed_multiplier;
     let mut candidate = player.position + movement * (speed * dt);
 
     if player.flying {
@@ -243,6 +275,41 @@ pub fn sync_player_camera_transform(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_vector_is_unit_length_and_matches_camera_target() {
+        let mut player = Player::default();
+        player.yaw = std::f32::consts::FRAC_PI_2;
+        player.pitch = 0.4;
+        let forward = player.forward();
+        assert!((forward.length() - 1.0).abs() < 0.000001);
+        assert!((forward.x - player.pitch.cos()).abs() < 0.000001);
+        assert!((forward.y - player.pitch.sin()).abs() < 0.000001);
+        assert!(forward.z.abs() < 0.000001);
+        let camera = PlayerCamera::from_player(&player);
+        assert!(camera.target.abs_diff_eq(player.position + forward, 0.000001));
+    }
+
+    #[test]
+    fn teleport_resets_momentum_and_rejects_invalid_coordinates() {
+        let mut player = Player::default();
+        player.vertical_velocity = -12.0;
+        let destination = Vec3::new(120.0, 450.0, -870.0);
+        assert!(player.teleport(destination));
+        assert_eq!(player.position, destination);
+        assert_eq!(player.vertical_velocity, 0.0);
+
+        player.vertical_velocity = 4.0;
+        for invalid in [
+            Vec3::new(f32::NAN, 0.0, 0.0),
+            Vec3::new(0.0, f32::INFINITY, 0.0),
+            Vec3::new(0.0, 0.0, f32::NEG_INFINITY),
+        ] {
+            assert!(!player.teleport(invalid));
+            assert_eq!(player.position, destination);
+            assert_eq!(player.vertical_velocity, 4.0);
+        }
+    }
 
     fn snowy_world() -> (NoiseField, ErosionCache, SnowState, Player) {
         // A constant field gives flat mountain ground away from the spawn

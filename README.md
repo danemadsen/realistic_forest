@@ -40,26 +40,37 @@ by naga at runtime either way.
 | Left Shift | Descend while flying |
 | Left Control | Movement boost |
 | V | Toggle flight |
-| Tab | Toggle the debug trainer and release the cursor |
-| F1 | Toggle the diagnostics panel and release the cursor |
+| F2 | Open or close the developer menu; release the cursor while open, capture it on close |
+| F3 | Toggle the debug text overlay |
 | F12 | Save a timestamped screenshot |
 | Escape | Release the cursor |
 | Left click | Capture the cursor again |
 
 Movement is unbounded in both walking and flight modes.
 
-The **Trainer [Tab]** button at the top right also opens a compact debug trainer.
+The developer menu opens at the top left with F2 and leaves no launcher or
+overlay when closed. Its movement tools teleport to exact XYZ coordinates
+(automatically enabling flight), place the player on the ground at the entered
+XZ coordinates (ignoring Y), return to spawn, place the player on the ground
+here, or rise 100 m. Movement speed is adjustable from 0.1× to 20×, and **Copy
+XYZ** copies the current position. Rendering shortcuts sit alongside the weather
+and time controls; click **Advanced controls** to expand them inside the same menu.
+
+F3 independently toggles a passive, plain text overlay at the top left, outside
+the developer menu. It reports FPS and frame timing, player XYZ, view direction,
+yaw and pitch, movement and ground state, time, weather, erosion, and vegetation.
+
 Choose a weather preset to apply it immediately around the player, or choose
 **Natural weather** to return to varied conditions. The **Move weather fronts**
 checkbox controls whether those conditions drift. Under a thunderstorm,
 **Strike lightning** fires the next discharge at once, and **Thunder volume**
 sets the loudness of thunder. Set the hour with
 the slider or Dawn, Noon, Dusk and Night buttons; changing it holds the selected
-time until **Hold selected time** is unchecked. **Advanced diagnostics** opens
-the full panel without using F1.
+time until **Hold selected time** is unchecked. **Advanced controls** expands
+the full controls.
 
-The diagnostics panel's **Sun and time** section sets the time of day, pauses the cycle,
-and changes its duration in real minutes. Dawn, Noon, Dusk and Night buttons
+The developer menu's advanced **Sun and time** section sets the time of day,
+pauses the cycle, and changes its duration in real minutes. Dawn, Noon, Dusk and Night buttons
 quickly select a lighting setup. The default starts at 10:00 and completes a
 full day in 24 real minutes. **Raymarched lighting** exposes terrain shadows,
 volumetric sunlight, water reflections, quality and light shaft strength;
@@ -69,8 +80,8 @@ volumetric sunlight, water reflections, quality and light shaft strength;
 Overcast, Fog / Whiteout, Rain, Snow, and Thunderstorm can occur in different
 parts of the world at the same time. Clear, Cloudy, and Overcast cover most of
 the map. Fog is less common; rain and snow occupy smaller areas; thunderstorms
-are the rarest. The starting area is Cloudy. The F1 condition selector biases
-the map toward a chosen condition while retaining local variation, and its
+are the rarest. The starting area is Cloudy. The advanced condition selector
+biases the map toward a chosen condition while retaining local variation, and its
 transition control blends that bias over 75 seconds by default. Weather
 changes cloud amount and altitude, moving shadows, sun strength, sky color,
 and atmospheric visibility together. Fog / Whiteout produces short-range
@@ -92,8 +103,8 @@ on nearby ground. Snow falls more slowly as flakes. Wet ground darkens and
 mirrors the sky, puddles collect on level ground outside the grass and ripple
 under the drops, and the ground stays damp between passing sheets, while
 snowfall gives upward surfaces a light dusting. Grass thrashes in storm gusts.
-The F1 panel reports local intensity and visibility. Rain makes short-lived
-ripples and splashes on the water; snowflakes briefly fleck its surface. Local
+The advanced weather controls report local intensity and visibility. Rain makes
+short-lived ripples and splashes on the water; snowflakes briefly fleck its surface. Local
 storm gusts roughen the existing wave spectrum without resetting it.
 Thunderheads dim the sky, clouds, terrain, and fog even between heavy rain
 sheets. Snow phase normally follows altitude and the mountain snowline;
@@ -618,8 +629,9 @@ permanent channels from rills and hillslopes, and shallow water velocities are
 gated when estimating transport strength.
 
 The flow output
-remains available for later river geometry. Press F1 and enable **Flow visualization** to inspect it on the
-terrain, or expand **Flow output** to inspect the cached target. Erosion
+remains available for later river geometry. Open the developer menu with F2,
+click **Advanced controls**, and enable **Flow visualization** to inspect
+it on the terrain, or expand **Flow output** to inspect the cached target. Erosion
 parameters can be edited from the same panel and applied with **Regenerate
 erosion cache**; besides the runoff controls they include stream power,
 channel incision, alluvial deposition, maximum incision, talus slide and
@@ -708,8 +720,8 @@ the world-heightfield shadows have different coverage from the reflections.
 | Balanced | Up to 48 | 5 | Default compromise between sampling detail and GPU cost |
 | High | Up to 72 | 6 | More samples to resolve clouds, shadows, shafts and reflection intersections; higher GPU cost |
 
-All three presets keep the same effects enabled. The F1 switches can disable
-individual effects independently, and `--no-raymarch` disables the traced
+All three presets keep the same effects enabled. The advanced rendering switches
+can disable individual effects independently, and `--no-raymarch` disables the traced
 effects together. Fog and clouds share a half-resolution integration target
 with a depth-aware upscale; the scene keeps its full output resolution. Cloud
 rays stop early once sufficiently opaque and skip lighting in empty regions.
