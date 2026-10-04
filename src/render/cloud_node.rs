@@ -1,5 +1,6 @@
-//! Periodic density noise and a raymarched, all-direction cloud reflection
-//! probe. The main atmosphere pass uses the same density and lighting model.
+//! Periodic density noise, the per-frame cloud shadow map and a raymarched,
+//! all-direction cloud reflection probe. The main atmosphere pass uses the
+//! same density and lighting model.
 
 use super::{ForestGlobals, ForestShaderHandles, globals_layout};
 use bevy::prelude::*;
@@ -13,6 +14,10 @@ const NOISE_SIZE: u32 = 64;
 const NOISE_MIP_COUNT: u32 = 7;
 pub const PROBE_WIDTH: u32 = 256;
 pub const PROBE_HEIGHT: u32 = 128;
+/// Texels per side of each cloud shadow map level (`CLOUD_SHADOW_MAP_TEXELS`
+/// in cloud-functions.wgslinc). The two levels sit side by side.
+pub const SHADOW_MAP_LEVEL_TEXELS: u32 = 1024;
+const SHADOW_MAP_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
 #[derive(Resource, Default)]
 pub struct CloudRenderState {
@@ -20,7 +25,8 @@ pub struct CloudRenderState {
 }
 
 pub struct CloudGpuResources {
-    /// Shared group 3: density noise and the completed sky reflection probe.
+    /// Shared group 3: density noise, the completed sky reflection probe and
+    /// the cloud shadow map.
     pub layout: BindGroupLayoutDescriptor,
     pub group: BindGroup,
     noise_group: BindGroup,
@@ -28,11 +34,16 @@ pub struct CloudGpuResources {
     empty_group: BindGroup,
     probe: wgpu::TextureView,
     pipeline: CachedRenderPipelineId,
+    /// Optical depth toward the sun per sun-ray entry point into the cloud
+    /// layer, rebuilt each frame before the atmosphere reads it.
+    shadow_map: wgpu::TextureView,
+    shadow_pipeline: CachedRenderPipelineId,
 }
 
-/// Renders the raymarched all-direction cloud reflection probe. Binds the
-/// noise group in slot 3 rather than the resource group: sampling the probe
-/// texture while it is the active attachment is invalid.
+/// Renders the cloud shadow map, then the raymarched all-direction cloud
+/// reflection probe. Both bind the noise group in slot 3 rather than the
+/// resource group: sampling a texture while it is the active attachment is
+/// invalid.
 pub fn cloud_probe_pass(world: &World, mut ctx: RenderContext) {
     let Some(resources) = world
         .get_resource::<CloudRenderState>()
@@ -41,6 +52,44 @@ pub fn cloud_probe_pass(world: &World, mut ctx: RenderContext) {
         return;
     };
     let cache = world.resource::<PipelineCache>();
+    // Until its pipeline compiles the map keeps its -1 fill, which the
+    // shaders read as "march the clouds instead".
+    let lighting = &world.resource::<ForestGlobals>().globals;
+    // Only the volumetric sunlight paths read this map. When those paths
+    // become active again, rebuild it before their first lookup this frame.
+    if lighting.raymarch[1] >= 0.5
+        && lighting.atmosphere[3] > 0.0
+        && lighting.settings_a[0] > 0.01
+        && lighting.clouds[0] >= 0.5
+        && lighting.clouds[2] > 0.001
+        && lighting.cloud_layer[2] > 0.001
+        && lighting.sun_direction[1] < 0.0
+        && let Some(pipeline) = cache.get_render_pipeline(resources.shadow_pipeline)
+    {
+        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+            label: Some("forest_cloud_shadow_map"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &resources.shadow_map,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    // The fullscreen triangle writes every texel.
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_render_pipeline(pipeline);
+        pass.set_bind_group(0, &resources.globals_group, &[]);
+        pass.set_bind_group(1, &resources.empty_group, &[]);
+        pass.set_bind_group(2, &resources.empty_group, &[]);
+        pass.set_bind_group(3, &resources.noise_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
     let Some(pipeline) = cache.get_render_pipeline(resources.pipeline) else {
         return;
     };
@@ -220,6 +269,52 @@ fn prepare_clouds(
             min_filter: wgpu::FilterMode::Linear,
             ..default()
         });
+    let shadow_texture = device
+        .wgpu_device()
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some("forest_cloud_shadow_map"),
+            size: wgpu::Extent3d {
+                width: 2 * SHADOW_MAP_LEVEL_TEXELS,
+                height: SHADOW_MAP_LEVEL_TEXELS,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SHADOW_MAP_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+    // -1 marks "not built yet": the shaders march the clouds instead.
+    let unbuilt: Vec<f32> = vec![-1.0; (2 * SHADOW_MAP_LEVEL_TEXELS * SHADOW_MAP_LEVEL_TEXELS) as usize];
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture: &shadow_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&unbuilt),
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(2 * SHADOW_MAP_LEVEL_TEXELS * 4),
+            rows_per_image: Some(SHADOW_MAP_LEVEL_TEXELS),
+        },
+        shadow_texture.size(),
+    );
+    let shadow_map = shadow_texture.create_view(&default());
+    let shadow_sampler = device
+        .wgpu_device()
+        .create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("forest_cloud_shadow_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..default()
+        });
     let noise_entries = [
         texture_layout(0, wgpu::TextureViewDimension::D3),
         sampler_layout(1),
@@ -232,6 +327,8 @@ fn prepare_clouds(
             noise_entries[1],
             texture_layout(2, wgpu::TextureViewDimension::D2),
             sampler_layout(3),
+            texture_layout(4, wgpu::TextureViewDimension::D2),
+            sampler_layout(5),
         ],
     );
     let noise_bindings = [
@@ -267,6 +364,14 @@ fn prepare_clouds(
                 binding: 3,
                 resource: wgpu::BindingResource::Sampler(&probe_sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&shadow_map),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+            },
         ],
     );
     let global_layout = globals_layout();
@@ -285,6 +390,36 @@ fn prepare_clouds(
         &empty_layout,
         &[],
     );
+    let shadow_pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
+        label: Some("forest_cloud_shadow_map_pipeline".into()),
+        layout: vec![
+            global_layout.clone(),
+            empty_layout.clone(),
+            empty_layout.clone(),
+            noise_layout.clone(),
+        ],
+        immediate_size: 0,
+        vertex: VertexState {
+            shader: shaders.cloud_shadow_map.clone(),
+            shader_defs: vec![],
+            entry_point: Some("vs_main".into()),
+            buffers: vec![],
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(FragmentState {
+            shader: shaders.cloud_shadow_map.clone(),
+            shader_defs: vec![],
+            entry_point: Some("fs_main".into()),
+            targets: vec![Some(wgpu::ColorTargetState {
+                format: SHADOW_MAP_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        zero_initialize_workgroup_memory: false,
+    });
     let pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("forest_cloud_probe_pipeline".into()),
         layout: vec![
@@ -323,6 +458,8 @@ fn prepare_clouds(
         empty_group,
         probe,
         pipeline,
+        shadow_map,
+        shadow_pipeline,
     });
 }
 
@@ -450,6 +587,18 @@ fn downsample_noise(source: &[u8], size: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The map's texture is sized from the Rust constant and addressed from
+    /// the WGSL one; they must agree or every lookup lands on the wrong texel.
+    #[test]
+    fn shadow_map_texel_count_matches_the_shaders() {
+        let common = include_str!("../../assets/shaders/cloud-functions.wgslinc");
+        let expected = format!(
+            "const CLOUD_SHADOW_MAP_TEXELS: f32 = {}.0;",
+            SHADOW_MAP_LEVEL_TEXELS
+        );
+        assert!(common.contains(&expected), "missing `{expected}`");
+    }
 
     #[test]
     fn density_noise_tiles_without_a_seam() {

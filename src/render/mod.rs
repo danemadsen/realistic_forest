@@ -131,6 +131,9 @@ pub struct GlobalUniformsGpu {
     pub view: [f32; 16],
     pub projection: [f32; 16],
     pub camera_position: [f32; 4],
+    /// xyz the direction sunlight travels. w is the highest terrain in the
+    /// lighting heightfield: the terrain pass reduces it on the GPU and copies
+    /// it over [`TERRAIN_HEIGHT_UNKNOWN`] each frame it draws the map.
     pub sun_direction: [f32; 4],
     pub viewport: [f32; 4],
     pub params: [f32; 4],
@@ -150,6 +153,14 @@ pub struct GlobalUniformsGpu {
     pub lightning_meta: [f32; 4],
 }
 const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 416);
+
+/// `sun_direction.w` until the terrain pass has measured the heightfield: no
+/// march ever rises above it, so the shaders' early exits stay off.
+pub const TERRAIN_HEIGHT_UNKNOWN: f32 = 1.0e9;
+/// Byte offset of `sun_direction.w`, where the terrain pass copies the
+/// measured highest terrain.
+pub const TERRAIN_HEIGHT_OFFSET: u64 =
+    std::mem::offset_of!(GlobalUniformsGpu, sun_direction) as u64 + 12;
 
 /// terrain-vs + terrain-fs share one canonical StageUniforms layout
 /// (272 bytes); the WGSL files are reconciled to this exact field order.
@@ -444,6 +455,8 @@ pub struct ForestShaderHandles {
     pub precipitation: Handle<Shader>,
     pub lightning: Handle<Shader>,
     pub cloud_probe: Handle<Shader>,
+    pub cloud_shadow_map: Handle<Shader>,
+    pub heightfield_max: Handle<Shader>,
 }
 
 pub struct ForestRenderPlugin {
@@ -492,6 +505,8 @@ impl Plugin for ForestRenderPlugin {
                 precipitation: asset_server.load::<Shader>("shaders/precipitation.wgsl"),
                 lightning: asset_server.load::<Shader>("shaders/lightning.wgsl"),
                 cloud_probe: asset_server.load::<Shader>("shaders/cloud-probe.wgsl"),
+                cloud_shadow_map: asset_server.load::<Shader>("shaders/cloud-shadow-map.wgsl"),
+                heightfield_max: asset_server.load::<Shader>("shaders/heightfield-max.wgsl"),
             }
         };
         // The main world's terrain layer images (and the erosion blend mask)
@@ -665,7 +680,12 @@ pub fn prepare_forest_globals(
         view: view_matrix,
         projection,
         camera_position: [view.player_position[0], view.player_position[1], view.player_position[2], 0.0],
-        sun_direction: lighting.sun_direction,
+        sun_direction: [
+            lighting.sun_direction[0],
+            lighting.sun_direction[1],
+            lighting.sun_direction[2],
+            TERRAIN_HEIGHT_UNKNOWN,
+        ],
         viewport: [width, height, 1.0 / width, 1.0 / height],
         params: [
             // Fog extinction is sampled by world position in the shader.
@@ -813,6 +833,7 @@ mod tests {
             include_str!("../../assets/shaders/cloud-probe.wgsl"),
             include_str!("../../assets/shaders/water-surface.wgsl"),
             include_str!("../../assets/shaders/water-underwater.wgsl"),
+            include_str!("../../assets/shaders/cloud-shadow-map.wgsl"),
         ] {
             assert!(source.contains(common), "cloud shape or lighting differs between passes");
         }
@@ -840,6 +861,7 @@ mod tests {
             include_str!("../../assets/shaders/lightning.wgsl"),
             include_str!("../../assets/shaders/cloud-probe.wgsl"),
             include_str!("../../assets/shaders/water-underwater.wgsl"),
+            include_str!("../../assets/shaders/cloud-shadow-map.wgsl"),
         ] {
             assert!(source.contains(common), "precipitation field differs between passes");
         }

@@ -320,6 +320,9 @@ fn weatherPrecipitation(world_position: vec3<f32>) -> vec4<f32> {
 // RG: smooth fractal / inverted Worley shape; B: fine detail; A: broad weather.
 @group(3) @binding(0) var cloud_noise: texture_3d<f32>;
 @group(3) @binding(1) var cloud_noise_sampler: sampler;
+// Optical depth toward the sun, per sun-ray entry point; see cloudSunShadow.
+@group(3) @binding(4) var cloud_shadow_map: texture_2d<f32>;
+@group(3) @binding(5) var cloud_shadow_sampler: sampler;
 const CLOUD_PI: f32 = 3.14159265;
 const CLOUD_EXTINCTION: f32 = 0.011;
 struct CloudResult {
@@ -404,15 +407,23 @@ fn cloudShadowMultiplier(severity: f32) -> f32 {
     return mix(0.22, 0.05, severity - 2.0);
 }
 
-// Return a bounded interval even when the eye lies inside or above the layer.
-// A horizontal ray is valid only if its origin already lies in the volume.
-fn cloudInterval(origin: vec3<f32>, ray: vec3<f32>, maximum_distance: f32) -> vec2<f32> {
-    // Local bases and tops vary along the ray. Enclose all four weather
-    // profiles so an off-camera front cannot be clipped by the camera layer.
+// The altitudes bounding every local cloud layer: x bottom, y top. Local
+// bases and tops vary with the weather; this encloses all four profiles so an
+// off-camera front cannot be clipped by the camera's own layer.
+fn cloudSlab() -> vec2<f32> {
     let overrides = u32(globals.weather.w);
     let bottom = max(globals.clouds.w - select(450.0, 0.0, (overrides & 4u) != 0u), 100.0);
     let top = globals.clouds.w + select(150.0, 0.0, (overrides & 4u) != 0u)
               + max(globals.cloud_layer.x, 50.0)*select(1.45, 1.0, (overrides & 8u) != 0u);
+    return vec2<f32>(bottom, top);
+}
+
+// Return a bounded interval even when the eye lies inside or above the layer.
+// A horizontal ray is valid only if its origin already lies in the volume.
+fn cloudInterval(origin: vec3<f32>, ray: vec3<f32>, maximum_distance: f32) -> vec2<f32> {
+    let slab = cloudSlab();
+    let bottom = slab.x;
+    let top = slab.y;
     if (abs(ray.y) < 0.00001) {
         if (origin.y <= bottom || origin.y >= top) { return vec2<f32>(0.0); }
         return vec2<f32>(0.0, maximum_distance);
@@ -610,11 +621,15 @@ fn marchClouds(origin: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, q
 
 // The same density projects moving shadows onto land, water and atmospheric
 // samples. Coarse taps deliberately omit fine erosion for a soft solar shadow.
-fn cloudShadow(world_position: vec3<f32>, to_light: vec3<f32>) -> f32 {
-    if (globals.clouds.x < 0.5 || globals.clouds.z <= 0.001
-        || globals.cloud_layer.z <= 0.001 || to_light.y <= 0.0) { return 1.0; }
-    let interval = cloudInterval(world_position, to_light, 65000.0);
-    if (interval.y <= interval.x) { return 1.0; }
+// True when no cloud shadow can apply toward this light.
+fn cloudShadowDisabled(to_light: vec3<f32>) -> bool {
+    return globals.clouds.x < 0.5 || globals.clouds.z <= 0.001
+        || globals.cloud_layer.z <= 0.001 || to_light.y <= 0.0;
+}
+
+// Optical depth through the layer from a point toward the light.
+fn cloudShadowDepth(world_position: vec3<f32>, to_light: vec3<f32>,
+                    interval: vec2<f32>) -> f32 {
     let count = 4u + u32(clamp(globals.cloud_layer.w, 0.0, 2.0));
     let step_length = (interval.y - interval.x)/f32(count);
     var optical_depth = 0.0;
@@ -624,9 +639,94 @@ fn cloudShadow(world_position: vec3<f32>, to_light: vec3<f32>) -> f32 {
         optical_depth += cloudDensityFiltered(world_position + to_light*distance,
                                               false, step_length)*step_length*CLOUD_EXTINCTION;
     }
+    return optical_depth;
+}
+
+fn cloudShadowFromDepth(world_position: vec3<f32>, optical_depth: f32) -> f32 {
     let strength = globals.cloud_layer.z*cloudShadowMultiplier(
         cloudFrontSeverity(world_position.xz));
     return mix(1.0, exp(-optical_depth), clamp(strength, 0.0, 1.0));
+}
+
+fn cloudShadow(world_position: vec3<f32>, to_light: vec3<f32>) -> f32 {
+    if (cloudShadowDisabled(to_light)) { return 1.0; }
+    let interval = cloudInterval(world_position, to_light, 65000.0);
+    if (interval.y <= interval.x) { return 1.0; }
+    return cloudShadowFromDepth(world_position,
+                                cloudShadowDepth(world_position, to_light, interval));
+}
+
+// The cloud shadow map (src/render/cloud_node.rs) is rebuilt every frame.
+// Below the layer, every point on one sun ray has the same interval through
+// it, sampled at the same world positions, so cloudShadowDepth depends only on
+// where that ray enters the layer's lower bound. The map stores that depth per
+// entry point in two camera-centred levels, side by side in one texture: a
+// fine one for the nearby air and a coarse one reaching past the 10 km fog
+// range. Each level snaps to its own texel lattice.
+const CLOUD_SHADOW_MAP_TEXELS: f32 = 1024.0;
+fn cloudShadowMapHalfExtent(level: u32) -> f32 {
+    return select(3072.0, 24576.0, level != 0u);
+}
+
+// The world XZ of texel (0, 0)'s lower corner in a level, for this sun.
+fn cloudShadowMapOrigin(level: u32, to_sun: vec3<f32>) -> vec2<f32> {
+    let slab = cloudSlab();
+    let camera = globals.camera_position.xyz;
+    let reach = (slab.x - min(camera.y, slab.x))/max(to_sun.y, 0.001);
+    let centre = camera.xz + to_sun.xz*reach;
+    let half_extent = cloudShadowMapHalfExtent(level);
+    let texel = 2.0*half_extent/CLOUD_SHADOW_MAP_TEXELS;
+    return floor(centre/texel + vec2<f32>(0.5))*texel - vec2<f32>(half_extent);
+}
+
+// Optical depth and an edge blend weight. Stay inside the texel centres so
+// filtering cannot cross the packed levels; blend over 32 texels to avoid a
+// seam when crossing from the fine level to the coarse one, or out of the map.
+fn cloudShadowMapSample(entry: vec2<f32>, level: u32, to_sun: vec3<f32>) -> vec2<f32> {
+    let texel = 2.0*cloudShadowMapHalfExtent(level)/CLOUD_SHADOW_MAP_TEXELS;
+    let coordinate = (entry - cloudShadowMapOrigin(level, to_sun))/texel - vec2<f32>(0.5);
+    let last = CLOUD_SHADOW_MAP_TEXELS - 1.0;
+    if (any(coordinate < vec2<f32>(0.0)) || any(coordinate > vec2<f32>(last))) {
+        return vec2<f32>(-1.0, 0.0);
+    }
+    let uv = (coordinate + vec2<f32>(0.5 + f32(level)*CLOUD_SHADOW_MAP_TEXELS, 0.5))
+             /vec2<f32>(2.0*CLOUD_SHADOW_MAP_TEXELS, CLOUD_SHADOW_MAP_TEXELS);
+    let edge = min(min(coordinate.x, coordinate.y), min(last - coordinate.x, last - coordinate.y));
+    return vec2<f32>(textureSampleLevel(cloud_shadow_map, cloud_shadow_sampler, uv, 0.0).r,
+                     smoothstep(0.0, 32.0, edge));
+}
+
+// The map's depth for a point, or -1 where it cannot stand in for the march:
+// inside or above the layer, outside both levels, under a sun so low that the
+// march's 65 km limit would clip the interval, or before the first build.
+fn cloudShadowMapDepth(world_position: vec3<f32>, to_sun: vec3<f32>) -> f32 {
+    let slab = cloudSlab();
+    if (world_position.y >= slab.x || slab.y - world_position.y > 65000.0*to_sun.y) {
+        return -1.0;
+    }
+    let entry = world_position.xz + to_sun.xz*((slab.x - world_position.y)/to_sun.y);
+    let fine = cloudShadowMapSample(entry, 0u, to_sun);
+    if (fine.x >= 0.0 && fine.y >= 1.0) { return fine.x; }
+    let coarse = cloudShadowMapSample(entry, 1u, to_sun);
+    var outer_depth = coarse.x;
+    if (outer_depth >= 0.0 && coarse.y < 1.0) {
+        let interval = cloudInterval(world_position, to_sun, 65000.0);
+        let exact = cloudShadowDepth(world_position, to_sun, interval);
+        outer_depth = mix(exact, outer_depth, coarse.y);
+    }
+    if (fine.x >= 0.0) {
+        if (outer_depth >= 0.0) { return mix(outer_depth, fine.x, fine.y); }
+        return fine.x;
+    }
+    return outer_depth;
+}
+
+// cloudShadow toward the sun, reading the shadow map where it applies.
+fn cloudSunShadow(world_position: vec3<f32>, to_sun: vec3<f32>) -> f32 {
+    if (cloudShadowDisabled(to_sun)) { return 1.0; }
+    let mapped = cloudShadowMapDepth(world_position, to_sun);
+    if (mapped >= 0.0) { return cloudShadowFromDepth(world_position, mapped); }
+    return cloudShadow(world_position, to_sun);
 }
 // END SHARED VOLUMETRIC CLOUDS
 

@@ -644,6 +644,10 @@ streamed erosion as the visible geometry. Hills outside the camera view can
 therefore cast shadows and occlude sunlight in the fog. Shadow coverage and fine
 occluder detail remain limited by the map's extent and 12-metre texels, with a
 fade at its outer boundary.
+The GPU also measures the highest terrain in this map. Light rays stop once
+they rise far enough above that bound that every remaining tap is fully lit,
+including the widening penumbra on surface shadows. This skips work without
+changing the visibility computed by the original terrain shadow march.
 
 Volumetric lighting integrates scattering and Beer–Lambert transmittance along
 view rays at half resolution. Height-dependent density concentrates haze near
@@ -668,6 +672,18 @@ The same wind-driven density casts moving shadows over terrain, water and fog.
 Cloud rays stop at opaque geometry, and the volume remains visible when flying
 inside or above it. This is one procedural cloud layer, with a `40 km` maximum
 view-ray distance and a gradual fade near that limit.
+
+Sunlight in the fog, including the fog over water, reuses a cloud shadow map
+rebuilt every frame. It stores optical depth through the cloud layer along
+sun rays in two camera-centred `1024×1024` levels: nearby rays use 6-metre
+texels and distant rays use 48-metre texels, with a smooth transition between
+the levels. Shadow strength still follows the weather at each fog sample.
+Samples inside or above the cloud layer, beyond the map, or under a sun low
+enough to clip the original shadow ray's distance limit use the original
+cloud march. Direct cloud shadows on terrain and water, underwater lighting,
+and moonlight retain their original marches. These optimizations keep the
+existing quality presets, sample budgets, scene resolution, half-resolution
+fog/cloud target and reflection probe resolution.
 
 Water traces reflected rays against the terrain view-position buffer, refines
 depth crossings, and samples the lit scene at each valid hit. This adds visible
@@ -704,7 +720,8 @@ hemisphere kernel, followed by a depth/normal-aware bilateral blur. A separate
 half-resolution atmosphere pass supplies combined fog/cloud scattering and
 transmittance to the lighting composite, which also evaluates terrain, cloud
 and plant shadows and the celestial sky. A cloud sky probe supplies reflection directions
-outside the current view.
+outside the current view, and the cloud shadow map supplies sunlight
+occlusion for fog in the atmosphere and water passes.
 The water surface then samples the opaque scene for refraction and raymarched
 reflections, followed by underwater effects where applicable. FXAA smooths the
 completed scene, and the diagnostics panel draws on top. The G-buffer, AO and

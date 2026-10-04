@@ -17,8 +17,8 @@ use bevy::asset::Handle;
 use bevy::mesh::VertexBufferLayout;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    BindGroup, BindGroupLayoutDescriptor, Buffer, CachedRenderPipelineId, FragmentState,
-    PipelineCache,
+    BindGroup, BindGroupLayoutDescriptor, Buffer, CachedComputePipelineId,
+    CachedRenderPipelineId, ComputePipelineDescriptor, FragmentState, PipelineCache,
     RenderPipelineDescriptor, VertexState,
 };
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
@@ -318,6 +318,11 @@ struct TerrainResources {
     terrain_textures: BindGroup,
     terrain_pipeline: CachedRenderPipelineId,
     heightfield_pipeline: CachedRenderPipelineId,
+    /// Reduces the lighting heightfield to its highest texel.
+    highest_pipeline: CachedComputePipelineId,
+    highest_layout: BindGroupLayoutDescriptor,
+    /// The reduction's result, as the bits of a non-negative f32.
+    highest_buffer: Buffer,
     habitat_pipeline: CachedRenderPipelineId,
     grass_ground_average_pipeline: CachedRenderPipelineId,
     habitat_globals: StageUniform,
@@ -416,6 +421,54 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         pass.set_bind_group(1, &resources.terrain_textures, &[]);
         pass.set_bind_group(2, &resources.levels[0].bind_group, &[]);
         pass.draw(0..3, 0..1);
+        drop(pass);
+
+        // The highest terrain in the map lets the sun-visibility marches stop
+        // once they rise above it. Reduced on the GPU and copied straight into
+        // this frame's globals, so no CPU readback and no stale bound; until
+        // it runs the globals keep TERRAIN_HEIGHT_UNKNOWN and the marches run
+        // in full.
+        if let (Some(highest), Some(globals_buffer), Some(device)) = (
+            pipeline_cache.get_compute_pipeline(resources.highest_pipeline),
+            globals.buffer.as_ref(),
+            world.get_resource::<RenderDevice>(),
+        ) {
+            let group = super::bind_group(
+                device,
+                pipeline_cache,
+                "forest_heightfield_highest",
+                &resources.highest_layout,
+                &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&gbuffer.heightfield_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: resources.highest_buffer.as_entire_binding(),
+                    },
+                ],
+            );
+            let encoder = ctx.command_encoder();
+            encoder.clear_buffer(&resources.highest_buffer, 0, None);
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("forest_heightfield_highest"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(highest);
+                pass.set_bind_group(0, Some(&*group), &[]);
+                let groups = LIGHTING_HEIGHTFIELD_SIZE.div_ceil(16);
+                pass.dispatch_workgroups(groups, groups, 1);
+            }
+            encoder.copy_buffer_to_buffer(
+                &resources.highest_buffer,
+                0,
+                globals_buffer,
+                super::TERRAIN_HEIGHT_OFFSET,
+                4,
+            );
+        }
     }
 
     // A separate one-metre map gives the water a world-space seabed, including
@@ -1322,6 +1375,47 @@ fn prepare_terrain(
         zero_initialize_workgroup_memory: false,
     });
 
+    let highest_layout = BindGroupLayoutDescriptor::new(
+        "forest_heightfield_highest_layout",
+        &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(4),
+                },
+                count: None,
+            },
+        ],
+    );
+    let highest_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("forest_heightfield_highest_pipeline".into()),
+        layout: vec![highest_layout.clone()],
+        immediate_size: 0,
+        shader: shaders.heightfield_max.clone(),
+        shader_defs: vec![],
+        entry_point: Some("reduce_highest".into()),
+        zero_initialize_workgroup_memory: false,
+    });
+    let highest_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("forest_heightfield_highest"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
     let levels: [StageUniform; CLIP_LEVELS] = std::array::from_fn(|_| {
         StageUniform::new(
             device,
@@ -1337,6 +1431,9 @@ fn prepare_terrain(
         terrain_textures,
         terrain_pipeline,
         heightfield_pipeline,
+        highest_pipeline,
+        highest_layout,
+        highest_buffer,
         habitat_pipeline,
         grass_ground_average_pipeline,
         habitat_globals: StageUniform::new(

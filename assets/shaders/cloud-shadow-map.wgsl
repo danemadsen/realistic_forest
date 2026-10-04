@@ -1,6 +1,12 @@
-// Full-sphere cloud-only reflection probe, rendered before the atmosphere.
-// Keep the canonical helper in cloud-functions.wgslinc synchronized; ABI and
-// shared-source regression tests validate all copies.
+// Per-frame cloud shadow map, rendered before the atmosphere: the optical
+// depth toward the sun through the cloud layer, per point where the sun ray
+// enters the layer's lower bound. Two levels sit side by side, each
+// CLOUD_SHADOW_MAP_TEXELS square (see cloudShadowMapDepth). The fog marches
+// read it in place of re-marching the clouds at every step; each texel is the
+// exact cloudShadowDepth of its entry point.
+// Keep the canonical helpers in cloud-functions.wgslinc and
+// precipitation-functions.wgslinc synchronized; ABI and shared-source
+// regression tests validate all copies.
 struct GlobalUniforms {
     view: mat4x4<f32>,            // matView: column-major world->view
     projection: mat4x4<f32>,      // matProjection (standard GL shape, z converted to [0,1] NDC)
@@ -544,14 +550,22 @@ fn vs_main(@builtin(vertex_index) vertex: u32) -> @builtin(position) vec4<f32> {
 
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
-    let uv = position.xy / vec2<f32>(256.0, 128.0);
-    let azimuth = (uv.x - 0.5)*2.0*CLOUD_PI;
-    let elevation = (0.5 - uv.y)*CLOUD_PI;
-    let ray = vec3<f32>(cos(azimuth)*cos(elevation), sin(elevation),
-                        sin(azimuth)*cos(elevation));
-    // Cloud parallax from a water pixel is small relative to the cloud layer;
-    // capturing at sea level also works while the player flies above the clouds.
-    let origin = vec3<f32>(globals.camera_position.x, 0.0, globals.camera_position.z);
-    let clouds = marchClouds(origin, ray, globals.cloud_motion.w, min(globals.cloud_layer.w, 1.0));
-    return vec4<f32>(clouds.scattering, clouds.transmittance);
+    let to_sun = -normalize(globals.sun_direction.xyz);
+    let slab = cloudSlab();
+    // Nothing reads the map unless the sun lights the fog through clouds.
+    if (cloudShadowDisabled(to_sun) || globals.settings_a.x <= 0.01
+        || globals.raymarch.y < 0.5 || globals.atmosphere.w <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    // If even the layer alone exceeds the original ray's distance limit,
+    // every receiver below it takes the exact fallback instead of this map.
+    if (slab.y - slab.x > 65000.0*to_sun.y) { return vec4<f32>(0.0); }
+    let level = select(0u, 1u, position.x >= CLOUD_SHADOW_MAP_TEXELS);
+    let index = floor(position.xy) - vec2<f32>(f32(level)*CLOUD_SHADOW_MAP_TEXELS, 0.0);
+    let texel = 2.0*cloudShadowMapHalfExtent(level)/CLOUD_SHADOW_MAP_TEXELS;
+    let entry = cloudShadowMapOrigin(level, to_sun) + (index + vec2<f32>(0.5))*texel;
+    let origin = vec3<f32>(entry.x, slab.x, entry.y);
+    let interval = cloudInterval(origin, to_sun, 65000.0);
+    if (interval.y <= interval.x) { return vec4<f32>(0.0); }
+    return vec4<f32>(cloudShadowDepth(origin, to_sun, interval), 0.0, 0.0, 1.0);
 }
