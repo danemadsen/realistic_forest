@@ -269,6 +269,62 @@ struct RawPrimitive {
     material: usize,
 }
 
+/// Some impostors provide separate front/back atlas views on overlapping
+/// planes. Their back faces must be culled even if the source material says
+/// double-sided (as the maple saplings do). Unpaired crossed cards still
+/// need both sides. Use the geometry rather than the species or vertex order.
+fn has_paired_billboard_cards(vertices: &[PlantVertex], indices: &[u32]) -> bool {
+    use bevy::math::Vec3;
+
+    struct Card {
+        normal: Vec3,
+        point: Vec3,
+        min: Vec3,
+        max: Vec3,
+    }
+
+    let min_y = vertices.iter().map(|v| v.position[1]).fold(f32::INFINITY, f32::min);
+    let max_y = vertices.iter().map(|v| v.position[1]).fold(f32::NEG_INFINITY, f32::max);
+    // The paired views are occasionally offset slightly during authoring.
+    let tolerance = ((max_y - min_y) * 0.03).max(1e-4);
+    let mut cards: Vec<Card> = Vec::new();
+    for triangle in indices.chunks_exact(3) {
+        let a = Vec3::from_array(vertices[triangle[0] as usize].position);
+        let b = Vec3::from_array(vertices[triangle[1] as usize].position);
+        let c = Vec3::from_array(vertices[triangle[2] as usize].position);
+        let Some(normal) = (b - a).cross(c - a).try_normalize() else {
+            continue;
+        };
+        // Ignore the horizontal crown cap: it has no underside view.
+        if normal.y.abs() > 0.1 {
+            continue;
+        }
+        let min = a.min(b).min(c);
+        let max = a.max(b).max(c);
+        if let Some(card) = cards.iter_mut().find(|card| {
+            normal.dot(card.normal) > 0.9999
+                && normal.dot(a - card.point).abs() <= tolerance
+        }) {
+            card.min = card.min.min(min);
+            card.max = card.max.max(max);
+        } else {
+            cards.push(Card { normal, point: a, min, max });
+        }
+    }
+    cards.len() >= 2 && cards.iter().all(|card| {
+        cards.iter().any(|other| {
+            card.normal.dot(other.normal) < -0.9999
+                && card.normal.dot(other.point - card.point).abs() <= tolerance
+                && card.min.y < other.max.y
+                && other.min.y < card.max.y
+                && card.min.x <= other.max.x + tolerance
+                && other.min.x <= card.max.x + tolerance
+                && card.min.z <= other.max.z + tolerance
+                && other.min.z <= card.max.z + tolerance
+        })
+    })
+}
+
 struct Loader {
     texture_keys: Vec<TextureKey>,
     texture_lookup: HashMap<TextureKey, usize>,
@@ -383,7 +439,10 @@ impl Loader {
                 }) {
                     return Err("non-finite vertex data".into());
                 }
-                let material = self.read_material(&primitive.material(), directory, lod)?;
+                let source_material = primitive.material();
+                let double_sided = source_material.double_sided()
+                    && !(lod == Some(3) && has_paired_billboard_cards(&vertices, &indices));
+                let material = self.read_material(&source_material, directory, lod, double_sided)?;
                 primitives.push(RawPrimitive {
                     vertices,
                     indices,
@@ -402,6 +461,7 @@ impl Loader {
         material: &gltf::Material<'_>,
         directory: &Path,
         lod: Option<u32>,
+        double_sided: bool,
     ) -> Result<usize, String> {
         // Only UV0 is carried; a texture on another set (maple bark's
         // roughness) falls back to the material's constant factor.
@@ -469,10 +529,7 @@ impl Loader {
             } else {
                 0.0
             },
-            // Every card is drawn two-sided: the LOD-3 billboards of several
-            // packs leave doubleSided unset although their crossed planes are
-            // single cards that must read from both sides.
-            double_sided: true,
+            double_sided,
         }))
     }
 }
@@ -1085,6 +1142,46 @@ mod tests {
         let packed = pack_detail(None, None, None);
         assert_eq!((packed.width, packed.height), (1, 1));
         assert_eq!(packed.rgba, vec![128, 128, 255, 255]);
+    }
+
+    #[test]
+    fn billboard_materials_cull_paired_views_and_keep_unpaired_cards_two_sided() {
+        // Read actual geometry, including all three maple saplings whose
+        // source material incorrectly enables both sides. No PNGs decoded.
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/models");
+        let mut loader = Loader {
+            texture_keys: Vec::new(),
+            texture_lookup: HashMap::new(),
+            materials: Vec::new(),
+            material_keys: Vec::new(),
+        };
+        let mut checked = [0usize; 2];
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.extension().is_some_and(|extension| extension == "glb") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|s| s.to_str()).and_then(parse_model_name) else {
+                continue;
+            };
+            if name.lod != Some(3) {
+                continue;
+            }
+            let paired = matches!(name.species, Species::Fir | Species::Oak | Species::Maple);
+            let primitives = loader.read_glb(&path, name.lod).unwrap();
+            for primitive in primitives {
+                assert_eq!(
+                    has_paired_billboard_cards(&primitive.vertices, &primitive.indices),
+                    paired,
+                    "card topology in {}", path.display()
+                );
+                let material = &loader.materials[primitive.material];
+                assert_eq!(material.surface, Surface::Billboard, "{}", path.display());
+                assert_eq!(material.double_sided, !paired, "{}", path.display());
+            }
+            checked[paired as usize] += 1;
+        }
+        assert_eq!(checked, [47, 38]);
     }
 
     /// Loading every model decodes ~150 PNGs; run explicitly with

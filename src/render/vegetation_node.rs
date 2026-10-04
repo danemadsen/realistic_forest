@@ -6,12 +6,12 @@
 //! against the view, picks its LOD and appends it to its model's region of
 //! that LOD's output, counting it straight into the indirect draw arguments.
 //! One indirect draw per (model, LOD, primitive) then renders the lists with a
-//! single pipeline (vegetation.wgsl), between the terrain and the grass so
+//! shared shader (vegetation.wgsl), between the terrain and the grass so
 //! the grass behind a trunk fails the depth test early. The CPU never reads
 //! anything back; a draw whose list came out empty costs almost nothing.
 
 use super::vegetation_shadows::{
-    Cascade, LightBasis, SHADOW_CASCADES, SHADOW_FORMAT, ShadowUniform, VegetationShadowMaps, fit_cascades,
+    Cascade, LightBasis, SHADOW_CASCADES, SHADOW_FORMAT, SHADOW_FRONT_FACE, ShadowUniform, VegetationShadowMaps, fit_cascades,
     light_basis,
 };
 use super::{ExtractedForestView, ForestGlobals, ForestShaderHandles, TerrainStageUniforms, terrain_node};
@@ -197,11 +197,17 @@ struct Draw {
 }
 
 /// Built once, when the library arrives.
+struct MaterialResources {
+    /// Keeps this material's textures alive.
+    bind_group: BindGroup,
+    double_sided: bool,
+}
+
+/// Built once, when the library arrives.
 struct LibraryResources {
     vertices: Buffer,
     indices: Buffer,
-    /// One bind group per material; each keeps its textures alive.
-    materials: Vec<BindGroup>,
+    materials: Vec<MaterialResources>,
     /// In submission order: LOD 0 of every model first, so the nearest,
     /// largest plants lay down depth before the cheaper, farther ones.
     draws: Vec<Draw>,
@@ -213,8 +219,9 @@ struct LibraryResources {
     params: Vec<ModelParams>,
     models: Buffer,
     cull_pipeline: CachedComputePipelineId,
-    draw_pipeline: CachedRenderPipelineId,
-    shadow_pipeline: CachedRenderPipelineId,
+    /// Single-sided, then double-sided, matching each material's flag.
+    draw_pipelines: [CachedRenderPipelineId; 2],
+    shadow_pipelines: [CachedRenderPipelineId; 2],
     canopy_pipeline: CachedRenderPipelineId,
     /// One uniform and bind group per cascade.
     cascade_buffers: Vec<Buffer>,
@@ -342,6 +349,17 @@ fn sampler(device: &RenderDevice, label: &str, address: wgpu::AddressMode, aniso
         mipmap_filter: wgpu::MipmapFilterMode::Linear,
         anisotropy_clamp: anisotropy,
         ..Default::default()
+    })
+}
+
+/// Paired billboard cards already have separate front and back faces. Cull
+/// their backfaces before rasterization so coplanar atlas sides cannot fight
+/// for depth. Ordinary foliage and unpaired cards still draw both sides.
+fn sided_pipelines(cache: &PipelineCache, descriptor: RenderPipelineDescriptor) -> [CachedRenderPipelineId; 2] {
+    [Some(wgpu::Face::Back), None].map(|cull_mode| {
+        let mut descriptor = descriptor.clone();
+        descriptor.primitive.cull_mode = cull_mode;
+        cache.queue_render_pipeline(descriptor)
     })
 }
 
@@ -486,7 +504,7 @@ fn build_library(
                 contents: bytemuck::bytes_of(&uniform),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
-            super::bind_group(
+            let bind_group = super::bind_group(
                 device,
                 cache,
                 "vegetation_material",
@@ -509,7 +527,8 @@ fn build_library(
                         resource: buffer.as_entire_binding(),
                     },
                 ],
-            )
+            );
+            MaterialResources { bind_group, double_sided: material.double_sided }
         })
         .collect();
 
@@ -672,7 +691,7 @@ fn build_library(
         },
     ];
     let draw_globals_layout = super::globals_layout();
-    let draw_pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
+    let draw_pipelines = sided_pipelines(cache, RenderPipelineDescriptor {
         label: Some("forest_vegetation_pipeline".into()),
         layout: vec![draw_globals_layout.clone(), frame_layout.clone(), material_layout.clone()],
         immediate_size: 0,
@@ -682,12 +701,7 @@ fn build_library(
             entry_point: Some("vs_main".into()),
             buffers: vertex_buffers.clone(),
         },
-        // Every card is two-sided; trunks are closed, so their back faces
-        // never pass the depth test anyway.
-        primitive: wgpu::PrimitiveState {
-            cull_mode: None,
-            ..Default::default()
-        },
+        primitive: wgpu::PrimitiveState::default(),
         depth_stencil: Some(wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: Some(true),
@@ -726,7 +740,7 @@ fn build_library(
             std::mem::size_of::<CascadeUniform>() as u64,
         )],
     );
-    let shadow_pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
+    let shadow_pipelines = sided_pipelines(cache, RenderPipelineDescriptor {
         label: Some("forest_vegetation_shadow_pipeline".into()),
         layout: vec![cascade_layout.clone(), frame_layout.clone(), material_layout],
         immediate_size: 0,
@@ -737,7 +751,7 @@ fn build_library(
             buffers: vertex_buffers,
         },
         primitive: wgpu::PrimitiveState {
-            cull_mode: None,
+            front_face: SHADOW_FRONT_FACE,
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {
@@ -857,8 +871,8 @@ fn build_library(
         params,
         models,
         cull_pipeline,
-        draw_pipeline,
-        shadow_pipeline,
+        draw_pipelines,
+        shadow_pipelines,
         canopy_pipeline,
         cascade_buffers,
         cascade_groups,
@@ -1138,12 +1152,13 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
     let Some(snapshot) = resources.snapshot.as_ref() else {
         return;
     };
-    let (Some(cull_pipeline), Some(draw_pipeline)) = (
+    let (Some(cull_pipeline), [Some(single_sided), Some(double_sided)]) = (
         cache.get_compute_pipeline(library.cull_pipeline),
-        cache.get_render_pipeline(library.draw_pipeline),
+        library.draw_pipelines.map(|pipeline| cache.get_render_pipeline(pipeline)),
     ) else {
         return;
     };
+    let draw_pipelines = [single_sided, double_sided];
 
     // Shadows, when wanted and possible this frame.
     let camera = [
@@ -1151,9 +1166,11 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
         globals.globals.camera_position[1],
         globals.globals.camera_position[2],
     ];
+    let shadow_pipelines = library.shadow_pipelines.map(|pipeline| cache.get_render_pipeline(pipeline));
+    let shadow_pipelines = shadow_pipelines[0].zip(shadow_pipelines[1]).map(|(single, double)| [single, double]);
     let shadows = shadow_targets
         .filter(|targets| targets.resolution > 1 && view.settings.vegetation_shadows)
-        .zip(cache.get_render_pipeline(library.shadow_pipeline))
+        .zip(shadow_pipelines)
         .zip(shadowing_light(&globals.globals))
         .map(|((targets, pipeline), (direction, moon))| {
             let light = light_basis(direction);
@@ -1303,7 +1320,6 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_render_pipeline(draw_pipeline);
         pass.set_bind_group(0, &library.draw_globals, &[]);
         pass.set_bind_group(1, &snapshot.frame_group, &[]);
         pass.set_vertex_buffer(0, library.vertices.slice(..));
@@ -1311,7 +1327,9 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
         for &(index, offset) in &snapshot.active {
             let draw = &library.draws[index];
             let region = snapshot.region_bytes[draw.model as usize];
-            pass.set_bind_group(2, &library.materials[draw.material], &[]);
+            let material = &library.materials[draw.material];
+            pass.set_render_pipeline(draw_pipelines[usize::from(material.double_sided)]);
+            pass.set_bind_group(2, &material.bind_group, &[]);
             pass.set_vertex_buffer(1, snapshot.visible.slice(offset..offset + region));
             pass.draw_indexed_indirect(&library.args, draw.args_offset);
         }
@@ -1349,7 +1367,7 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
         resources.canopy_stamp = Some(stamp);
     }
 
-    let Some((targets, shadow_pipeline, light, cascades, moon)) = shadows else {
+    let Some((targets, shadow_pipelines, light, cascades, moon)) = shadows else {
         return;
     };
     for (index, layer) in targets.layer_views.iter().enumerate() {
@@ -1368,7 +1386,6 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_render_pipeline(shadow_pipeline);
         pass.set_bind_group(0, &library.cascade_groups[index], &[]);
         pass.set_bind_group(1, &snapshot.frame_group, &[]);
         pass.set_vertex_buffer(0, library.vertices.slice(..));
@@ -1376,7 +1393,9 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
         for &(draw_index, offset) in &snapshot.shadow_active[index] {
             let draw = &library.shadow_draws[draw_index];
             let region = snapshot.region_bytes[draw.model as usize];
-            pass.set_bind_group(2, &library.materials[draw.material], &[]);
+            let material = &library.materials[draw.material];
+            pass.set_render_pipeline(shadow_pipelines[usize::from(material.double_sided)]);
+            pass.set_bind_group(2, &material.bind_group, &[]);
             pass.set_vertex_buffer(1, snapshot.visible.slice(offset..offset + region));
             pass.draw_indexed_indirect(&library.args, draw.args_offset);
         }

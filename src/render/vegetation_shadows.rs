@@ -32,6 +32,9 @@ pub const CASTER_REACH: f32 = 680.0;
 pub const CASCADE_BLEND: f32 = 0.12;
 /// Format of the depth array.
 pub const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// The light basis projects along +Z, with right × up = forward. A face
+/// pointing toward the light therefore winds clockwise in shadow clip XY.
+pub const SHADOW_FRONT_FACE: wgpu::FrontFace = wgpu::FrontFace::Cw;
 
 /// An orthonormal frame looking along the light: `forward` is the direction
 /// the light travels.
@@ -303,6 +306,63 @@ mod tests {
             crate::matrices::view_matrix(eye, eye + look, Vec3::Y),
             crate::matrices::perspective(68.0, 16.0 / 9.0, 0.1, 5800.0),
         )
+    }
+
+    #[test]
+    fn light_facing_triangles_keep_the_shadow_front_face() {
+        let eye = Vec3::new(812.5, 64.0, -2210.25);
+        let (view, projection) = camera(eye, Vec3::new(0.3, -0.25, -1.0).normalize());
+        let signed_area = |matrix: &[f32; 16], triangle: [Vec3; 3]| {
+            let projected = triangle.map(|vertex| {
+                let clip = transform(matrix, vertex.to_array());
+                Vec2::new(clip[0], clip[1]) / clip[3]
+            });
+            (projected[1] - projected[0]).perp_dot(projected[2] - projected[0])
+        };
+        // Include the alternate reference axis used for overhead sunlight,
+        // either horizon direction, and a light coming from below the view.
+        for direction in [
+            [-0.22, -0.62, 0.76],
+            [0.4, -0.5, 0.3],
+            [0.0, -1.0, 0.0],
+            [0.001, -1.0, -0.001],
+            [0.0, 1.0, 0.0],
+            [0.6, 0.7, -0.2],
+            [0.0, 0.0, -1.0],
+            [0.0, 0.0, 1.0],
+        ] {
+            let light = light_basis(direction);
+            let toward_light = -Vec3::from_array(light.forward);
+            let reference = if toward_light.y.abs() > 0.9 { Vec3::X } else { Vec3::Y };
+            let tangent = reference.cross(toward_light).normalize();
+            let bitangent = toward_light.cross(tangent);
+            for cascade in fit_cascades(&view, &projection, eye.to_array(), &light) {
+                let centre = Vec3::from_array(light.right) * cascade.centre[0]
+                    + Vec3::from_array(light.up) * cascade.centre[1]
+                    + Vec3::from_array(light.forward) * (0.5 * (cascade.near + cascade.far));
+                let size = cascade.half_extent * 0.125;
+                let triangle = [
+                    centre - (tangent + bitangent) * size,
+                    centre + (tangent - bitangent) * size,
+                    centre + bitangent * size,
+                ];
+                // This is the authored front: its geometric normal faces
+                // the light source, before either projection transforms it.
+                assert!((triangle[1] - triangle[0]).cross(triangle[2] - triangle[0]).dot(toward_light) > 0.0);
+                let area = signed_area(&cascade.view_projection, triangle);
+                assert!(area.abs() > 1e-4, "degenerate projected triangle for {direction:?}");
+                let front_face = if area > 0.0 { wgpu::FrontFace::Ccw } else { wgpu::FrontFace::Cw };
+                assert_eq!(front_face, SHADOW_FRONT_FACE, "light {direction:?}");
+
+                // The ordinary camera looks down -Z, so the same front
+                // winds the other way when seen from the light's position.
+                let camera_view = crate::matrices::view_matrix(
+                    centre + toward_light * (size * 4.0), centre, reference,
+                );
+                let camera_clip = crate::matrices::mul_m4(&projection, &camera_view);
+                assert!(signed_area(&camera_clip, triangle) > 0.0, "camera winding for {direction:?}");
+            }
+        }
     }
 
     #[test]

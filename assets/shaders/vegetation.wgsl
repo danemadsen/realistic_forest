@@ -5,8 +5,9 @@
 // ground is; foliage carries a translucency mask in the position alpha that
 // the composite's canopy lighting reads, as the grass does.
 //
-// `vs_shadow`/`fs_shadow` draw the same plants, bent by the same wind, into
-// the shadow cascades: depth only, alpha-tested, from the light.
+// `vs_shadow`/`fs_shadow` draw the same plants into the shadow cascades:
+// depth only, alpha-tested, from the light. Mesh LODs share the view's wind
+// deformation; LOD-3 billboards stay static in both passes.
 // `vs_canopy`/`fs_canopy` lay every tree's crown, seen from above, over the
 // grass capture so the grass thins in the shade under the trees.
 
@@ -119,7 +120,7 @@ fn crownProfile(model: ModelParams, y: f32) -> f32 {
 }
 
 // Where a vertex of a placed plant ends up in the world: the plant's own
-// lean, its yaw and scale, then the wind.
+// lean, its yaw and scale, then the wind for mesh LODs only.
 fn placeVertex(model: ModelParams, position: vec3<f32>, normal: vec3<f32>, root: vec3<f32>,
                scale: f32, yaw: f32, seed: f32) -> vec3<f32> {
     let kind = material.surface.x;
@@ -136,6 +137,13 @@ fn placeVertex(model: ModelParams, position: vec3<f32>, normal: vec3<f32>, root:
     let c = cos(yaw);
     let s = sin(yaw);
     var offset = yawRotate(local, c, s) * scale;
+
+    // LOD-3 billboards keep their baked silhouette. Bending or fluttering
+    // their crossed cards makes the alpha-tested vegetation flicker.
+    // Both the view and shadow passes use this static placement.
+    if (kind > 1.5) {
+        return root + offset;
+    }
 
     // Wind. Gusts sweep downwind across the canopy, so neighbours bow
     // together; each stem then sways at a rate set by its height (tall trees

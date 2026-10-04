@@ -452,8 +452,12 @@ cross-fades through a screen-door dither, each plant at a slightly different
 distance, so no ring of popping trees follows the camera. Trees are drawn to
 2 km, bushes and lilacs to between 160 and 900 metres depending on their size,
 broadleaf plants to 170 m and lavender to 230 m, each dissolving out at its
-edge. Wind from the weather bends every stem from its root, with gusts
-sweeping across the canopy and leaves fluttering at the crown's rim.
+edge. Wind from the weather bends stems in the mesh LODs from their roots,
+with gusts sweeping across the canopy and leaves fluttering at the crown's
+rim. LOD3 billboards stay static in both the view and shadow passes.
+Billboards with separate front and back cards cull their backfaces in both
+passes, preventing overlapping atlas faces from flashing dark as the camera
+moves. Billboards made of single crossed cards remain two-sided.
 
 Plants are lit by the same composite as the ground, with terrain, cloud and
 volumetric lighting. Foliage shades as one rounded crown rather than a stack
