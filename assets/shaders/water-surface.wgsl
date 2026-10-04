@@ -2338,8 +2338,14 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
 
     let extinction = mix(RIVER_EXTINCTION, LAKE_EXTINCTION, stillness);
     let backscatter = mix(RIVER_SCATTER, LAKE_SCATTER, stillness);
-    // Rapids turn milky even where no foam lies on top.
-    let aeration = smoothstepf(0.3, 0.9, turbulence)*0.6;
+    // Whitewater gathers where the bed steps: over the ledges and boulders
+    // of a rapid, with dark glassy tongues of water running between them.
+    // The steps stay put as the water runs over them.
+    let steps = smoothstepf(0.25, 0.75,
+                            valueNoise(vec2<f32>(along/(2.5*max(half_width, 0.6)), across*1.7 + 3.1)));
+    // Rapids turn milky below each step, where the water plunges and fills
+    // with bubbles, and run clear over the smooth tongues between.
+    let aeration = smoothstepf(0.3, 0.9, turbulence)*mix(0.15, 0.7, steps);
     let sigma_t = extinction + vec3<f32>(BUBBLE_SCATTER*aeration);
     let sigma_s = backscatter + vec3<f32>(0.5*BUBBLE_SCATTER*aeration);
     // The eye's ray bends down into the water, so it crosses the column far
@@ -2392,13 +2398,12 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     var lit = mix(body, reflected, fresnel) + specular*sun_colour + moon_specular*moon_colour;
 
     // --- Whitewater and foam ------------------------------------------------
-    let foam_stretch = select(1.0, 1.0 + 2.5*smoothstepf(0.3, 1.5, speed), river);
+    // Foam on a run is drawn out along the current; churned in a rapid it
+    // breaks into short ragged patches.
+    let foam_stretch = select(1.0, 1.0 + 2.5*smoothstepf(0.3, 1.5, speed)*(1.0 - 0.75*turbulence), river);
     let pattern = riverFoamPattern(st, flow, foam_stretch, time, footprint);
-    // Whitewater where the bed breaks the surface: over the steps and
-    // boulders of a rapid, with dark glassy tongues of water between them.
-    // The steps stay put as the water runs over them.
-    let steps = valueNoise(vec2<f32>(along/(2.5*max(half_width, 0.6)), across*1.7 + 3.1));
-    let whitewater = smoothstepf(0.35, 0.85, turbulence)*mix(0.2, 0.85, smoothstepf(0.25, 0.75, steps));
+    // Whitewater where the bed breaks the surface, below the steps.
+    let whitewater = smoothstepf(0.35, 0.85, turbulence)*mix(0.15, 0.8, steps);
     // Flecks on the faces of a riffle's standing waves.
     let flecks = water_surface.crest*riffle*0.5;
     // Foam the whitewater upstream made drifts down as a thin lace, gathered

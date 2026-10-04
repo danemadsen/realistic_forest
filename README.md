@@ -681,7 +681,15 @@ stair-steps are smoothed out and the path settled back onto the lowest ground
 across it. Its bends are the land's own, so a lowland creek wanders over its
 floodplain while a mountain stream keeps to the bottom of its V. A tributary
 runs until it reaches its parent's channel, wherever the ground brings it
-there; its corridor reaches the parent's actual course. Where water seems held
+there; its corridor reaches the parent's actual course. A course that comes
+down beside a river already there (two streams settling onto one valley
+floor) joins it where they first meet, rather than running on alongside it
+in a channel of its own. A tributary arrives at its parent's level, as real
+confluences do, its mouth drowned in the parent's water and calm: over its
+last metres it stands at that level and above them rises at most 3 cm per
+metre, its channel cut down for it (a gorge where it comes down a steep
+valley side, and no more than 2.5 m farther up, where any steeper water
+stays as rapids). Where water seems held
 in a basin it could in fact leave, the corridor was too narrow to show its
 way: a basin that drains to the sea through a gap the coarse grid missed
 sends its river out through that gap, and any other is routed again through

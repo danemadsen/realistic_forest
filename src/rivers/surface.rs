@@ -223,7 +223,8 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
         }
     };
     let sheets = Sheets::new(lakes);
-    for river in rivers {
+    let seas = sea_blends(rivers);
+    for (river, &(sea_share, sea_along)) in rivers.iter().zip(&seas) {
         let nodes = &river.nodes;
         // A river's surface runs on past where its own water ends, sunk
         // under the still water it meets, so it never ends in an edge: one
@@ -232,12 +233,7 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
         let last = nodes.len().saturating_sub(1);
         // Where a river's water comes down to the sea's level: the coast,
         // from which the sea's own surface fills its mouth.
-        let coast = (river.end == RiverEnd::Sea)
-            .then(|| nodes.iter().position(|n| n.water <= SEA_LEVEL + 0.03))
-            .flatten()
-            .unwrap_or(river.surface_end)
-            .min(river.surface_end)
-            .max(1);
+        let coast = coast_of(river);
         let (end, sink) = match river.end {
             // One node on, tucked just under the sea.
             RiverEnd::Sea => ((coast + 1).min(last), 0.0),
@@ -334,14 +330,10 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
             // still water it meets (the sea, its parent); and water standing
             // at the sea's level is the sea's, drawn by the sea itself.
             let mut water = if i > river.surface_end { node.water - sink } else { node.water };
-            let sea = if river.end == RiverEnd::Sea {
-                if i > coast {
-                    water = water.min(SEA_LEVEL - UNDER_SEA);
-                }
-                1.0 - smoothstep(0.0, SEA_BLEND, nodes[coast].along - node.along)
-            } else {
-                0.0
-            };
+            if river.end == RiverEnd::Sea && i > coast {
+                water = water.min(SEA_LEVEL - UNDER_SEA);
+            }
+            let sea = sea_share * (1.0 - smoothstep(0.0, SEA_BLEND, sea_along - node.along));
             let still = 1.0 - smoothstep(0.0, LIFT_FADE, from_still[i]);
             let row = vertices.len() as u32;
             let mut hidden = true;
@@ -412,6 +404,58 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
         indices,
         chunks,
     }
+}
+
+/// Where a river to the sea comes down to the sea's level: the coast, from
+/// which the sea's own surface fills its mouth.
+fn coast_of(river: &River) -> usize {
+    (river.end == RiverEnd::Sea)
+        .then(|| river.nodes.iter().position(|n| n.water <= SEA_LEVEL + 0.03))
+        .flatten()
+        .unwrap_or(river.surface_end)
+        .min(river.surface_end)
+        .max(1)
+}
+
+/// How far each river's water has turned to the sea's at each node: all of
+/// it at a river's coast, fading over `SEA_BLEND` metres up it, and a
+/// tributary joining it there takes on what its parent has at the
+/// confluence, fading the same way up the tributary, so no seam of colour
+/// crosses the water where they meet. Per river: the share at its end
+/// (the coast, or the confluence), and how far along the river that is.
+fn sea_blends(rivers: &[River]) -> Vec<(f32, f32)> {
+    let mut ends: Vec<Option<(f32, f32)>> = vec![None; rivers.len()];
+    fn resolve(rivers: &[River], ends: &mut Vec<Option<(f32, f32)>>, index: usize, depth: usize) -> (f32, f32) {
+        if let Some(end) = ends[index] {
+            return end;
+        }
+        let river = &rivers[index];
+        let Some(last) = river.nodes.last() else {
+            return (0.0, 0.0);
+        };
+        let end = match river.end {
+            RiverEnd::Sea => (1.0, river.nodes[coast_of(river).min(river.nodes.len() - 1)].along),
+            RiverEnd::Confluence(parent, _) if depth < 8 && parent < rivers.len() => {
+                let (share, along) = resolve(rivers, ends, parent, depth + 1);
+                // The parent's node nearest where the tributary ends.
+                let here = rivers[parent]
+                    .nodes
+                    .iter()
+                    .min_by(|a, b| {
+                        let d = |n: &&super::network::RiverNode| {
+                            (n.position[0] - last.position[0]).hypot(n.position[1] - last.position[1])
+                        };
+                        d(a).total_cmp(&d(b))
+                    })
+                    .map_or(f32::NEG_INFINITY, |n| n.along);
+                (share * (1.0 - smoothstep(0.0, SEA_BLEND, along - here)), last.along)
+            }
+            _ => (0.0, last.along),
+        };
+        ends[index] = Some(end);
+        end
+    }
+    (0..rivers.len()).map(|index| resolve(rivers, &mut ends, index, 0)).collect()
 }
 
 /// A lake's sheet: a quad over every flow-grid cell of its water and of its

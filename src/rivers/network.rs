@@ -1532,6 +1532,48 @@ fn fit_falling(raw: &[f32], ground: &[f32], s: &[f64]) -> Vec<f32> {
     fitted
 }
 
+/// A tributary arrives at its parent's level: over its last `JUNCTION_FLAT`
+/// metres it stands at it, and above that it may rise at most
+/// `JUNCTION_GRADE` per metre, cutting its channel down to it as far as
+/// `JUNCTION_CUT` under its own profile, and deeper toward the confluence
+/// (`JUNCTION_DEEPENING` more per metre over the last `JUNCTION_GORGE`).
+const JUNCTION_FLAT: f32 = 6.0;
+const JUNCTION_GRADE: f32 = 0.03;
+const JUNCTION_CUT: f32 = 2.5;
+const JUNCTION_GORGE: f32 = 20.0;
+const JUNCTION_DEEPENING: f32 = 0.4;
+
+/// Grade a tributary's water down to its parent's at their confluence, so
+/// the two meet level as real confluences do, the tributary's mouth drowned
+/// in its parent's water, rather than the tributary tumbling into the
+/// parent over its last metres. Its channel is cut down into the ground for
+/// it, a gorge where it comes down a steep valley side; farther up the cut
+/// is held to `JUNCTION_CUT` and the steeper water stays there, as rapids.
+fn grade_to_parent(water: &mut [f32], s: &[f64], floor: &[f32], level: f32) {
+    let n = water.len();
+    let end = s[n - 1];
+    for i in 0..n {
+        let run = (end - s[i]) as f32;
+        let chord = level + JUNCTION_GRADE * (run - JUNCTION_FLAT).max(0.0);
+        let cut = JUNCTION_CUT + JUNCTION_DEEPENING * (JUNCTION_GORGE - run).max(0.0);
+        water[i] = water[i].min(chord.max(water[i] - cut)).max(level).max(floor[i]);
+    }
+}
+
+/// The water surface's slope at each point over a few channel widths.
+fn reach_slopes(points: &[PathPoint], s: &[f64], water: &[f32]) -> Vec<f32> {
+    let n = water.len();
+    (0..n)
+        .map(|i| {
+            let width = 2.0 * half_width(points[i].area as f32) as f64;
+            let span = (width * 4.0).max(24.0);
+            let a = s.partition_point(|&v| v < s[i] - span).min(n - 1);
+            let b = s.partition_point(|&v| v <= s[i] + span).saturating_sub(1).max(a);
+            if b > a { ((water[a] - water[b]) / (s[b] - s[a]) as f32).max(4e-4) } else { 4e-4 }
+        })
+        .collect()
+}
+
 /// The least a smoothed water surface keeps under the ground beside it.
 const SMOOTHING_FREEBOARD: f32 = 0.1;
 
@@ -1631,14 +1673,7 @@ fn water_profile(noise: &NoiseField, points: Vec<PathPoint>, end_level: Option<f
         if let Some(shore) = shore {
             grade_to_sea(&mut water, &s, &floor, shore);
         }
-        // Reach slope over a few channel widths.
-        for i in 0..n {
-            let width = 2.0 * half_width(points[i].area as f32) as f64;
-            let span = (width * 4.0).max(24.0);
-            let a = s.partition_point(|&v| v < s[i] - span).min(n - 1);
-            let b = s.partition_point(|&v| v <= s[i] + span).saturating_sub(1).max(a);
-            slope[i] = if b > a { ((water[a] - water[b]) / (s[b] - s[a]) as f32).max(4e-4) } else { 4e-4 };
-        }
+        slope = reach_slopes(&points, &s, &water);
     }
     // Smooth the surface; a positive kernel keeps it falling downstream.
     // Smoothing rounds a steep drop off on both sides, lifting the water at
@@ -1655,9 +1690,15 @@ fn water_profile(noise: &NoiseField, points: Vec<PathPoint>, end_level: Option<f
     if let Some(shore) = shore {
         grade_to_sea(&mut water, &s, &floor, shore);
     }
+    if let Some(level) = end_level {
+        grade_to_parent(&mut water, &s, &floor, level);
+    }
     for i in 1..n {
         water[i] = water[i].min(water[i - 1]);
     }
+    // The reach slope of the surface as it finally stands: graded down to
+    // the sea or a parent, a river runs calm into it.
+    let slope = reach_slopes(&points, &s, &water);
     Profiled { points, s, water, slope }
 }
 
@@ -2009,6 +2050,8 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
     // Tributaries read their parent's finished centreline.
     let mut rivers: Vec<Option<River>> = vec![None; paths.len()];
     let mut lakes = Lakes::default();
+    // The rivers built so far, node by node, by `JOIN_CELL` cell.
+    let mut built: std::collections::HashMap<[i64; 2], Vec<(usize, usize)>> = Default::default();
     for &index in &order {
         let path = &paths[index];
         let mut coarse: Vec<PathPoint> = path
@@ -2093,8 +2136,8 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
                 },
             }
         };
-        let end = if to_sea { RiverEnd::Sea } else { path.end };
-        let parent = parent.filter(|_| !to_sea);
+        let mut end = if to_sea { RiverEnd::Sea } else { path.end };
+        let mut parent = parent.filter(|_| !to_sea);
         let Some(flow) = flow else {
             continue;
         };
@@ -2114,6 +2157,15 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
                 area: coarse[j].area,
                 lake: f64::NEG_INFINITY,
             });
+        }
+        // Where its course comes down beside a river already there (two
+        // streams settling onto one valley floor), the water has joined it:
+        // it ends there as that river's tributary rather than running on in a
+        // channel of its own alongside, which would fold the two together.
+        if let Some((k, other)) = joins_early(&points, &rivers, &built, index, |p| lakes.level_at(p)) {
+            points.truncate(k + 1);
+            end = RiverEnd::Confluence(other, 0);
+            parent = rivers[other].as_ref().map(|river| (other, river));
         }
         let mut end_level = None;
         if let Some((_, parent_river)) = parent {
@@ -2200,6 +2252,15 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
         if end == RiverEnd::Sea {
             mouths.push((nodes[surface_end].along, 0.5, 8.0, 15.0, true));
         }
+        // A tributary backed up to its parent's level runs calm into it: its
+        // mouth is drowned in the parent's water, with no rapids at the join.
+        if matches!(end, RiverEnd::Confluence(..)) {
+            let level = nodes[nodes.len() - 1].water;
+            for node in nodes.iter_mut() {
+                let backed = 1.0 - smoothstep(0.02, 0.3, node.water - level);
+                node.turbulence *= 1.0 - 0.8 * backed;
+            }
+        }
         for node in nodes.iter_mut() {
             let (t, spread, sea) = mouths.iter().fold((0.0f32, 0.0f32, false), |best, &(at, spread, reach, least, sea)| {
                 let reach = (reach * node.half_width).max(least);
@@ -2213,6 +2274,13 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
             node.speed *= 1.0 - 0.6 * calm;
             node.turbulence *= 1.0 - calm;
             node.depth *= if sea { 1.0 + 0.25 * t } else { 1.0 - 0.6 * spread * t };
+        }
+        for (k, node) in nodes.iter().enumerate() {
+            let cell = [
+                (node.position[0] as f64 / JOIN_CELL).floor() as i64,
+                (node.position[1] as f64 / JOIN_CELL).floor() as i64,
+            ];
+            built.entry(cell).or_default().push((index, k));
         }
         rivers[index] = Some(River {
             nodes,
@@ -2695,6 +2763,62 @@ fn sheet_current(segments: &[RiverSegment], grid: &SegmentGrid, lake: &Lake) -> 
 }
 
 /// The node of `river` nearest `p` and the nearest point on its centreline.
+/// Side of the cells the rivers already built are indexed by, metres.
+const JOIN_CELL: f64 = 16.0;
+/// A course this many metres or more past a river's waterline has not
+/// reached it (its own half width is added).
+const JOIN_REACH: f64 = 1.5;
+
+/// The first point of a course (past its first few, where a stream may
+/// spring beside another) that comes within reach of the channel of a river
+/// built before it, outside any lake, and that river: where the water joins
+/// it. Nearest the head wins, so a stream that settles beside another joins
+/// it where they first meet.
+fn joins_early(
+    points: &[PathPoint],
+    rivers: &[Option<River>],
+    built: &std::collections::HashMap<[i64; 2], Vec<(usize, usize)>>,
+    own: usize,
+    lake_at: impl Fn([f64; 2]) -> f64,
+) -> Option<(usize, usize)> {
+    for (k, point) in points.iter().enumerate().skip(4) {
+        let p = point.p;
+        if lake_at(p).is_finite() {
+            continue;
+        }
+        let reach = half_width(point.area as f32) as f64 + JOIN_REACH;
+        let cell = [(p[0] / JOIN_CELL).floor() as i64, (p[1] / JOIN_CELL).floor() as i64];
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                let Some(list) = built.get(&[cell[0] + dx, cell[1] + dz]) else {
+                    continue;
+                };
+                for &(river, node) in list {
+                    if river == own {
+                        continue;
+                    }
+                    let Some(other) = rivers[river].as_ref() else {
+                        continue;
+                    };
+                    let a = &other.nodes[node];
+                    if a.lake || node > other.surface_end {
+                        continue;
+                    }
+                    let b = &other.nodes[(node + 1).min(other.nodes.len() - 1)];
+                    let (pa, pb) = ([a.position[0] as f64, a.position[1] as f64], [b.position[0] as f64, b.position[1] as f64]);
+                    let ab = [pb[0] - pa[0], pb[1] - pa[1]];
+                    let t = (((p[0] - pa[0]) * ab[0] + (p[1] - pa[1]) * ab[1]) / (ab[0] * ab[0] + ab[1] * ab[1]).max(1e-9)).clamp(0.0, 1.0);
+                    let q = [pa[0] + ab[0] * t, pa[1] + ab[1] * t];
+                    if distance(p, q) <= a.half_width.max(b.half_width) as f64 + reach {
+                        return Some((k, river));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn nearest_on_river(river: &River, p: [f64; 2]) -> (usize, [f64; 2]) {
     let mut best = (0usize, [0.0, 0.0], f64::INFINITY);
     for i in 0..river.nodes.len().saturating_sub(1) {
