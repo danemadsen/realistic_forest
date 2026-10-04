@@ -40,15 +40,15 @@ by naga at runtime either way.
 | Left Shift | Descend while flying |
 | Left Control | Movement boost |
 | V | Toggle flight |
-| F2 | Open or close the developer menu; release the cursor while open, capture it on close |
-| F3 | Toggle the debug text overlay |
+| 2 | Open or close the developer menu; release the cursor while open, capture it on close |
+| 3 | Toggle the debug text overlay |
 | F12 | Save a timestamped screenshot |
 | Escape | Release the cursor |
 | Left click | Capture the cursor again |
 
 Movement is unbounded in both walking and flight modes.
 
-The developer menu opens at the top left with F2 and leaves no launcher or
+The developer menu opens at the top left with 2 and leaves no launcher or
 overlay when closed. Its movement tools teleport to exact XYZ coordinates
 (automatically enabling flight), place the player on the ground at the entered
 XZ coordinates (ignoring Y), return to spawn, place the player on the ground
@@ -56,7 +56,7 @@ here, or rise 100 m. Movement speed is adjustable from 0.1× to 20×, and **Copy
 XYZ** copies the current position. Rendering shortcuts sit alongside the weather
 and time controls; click **Advanced controls** to expand them inside the same menu.
 
-F3 independently toggles a passive, plain text overlay at the top left, outside
+3 independently toggles a passive, plain text overlay at the top left, outside
 the developer menu. It reports FPS and frame timing, player XYZ, view direction,
 yaw and pitch, movement and ground state, time, weather, erosion, and vegetation.
 
@@ -629,7 +629,7 @@ permanent channels from rills and hillslopes, and shallow water velocities are
 gated when estimating transport strength.
 
 The flow output
-remains available for later river geometry. Open the developer menu with F2,
+remains available for later river geometry. Open the developer menu with 2,
 click **Advanced controls**, and enable **Flow visualization** to inspect
 it on the terrain, or expand **Flow output** to inspect the cached target. Erosion
 parameters can be edited from the same panel and applied with **Regenerate

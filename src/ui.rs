@@ -1,4 +1,4 @@
-//! F3 passive debug text, F2 developer controls, and screen-space overlays.
+//! 3 toggles passive debug text; 2 opens developer controls.
 //!
 //! Debug text uses logical egui points and never captures input. The trainer
 //! owns all interactive controls, including the advanced terrain/rendering
@@ -427,7 +427,7 @@ fn draw_trainer_window(
     } else {
         ctx.content_rect().top() + 12.0
     };
-    egui::Window::new("Developer menu [F2]")
+    egui::Window::new("Developer menu [2]")
         .id(egui::Id::new("developer_menu"))
         .anchor(
             egui::Align2::LEFT_TOP,
@@ -536,7 +536,7 @@ fn draw_trainer_window(
                     rerun,
                 );
             }
-            ui.small("F2 close menu  |  F3 debug text  |  F12 screenshot");
+            ui.small("2 close menu  |  3 debug text  |  F12 screenshot");
         });
     settings.show_trainer = open;
     if player.position != previous_position {
@@ -873,7 +873,7 @@ fn draw_advanced_controls(
     ui.label("WASD move  |  mouse look");
     ui.label("Space jump/up  |  Shift down");
     ui.label("V flight  |  Ctrl boost");
-    ui.label("F2 dev menu  |  F3 debug text  |  Esc release cursor");
+    ui.label("2 dev menu  |  3 debug text  |  Esc release cursor");
     // The C++ printed the noise texture's own dimensions, which are
     // NOISE_RESOLUTION square by construction.
     ui.weak(format!(

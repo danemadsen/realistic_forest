@@ -39,6 +39,7 @@ use bevy::render::view::window::screenshot::{Screenshot, ScreenshotCaptured};
 use bevy::render::view::Msaa;
 use bevy::render::RenderPlugin;
 use bevy::window::{CursorOptions, PrimaryWindow, WindowResolution};
+use bevy_egui::input::EguiWantsInput;
 use bevy_egui::{EguiPlugin, EguiPostUpdateSet, EguiPrimaryContextPass};
 use std::path::Path;
 
@@ -487,7 +488,7 @@ fn setup_cursor_and_player(
     );
 }
 
-/// F2 toggles the trainer and pointer capture; F3 toggles passive debug text.
+/// 2 toggles the trainer and pointer capture; 3 toggles passive debug text.
 /// F12 saves a timestamped screenshot.
 fn handle_global_keys(
     mut settings: ResMut<AppSettings>,
@@ -496,12 +497,22 @@ fn handle_global_keys(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut commands: Commands,
     automation: Option<Res<AutomationSettings>>,
+    egui_wants_input: Option<Res<EguiWantsInput>>,
 ) {
+    // Number keys must remain available when entering teleport coordinates.
+    let editing_menu = settings.show_trainer
+        && egui_wants_input
+            .as_ref()
+            .is_some_and(|input| input.wants_any_keyboard_input());
     let trainer_was_open = settings.show_trainer;
-    if keyboard.just_pressed(KeyCode::F2) {
+    if !editing_menu
+        && (keyboard.just_pressed(KeyCode::Digit2) || keyboard.just_pressed(KeyCode::Numpad2))
+    {
         settings.show_trainer = !settings.show_trainer;
     }
-    if keyboard.just_pressed(KeyCode::F3) {
+    if !editing_menu
+        && (keyboard.just_pressed(KeyCode::Digit3) || keyboard.just_pressed(KeyCode::Numpad3))
+    {
         settings.show_debug = !settings.show_debug;
     }
     if settings.show_trainer != trainer_was_open {
@@ -881,9 +892,9 @@ mod global_key_tests {
     }
 
     #[test]
-    fn f2_releases_cursor_and_closing_recaptures_with_warmup() {
+    fn digit2_releases_cursor_and_closing_recaptures_with_warmup() {
         let (mut app, player, cursor) = input_app();
-        press(&mut app, KeyCode::F2);
+        press(&mut app, KeyCode::Digit2);
         assert!(app.world().resource::<AppSettings>().show_trainer);
         assert!(!app.world().get::<Player>(player).unwrap().mouse_captured);
         let cursor_options = app.world().get::<CursorOptions>(cursor).unwrap();
@@ -891,7 +902,7 @@ mod global_key_tests {
         assert!(cursor_options.visible);
 
         app.world_mut().get_mut::<Player>(player).unwrap().mouse_warmup_frames = 0;
-        press(&mut app, KeyCode::F2);
+        press(&mut app, KeyCode::Digit2);
         assert!(!app.world().resource::<AppSettings>().show_trainer);
         let player = app.world().get::<Player>(player).unwrap();
         assert!(player.mouse_captured);
@@ -902,9 +913,9 @@ mod global_key_tests {
     }
 
     #[test]
-    fn f3_toggles_only_debug_text_and_tab_no_longer_opens_trainer() {
+    fn digit3_toggles_only_debug_text_and_tab_no_longer_opens_trainer() {
         let (mut app, player, cursor) = input_app();
-        press(&mut app, KeyCode::F3);
+        press(&mut app, KeyCode::Digit3);
         let settings = app.world().resource::<AppSettings>();
         assert!(settings.show_debug);
         assert!(!settings.show_trainer);
@@ -914,7 +925,7 @@ mod global_key_tests {
             app.world().get::<CursorOptions>(cursor).unwrap().grab_mode,
             CursorGrabMode::Locked,
         );
-        press(&mut app, KeyCode::F3);
+        press(&mut app, KeyCode::Digit3);
         assert!(!app.world().resource::<AppSettings>().show_debug);
         press(&mut app, KeyCode::Tab);
         assert!(!app.world().resource::<AppSettings>().show_trainer);
@@ -928,13 +939,70 @@ mod global_key_tests {
         assert!(!settings.show_ui);
         assert!(!settings.show_trainer);
         assert!(app.world().get::<Player>(player).unwrap().mouse_captured);
-        press(&mut app, KeyCode::F2);
+        press(&mut app, KeyCode::Digit2);
         app.world_mut().resource_mut::<AppSettings>().show_ui = true;
         press(&mut app, KeyCode::F1);
         let settings = app.world().resource::<AppSettings>();
         assert!(settings.show_ui);
         assert!(settings.show_trainer);
         assert!(!app.world().get::<Player>(player).unwrap().mouse_captured);
+    }
+
+    #[test]
+    fn numpad2_and_numpad3_toggle_the_same_controls() {
+        let (mut app, _, _) = input_app();
+        press(&mut app, KeyCode::Numpad2);
+        assert!(app.world().resource::<AppSettings>().show_trainer);
+        press(&mut app, KeyCode::Numpad3);
+        assert!(app.world().resource::<AppSettings>().show_debug);
+        press(&mut app, KeyCode::Numpad2);
+        assert!(!app.world().resource::<AppSettings>().show_trainer);
+        press(&mut app, KeyCode::Numpad3);
+        assert!(!app.world().resource::<AppSettings>().show_debug);
+    }
+
+    #[test]
+    fn typing_numbers_in_menu_fields_does_not_toggle_shortcuts() {
+        use bevy_egui::{EguiContext, egui};
+        let (mut app, player, _) = input_app();
+        app.init_resource::<EguiWantsInput>()
+            .add_systems(PreUpdate, bevy_egui::input::write_egui_wants_input_system);
+        let mut context = EguiContext::default();
+        let ctx = context.get_mut();
+        ctx.begin_pass(egui::RawInput::default());
+        let mut coordinate = String::new();
+        let field = egui::Area::new(egui::Id::new("coordinate_input_test"))
+            .show(ctx, |ui| {
+                let response = ui.text_edit_singleline(&mut coordinate);
+                response.request_focus();
+                response.id
+            })
+            .inner;
+        let mut output = ctx.end_pass();
+        output.textures_delta.clear();
+        let context_entity = app.world_mut().spawn(context).id();
+        app.world_mut().resource_mut::<AppSettings>().show_trainer = true;
+        for key in [
+            KeyCode::Digit2,
+            KeyCode::Digit3,
+            KeyCode::Numpad2,
+            KeyCode::Numpad3,
+        ] {
+            press(&mut app, key);
+            let settings = app.world().resource::<AppSettings>();
+            assert!(settings.show_trainer);
+            assert!(!settings.show_debug);
+        }
+        app.world_mut()
+            .get_mut::<EguiContext>(context_entity)
+            .unwrap()
+            .get_mut()
+            .memory_mut(|memory| memory.surrender_focus(field));
+        press(&mut app, KeyCode::Digit2);
+        assert!(!app.world().resource::<AppSettings>().show_trainer);
+        assert!(app.world().get::<Player>(player).unwrap().mouse_captured);
+        press(&mut app, KeyCode::Digit3);
+        assert!(app.world().resource::<AppSettings>().show_debug);
     }
 
     #[test]
@@ -945,8 +1013,8 @@ mod global_key_tests {
             shot_path: Some("capture.png".into()),
             ..default()
         });
-        press(&mut app, KeyCode::F2);
-        press(&mut app, KeyCode::F2);
+        press(&mut app, KeyCode::Digit2);
+        press(&mut app, KeyCode::Digit2);
         assert!(!app.world().get::<Player>(player).unwrap().mouse_captured);
         assert_eq!(
             app.world().get::<CursorOptions>(cursor).unwrap().grab_mode,
