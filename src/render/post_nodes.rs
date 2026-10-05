@@ -389,7 +389,7 @@ fn prepare_post_pipelines(
                 texture_entry(3, blurred),
                 texture_entry(4, &gbuffer.heightfield_view),
                 texture_entry(5, &targets.atmosphere_view),
-                texture_entry(6, &shadows.array_view),
+                texture_entry(6, &shadows.cascade_views[0]),
                 BindGroupEntry {
                     binding: 7,
                     resource: shadows.uniform.as_entire_binding(),
@@ -401,6 +401,8 @@ fn prepare_post_pipelines(
                 sampler_entry(12, &samplers.linear_clamp),
                 sampler_entry(13, &samplers.linear_clamp),
                 sampler_entry(14, &shadows.sampler),
+                texture_entry(15, &shadows.cascade_views[1]),
+                texture_entry(16, &shadows.cascade_views[2]),
             ],
         );
 
@@ -1023,20 +1025,22 @@ fn screen_group_layout(
     BindGroupLayoutDescriptor::new(label, &entries)
 }
 
-/// Adds the plants' shadow cascades to the composite's group: the depth
-/// array at binding 6, its uniform at 7 and the comparison sampler at 14.
+/// Adds the plants' independently sized depth cascades at bindings 6 and
+/// 15..=16, their uniform at 7 and the comparison sampler at 14.
 fn with_vegetation_shadows(mut layout: BindGroupLayoutDescriptor) -> BindGroupLayoutDescriptor {
-    layout.entries.extend([
-        wgpu::BindGroupLayoutEntry {
-            binding: 6,
+    layout.entries.extend(
+        [6, 15, 16].map(|binding| wgpu::BindGroupLayoutEntry {
+            binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Texture {
                 sample_type: wgpu::TextureSampleType::Depth,
-                view_dimension: wgpu::TextureViewDimension::D2Array,
+                view_dimension: wgpu::TextureViewDimension::D2,
                 multisampled: false,
             },
             count: None,
-        },
+        }),
+    );
+    layout.entries.extend([
         wgpu::BindGroupLayoutEntry {
             binding: 7,
             visibility: wgpu::ShaderStages::FRAGMENT,
