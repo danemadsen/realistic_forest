@@ -457,7 +457,7 @@ fn prepare_post_pipelines(
         ));
     }
 
-    if let Some(stage) = inner.ssao_stage.as_ref() {
+    if view.settings.ssao_enabled && let Some(stage) = inner.ssao_stage.as_ref() {
         let uniforms = SsaoStageUniforms {
             screen_size: [ao_width, ao_height],
             radius: view.settings.ao_radius,
@@ -470,7 +470,7 @@ fn prepare_post_pipelines(
 
     let full_width = view.physical_width.max(1) as f32;
     let full_height = view.physical_height.max(1) as f32;
-    if let Some(stage) = inner.blur_stage.as_ref() {
+    if view.settings.ssao_enabled && let Some(stage) = inner.blur_stage.as_ref() {
         // uTexelSize steps one AO texel in AO-target uv space.
         let uniforms = BlurStageUniforms {
             texel_size: [2.0 / full_width, 2.0 / full_height],
@@ -493,9 +493,8 @@ fn prepare_post_pipelines(
                 matrix[2] * sun[0] + matrix[6] * sun[1] + matrix[10] * sun[2],
                 0.0,
             ],
-            // uAoStrength: with SSAO switched off the C++ still renders and
-            // blurs the AO buffer and only drops the composite's AO weighting
-            // to zero.
+            // Disabled SSAO skips both passes; the composite uses neutral AO
+            // without sampling the held blur target.
             ao_strength: if view.settings.ssao_enabled {
                 view.settings.ao_strength
             } else {
@@ -571,6 +570,12 @@ pub fn register_post_systems(render_app: &mut SubApp) {
 /// `RenderSSAO`'s first half: the raw ambient occlusion term into the half-res
 /// AO target.
 pub fn forest_ssao_pass(world: &World, mut ctx: RenderContext) {
+    if !world
+        .get_resource::<ExtractedForestView>()
+        .is_some_and(|view| view.settings.ssao_enabled)
+    {
+        return;
+    }
     let Some(state) = world.get_resource::<SsaoNodeState>() else {
         return;
     };
@@ -620,6 +625,12 @@ pub fn forest_ssao_pass(world: &World, mut ctx: RenderContext) {
 /// `RenderSSAO`'s second half: the bilateral, depth/normal-weighted blur of the
 /// raw AO buffer into the second half-res target.
 pub fn forest_blur_pass(world: &World, mut ctx: RenderContext) {
+    if !world
+        .get_resource::<ExtractedForestView>()
+        .is_some_and(|view| view.settings.ssao_enabled)
+    {
+        return;
+    }
     let Some(state) = world.get_resource::<SsaoNodeState>() else {
         return;
     };

@@ -1114,7 +1114,12 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let packed_position = textureSample(texture0, texture0_sampler, uv);
     let normal_sample = textureSample(texture1, texture1_sampler, uv);
     let albedo_sample = textureSample(texture2, texture2_sampler, uv);
-    let ssao = textureSample(texture3, texture3_sampler, uv).r;
+    // Skipped AO passes can leave this target unwritten or from an older frame.
+    // Keep neutral occlusion while disabled and avoid reading the held target.
+    var ssao = 1.0;
+    if (globals.params.w > 0.5) {
+        ssao = textureSampleLevel(texture3, texture3_sampler, uv, 0.0).r;
+    }
     let world_ray = worldViewRay(uv);
     let is_sky = packed_position.a < 0.5;
     let view_distance = select(length(packed_position.xyz), globals.params.y, is_sky);
