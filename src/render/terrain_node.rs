@@ -70,6 +70,18 @@ pub const LIGHTING_HEIGHTFIELD_SPAN: f32 = 12288.0;
 /// fixed in world space as the camera moves.
 pub const SHORE_HEIGHTFIELD_SIZE: u32 = 512;
 pub const SHORE_HEIGHTFIELD_SPAN: f32 = 512.0;
+/// The shore window moves eight texels at a time.
+const SHORE_HEIGHTFIELD_SNAP: f32 = SHORE_HEIGHTFIELD_SPAN / SHORE_HEIGHTFIELD_SIZE as f32 * 8.0;
+
+// The shore capture is kept while the player walks about inside its snap, so
+// the erosion fade it was rendered with must be flat over every texel it
+// holds: the window's far corner plus the snap, with room to spare, lies well
+// inside the radius where erosion is at full strength. The lighting map
+// reaches far past the fade, so its key holds the fade's centre instead.
+const _: () = assert!(
+    (SHORE_HEIGHTFIELD_SPAN / 2.0 + SHORE_HEIGHTFIELD_SNAP) * 1.5 < EROSION_VISIBILITY_FULL_RADIUS,
+    "the shore heightfield window must sit inside the full-strength erosion radius"
+);
 
 /// Fixed world lattice shared with instanced vegetation. Sub-metre samples
 /// retain narrow bare patches; root-footprint tests dilate their exclusion.
@@ -193,13 +205,62 @@ static HABITAT_GENERATIONS: AtomicU64 = AtomicU64::new(1);
 /// the vertex and fragment passes or when crossing a snap boundary.
 pub fn shore_heightfield_mapping(camera_position: [f32; 4]) -> [f32; 4] {
     let texel = SHORE_HEIGHTFIELD_SPAN / SHORE_HEIGHTFIELD_SIZE as f32;
-    let snap = texel * 8.0;
+    let snap = SHORE_HEIGHTFIELD_SNAP;
     [
         (camera_position[0] / snap).floor() * snap,
         (camera_position[2] / snap).floor() * snap,
         SHORE_HEIGHTFIELD_SPAN,
         texel,
     ]
+}
+
+/// Everything a heightfield capture depends on, and for the lighting map the
+/// highest terrain reduced from it too. While this is unchanged the held
+/// capture is exactly what a new one would be, so it is kept. A capture
+/// evaluates `terrainHeight` alone, whose other inputs (the base noise, the
+/// blend mask and the stage constants) never change after startup; when the
+/// shader gains an input, add it here, or a stale capture will outlive it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeightfieldKey {
+    /// The captured window (`globals.heightfield` layout), as bit patterns so
+    /// equality is exact.
+    mapping: [u32; 4],
+    /// The erosion fade's centre, the player's XZ, for a window the fade
+    /// reaches into. `None` for a window wholly at full strength.
+    fade_centre: Option<[u32; 2]>,
+    lookup_minimum: (i64, i64),
+    /// Erosion lookup, atlas and river contents, see `TerrainRevision`.
+    terrain_revision: u64,
+}
+
+impl HeightfieldKey {
+    /// The lighting map reaches far past the erosion fade, so every step the
+    /// player takes moves the faded ring of erosion across it.
+    fn lighting(
+        mapping: [f32; 4],
+        fade_centre: [f32; 2],
+        lookup_minimum: (i64, i64),
+        terrain_revision: u64,
+    ) -> Self {
+        Self {
+            mapping: mapping.map(f32::to_bits),
+            fade_centre: Some(fade_centre.map(f32::to_bits)),
+            lookup_minimum,
+            terrain_revision,
+        }
+    }
+
+    /// The shore map lies wholly at full erosion strength (see
+    /// SHORE_HEIGHTFIELD_SNAP), so the player can walk about inside its snap
+    /// without retaking it.
+    fn shore(mapping: [f32; 4], lookup_minimum: (i64, i64), terrain_revision: u64) -> Self {
+        Self {
+            mapping: mapping.map(f32::to_bits),
+            fade_centre: None,
+            lookup_minimum,
+            terrain_revision,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,8 +276,18 @@ pub struct GbufferTargets {
     pub depth_view: wgpu::TextureView,    // Depth32Float
     pub heightfield_view: wgpu::TextureView, // R32Float world-space terrain height
     pub shore_heightfield_view: wgpu::TextureView, // R32Float local seabed elevation
-    /// False until this frame's capture is encoded, including after resize or
-    /// while its pipeline is compiling. Water must never sample an empty map.
+    /// What the held lighting heightfield was rendered from, `None` until
+    /// there is one.
+    lighting_heightfield_key: Option<HeightfieldKey>,
+    /// Whether the highest-terrain buffer holds the held lighting
+    /// heightfield's reduction. The buffer outlives a resize; this does not,
+    /// because the resize discards the capture the reduction was taken from.
+    lighting_highest_ready: bool,
+    /// What the held shore heightfield was rendered from, `None` until there
+    /// is one.
+    shore_heightfield_key: Option<HeightfieldKey>,
+    /// True while a shore capture matches this frame's inputs and the sea is
+    /// drawn. Water must never sample an empty or stale map.
     pub shore_heightfield_ready: bool,
     pub grass_habitat_view: wgpu::TextureView,
     /// Linear terrain albedo at the same world-space texels as grass_habitat_view.
@@ -417,46 +488,70 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         queue.write_buffer(&stage.buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
+    // Everything derived from the terrain (the two heightfields and the grass
+    // habitat below) is kept until this moves or its own inputs change.
+    let terrain_revision = world
+        .get_resource::<GpuWorldTexturesOption>()
+        .and_then(|option| option.0.as_deref())
+        .map_or(0, |textures| textures.revision.current());
+    let water = world.get_resource::<super::water_node::ExtractedWater>();
+
     // This is independent of camera visibility: hills behind the camera
-    // still cast shadows and occlude light inside the fog. Updating after
-    // erosion and before lighting also follows tile reveals without a
-    // CPU height readback or stale lighting cache.
+    // still cast shadows and occlude light inside the fog. Rendering after
+    // erosion and before lighting also follows tile reveals without a CPU
+    // height readback. The capture is a function of the inputs in
+    // `HeightfieldKey`; it is redone when one of them changes (the window
+    // moving on, a tile streaming in or revealing, a new river network, the
+    // player stepping, which moves the erosion fade across the map) and kept
+    // otherwise, so standing still costs nothing.
     if view.settings.raymarched_shadows
         && let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.heightfield_pipeline)
     {
-        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
-            label: Some("forest_lighting_heightfield"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &gbuffer.heightfield_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_render_pipeline(pipeline);
-        pass.set_bind_group(0, &resources.globals, &[]);
-        pass.set_bind_group(1, &resources.terrain_textures, &[]);
-        pass.set_bind_group(2, &resources.levels[0].bind_group, &[]);
-        pass.draw(0..3, 0..1);
-        drop(pass);
+        let key = HeightfieldKey::lighting(
+            globals.globals.heightfield,
+            visibility_center,
+            view.lookup_minimum,
+            terrain_revision,
+        );
+        if gbuffer.lighting_heightfield_key != Some(key) {
+            let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+                label: Some("forest_lighting_heightfield"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &gbuffer.heightfield_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_render_pipeline(pipeline);
+            pass.set_bind_group(0, &resources.globals, &[]);
+            pass.set_bind_group(1, &resources.terrain_textures, &[]);
+            pass.set_bind_group(2, &resources.levels[0].bind_group, &[]);
+            pass.draw(0..3, 0..1);
+            drop(pass);
+            gbuffer.lighting_heightfield_key = Some(key);
+            gbuffer.lighting_highest_ready = false;
+        }
 
         // The highest terrain in the map lets the sun-visibility marches stop
-        // once they rise above it. Reduced on the GPU and copied straight into
-        // this frame's globals, so no CPU readback and no stale bound; until
-        // it runs the globals keep TERRAIN_HEIGHT_UNKNOWN and the marches run
+        // once they rise above it. Reduced on the GPU once per capture, so no
+        // CPU readback and no stale bound, and copied into the globals every
+        // frame, because `prepare_forest_globals` writes them afresh with
+        // TERRAIN_HEIGHT_UNKNOWN; until there is a reduction the marches run
         // in full.
-        if let (Some(highest), Some(globals_buffer), Some(device)) = (
-            pipeline_cache.get_compute_pipeline(resources.highest_pipeline),
-            globals.buffer.as_ref(),
-            world.get_resource::<RenderDevice>(),
-        ) {
+        if !gbuffer.lighting_highest_ready
+            && let (Some(highest), Some(device)) = (
+                pipeline_cache.get_compute_pipeline(resources.highest_pipeline),
+                world.get_resource::<RenderDevice>(),
+            )
+        {
             let group = super::bind_group(
                 device,
                 pipeline_cache,
@@ -485,7 +580,12 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
                 let groups = LIGHTING_HEIGHTFIELD_SIZE.div_ceil(16);
                 pass.dispatch_workgroups(groups, groups, 1);
             }
-            encoder.copy_buffer_to_buffer(
+            gbuffer.lighting_highest_ready = true;
+        }
+        if gbuffer.lighting_highest_ready
+            && let Some(globals_buffer) = globals.buffer.as_ref()
+        {
+            ctx.command_encoder().copy_buffer_to_buffer(
                 &resources.highest_buffer,
                 0,
                 globals_buffer,
@@ -498,14 +598,17 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
     // A separate one-metre map gives the water a world-space seabed, including
     // off-screen shores. It follows the exact same terrain/erosion function as
     // the mesh, and remains available when raymarched shadows are disabled.
-    gbuffer.shore_heightfield_ready = false;
-    if world
-        .get_resource::<super::water_node::ExtractedWater>()
-        .is_some_and(|water| water.draw)
+    // It is kept like the lighting map, but its window lies wholly inside the
+    // full-strength erosion radius, so the erosion fade is flat over it.
+    let draw_sea = water.is_some_and(|water| water.draw);
+    let shore_mapping = shore_heightfield_mapping(globals.globals.camera_position);
+    let shore_key = HeightfieldKey::shore(shore_mapping, view.lookup_minimum, terrain_revision);
+    if draw_sea
+        && gbuffer.shore_heightfield_key != Some(shore_key)
         && let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.heightfield_pipeline)
     {
         let mut local_globals = globals.globals;
-        local_globals.heightfield = shore_heightfield_mapping(local_globals.camera_position);
+        local_globals.heightfield = shore_mapping;
         queue.write_buffer(&resources.shore_globals.buffer, 0, bytemuck::bytes_of(&local_globals));
         let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
             label: Some("forest_shore_heightfield"),
@@ -529,8 +632,9 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         pass.set_bind_group(2, &resources.levels[0].bind_group, &[]);
         pass.draw(0..3, 0..1);
         drop(pass);
-        gbuffer.shore_heightfield_ready = true;
+        gbuffer.shore_heightfield_key = Some(shore_key);
     }
+    gbuffer.shore_heightfield_ready = draw_sea && gbuffer.shore_heightfield_key == Some(shore_key);
 
     // Capture the *visible clipmap's* interpolated height and material contacts.
     // The capture is a function of the inputs in `HabitatKey`; it is redone when
@@ -539,11 +643,6 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
     // standing still costs nothing. Reveals and regeneration still reach the
     // grass: they move the key.
     let mapping = grass_habitat_mapping(view.player_position);
-    let water = world.get_resource::<super::water_node::ExtractedWater>();
-    let terrain_revision = world
-        .get_resource::<GpuWorldTexturesOption>()
-        .and_then(|option| option.0.as_deref())
-        .map_or(0, |textures| textures.revision.current());
     let key = HabitatKey::new(
         view.player_position,
         view.lookup_minimum,
@@ -1775,6 +1874,9 @@ pub(crate) fn resize_gbuffer(
             grass_habitat_generation: 0,
             grass_habitat_key: None,
             grass_habitat_ready: false,
+            lighting_heightfield_key: None,
+            lighting_highest_ready: false,
+            shore_heightfield_key: None,
             shore_heightfield_ready: false,
             width,
             height,
@@ -1984,6 +2086,212 @@ mod habitat_cache_tests {
             uses(vertex, "globals."),
             set(&["camera_position", "heightfield", "projection", "view"]),
             "terrain-vs.wgsl reads a global HabitatKey does not know about"
+        );
+    }
+}
+
+#[cfg(test)]
+mod heightfield_cache_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn shore_key(position: [f32; 3]) -> HeightfieldKey {
+        let mapping = shore_heightfield_mapping([position[0], position[1], position[2], 0.0]);
+        HeightfieldKey::shore(mapping, (0, 0), 0)
+    }
+
+    #[test]
+    fn walking_inside_a_shore_snap_keeps_its_capture() {
+        // The corners and middle of the snap square [64, 72) x [-8, 0), at
+        // any height.
+        let positions = [
+            [64.0, 3.0, -8.0],
+            [71.99, 40.0, -0.01],
+            [64.0, 9.0, -0.01],
+            [71.99, 3.0, -8.0],
+            [68.0, 120.0, -4.0],
+        ];
+        for position in positions {
+            assert_eq!(shore_key(position), shore_key(positions[0]), "{position:?}");
+            // What lets the key leave the player out: wherever they stand in
+            // the snap, erosion is at full strength out to the window's far
+            // corners.
+            let [x, z, span, _] =
+                shore_heightfield_mapping([position[0], position[1], position[2], 0.0]);
+            for (dx, dz) in [(-0.5, -0.5), (0.5, -0.5), (-0.5, 0.5), (0.5, 0.5)] {
+                let fade = crate::erosion::erosion_visibility(
+                    x + dx * span,
+                    z + dz * span,
+                    [position[0], position[2]],
+                );
+                assert_eq!(fade, 1.0, "{position:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn crossing_into_the_next_shore_snap_retakes_it() {
+        assert_ne!(shore_key([71.9, 20.0, 1.0]), shore_key([72.1, 20.0, 1.0]));
+        assert_ne!(shore_key([65.0, 20.0, 7.9]), shore_key([65.0, 20.0, 8.1]));
+        // West and south of the origin too: the window floors, never truncates.
+        assert_ne!(shore_key([-0.1, 20.0, 0.0]), shore_key([0.1, 20.0, 0.0]));
+    }
+
+    #[test]
+    fn any_step_retakes_the_lighting_map_but_not_the_shore() {
+        // A centimetre, inside one lighting window and one shore snap.
+        let (from, to) = ([10.0, 20.0], [10.01, 20.0]);
+        let mapping = [0.0, 0.0, LIGHTING_HEIGHTFIELD_SPAN, 12.0];
+        assert_ne!(
+            HeightfieldKey::lighting(mapping, from, (0, 0), 0),
+            HeightfieldKey::lighting(mapping, to, (0, 0), 0)
+        );
+        // Because the step moves the erosion drawn far out in the map: 1.35 km
+        // away, well inside the 12 km window, the fade is partway down its ramp.
+        let far = [from[0] + 1350.0, from[1]];
+        assert_ne!(
+            crate::erosion::erosion_visibility(far[0], far[1], from),
+            crate::erosion::erosion_visibility(far[0], far[1], to)
+        );
+        assert_eq!(shore_key([from[0], 5.0, from[1]]), shore_key([to[0], 5.0, to[1]]));
+    }
+
+    #[test]
+    fn terrain_changes_retake_both_maps() {
+        // A streamed tile, a reveal step or a new river network moves the
+        // revision; the lookup window recentring moves its corner.
+        let mapping = [0.0, 0.0, LIGHTING_HEIGHTFIELD_SPAN, 12.0];
+        let lighting =
+            |revision, lookup| HeightfieldKey::lighting(mapping, [10.0, 20.0], lookup, revision);
+        let shore_mapping = shore_heightfield_mapping([10.0, 5.0, 20.0, 0.0]);
+        let shore = |revision, lookup| HeightfieldKey::shore(shore_mapping, lookup, revision);
+        assert_ne!(lighting(0, (0, 0)), lighting(1, (0, 0)));
+        assert_ne!(lighting(0, (0, 0)), lighting(0, (1, 0)));
+        assert_ne!(shore(0, (0, 0)), shore(1, (0, 0)));
+        assert_ne!(shore(0, (0, 0)), shore(0, (0, -1)));
+    }
+
+    /// Every function a block calls, however deeply nested the call.
+    fn calls(block: &naga::Block, found: &mut Vec<naga::Handle<naga::Function>>) {
+        for statement in block.iter() {
+            match statement {
+                naga::Statement::Call { function, .. } => found.push(*function),
+                naga::Statement::Block(inner) => calls(inner, found),
+                naga::Statement::If { accept, reject, .. } => {
+                    calls(accept, found);
+                    calls(reject, found);
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    for case in cases {
+                        calls(&case.body, found);
+                    }
+                }
+                naga::Statement::Loop { body, continuing, .. } => {
+                    calls(body, found);
+                    calls(continuing, found);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A capture is kept across frames, so it is only right while every input
+    /// its shader reads is in `HeightfieldKey` or fixed from startup. This
+    /// follows the capture's entry points through every function they call and
+    /// lists what is read; a new input means the key (and this list) must be
+    /// revisited.
+    #[test]
+    fn the_heightfield_shader_reads_only_inputs_the_key_accounts_for() {
+        let source = include_str!("../../assets/shaders/terrain-vs.wgsl");
+        let module = naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
+        let mut pending: Vec<&naga::Function> = module
+            .entry_points
+            .iter()
+            .filter(|entry| matches!(entry.name.as_str(), "vs_heightfield" | "fs_heightfield"))
+            .map(|entry| &entry.function)
+            .collect();
+        assert_eq!(pending.len(), 2, "the capture's entry points moved");
+        let mut visited = std::collections::HashSet::new();
+        // Bound resources by name, and uniform members as `block.member`.
+        let mut read = BTreeSet::new();
+        let mut members = BTreeSet::new();
+        while let Some(function) = pending.pop() {
+            let mut called = Vec::new();
+            calls(&function.body, &mut called);
+            for handle in called {
+                if visited.insert(handle) {
+                    pending.push(&module.functions[handle]);
+                }
+            }
+            for (_, expression) in function.expressions.iter() {
+                match *expression {
+                    naga::Expression::GlobalVariable(variable) => {
+                        read.insert(module.global_variables[variable].name.clone().unwrap());
+                    }
+                    naga::Expression::AccessIndex { base, index } => {
+                        let naga::Expression::GlobalVariable(variable) = function.expressions[base]
+                        else {
+                            continue;
+                        };
+                        let variable = &module.global_variables[variable];
+                        if let naga::TypeInner::Struct { members: fields, .. } =
+                            &module.types[variable.ty].inner
+                        {
+                            members.insert(format!(
+                                "{}.{}",
+                                variable.name.as_deref().unwrap(),
+                                fields[index as usize].name.as_deref().unwrap()
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let set = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| name.to_string()).collect()
+        };
+        let uses = |block: &str| -> BTreeSet<String> {
+            let prefix = format!("{block}.");
+            members
+                .iter()
+                .filter_map(|member| member.strip_prefix(&prefix))
+                .map(str::to_string)
+                .collect()
+        };
+
+        // The two uniform blocks below; the base noise and blend mask,
+        // uploaded once; the surface atlas, tile lookup and river buffers,
+        // which all move TerrainRevision; and their samplers. Not the snow,
+        // so a fresh trail leaves both maps be.
+        assert_eq!(
+            read,
+            set(&[
+                "globals", "river_grid", "river_segments", "stage", "tex0", "tex0_sampler",
+                "tex1", "tex1_sampler", "tex3", "tex4", "tex4_sampler",
+            ]),
+            "the heightfield capture reads a resource HeightfieldKey does not know about"
+        );
+        // Of the globals, only the window itself.
+        assert_eq!(uses("globals"), set(&["heightfield"]));
+        // Every stage field read is a constant of TerrainStageUniforms::build
+        // except the lookup's corner and the fade's centre, which the key holds.
+        assert_eq!(
+            uses("stage"),
+            set(&[
+                "erosion_atlas_gutter", "erosion_atlas_pitch", "erosion_atlas_size",
+                "erosion_footprint_size", "erosion_lookup_min_tile", "erosion_lookup_size",
+                "erosion_output_resolution", "erosion_tile_stride", "erosion_visibility_center",
+                "erosion_visibility_full_radius", "erosion_visibility_zero_radius",
+                "land_profile_curve", "land_profile_peak", "land_profile_reference",
+                "landform_horizontal_scale", "landform_vertical_scale", "noise_period",
+                "ocean_profile_curve", "ocean_profile_depth", "ocean_profile_reference",
+                "sea_level", "waterline_clearance", "waterline_clearance_decay",
+                "waterline_clearance_scale", "waterline_push_land", "waterline_push_scale",
+                "waterline_push_sea",
+            ]),
+            "the heightfield capture reads a stage field HeightfieldKey does not know about"
         );
     }
 }

@@ -92,7 +92,7 @@ fn extract_rivers(main_world: Res<MainWorld>, mut extracted: ResMut<ExtractedRiv
 }
 
 /// Write a new network over the river buffers. The terrain revision moves
-/// with it, so the grass habitat capture is redone over the new channels.
+/// with it, so heightfield and grass habitat captures follow the new channels.
 fn upload_rivers(
     textures: Res<GpuWorldTexturesOption>,
     mut rivers: ResMut<ExtractedRivers>,

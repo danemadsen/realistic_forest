@@ -996,6 +996,15 @@ they rise far enough above that bound that every remaining tap is fully lit,
 including the widening penumbra on surface shadows. This skips work without
 changing the visibility computed by the original terrain shadow march.
 
+The lighting heightfield, its maximum-height reduction, and the 512×512 shoreline
+heightfield are cached until their terrain inputs or world mappings change.
+Erosion tile uploads and reveals, lookup shifts, and river updates invalidate
+both maps. Moving the player also invalidates the lighting map because erosion
+fades with distance from the player. The shoreline map stays entirely inside
+the full-strength erosion radius, so it can be reused within its eight-metre
+mapping snap. Stationary frames after streaming settles reuse both captures and
+copy the cached maximum into the frame's lighting uniforms.
+
 Volumetric lighting integrates scattering and Beer–Lambert transmittance along
 view rays at half resolution. Height-dependent density concentrates haze near
 the ground, and samples toward the sun through the heightfield produce shafts

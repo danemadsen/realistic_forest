@@ -350,10 +350,10 @@ pub fn register_main_texture_systems(app: &mut bevy::app::App) {
 
 pub const SIM_TEXTURE_SIZE: u32 = EROSION_RESOLUTION as u32;
 
-/// A change counter for the erosion data the terrain shaders read: the tile
-/// lookup records and the height and flow atlases. Whoever caches something
-/// derived from the terrain (the grass habitat capture) keeps the value it saw
-/// and redoes the work when this moves.
+/// A change counter for the mutable data the terrain shaders read: the tile
+/// lookup records, height and flow atlases, and river buffers. Terrain-derived
+/// captures (lighting, shoreline, and grass habitat) keep the value they saw
+/// and redo the work when this moves.
 #[derive(Default)]
 pub struct TerrainRevision {
     counter: AtomicU64,
@@ -377,7 +377,7 @@ impl TerrainRevision {
         }
     }
 
-    /// An atlas patch was written into the height and flow atlases.
+    /// An atlas patch or river network was uploaded.
     pub fn note_atlas_upload(&self) {
         self.counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -386,7 +386,7 @@ impl TerrainRevision {
 /// All world textures held by the render passes; created once by
 /// `prepare_gpu_textures` after CPU data extraction.
 pub struct GpuWorldTextures {
-    /// Moves whenever the lookup or an atlas changes; see [`TerrainRevision`].
+    /// Moves when lookup, atlas, or river data changes; see [`TerrainRevision`].
     pub revision: TerrainRevision,
     /// R32 1024², 11 mips, trilinear + repeat (base noise). Held so the
     /// texture outlives the view the samplers bind.
