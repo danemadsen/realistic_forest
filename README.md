@@ -336,17 +336,23 @@ Grass streams on a permanent 16-metre world grid, with each density tier
 loaded independently. When the 8-metre planning anchor moves, only entering
 chunk tiers are generated and grouped by model on background workers. Nearby
 chunks stay resident through a retention margin, including when the player
-turns back. Four persistent GPU instance arenas recycle vacated chunk slots;
-each frame uploads at most 16 chunk tiers and 2 MiB of instance data. Their
-bounded capacity reserves about 65 MiB, including prefetch and retention space.
+turns back. Eight persistent GPU instance arenas recycle vacated chunk slots:
+four 32-byte candidate arenas and, beside them, four 48-byte prepared arenas
+holding each clump's seated, habitat-approved records. Each frame uploads at
+most 16 chunk tiers and 2 MiB of instance data. Their bounded capacity
+reserves about 160 MiB — roughly 65 MiB of candidates and 97 MiB of prepared
+copies, with the near-carpet tier owning about half — including prefetch and
+retention space.
 Screenshot runs wait until the current grass stream has been uploaded and drawn.
 
 Each frame draws only the chunks that can reach the screen: those within a tier's
 fade distance (33, 140, 200 and 235 metres) and within the footprint the view
 frustum covers on the ground, which holds at any terrain height. A chunk is
-dropped only when no clump rooted in it can produce a pixel; the vertex shader
-still thins what remains. Visible ranges use batched indirect draws where the
-device supports them, with direct draws as a fallback.
+dropped only when no clump rooted in it can produce a pixel. A compute pass
+then thins what remains: each surviving candidate's habitat is evaluated once,
+not once per mesh vertex, and the accepted clumps compact into the arena the
+vertex stage reads. Draws are batched indirect draws; adapters without
+indirect execution render no grass, as for the plant library.
 
 The GPU captures a 512-metre local map of terrain height, grass suitability and
 ground colour, using the terrain's actual snow, sand, soil, rock, gravel and

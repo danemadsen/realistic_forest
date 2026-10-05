@@ -1,5 +1,5 @@
-//! Bounded, instanced vegetation in the terrain G-buffer. No entity per tuft,
-//! CPU erosion readback, or alternative approximation of the biome rules.
+//! Bounded grass candidates, evaluated once per root in compute, then
+//! compacted into prepared instance arenas and drawn indirectly in the G-buffer.
 use super::{ExtractedForestView, ForestGlobals, ForestShaderHandles, terrain_node};
 use crate::grass::{self, GrassInstance, GrassReadiness, GrassTexture, SharedGrassAssets};
 use crate::grass_cull::{Footprint, LAYER_COUNT};
@@ -7,8 +7,8 @@ use crate::grass_stream::GrassStream;
 use bevy::mesh::VertexBufferLayout;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
-    BindGroup, BindGroupLayoutDescriptor, Buffer, CachedRenderPipelineId, FragmentState,
-    PipelineCache, RenderPipelineDescriptor, VertexState,
+    BindGroup, BindGroupLayoutDescriptor, Buffer, CachedComputePipelineId, CachedRenderPipelineId,
+    ComputePipelineDescriptor, FragmentState, PipelineCache, RenderPipelineDescriptor, VertexState,
 };
 use bevy::render::renderer::{RenderAdapter, RenderContext, RenderDevice, RenderQueue};
 use std::sync::Mutex;
@@ -42,10 +42,48 @@ struct GrassDraw {
 }
 const _: () = assert!(std::mem::size_of::<GrassDraw>() == 20);
 
-struct GrassDrawLayer {
-    indirect: Option<Buffer>,
-    /// Reused CPU command capacity; only visibility/counts change each frame.
+/// Rooted data consumed by the vertex stage, packed into three 16-byte rows.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GrassDrawInstance {
+    xz: [f32; 2],
+    rotation: f32,
+    scale: f32,
+    tint: f32,
+    seed: f32,
+    /// Seated height and the slope's X component.
+    ground: [f32; 2],
+    /// Linear ground RGB and the slope's Z component.
+    ground_colour: [f32; 4],
+}
+
+/// One workgroup's contiguous candidates, sharing a bounded output region
+/// and its indexed-indirect instance counter. Mirrors grass-cull.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GrassCullJob {
+    input_first: u32,
+    count: u32,
+    output_first: u32,
+    draw_word: u32,
+    radius: f32,
+    _pad: [f32; 3],
+}
+const _: () = assert!(std::mem::size_of::<GrassDrawInstance>() == 48);
+const _: () = assert!(std::mem::size_of::<GrassCullJob>() == 32);
+const WORKGROUP_SIZE: u32 = 64;
+const ARGS_WORDS: u32 = 5;
+
+struct GrassLayer {
+    candidates: Buffer,
+    visible: Buffer,
+    indirect: Buffer,
+    jobs_buffer: Buffer,
+    cull_group: BindGroup,
+    /// Reused CPU descriptor capacity; GPU counts start at zero each frame.
     commands: Vec<GrassDraw>,
+    output_starts: Vec<u32>,
+    jobs: Vec<GrassCullJob>,
 }
 
 fn instances_per_slot(layer: usize) -> usize {
@@ -56,19 +94,23 @@ struct GrassMesh {
     vertices: Buffer,
     indices: Buffer,
     index_count: u32,
+    radius: f32,
     material: BindGroup,
-    layers: [GrassDrawLayer; LAYER_COUNT],
+    draws: [std::ops::Range<usize>; LAYER_COUNT],
 }
 struct GrassResources {
     pipeline: CachedRenderPipelineId,
+    cull_pipeline: CachedComputePipelineId,
     globals: BindGroup,
     frame_buffer: Buffer,
     frame_layout: BindGroupLayoutDescriptor,
     meshes: Vec<GrassMesh>,
     stream: GrassStream,
-    /// Permanent per-layer arenas shared by every model. A chunk occupies one
-    /// fixed-size slot, partitioned by model; leaving chunks recycle the slot.
-    instances: [Buffer; LAYER_COUNT],
+    /// Permanent per-layer arenas shared by every model. Each chunk/model
+    /// compacts inside its original candidate subrange, so it cannot overflow.
+    layers: [GrassLayer; LAYER_COUNT],
+    indirect_first_instance: bool,
+    habitat_sampler: wgpu::Sampler,
     /// The widest root radius and the tallest blade of any model, unscaled.
     widest: f32,
     tallest: f32,
@@ -106,6 +148,38 @@ fn uniform_entry(binding: u32, size: u64) -> wgpu::BindGroupLayoutEntry {
             min_binding_size: wgpu::BufferSize::new(size),
         },
         count: None,
+    }
+}
+fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn push_cull_jobs(
+    jobs: &mut Vec<GrassCullJob>,
+    input_first: u32,
+    count: u32,
+    output_first: u32,
+    draw_word: u32,
+    radius: f32,
+) {
+    for offset in (0..count).step_by(WORKGROUP_SIZE as usize) {
+        jobs.push(GrassCullJob {
+            input_first: input_first + offset,
+            count: (count - offset).min(WORKGROUP_SIZE),
+            output_first,
+            draw_word,
+            radius,
+            _pad: [0.0; 3],
+        });
     }
 }
 fn upload_texture(
@@ -160,6 +234,18 @@ fn upload_texture(
     texture.create_view(&Default::default())
 }
 
+/// Mesh attributes: positions, normals, texcoords and tangents of the imported
+/// models, laid out as `grass::GrassVertex`.
+fn mesh_vertex_attributes() -> [wgpu::VertexAttribute; 4] {
+    wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4]
+}
+/// Prepared root attributes laid out as the compute pass writes them, in
+/// `GrassDrawInstance` order: identity, then seated height, slope and colour.
+fn draw_instance_attributes() -> [wgpu::VertexAttribute; 7] {
+    wgpu::vertex_attr_array![4 => Float32x2, 5 => Float32, 6 => Float32, 7 => Float32, 8 => Float32, 9 => Float32x2, 10 => Float32x4]
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prepare_grass(
     device: Res<RenderDevice>,
     adapter: Res<RenderAdapter>,
@@ -169,6 +255,7 @@ fn prepare_grass(
     shaders: Res<ForestShaderHandles>,
     assets: Option<Res<SharedGrassAssets>>,
     state: Res<GrassNodeState>,
+    readiness: Res<GrassReadiness>,
 ) {
     let mut state = state.0.lock().unwrap_or_else(|e| e.into_inner());
     if state.is_some() {
@@ -177,15 +264,44 @@ fn prepare_grass(
     let (Some(assets), Some(global_buffer)) = (assets, globals.buffer.as_ref()) else {
         return;
     };
+    if !adapter
+        .get_downlevel_capabilities()
+        .flags
+        .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION)
+    {
+        bevy::log::warn_once!("Grass requires GPU indirect drawing on this adapter");
+        readiness.disable();
+        return;
+    }
+    let mut frame_uniform = uniform_entry(2, std::mem::size_of::<GrassFrame>() as u64);
+    frame_uniform.visibility = wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::COMPUTE;
     let frame_layout = BindGroupLayoutDescriptor::new(
         "grass_frame_layout",
         &[
-            texture_entry(0, wgpu::ShaderStages::VERTEX),
-            sampler_entry(1, wgpu::ShaderStages::VERTEX),
-            uniform_entry(2, std::mem::size_of::<GrassFrame>() as u64),
-            texture_entry(3, wgpu::ShaderStages::VERTEX),
+            texture_entry(0, wgpu::ShaderStages::COMPUTE),
+            sampler_entry(1, wgpu::ShaderStages::COMPUTE),
+            frame_uniform,
+            texture_entry(3, wgpu::ShaderStages::COMPUTE),
         ],
     );
+    let cull_layout = BindGroupLayoutDescriptor::new(
+        "grass_cull_layout",
+        &[
+            storage_entry(0, true),
+            storage_entry(1, true),
+            storage_entry(2, false),
+            storage_entry(3, false),
+        ],
+    );
+    let cull_pipeline = cache.queue_compute_pipeline(ComputePipelineDescriptor {
+        label: Some("forest_grass_cull_pipeline".into()),
+        layout: vec![cull_layout.clone(), frame_layout.clone()],
+        immediate_size: 0,
+        shader: shaders.grass_cull.clone(),
+        shader_defs: vec![],
+        entry_point: Some("cull_grass".into()),
+        zero_initialize_workgroup_memory: false,
+    });
     let material_layout = BindGroupLayoutDescriptor::new(
         "grass_material_layout",
         &[
@@ -231,13 +347,9 @@ fn prepare_grass(
         .collect();
     let stream = GrassStream::new(active_models.len());
     let slot_capacities = stream.slot_capacities();
-    let indirect_supported = device
+    let indirect_first_instance = device
         .features()
-        .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE)
-        && adapter
-            .get_downlevel_capabilities()
-            .flags
-            .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
+        .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE);
     let textures: Vec<_> = assets
         .0
         .materials
@@ -330,25 +442,12 @@ fn prepare_grass(
                     usage: wgpu::BufferUsages::INDEX,
                 }),
                 index_count: model.indices.len() as u32,
+                radius: model.radius,
                 material,
-                layers: std::array::from_fn(|layer| GrassDrawLayer {
-                    indirect: indirect_supported.then(|| {
-                        device.create_buffer(&wgpu::BufferDescriptor {
-                            label: Some("grass_chunk_draws"),
-                            size: (slot_capacities[layer] * std::mem::size_of::<GrassDraw>())
-                                as u64,
-                            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
-                            mapped_at_creation: false,
-                        })
-                    }),
-                    commands: Vec::with_capacity(slot_capacities[layer]),
-                }),
+                draws: std::array::from_fn(|_| 0..0),
             }
         })
         .collect();
-    let vertex_attributes =
-        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
-    let instance_attributes = wgpu::vertex_attr_array![4 => Float32x2, 5 => Float32, 6 => Float32, 7 => Float32, 8 => Float32, 9 => Float32x2];
     let pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
         label: Some("forest_grass_pipeline".into()),
         layout: vec![global_layout, frame_layout.clone(), material_layout],
@@ -359,14 +458,14 @@ fn prepare_grass(
             entry_point: Some("vs_main".into()),
             buffers: vec![
                 VertexBufferLayout {
-                    array_stride: 48,
+                    array_stride: std::mem::size_of::<crate::grass::GrassVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: vertex_attributes.to_vec(),
+                    attributes: mesh_vertex_attributes().to_vec(),
                 },
                 VertexBufferLayout {
-                    array_stride: std::mem::size_of::<GrassInstance>() as u64,
+                    array_stride: std::mem::size_of::<GrassDrawInstance>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: instance_attributes.to_vec(),
+                    attributes: draw_instance_attributes().to_vec(),
                 },
             ],
         },
@@ -406,20 +505,78 @@ fn prepare_grass(
     let tallest = active_models.iter().map(|model| model.height).fold(0.0, f32::max);
     *state = Some(GrassResources {
         pipeline,
+        cull_pipeline,
         globals: global_group,
         frame_buffer,
         frame_layout,
         meshes,
         stream,
-        instances: std::array::from_fn(|layer| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("grass_chunk_instances"),
-                size: (slot_capacities[layer]
-                    * instances_per_slot(layer)
-                    * std::mem::size_of::<GrassInstance>()) as u64,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
+        layers: std::array::from_fn(|layer| {
+            let instance_capacity = slot_capacities[layer] * instances_per_slot(layer);
+            let draw_capacity = slot_capacities[layer] * active_models.len().max(1);
+            // Splitting a slot across models adds at most one partial
+            // workgroup per model beyond the first.
+            let job_capacity = slot_capacities[layer]
+                * (instances_per_slot(layer).div_ceil(WORKGROUP_SIZE as usize)
+                    + active_models.len().saturating_sub(1));
+            assert!(job_capacity <= device.limits().max_compute_workgroups_per_dimension as usize);
+            let buffer = |label, size, usage| {
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some(label),
+                    size,
+                    usage,
+                    mapped_at_creation: false,
+                })
+            };
+            let candidates = buffer(
+                "grass_chunk_candidates",
+                (instance_capacity * std::mem::size_of::<GrassInstance>()) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            let visible = buffer(
+                "grass_prepared_instances",
+                (instance_capacity * std::mem::size_of::<GrassDrawInstance>()) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX,
+            );
+            let indirect = buffer(
+                "grass_chunk_draws",
+                (draw_capacity * std::mem::size_of::<GrassDraw>()) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            );
+            let jobs_buffer = buffer(
+                "grass_cull_jobs",
+                (job_capacity * std::mem::size_of::<GrassCullJob>()) as u64,
+                wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            );
+            let cull_group = super::bind_group(
+                &device,
+                &cache,
+                "grass_cull_buffers",
+                &cull_layout,
+                &[
+                    wgpu::BindGroupEntry { binding: 0, resource: candidates.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: jobs_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: visible.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: indirect.as_entire_binding() },
+                ],
+            );
+            GrassLayer {
+                candidates,
+                visible,
+                indirect,
+                jobs_buffer,
+                cull_group,
+                commands: Vec::with_capacity(draw_capacity),
+                output_starts: Vec::with_capacity(draw_capacity),
+                jobs: Vec::with_capacity(job_capacity),
+            }
+        }),
+        indirect_first_instance,
+        habitat_sampler: device.wgpu_device().create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("grass_habitat_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
         }),
         widest,
         tallest,
@@ -444,7 +601,7 @@ fn prepare_grass_instances(
             * instances_per_slot(upload.key.layer)
             * std::mem::size_of::<GrassInstance>();
         queue.write_buffer(
-            &resources.instances[upload.key.layer],
+            &resources.layers[upload.key.layer].candidates,
             offset as u64,
             bytemuck::cast_slice(&upload.instances),
         );
@@ -484,7 +641,10 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
     let Some(resources) = guard.as_mut() else {
         return;
     };
-    let Some(pipeline) = cache.get_render_pipeline(resources.pipeline) else {
+    let (Some(pipeline), Some(cull_pipeline)) = (
+        cache.get_render_pipeline(resources.pipeline),
+        cache.get_compute_pipeline(resources.cull_pipeline),
+    ) else {
         return;
     };
     let center = [view.player_position[0], view.player_position[2]];
@@ -499,7 +659,7 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
     let frame = GrassFrame {
         mapping: gbuffer.grass_habitat_mapping,
         wind: [direction.cos(), direction.sin(), elapsed, wind_strength],
-        range: [100.0, grass::SCATTER_RADIUS, 0.0, 0.0],
+        range: [100.0, grass::SCATTER_RADIUS, center[0], center[1]],
         layer_end: [
             grass::LAYER_END[1],
             grass::LAYER_END[2],
@@ -513,50 +673,55 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
     let blade_extent =
         grass::MAX_SCALE * (resources.widest + resources.tallest * wind_strength.abs()) + 0.25;
     let footprint = Footprint::new(center, &globals.globals.view, &globals.globals.projection);
-    for mesh in &mut resources.meshes {
-        for layer in &mut mesh.layers {
-            layer.commands.clear();
-        }
+    for layer in &mut resources.layers {
+        layer.commands.clear();
+        layer.output_starts.clear();
+        layer.jobs.clear();
     }
-    for chunk in resources.stream.slots() {
-        let layer = chunk.key.layer;
-        let centre = chunk.key.centre();
-        if !footprint.may_draw(centre, chunk.key.root_radius(), grass::LAYER_END[layer], blade_extent) {
-            continue;
-        }
-        let first_instance = (chunk.slot * instances_per_slot(layer)) as u32;
-        for (model, mesh) in resources.meshes.iter_mut().enumerate() {
+    // Commands for a model are contiguous in each layer, allowing one
+    // multi-draw per model/layer. Only CPU-visible, fully uploaded slots enter
+    // the job list; retained and recycled slots cannot leak old candidates.
+    let chunks: Vec<_> = resources.stream.slots().filter(|chunk| {
+        footprint.may_draw(
+            chunk.key.centre(),
+            chunk.key.root_radius(),
+            grass::LAYER_END[chunk.key.layer],
+            blade_extent,
+        )
+    }).collect();
+    for (model, mesh) in resources.meshes.iter_mut().enumerate() {
+        let first_draw = resources.layers.each_ref().map(|layer| layer.commands.len());
+        for chunk in &chunks {
+            let layer_index = chunk.key.layer;
+            let layer = &mut resources.layers[layer_index];
             let start = chunk.model_starts[model];
             let count = chunk.model_starts[model + 1] - start;
             if count > 0 {
-                mesh.layers[layer].commands.push(GrassDraw {
+                let first_instance = (chunk.slot * instances_per_slot(layer_index)) as u32 + start;
+                let draw_word = layer.commands.len() as u32 * ARGS_WORDS + 1;
+                layer.commands.push(GrassDraw {
                     index_count: mesh.index_count,
-                    instance_count: count,
+                    instance_count: 0,
                     first_index: 0,
                     base_vertex: 0,
-                    first_instance: first_instance + start,
+                    first_instance: if resources.indirect_first_instance { first_instance } else { 0 },
                 });
+                layer.output_starts.push(first_instance);
+                push_cull_jobs(&mut layer.jobs, first_instance, count, first_instance, draw_word, mesh.radius);
             }
         }
+        mesh.draws = std::array::from_fn(|layer| first_draw[layer]..resources.layers[layer].commands.len());
     }
-    for mesh in &resources.meshes {
-        for layer in &mesh.layers {
-            if let Some(indirect) = &layer.indirect
-                && !layer.commands.is_empty()
-            {
-                queue.write_buffer(indirect, 0, bytemuck::cast_slice(&layer.commands));
-            }
+    for layer in &resources.layers {
+        if !layer.commands.is_empty() {
+            // Every active draw starts empty, including one which rejected
+            // all roots this frame after drawing survivors in the last frame.
+            queue.write_buffer(&layer.indirect, 0, bytemuck::cast_slice(&layer.commands));
+            queue.write_buffer(&layer.jobs_buffer, 0, bytemuck::cast_slice(&layer.jobs));
         }
     }
     queue.write_buffer(&resources.frame_buffer, 0, bytemuck::bytes_of(&frame));
     // Rebinding the capture view also handles window resize without stale views.
-    let sampler = device
-        .wgpu_device()
-        .create_sampler(&wgpu::SamplerDescriptor {
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
     let frame_group = super::bind_group(
         device,
         cache,
@@ -569,7 +734,7 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
+                resource: wgpu::BindingResource::Sampler(&resources.habitat_sampler),
             },
             wgpu::BindGroupEntry {
                 binding: 2,
@@ -581,6 +746,23 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
             },
         ],
     );
+    {
+        // This pass follows the habitat and tree-canopy captures and precedes
+        // the draw, so prepared roots and survivor counts share this frame's
+        // terrain, shade and camera fades without a GPU readback.
+        let mut pass = ctx.command_encoder().begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("forest_grass_cull"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(cull_pipeline);
+        pass.set_bind_group(1, Some(&*frame_group), &[]);
+        for layer in &resources.layers {
+            if !layer.jobs.is_empty() {
+                pass.set_bind_group(0, Some(&*layer.cull_group), &[]);
+                pass.dispatch_workgroups(layer.jobs.len() as u32, 1, 1);
+            }
+        }
+    }
     let attachments = [
         &gbuffer.position_view,
         &gbuffer.normal_view,
@@ -619,20 +801,22 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
         pass.set_bind_group(2, &mesh.material, &[]);
         pass.set_vertex_buffer(0, mesh.vertices.slice(..));
         pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-        for (layer, draws) in mesh.layers.iter().enumerate() {
-            if draws.commands.is_empty() {
+        for (layer_index, draws) in mesh.draws.iter().enumerate() {
+            if draws.is_empty() {
                 continue;
             }
-            pass.set_vertex_buffer(1, resources.instances[layer].slice(..));
-            if let Some(indirect) = &draws.indirect {
-                pass.multi_draw_indexed_indirect(indirect, 0, draws.commands.len() as u32);
+            let layer = &resources.layers[layer_index];
+            let args_stride = std::mem::size_of::<GrassDraw>() as u64;
+            if resources.indirect_first_instance {
+                pass.set_vertex_buffer(1, layer.visible.slice(..));
+                pass.multi_draw_indexed_indirect(&layer.indirect, draws.start as u64 * args_stride, draws.len() as u32);
             } else {
-                for draw in &draws.commands {
-                    pass.draw_indexed(
-                        0..mesh.index_count,
-                        0,
-                        draw.first_instance..draw.first_instance + draw.instance_count,
-                    );
+                for draw in draws.clone() {
+                    // first_instance remains zero on adapters without that
+                    // feature; the slice supplies the same compacted region.
+                    let offset = layer.output_starts[draw] as u64 * std::mem::size_of::<GrassDrawInstance>() as u64;
+                    pass.set_vertex_buffer(1, layer.visible.slice(offset..));
+                    pass.draw_indexed_indirect(&layer.indirect, draw as u64 * args_stride);
                 }
             }
         }
@@ -644,6 +828,10 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
         readiness.set_ready(resources.stream.anchor());
     }
 }
+
+#[cfg(test)]
+#[path = "grass_node_tests.rs"]
+mod tests;
 
 pub fn register_grass_systems(app: &mut bevy::app::SubApp) {
     app.init_resource::<GrassNodeState>();

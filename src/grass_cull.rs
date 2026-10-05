@@ -1,10 +1,9 @@
 //! Conservative visibility tests for the grass field's square chunks.
 //!
-//! The grass vertex shader already rejects instances one at a time (beyond the
-//! draw radius, beyond their layer's fade, thinned out, unsuitable ground), but
-//! every instance still costs a vertex-shader invocation per vertex to find
-//! that out. These tests drop whole chunks on the CPU first, so the GPU only
-//! sees instances that can reach the screen.
+//! The grass compute pass rejects individual instances beyond their draw
+//! radius or layer fade, thinned out by density, or rooted on unsuitable
+//! ground. These tests drop whole chunks on the CPU first, so the compute pass
+//! only evaluates candidates in chunks that can reach the screen.
 //!
 //! Both tests are deliberately *looser* than what the shader decides, never
 //! tighter: a chunk is dropped only when no instance rooted in it can produce a

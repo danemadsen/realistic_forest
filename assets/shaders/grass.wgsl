@@ -1,5 +1,5 @@
-// Instanced, alpha-tested imported grass. Habitat is captured with the same
-// terrain material shader and clipmap triangles immediately before this pass.
+// Instanced, alpha-tested imported grass. The compute pass evaluates habitat
+// once per clump and compacts the prepared roots used by this pass.
 struct GlobalUniforms {
     view: mat4x4<f32>, projection: mat4x4<f32>, camera_position: vec4<f32>,
     sun_direction: vec4<f32>, viewport: vec4<f32>, params: vec4<f32>,
@@ -15,7 +15,7 @@ struct GlobalUniforms {
 struct GrassFrame {
     mapping: vec4<f32>, // centre XZ, span, metres per texel
     wind: vec4<f32>,    // wind direction XZ, time, strength
-    range: vec4<f32>,   // full density distance, draw radius, unused
+    range: vec4<f32>,   // full density distance, draw radius, camera XZ
     // Distance at which layers 1..3 (far middle, close middle, carpet) fade to
     // nothing. The CPU culls whole chunks by the same numbers, so they come
     // from one place: grass.rs LAYER_END.
@@ -28,7 +28,7 @@ struct GrassFrame {
 struct GrassMaterial {
     colour: vec4<f32>,
     pbr: vec4<f32>, // alpha cutoff, normal strength, metal factor, rough factor
-    shape: vec4<f32>, // original height, root radius, AO strength, visible atlas mean luminance
+    shape: vec4<f32>, // blade height, [1] unused (the cull pass carries radius), AO strength, visible atlas mean luminance
 };
 @group(2) @binding(0) var base_colour: texture_2d<f32>;
 @group(2) @binding(1) var normal_map: texture_2d<f32>;
@@ -45,23 +45,6 @@ struct GrassOut {
     @location(5) blade_height: f32,
     @location(6) ground_average: vec3<f32>,
 };
-fn habitatUV(xz: vec2<f32>) -> vec2<f32> {
-    return (xz - frame.mapping.xy) / frame.mapping.z + 0.5;
-}
-fn groundAt(xz: vec2<f32>) -> vec4<f32> {
-    return textureSampleLevel(habitat, habitat_sampler, habitatUV(xz), 0.0);
-}
-// Read the least suitable texel, never an average across a forbidden boundary.
-fn allowedAt(xz: vec2<f32>) -> f32 {
-    let size = vec2<i32>(textureDimensions(habitat));
-    let cell = vec2<i32>(floor(habitatUV(xz) * vec2<f32>(size) - 0.5));
-    if (any(cell < vec2<i32>(0)) || any(cell + 1 >= size)) { return 0.0; }
-    // One hardware gather fetches the four neighbouring texels together.
-    // Taking their minimum keeps forbidden surfaces from being blurred into
-    // an eligible root at material, water or gully boundaries.
-    let four = textureGather(1u, habitat, habitat_sampler, habitatUV(xz));
-    return min(min(four.x, four.y), min(four.z, four.w));
-}
 fn yawRotate(v: vec3<f32>, c: f32, s: f32) -> vec3<f32> {
     return vec3<f32>(v.x * c + v.z * s, v.y, -v.x * s + v.z * c);
 }
@@ -71,60 +54,22 @@ fn vs_main(
     @location(2) uv: vec2<f32>, @location(3) tangent: vec4<f32>,
     @location(4) root: vec2<f32>, @location(5) rotation: f32, @location(6) scale: f32,
     @location(7) tint: f32, @location(8) seed: f32,
-    @location(9) scatter_data: vec2<f32>,
+    @location(9) ground_height_slope_x: vec2<f32>,
+    @location(10) ground_average_slope_z: vec4<f32>,
 ) -> GrassOut {
     var out: GrassOut;
-    out.position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
-    let distance = length(root - globals.camera_position.xz);
-    if (distance >= frame.range.y) { return out; }
-    // Continuous, nested density reduction: every independent imported model
-    // remains itself. Seed and position do not change on camera-cell crossings.
-    // Keep a living outer meadow: distant clumps become sparser gradually,
-    // but retain enough full-size silhouettes to read against the terrain.
-    let density = mix(1.0, 0.78, smoothstep(frame.range.x, frame.range.y, distance)) * scatter_data.x;
-    let survival = smoothstep(seed - 0.10, seed + 0.10, density);
-    let fade = 1.0 - smoothstep(frame.range.y - 22.0, frame.range.y, distance);
-    // Two gradually thinning middle tiers keep the valley planted without
-    // sending foreground-level card counts into the far field. Candidate
-    // rings extend past their zero-growth edges across camera-anchor moves.
-    let far_medium = 1.0 - smoothstep(frame.layer_end.x - 30.0, frame.layer_end.x, distance);
-    let near_medium = 1.0 - smoothstep(frame.layer_end.y - 30.0, frame.layer_end.y, distance);
-    let carpet = 1.0 - smoothstep(frame.layer_end.z - 8.0, frame.layer_end.z, distance);
-    let layer = select(1.0,
-                       select(far_medium,
-                              select(near_medium, carpet, scatter_data.y > 2.5),
-                              scatter_data.y > 1.5),
-                       scatter_data.y > 0.5);
-    // The ground-colour texture's alpha is the share of open sky the tree
-    // crowns leave over the root (vegetation.wgsl's canopy pass): deep shade
-    // under a closed canopy keeps only a few, smaller clumps.
-    let ground_colour = textureSampleLevel(grass_ground_albedo, habitat_sampler, habitatUV(root), 0.0);
-    let sky = ground_colour.a;
-    let shade_survival = smoothstep(seed - 0.12, seed + 0.12, 1.25 * sky - 0.12);
-    let potential = survival * fade * layer * shade_survival;
-    if (potential < 0.02) { return out; }
-    let ground = groundAt(root);
-    let radius = max(0.12, material.shape.y * scale);
-    var suitability = allowedAt(root);
-    if (suitability < 0.02) { return out; }
-    suitability = min(suitability, allowedAt(root + vec2<f32>(radius, 0.0)));
-    suitability = min(suitability, allowedAt(root - vec2<f32>(radius, 0.0)));
-    suitability = min(suitability, allowedAt(root + vec2<f32>(0.0, radius)));
-    suitability = min(suitability, allowedAt(root - vec2<f32>(0.0, radius)));
-    let growth = suitability * potential * mix(0.6, 1.0, sky);
-    if (growth < 0.02) { return out; }
-    let up = normalize(vec3<f32>(ground.b, sqrt(max(0.01, 1.0 - dot(ground.ba, ground.ba))), ground.a));
     let c = cos(rotation); let s = sin(rotation);
     let blade = clamp(position.y / max(material.shape.x, 0.01), 0.0, 1.0);
-    var offset = yawRotate(position * (scale * growth), c, s);
+    var offset = yawRotate(position * scale, c, s);
     // Set the wide card roots into the local slope while letting tips grow up.
-    offset.y -= dot(up.xz, offset.xz) / max(up.y, 0.5) * (1.0 - blade);
+    let slope = vec2<f32>(ground_height_slope_x.y, ground_average_slope_z.w);
+    offset.y -= dot(slope, offset.xz) * (1.0 - blade);
     let phase = dot(root, vec2<f32>(0.37, 0.21)) - frame.wind.z * 1.8;
     let gust = sin(phase) * 0.65 + sin(phase * 0.47 + seed * 6.283) * 0.35;
-    let bend = blade * blade * material.shape.x * scale * growth;
+    let bend = blade * blade * material.shape.x * scale;
     offset.x += frame.wind.x * gust * bend * frame.wind.w;
     offset.z += frame.wind.y * gust * bend * frame.wind.w;
-    let world = vec3<f32>(root.x, ground.r - 0.015, root.y) + offset;
+    let world = vec3<f32>(root.x, ground_height_slope_x.x, root.y) + offset;
     let view = globals.view * vec4<f32>(world, 1.0);
     out.position = globals.projection * view;
     out.view_position = view.xyz;
@@ -136,7 +81,7 @@ fn vs_main(
     out.tint = tint;
     out.blade_height = blade;
     // One averaged terrain colour per rooted clump, before lighting and shadow.
-    out.ground_average = ground_colour.rgb;
+    out.ground_average = ground_average_slope_z.rgb;
     return out;
 }
 struct Gbuffer {

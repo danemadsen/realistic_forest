@@ -1,8 +1,8 @@
 //! Imported grass geometry and a deterministic, bounded field of instances.
 //!
 //! Placement is indexed by world cells rather than camera frames. Terrain and
-//! erosion eligibility are evaluated by the render shader using the same height
-//! and material functions as the terrain itself.
+//! erosion eligibility are evaluated once per instance in compute using the
+//! captured terrain height and material suitability.
 
 #[cfg(test)]
 pub use crate::grass_cull::ChunkGrid;
@@ -44,7 +44,7 @@ pub const SCALE_SPAN: f32 = 0.46;
 pub const MAX_SCALE: f32 = MIN_SCALE + SCALE_SPAN;
 
 /// Distance from the camera at which each layer's fade reaches zero: beyond it
-/// the vertex shader drops every instance of the layer. The CPU culls whole
+/// the compute shader drops every instance of the layer. The CPU culls whole
 /// chunks by these numbers and the shader reads the same ones from its frame
 /// uniform, so the two cannot drift apart.
 pub const LAYER_END: [f32; LAYER_COUNT] = [SCATTER_RADIUS, 200.0, 140.0, 33.0];

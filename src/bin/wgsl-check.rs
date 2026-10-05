@@ -65,6 +65,8 @@ fn main() {
             ]
         } else if path.file_name().is_some_and(|name| name == "vegetation-cull.wgsl") {
             vec![EntryPoint { stage: naga::ShaderStage::Compute, name: "cull_plants".into() }]
+        } else if path.file_name().is_some_and(|name| name == "grass-cull.wgsl") {
+            vec![EntryPoint { stage: naga::ShaderStage::Compute, name: "cull_grass".into() }]
         } else if path.file_name().is_some_and(|name| name == "heightfield-max.wgsl") {
             vec![EntryPoint { stage: naga::ShaderStage::Compute, name: "reduce_highest".into() }]
         } else if path.file_name().is_some_and(|name| name == "vegetation.wgsl") {
