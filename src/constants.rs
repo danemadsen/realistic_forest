@@ -228,6 +228,8 @@ pub struct AppSettings {
     pub vegetation_detail: f32,
     /// Plants cast sun (and moon) shadows through cascaded shadow maps.
     pub vegetation_shadows: bool,
+    /// Draw the rivers' and lakes' water surfaces.
+    pub rivers_visible: bool,
 }
 
 impl Default for AppSettings {
@@ -276,6 +278,7 @@ impl Default for AppSettings {
             vegetation_enabled: true,
             vegetation_detail: 1.0,
             vegetation_shadows: true,
+            rivers_visible: true,
         }
     }
 }

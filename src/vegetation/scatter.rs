@@ -238,6 +238,7 @@ fn lerp_habitat(a: &Habitat, b: &Habitat, t: f32) -> Habitat {
             valley: l(a.site.valley, b.site.valley),
             turf: l(a.site.turf, b.site.turf),
             shore: l(a.site.shore, b.site.shore),
+            river: l(a.site.river, b.site.river),
         },
         forest: l(a.forest, b.forest),
         edge: l(a.edge, b.edge),
@@ -735,17 +736,64 @@ const TREE_CONTEXT: f64 = 24.0;
 /// trees; 1 the shrubs; 2 the herbs and lavender. Each level recomputes the
 /// trees around the chunk to stay clear of them, which keeps every level a
 /// pure function of the chunk coordinates.
-pub fn generate_level(noise: &NoiseField, catalog: &Catalog, chunk: [i64; 2], level: u8) -> Vec<PlantInstance> {
+/// How far past a river's or lake's waterline each layer's stems stand at
+/// least: the margin its floods scour stays open turf, trees and shrubs keep
+/// a few metres back, the bank's broadleaf plants begin a metre and a half
+/// up, and lavender, which wants dry ground, keeps well back. The GPU cull
+/// holds the drawn plants to the same margin.
+const RIVER_CLEARANCE: [f32; 5] = [4.5, 4.0, 3.5, 1.5, 3.0];
+
+/// How far past the waterline a canopy tree of crown radius `reach` stands
+/// at least: back by most of its crown, so a broad tree leans over the water
+/// rather than spreading across a creek or a lake's outlet. The GPU cull
+/// holds the drawn trees to the same.
+pub fn crown_clearance(reach: f32) -> f32 {
+    0.75 * reach + 1.5
+}
+
+/// How far past the waterline the GPU cull lets a plant of this model at
+/// this scale stand (vegetation-cull.wgsl's footing): a tree or tall shrub
+/// back by a few metres, more for a tall one, and by most of its crown; a
+/// ground plant by its crown and a metre. The scatter holds every plant to
+/// it as well, so none it places for the others to make room for is hidden;
+/// a tree or tall shrub with `FOOTING_MARGIN` to spare, for the GPU measures
+/// a lake's shore from the eroded ground, which the scatter does not see,
+/// and a lake's bank grows six times as fast as the ground rises.
+fn river_footing(catalog: &Catalog, model: u32, scale: f32) -> f32 {
+    let model = &catalog.models[model as usize];
+    let reach = model.crown_radius * scale;
+    if super::render_profile(model.species, &model.form).ground_habitat {
+        (reach + 1.0).max(1.5)
+    } else {
+        (4.0 + 0.06 * model.height * scale).max(crown_clearance(reach)) + FOOTING_MARGIN
+    }
+}
+
+/// Spare bank the scatter leaves a tree or tall shrub over the GPU cull's
+/// footing, metres.
+const FOOTING_MARGIN: f32 = 1.0;
+
+pub fn generate_level(
+    noise: &NoiseField,
+    catalog: &Catalog,
+    rivers: Option<&crate::rivers::network::RiverNetwork>,
+    chunk: [i64; 2],
+    level: u8,
+) -> Vec<PlantInstance> {
     let (minimum, maximum) = chunk_bounds(chunk);
     let canopy_margin = (CANOPY.overlap * 2.0 * MAX_CANOPY_REACH) as f64 + 2.0;
     let (outer_min, outer_max) = grow(minimum, maximum, TREE_CONTEXT + canopy_margin + 8.0);
-    let sampler = SiteSampler::new(noise, outer_min, outer_max);
+    let sampler = SiteSampler::new(noise, outer_min, outer_max).with_rivers(rivers);
+    let dry = |x: f64, z: f64, layer: Layer, model: u32, scale: f32| {
+        sampler.river_bank(x, z) >= RIVER_CLEARANCE[layer as usize].max(river_footing(catalog, model, scale))
+    };
     let habitats = HabitatGrid::build(&sampler, outer_min, outer_max);
 
     // Canopy, accepted out to the tree context around the chunk.
     let (canopy_min, canopy_max) = grow(minimum, maximum, TREE_CONTEXT + canopy_margin);
     let canopy = CandidateGrid::build(&CANOPY, canopy_min, canopy_max, |x, z, key| {
         canopy_candidate(catalog, &habitats, x, z, key)
+            .filter(|&(_, _, model, scale)| dry(x, z, Layer::Canopy, model, scale))
     });
     let (context_min, context_max) = grow(minimum, maximum, TREE_CONTEXT);
     let canopy_trees = canopy.survivors(CANOPY.overlap, MAX_CANOPY_REACH, context_min, context_max);
@@ -758,7 +806,8 @@ pub fn generate_level(noise: &NoiseField, catalog: &Catalog, chunk: [i64; 2], le
     let (regen_min, regen_max) = grow(context_min, context_max, 8.0);
     let regeneration = CandidateGrid::build(&REGENERATION, regen_min, regen_max, |x, z, key| {
         let candidate = regeneration_candidate(catalog, &habitats, x, z, key)?;
-        (!trees.blocks(x, z, candidate.1 * 0.6, 0.62)).then_some(candidate)
+        (!trees.blocks(x, z, candidate.1 * 0.6, 0.62) && dry(x, z, Layer::Regeneration, candidate.2, candidate.3))
+            .then_some(candidate)
     });
     let young_trees = regeneration.survivors(REGENERATION.overlap, 2.5, context_min, context_max);
     for tree in &young_trees {
@@ -782,7 +831,8 @@ pub fn generate_level(noise: &NoiseField, catalog: &Catalog, chunk: [i64; 2], le
             // Shrubs grow under crown edges but not against a trunk.
             let shrubs = CandidateGrid::build(&SHRUB, shrub_min, shrub_max, |x, z, key| {
                 let candidate = shrub_candidate(catalog, &habitats, x, z, key)?;
-                (!trees.blocks(x, z, candidate.1 * 0.45, 0.30)).then_some(candidate)
+                (!trees.blocks(x, z, candidate.1 * 0.45, 0.30) && dry(x, z, Layer::Shrub, candidate.2, candidate.3))
+                    .then_some(candidate)
             });
             out.extend(
                 shrubs
@@ -795,7 +845,8 @@ pub fn generate_level(noise: &NoiseField, catalog: &Catalog, chunk: [i64; 2], le
             let (shrub_min, shrub_max) = grow(minimum, maximum, 10.0);
             let shrubs = CandidateGrid::build(&SHRUB, shrub_min, shrub_max, |x, z, key| {
                 let candidate = shrub_candidate(catalog, &habitats, x, z, key)?;
-                (!trees.blocks(x, z, candidate.1 * 0.45, 0.30)).then_some(candidate)
+                (!trees.blocks(x, z, candidate.1 * 0.45, 0.30) && dry(x, z, Layer::Shrub, candidate.2, candidate.3))
+                    .then_some(candidate)
             });
             let mut cover = Occupancy::new(4.0);
             let (near_min, near_max) = grow(minimum, maximum, 4.0);
@@ -808,7 +859,11 @@ pub fn generate_level(noise: &NoiseField, catalog: &Catalog, chunk: [i64; 2], le
             let (herb_min, herb_max) = grow(minimum, maximum, herb_margin);
             let herbs = CandidateGrid::build(&HERB, herb_min, herb_max, |x, z, key| {
                 let candidate = herb_candidate(catalog, &habitats, x, z, key)?;
-                (!trees.blocks(x, z, 0.5, 0.12) && !cover.blocks(x, z, 0.1, 0.6)).then_some(candidate)
+                (!trees.blocks(x, z, 0.5, 0.12)
+                    && !cover.blocks(x, z, 0.1, 0.6)
+                    && dry(x, z, Layer::Herb, candidate.2, candidate.3)
+                    && sampler.river_bank(x, z) >= RIVER_CLEARANCE[Layer::Herb as usize] + candidate.1 * 0.5)
+                    .then_some(candidate)
             });
             out.extend(
                 herbs
@@ -820,7 +875,8 @@ pub fn generate_level(noise: &NoiseField, catalog: &Catalog, chunk: [i64; 2], le
             let (tuft_min, tuft_max) = grow(minimum, maximum, tuft_margin);
             let lavender = CandidateGrid::build(&LAVENDER, tuft_min, tuft_max, |x, z, key| {
                 let candidate = lavender_candidate(catalog, &habitats, x, z, key)?;
-                (!trees.blocks(x, z, 0.4, 0.85) && !cover.blocks(x, z, 0.2, 0.9)).then_some(candidate)
+                (!trees.blocks(x, z, 0.4, 0.85) && !cover.blocks(x, z, 0.2, 0.9) && dry(x, z, Layer::Lavender, candidate.2, candidate.3))
+                    .then_some(candidate)
             });
             out.extend(
                 lavender

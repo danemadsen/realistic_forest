@@ -1,0 +1,32 @@
+// BEGIN SHORE RUN
+// How far up the nearest river's or lake's shore ground at `height` lies:
+// the coordinate the terrain's bank band is measured in (terrain-fs.wgsl).
+// terrain-vs.wgsl hands each vertex's value on and terrain-fs.wgsl measures
+// it again exactly near the water, so both paste this block verbatim (a
+// test keeps the copies identical).
+//
+// Where the shore is gentle the run is the horizontal distance from the
+// waterline; where it climbs steeply, six metres per metre of rise
+// (RIVER_LAKE_SHORE_RUN, a lake's own shore unit), so a band measured in it
+// spreads over a floodplain or a flat pond margin and narrows on a cut bank
+// or a valley wall. A river's bank distance is its horizontal run. A lake
+// records only its level, so a lake's run is the rise over the slope of the
+// ground (`groundNormal`, the prefiltered material normal), as if its shore
+// were a plane, never taken gentler than 1 in 100. The run counts in the
+// water's own size: a creek's narrow margin reads as farther (its band is
+// narrower), a river's or a pond's broad one as nearer. Negative under
+// water; ground near no water reads 40, as frag_river's bank does.
+const RIVER_SHORE_LAKE_SCALE: f32 = 0.9;
+
+fn riverShoreRun(envelope: RiverEnvelope, height: f32, groundNormal: vec3<f32>) -> f32
+{
+    let tangent = sqrt(max(1.0 - groundNormal.y*groundNormal.y, 0.0))/max(groundNormal.y, 0.05);
+    let riverScale = clamp(0.3 + 0.28*envelope.half_width, 0.35, 1.3);
+    let riverRun = max(envelope.bank_distance,
+                       (height - envelope.water)*RIVER_LAKE_SHORE_RUN)/riverScale;
+    let lakeRise = height - envelope.lake;
+    let lakeRun = max(lakeRise/max(tangent, 0.01), lakeRise*RIVER_LAKE_SHORE_RUN)
+                / RIVER_SHORE_LAKE_SCALE;
+    return clamp(min(riverRun, lakeRun), -40.0, 40.0);
+}
+// END SHORE RUN

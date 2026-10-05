@@ -66,8 +66,14 @@ pub struct AutomationSettings {
     /// `--map-centre x,z` and `--map-extent metres` frame that chart.
     pub map_centre: [f64; 2],
     pub map_extent: f64,
+    /// Whether `--map-extent` was given; the river map defaults wider.
+    pub map_extent_set: bool,
     /// `--no-vegetation`: scatter and draw no plants, to price them.
     pub no_vegetation: bool,
+    /// `--river-map path.png`: chart the river network and exit.
+    pub river_map: Option<String>,
+    /// `--no-rivers`: generate and draw no rivers.
+    pub no_rivers: bool,
     pub width: i32,
     pub height: i32,
     pub probe_extent: f32,
@@ -115,7 +121,10 @@ impl Default for AutomationSettings {
             vegetation_map: None,
             map_centre: [0.0, 0.0],
             map_extent: 1024.0,
+            map_extent_set: false,
             no_vegetation: false,
+            river_map: None,
+            no_rivers: false,
             width: 1600,
             height: 900,
             probe_extent: 4096.0,
@@ -247,6 +256,13 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             }
             "--probe" => automation.probe = true,
             "--no-vegetation" => automation.no_vegetation = true,
+            "--no-rivers" => automation.no_rivers = true,
+            "--river-map" => {
+                if let Some(next) = next {
+                    index += 1;
+                    automation.river_map = Some(next.clone());
+                }
+            }
             "--vegetation-map" => {
                 if let Some(next) = next {
                     index += 1;
@@ -267,6 +283,7 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                     index += 1;
                     if let Ok(value) = next.parse::<f64>() {
                         automation.map_extent = value.clamp(16.0, 16384.0);
+                        automation.map_extent_set = true;
                     }
                 }
             }

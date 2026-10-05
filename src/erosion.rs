@@ -188,6 +188,10 @@ pub fn sample_eroded_height(
         total_weight += masks[index];
     }
 
+    let envelope = cache
+        .rivers
+        .as_ref()
+        .map_or(crate::rivers::carve::Envelope::NONE, |network| network.envelope(x, z));
     let mut delta = 0.0f32;
     if total_weight > 0.000001 {
         let inverse_weight = 1.0 / total_weight;
@@ -203,7 +207,11 @@ pub fn sample_eroded_height(
             }
         }
     }
-    crate::noise::base_height(noise, x, z) + delta * erosion_visibility(x, z, visibility_center)
+    // Erosion ran over the carved base; the channels hold over the result.
+    envelope.clamp(
+        envelope.clamp(crate::noise::base_height(noise, x, z))
+            + delta * erosion_visibility(x, z, visibility_center),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +240,8 @@ pub struct InitTileCommand {
     /// Contributing area of every base cell (see [`route_base_drainage`]),
     /// so stream power acts on whole catchments from the first iteration.
     pub drainage_area: Vec<f32>,
+    /// 1 where a river's water covers the cell: held fixed, and a sink.
+    pub river: Vec<f32>,
 }
 
 pub struct IterateCommand {
@@ -377,6 +387,9 @@ pub struct ErosionCache {
     /// Keys whose reveal jumps straight to 1.0 when the finalize event lands
     /// (spawn prewarm and UI-triggered re-runs).
     pub force_reveal: Option<TileKey>,
+    /// The river network in force: tiles simulate over its carved channels
+    /// and height queries hold its channels and banks.
+    pub rivers: Option<Arc<crate::rivers::network::RiverNetwork>>,
 }
 
 impl Default for ErosionCache {
@@ -392,6 +405,7 @@ impl Default for ErosionCache {
             ready: true,
             cache_dropped: false,
             force_reveal: None,
+            rivers: None,
         }
     }
 }
@@ -594,15 +608,21 @@ pub struct PreparedTile {
     pub key: TileKey,
     pub base_height: Vec<f32>,
     pub drainage_area: Vec<f32>,
+    pub river: Vec<f32>,
 }
 
-pub fn prepare_tile(noise: &NoiseField, key: TileKey) -> PreparedTile {
-    let base_height = crate::noise::create_base_height_map(noise, key);
+pub fn prepare_tile(
+    noise: &NoiseField,
+    rivers: Option<&crate::rivers::network::RiverNetwork>,
+    key: TileKey,
+) -> PreparedTile {
+    let (base_height, river) = crate::noise::create_base_height_map(noise, key, rivers);
     let drainage_area = route_base_drainage(&base_height, EROSION_RESOLUTION, EROSION_CELL_SIZE);
     PreparedTile {
         key,
         base_height,
         drainage_area,
+        river,
     }
 }
 
@@ -640,7 +660,9 @@ impl TilePreparation {
         }
         let Some((key, mut task)) = self.pending.take() else {
             let noise = self.noise.clone();
-            let task = AsyncComputeTaskPool::get().spawn(async move { prepare_tile(&noise, next) });
+            let rivers = cache.rivers.clone();
+            let task = AsyncComputeTaskPool::get()
+                .spawn(async move { prepare_tile(&noise, rivers.as_deref(), next) });
             self.pending = Some((next, task));
             return None;
         };
@@ -665,7 +687,8 @@ pub fn begin_tile(
     if !cache.tiles.contains_key(&key) {
         return;
     }
-    begin_prepared_tile(cache, commands, prepare_tile(noise, key));
+    let prepared = prepare_tile(noise, cache.rivers.as_deref(), key);
+    begin_prepared_tile(cache, commands, prepared);
 }
 
 /// [`begin_tile`] with inputs already built, synchronously or by
@@ -684,6 +707,7 @@ pub fn begin_prepared_tile(
         key,
         base_height: prepared.base_height,
         drainage_area: prepared.drainage_area,
+        river: prepared.river,
     });
     if let Some(existing) = cache.tiles.get_mut(&key) {
         existing.state = ErosionTileState::Simulating;
@@ -964,6 +988,7 @@ mod tests {
                     key: tile(0, 0),
                     base_height: vec![1.0, 2.0],
                     drainage_area: vec![1.0, 1.0],
+                    river: vec![0.0, 0.0],
                 }),
                 iterate: Some(IterateCommand {
                     count: 6,

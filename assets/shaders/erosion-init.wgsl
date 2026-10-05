@@ -168,7 +168,9 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
     {
         // The CPU routes the base surface's drainage before the tile starts,
         // so stream power acts on whole catchments from the first iteration.
-        return vec4<f32>(max(base.g, 0.0), 0.0, 0.0, 0.0);
+        // A marks the cells a river's water covers (base B); the terrain
+        // and thermal passes hold them fixed and keep the mark.
+        return vec4<f32>(max(base.g, 0.0), 0.0, 0.0, select(0.0, 1.0, base.b > 0.5));
     }
     else
     {

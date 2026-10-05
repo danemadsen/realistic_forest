@@ -14,6 +14,7 @@ pub mod grass_node;
 pub mod post_nodes;
 pub mod lightning_node;
 pub mod precipitation_node;
+pub mod river_node;
 pub mod terrain_node;
 pub mod vegetation_node;
 pub mod vegetation_shadows;
@@ -550,6 +551,7 @@ impl Plugin for ForestRenderPlugin {
         water_node::register_water_systems(render_app);
 
         gpu_textures::register_gpu_texture_systems(render_app);
+        river_node::register_river_systems(render_app);
         erosion_node::register_erosion_systems(render_app);
         terrain_node::register_terrain_systems(render_app);
         post_nodes::register_post_systems(render_app);

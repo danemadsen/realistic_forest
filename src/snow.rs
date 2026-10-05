@@ -240,9 +240,15 @@ pub fn sample_surface(
     let dx = Vec2::new(SLOPE_SAMPLE_DISTANCE, 0.0);
     let dz = Vec2::new(0.0, SLOPE_SAMPLE_DISTANCE);
     let gradient = Vec2::new(at(dx) - at(-dx), at(dz) - at(-dz)) / (2.0 * SLOPE_SAMPLE_DISTANCE);
+    // Snow lies on dry ground only, thinning to nothing at a river's or
+    // lake's waterline, as terrain-vs.wgsl draws it: no bed stands above its
+    // water, and a wading player tramples no trail in it.
+    let dry = erosion.rivers.as_ref().map_or(1.0, |network| {
+        smooth_hermite(0.0, 1.0, network.envelope(position.x, position.y).bank_at(base_height))
+    });
     SnowSurface {
         base_height,
-        coverage: snow_coverage(base_height, gradient),
+        coverage: dry * snow_coverage(base_height, gradient),
     }
 }
 

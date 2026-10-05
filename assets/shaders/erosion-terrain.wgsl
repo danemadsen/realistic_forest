@@ -344,6 +344,15 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
     {
         return FragmentOutput(vec4<f32>(base_height, 0.0, base_height, loose), vec4<f32>(0.0));
     }
+    // So does a river channel: its bed is the river's, and the river
+    // carries off whatever water and sediment reach it. Drainage A keeps the
+    // mark for the next iteration and the thermal pass; B reads as hard rock
+    // so the banks above it are not undercut by the talus pass.
+    if (fetchDrainage(coord).a > 0.5)
+    {
+        return FragmentOutput(vec4<f32>(base_height, 0.0, base_height, loose),
+                              vec4<f32>(0.0, 0.0, 1.0, 1.0));
+    }
 
     let dt = max(stage.delta_time, 0.0);
     let cell_size = max(stage.cell_size, 0.0001);

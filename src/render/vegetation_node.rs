@@ -644,6 +644,8 @@ fn build_library(
             uniform_entry(7, compute, std::mem::size_of::<TerrainStageUniforms>() as u64),
             texture_entry(8, compute),
             sampler_entry(9, compute),
+            storage_entry(10, compute, true),
+            storage_entry(11, compute, true),
         ],
     );
     let cull_layout = BindGroupLayoutDescriptor::new(
@@ -1276,6 +1278,14 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
                 binding: 9,
                 resource: wgpu::BindingResource::Sampler(&library.habitat_sampler),
             },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: textures.river_grid.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: textures.river_segments.as_entire_binding(),
+            },
         ],
     );
 
@@ -1496,6 +1506,21 @@ mod tests {
             include_str!("../../assets/shaders/vegetation-cull.wgsl"),
         ] {
             assert!(source.contains(common), "terrain height model diverged");
+        }
+    }
+
+    /// The rivers carve the clipmap, keep the plants out of the water, and
+    /// shape the CPU's footing and erosion bases (src/rivers/carve.rs) from
+    /// one envelope; the pasted copies of its shader must not drift apart.
+    #[test]
+    fn rivers_carve_the_same_ground_everywhere() {
+        let common = include_str!("../../assets/shaders/river-functions.wgslinc").trim();
+        for source in [
+            include_str!("../../assets/shaders/terrain-vs.wgsl"),
+            include_str!("../../assets/shaders/terrain-fs.wgsl"),
+            include_str!("../../assets/shaders/vegetation-cull.wgsl"),
+        ] {
+            assert!(source.contains(common), "river carve diverged");
         }
     }
 

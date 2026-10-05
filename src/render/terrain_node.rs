@@ -968,8 +968,24 @@ fn terrain_texture_layout() -> BindGroupLayoutDescriptor {
                 },
                 count: None,
             },
+            river_storage_entry(17), // river lookup grid
+            river_storage_entry(18), // river carve segments
         ],
     )
+}
+
+/// A read-only river storage buffer, read where the ground height is.
+fn river_storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
 }
 
 /// Input to the local terrain-colour averaging pass.
@@ -1185,6 +1201,14 @@ fn terrain_texture_bind_group(
         wgpu::BindGroupEntry {
             binding: 16,
             resource: snow_uniform.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 17,
+            resource: textures.river_grid.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 18,
+            resource: textures.river_segments.as_entire_binding(),
         },
     ];
     super::bind_group(device, cache, "forest_terrain_textures", layout, &entries)
@@ -1904,6 +1928,21 @@ mod habitat_cache_tests {
             habitat_capture_globals(&GlobalUniformsGpu::default(), mapping, Some(0.7)).camera_position[3],
             0.7
         );
+    }
+
+    /// The vertex stage hands each vertex's run up its shore to the fragment
+    /// stage, which measures it again exactly near the water; the two must
+    /// measure alike, or the bank band seams where the exact lookup hands
+    /// over to the vertices.
+    #[test]
+    fn both_terrain_stages_measure_the_shore_alike() {
+        let common = include_str!("../../assets/shaders/river-shore.wgslinc").trim();
+        for source in [
+            include_str!("../../assets/shaders/terrain-vs.wgsl"),
+            include_str!("../../assets/shaders/terrain-fs.wgsl"),
+        ] {
+            assert!(source.contains(common), "shore run diverged");
+        }
     }
 
     /// The capture is kept across frames, so it is only right while every input

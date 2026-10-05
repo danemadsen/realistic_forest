@@ -64,7 +64,10 @@ pub fn draw_diagnostics_ui(
     mut players: Query<&mut Player>,
     automation: Res<AutomationSettings>,
     mut rerun: ResMut<RerunErosion>,
-    vegetation: Option<Res<crate::vegetation::VegetationField>>,
+    (vegetation, rivers): (
+        Option<Res<crate::vegetation::VegetationField>>,
+        Option<Res<crate::rivers::RiverField>>,
+    ),
     mut snow: ResMut<SnowState>,
     mut trainer: Local<TrainerState>,
     mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>,
@@ -108,6 +111,7 @@ pub fn draw_diagnostics_ui(
             &mut player,
             &mut trainer,
             &mut rerun,
+            rivers.as_deref(),
         );
         if !settings.show_trainer && automation.shot_path.is_none() {
             if let Ok(mut cursor) = cursors.single_mut() {
@@ -419,6 +423,7 @@ fn draw_trainer_window(
     player: &mut Player,
     trainer: &mut TrainerState,
     rerun: &mut RerunErosion,
+    rivers: Option<&crate::rivers::RiverField>,
 ) {
     let mut open = settings.show_trainer;
     let previous_position = player.position;
@@ -534,6 +539,7 @@ fn draw_trainer_window(
                     weather,
                     player,
                     rerun,
+                    rivers,
                 );
             }
             ui.small("2 close menu  |  3 debug text  |  F12 screenshot");
@@ -556,6 +562,7 @@ fn draw_advanced_controls(
     weather: &mut WeatherState,
     player: &Player,
     rerun: &mut RerunErosion,
+    rivers: Option<&crate::rivers::RiverField>,
 ) {
     separator_text(ui, "Weather");
     ui.checkbox(&mut weather.automatic, "Moving weather fronts");
@@ -763,6 +770,42 @@ fn draw_advanced_controls(
             .text("Plant detail distance")
             .fixed_decimals(2),
     );
+
+    separator_text(ui, "Rivers");
+    ui.checkbox(&mut settings.rivers_visible, "River and lake surfaces");
+    match rivers.and_then(|field| field.network()) {
+        Some(network) => {
+            ui.label(format!(
+                "{} rivers, {:.1} km of channel, {} lakes (region built in {:.2} s)",
+                network.rivers.len(),
+                network.total_length_km(),
+                network.lakes.len(),
+                network.build_seconds
+            ));
+            let here = network.envelope(player.position.x, player.position.z);
+            if here.is_none() {
+                ui.label("No river within reach of the player");
+            } else {
+                ui.label(format!(
+                    "Nearest channel: {:.1} m wide, water at {:.1} m, {:.1} m past its bank",
+                    here.half_width * 2.0,
+                    here.water,
+                    here.bank_distance
+                ));
+            }
+            if player.wading_depth > 0.0 {
+                ui.label(format!(
+                    "Wading {:.2} m deep in a {:.2} m/s current{}",
+                    player.wading_depth,
+                    player.current.length(),
+                    if player.swept { ", swept off your feet" } else { "" }
+                ));
+            }
+        }
+        None => {
+            ui.label("Rivers disabled (--no-rivers)");
+        }
+    }
 
     separator_text(ui, "Terrain textures");
     ui.add(
@@ -1296,6 +1339,7 @@ mod tests {
                     &mut player,
                     &mut trainer,
                     &mut rerun,
+                    None,
                 );
                 let mut output = ctx.end_pass();
                 output.textures_delta.clear();

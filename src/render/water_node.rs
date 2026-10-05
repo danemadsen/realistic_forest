@@ -13,11 +13,19 @@
 //! cloud sky probe supplies offscreen reflections and Snell's window.
 //! FXAA sees the result.
 //!
-//! Neither pass has a depth attachment. The surface pass stands in for one by
-//! testing the G-buffer's view-space z against the water fragment's own (view
-//! space looks down -Z, so a greater z is nearer). That is also why the passes
-//! must not be reordered relative to the composite: the G-buffer is written by
-//! the terrain pass and stays valid for the whole frame.
+//! The surface pass depth-tests against the G-buffer's own depth buffer, which
+//! the terrain, plants and grass have finished with by now. The test runs in
+//! hardware ahead of the shader, so the sea and rivers hidden behind a
+//! hillside or a tree never run their (costly) shading at all; the water
+//! writes its own depth too, so a river drawn after the sea never paints over
+//! a wave in front of it. The shader still reads the G-buffer's view-space
+//! position for the light path through the water. That is also why the
+//! passes must not be reordered relative to the composite: the G-buffer is
+//! written by the terrain pass and stays valid for the whole frame.
+//!
+//! The rivers draw in the same pass after the sea, from
+//! `river_node::ExtractedRivers`: chunks of their surface ribbons culled
+//! against the view, through `vs_river`/`fs_river` in the same shader file.
 //!
 //! `--no-water` (`WorldOptions::draw_ocean`) skips the surface pass outright.
 //! The placeholder ocean plane it used to skip is gone; the flag now means
@@ -227,6 +235,10 @@ struct WaterInner {
     meshes: Option<WaterMeshes>,
     surface_pipeline: HashMap<TextureFormat, CachedRenderPipelineId>,
     blit_pipeline: HashMap<TextureFormat, CachedRenderPipelineId>,
+    river_pipeline: HashMap<TextureFormat, CachedRenderPipelineId>,
+    /// Group 2 for the rivers: the surface stage block and the plants'
+    /// shadow cascades.
+    river_stage: Option<(BindGroupLayoutDescriptor, BindGroup)>,
     underwater_pipeline: HashMap<TextureFormat, CachedRenderPipelineId>,
     /// Ring centre the instance buffers currently hold, so a static camera
     /// rewrites nothing.
@@ -268,6 +280,8 @@ impl Default for WaterNodeState {
                 meshes: None,
                 surface_pipeline: HashMap::new(),
                 blit_pipeline: HashMap::new(),
+                river_pipeline: HashMap::new(),
+                river_stage: None,
                 underwater_pipeline: HashMap::new(),
                 snapped_centre: None,
                 wave_key: None,
@@ -421,11 +435,13 @@ fn prepare_water_rings(
 /// Builds the layouts, samplers, uniform slots and uniform contents both passes
 /// draw with. Everything is skipped (and retried next frame) until the G-buffer
 /// and the globals buffer exist.
+#[allow(clippy::too_many_arguments)]
 fn prepare_water(
     state: Res<WaterNodeState>,
     globals: Res<ForestGlobals>,
     terrain: Res<TerrainNodeState>,
     water: Res<ExtractedWater>,
+    plant_shadows: Res<crate::render::vegetation_shadows::VegetationShadowMaps>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
@@ -463,11 +479,12 @@ fn prepare_water(
         inner.samplers = Some(create_samplers(&device));
     }
     if inner.surface_screen.is_none() {
-        // Group 1: composited frame and the lighting/seabed maps (bilinear),
-        // plus G-buffer position (point). Texture N pairs with sampler N + 8.
+        // Group 1: composited frame, the lighting and seabed maps and the
+        // canopy over the grass capture (bilinear), plus G-buffer position
+        // (point). Texture N pairs with sampler N + 8.
         inner.surface_screen = Some(screen_layout(
             "forest_water_surface_layout",
-            &[true, false, true, true],
+            &[true, false, true, true, true],
         ));
     }
     if inner.underwater_screen.is_none() {
@@ -483,6 +500,78 @@ fn prepare_water(
             "forest_water_surface_stage",
             std::mem::size_of::<WaterStageUniforms>() as u64,
         ));
+    }
+    if inner.river_stage.is_none()
+        && let (Some(stage), Some(shadows)) = (inner.surface_stage.as_ref(), plant_shadows.targets.as_ref())
+    {
+        let layout = BindGroupLayoutDescriptor::new(
+            "forest_river_stage",
+            &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::VERTEX_FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: BufferSize::new(std::mem::size_of::<WaterStageUniforms>() as u64),
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Depth,
+                        view_dimension: TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: BufferSize::new(std::mem::size_of::<
+                            crate::render::vegetation_shadows::ShadowUniform,
+                        >() as u64),
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Comparison),
+                    count: None,
+                },
+            ],
+        );
+        let group = super::bind_group(
+            &device,
+            &pipeline_cache,
+            "forest_river_stage",
+            &layout,
+            &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: stage.buffer.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&shadows.array_view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: shadows.uniform.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: BindingResource::Sampler(&shadows.sampler),
+                },
+            ],
+        );
+        inner.river_stage = Some((layout, group));
     }
     if inner.underwater_stage.is_none() {
         inner.underwater_stage = Some(create_stage(
@@ -542,10 +631,28 @@ fn prepare_water(
             SURFACE_PARAMS_OFFSET,
             bytemuck::bytes_of(&inner.surface_frame),
         );
+        // The seabed map is only drawn while the sea is; the rivers read it
+        // too, as the ground of their banks, and must know when it is not
+        // there.
+        let shore_map = if water.draw {
+            shore_heightfield_mapping(globals.globals.camera_position)
+        } else {
+            [0.0; 4]
+        };
         queue.write_buffer(
             &stage.buffer,
             std::mem::offset_of!(WaterStageUniforms, shore_map) as u64,
-            bytemuck::bytes_of(&shore_heightfield_mapping(globals.globals.camera_position)),
+            bytemuck::bytes_of(&shore_map),
+        );
+        // Where the canopy capture lies, while there is one to read.
+        let canopy_map = gbuffer_guard
+            .as_ref()
+            .filter(|gbuffer| gbuffer.grass_habitat_ready)
+            .map_or([0.0; 4], |gbuffer| gbuffer.grass_habitat_mapping);
+        queue.write_buffer(
+            &stage.buffer,
+            std::mem::offset_of!(WaterStageUniforms, canopy_map) as u64,
+            bytemuck::bytes_of(&canopy_map),
         );
     }
 
@@ -698,7 +805,14 @@ pub fn forest_water_surface_pass(
     let Some(water) = world.get_resource::<ExtractedWater>() else {
         return;
     };
-    if !water.draw {
+    let rivers_visible = world
+        .get_resource::<ExtractedForestView>()
+        .is_some_and(|view| view.settings.rivers_visible);
+    let rivers = world
+        .get_resource::<super::river_node::ExtractedRivers>()
+        .and_then(|rivers| rivers.surface.as_ref())
+        .filter(|_| rivers_visible);
+    if !water.draw && rivers.is_none() {
         return;
     }
     let (Some(shaders), Some(extracted)) = (
@@ -716,6 +830,9 @@ pub fn forest_water_surface_pass(
     let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
         return;
     };
+    let Some(globals) = world.get_resource::<ForestGlobals>() else {
+        return;
+    };
     let Ok(mut inner) = state.inner.lock() else {
         return;
     };
@@ -725,7 +842,15 @@ pub fn forest_water_surface_pass(
     let Some(gbuffer) = gbuffer_guard.as_ref() else {
         return;
     };
-    if !gbuffer.shore_heightfield_ready {
+    // The sea samples the seabed map, which only exists while it is drawn.
+    let draw_ocean = water.draw && gbuffer.shore_heightfield_ready;
+    if !draw_ocean && rivers.is_none() {
+        return;
+    }
+    // The G-buffer's depth is the water's depth attachment, so the two must
+    // agree in size; for the frame a window resize lands in they may not.
+    let target = view.main_texture().size();
+    if target.width != gbuffer.width || target.height != gbuffer.height {
         return;
     }
     let Some(cloud_state) = world.get_resource::<CloudRenderState>() else {
@@ -735,7 +860,7 @@ pub fn forest_water_surface_pass(
         return;
     };
 
-    let Some((pipeline_id, blit_id)) = surface_pipelines(
+    let Some((pipeline_id, blit_id, river_id)) = surface_pipelines(
         &mut inner,
         pipeline_cache,
         shaders,
@@ -750,6 +875,7 @@ pub fn forest_water_surface_pass(
     ) else {
         return;
     };
+    let river_pipeline = river_id.and_then(|id| pipeline_cache.get_render_pipeline(id));
     // Wait for both asynchronous pipelines before swapping the frame;
     // otherwise a shader still compiling would leave an unwritten target.
     // Rebuild group 1 from the source the ping-pong hands back each frame.
@@ -766,6 +892,7 @@ pub fn forest_water_surface_pass(
             &gbuffer.position_view,
             &gbuffer.heightfield_view,
             &gbuffer.shore_heightfield_view,
+            &gbuffer.grass_ground_average_view,
             post_process.source,
         ),
     ) else {
@@ -787,7 +914,16 @@ pub fn forest_water_surface_pass(
                 store: wgpu::StoreOp::Store,
             },
         })],
-        depth_stencil_attachment: None,
+        // The opaque scene's depth: read for the hardware test, written by
+        // the water so a river never paints over a nearer wave.
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: &gbuffer.depth_view,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
         timestamp_writes: None,
         occlusion_query_set: None,
         multiview_mask: None,
@@ -803,18 +939,81 @@ pub fn forest_water_surface_pass(
     render_pass.set_render_pipeline(blit);
     render_pass.draw(0..3, 0..1);
 
-    render_pass.set_render_pipeline(pipeline);
-    render_pass.set_bind_group(2, &stage.group, &[]);
     render_pass.set_bind_group(3, &clouds.group, &[]);
-    for patch in meshes.patches.iter() {
-        if patch.instance_count == 0 {
-            continue;
+    if draw_ocean {
+        render_pass.set_render_pipeline(pipeline);
+        render_pass.set_bind_group(2, &stage.group, &[]);
+        for patch in meshes.patches.iter() {
+            if patch.instance_count == 0 {
+                continue;
+            }
+            render_pass.set_vertex_buffer(0, patch.vertex.slice(..));
+            render_pass.set_vertex_buffer(1, patch.instance.slice(..));
+            render_pass.set_index_buffer(patch.index.slice(..), IndexFormat::Uint32);
+            render_pass.draw_indexed(0..patch.index_count, 0, 0..patch.instance_count);
         }
-        render_pass.set_vertex_buffer(0, patch.vertex.slice(..));
-        render_pass.set_vertex_buffer(1, patch.instance.slice(..));
-        render_pass.set_index_buffer(patch.index.slice(..), IndexFormat::Uint32);
-        render_pass.draw_indexed(0..patch.index_count, 0, 0..patch.instance_count);
     }
+
+    if let (Some(rivers), Some(river_pipeline), Some((_, river_group))) =
+        (rivers, river_pipeline, inner.river_stage.as_ref())
+    {
+        let g = &globals.globals;
+        let view_projection = (bevy::math::Mat4::from_cols_array(&g.projection)
+            * bevy::math::Mat4::from_cols_array(&g.view))
+        .to_cols_array();
+        let eye = [g.camera_position[0], g.camera_position[1], g.camera_position[2]];
+        let ranges = rivers.visible(&view_projection, eye);
+        if !ranges.is_empty() {
+            render_pass.set_render_pipeline(river_pipeline);
+            render_pass.set_bind_group(2, river_group, &[]);
+            render_pass.set_vertex_buffer(0, rivers.vertices.slice(..));
+            render_pass.set_index_buffer(rivers.indices.slice(..), IndexFormat::Uint32);
+            for (first, count) in ranges {
+                render_pass.draw_indexed(first..first + count, 0, 0..1);
+            }
+        }
+    }
+}
+
+/// The water's depth state: tested against the G-buffer's reverse-Z depth
+/// (an exact tie goes to the water, as the terrain pass's comparison does)
+/// and written, or for the blit neither.
+fn water_depth(test: bool) -> wgpu::DepthStencilState {
+    wgpu::DepthStencilState {
+        format: TextureFormat::Depth32Float,
+        depth_write_enabled: Some(test),
+        depth_compare: Some(if test {
+            wgpu::CompareFunction::GreaterEqual
+        } else {
+            wgpu::CompareFunction::Always
+        }),
+        stencil: wgpu::StencilState::default(),
+        bias: wgpu::DepthBiasState::default(),
+    }
+}
+
+/// The river vertex: `SurfaceVertex` in src/rivers/surface.rs.
+fn river_vertex_layout() -> Vec<VertexBufferLayout> {
+    let attribute = |location: u32, offset: u64, format: VertexFormat| VertexAttribute {
+        format,
+        offset,
+        shader_location: location,
+    };
+    vec![VertexBufferLayout {
+        array_stride: std::mem::size_of::<crate::rivers::surface::SurfaceVertex>() as u64,
+        step_mode: VertexStepMode::Vertex,
+        attributes: vec![
+            attribute(0, 0, VertexFormat::Float32x3),
+            attribute(1, 12, VertexFormat::Float32x2),
+            attribute(2, 20, VertexFormat::Float32),
+            attribute(3, 24, VertexFormat::Float32),
+            attribute(4, 28, VertexFormat::Float32),
+            attribute(5, 32, VertexFormat::Float32),
+            attribute(6, 36, VertexFormat::Float32),
+            attribute(7, 40, VertexFormat::Float32),
+            attribute(8, 44, VertexFormat::Float32),
+        ],
+    }]
 }
 
 /// Queues the surface and blit pipelines for `format` if they are not cached,
@@ -825,7 +1024,7 @@ fn surface_pipelines(
     shaders: &ForestShaderHandles,
     format: TextureFormat,
     cloud_layout: &BindGroupLayoutDescriptor,
-) -> Option<(CachedRenderPipelineId, CachedRenderPipelineId)> {
+) -> Option<(CachedRenderPipelineId, CachedRenderPipelineId, Option<CachedRenderPipelineId>)> {
     let _ = pipeline_cache;
     let surface = match inner.surface_pipeline.get(&format).copied() {
         Some(id) => id,
@@ -846,10 +1045,9 @@ fn surface_pipelines(
                         buffers: surface_vertex_layouts(),
                     },
                     primitive: PrimitiveState::default(),
-                    // No depth attachment and no culling: this is a post pass
-                    // that tests depth in the shader against the G-buffer, and
-                    // the surface has to be drawable from below as well.
-                    depth_stencil: None,
+                    // No culling: the surface has to be drawable from below
+                    // as well. Depth is the G-buffer's, tested in hardware.
+                    depth_stencil: Some(water_depth(true)),
                     multisample: MultisampleState::default(),
                     fragment: Some(FragmentState {
                         shader: shaders.water_surface.clone(),
@@ -890,7 +1088,7 @@ fn surface_pipelines(
                     buffers: Vec::new(),
                 },
                 primitive: PrimitiveState::default(),
-                depth_stencil: None,
+                depth_stencil: Some(water_depth(false)),
                 multisample: MultisampleState::default(),
                 fragment: Some(FragmentState {
                     shader: shaders.water_blit.clone(),
@@ -909,7 +1107,46 @@ fn surface_pipelines(
             id
         }
     };
-    Some((surface, blit))
+    let river = match inner.river_pipeline.get(&format).copied() {
+        Some(id) => Some(id),
+        None => inner.river_stage.as_ref().map(|(river_layout, _)| {
+            let layout = vec![
+                inner.globals_layout.clone().expect("built with the river stage"),
+                inner.surface_screen.clone().expect("built with the river stage"),
+                river_layout.clone(),
+                cloud_layout.clone(),
+            ];
+            let descriptor = RenderPipelineDescriptor {
+                label: Some("forest_river_surface_pipeline".into()),
+                layout,
+                immediate_size: 0,
+                vertex: VertexState {
+                    shader: shaders.water_surface.clone(),
+                    shader_defs: Vec::new(),
+                    entry_point: Some("vs_river".into()),
+                    buffers: river_vertex_layout(),
+                },
+                primitive: PrimitiveState::default(),
+                depth_stencil: Some(water_depth(true)),
+                multisample: MultisampleState::default(),
+                fragment: Some(FragmentState {
+                    shader: shaders.water_surface.clone(),
+                    shader_defs: Vec::new(),
+                    entry_point: Some("fs_river".into()),
+                    targets: vec![Some(ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: ColorWrites::ALL,
+                    })],
+                }),
+                zero_initialize_workgroup_memory: true,
+            };
+            let id = pipeline_cache.queue_render_pipeline(descriptor);
+            inner.river_pipeline.insert(format, id);
+            id
+        }),
+    };
+    Some((surface, blit, river))
 }
 
 /// The three group layouts every water pipeline shares, cloned out of the
@@ -1070,6 +1307,7 @@ pub fn forest_underwater_pass(view: ViewQuery<&ViewTarget>, world: &World, mut c
 /// The surface and blit passes' group-1 bind group: the composited frame at 0/8,
 /// the G-buffer position at 1/9, lighting heightfield at 2/10 and local seabed
 /// heightfield at 3/11.
+#[allow(clippy::too_many_arguments)]
 fn surface_group(
     device: &RenderDevice,
     cache: &PipelineCache,
@@ -1077,6 +1315,7 @@ fn surface_group(
     gbuffer_position: &wgpu::TextureView,
     heightfield: &wgpu::TextureView,
     shore_heightfield: &wgpu::TextureView,
+    canopy: &wgpu::TextureView,
     source: &wgpu::TextureView,
 ) -> Option<BindGroup> {
     screen_group(
@@ -1087,8 +1326,7 @@ fn surface_group(
         inner.samplers.as_ref()?,
         gbuffer_position,
         source,
-        Some(heightfield),
-        Some(shore_heightfield),
+        &[heightfield, shore_heightfield, canopy],
     )
 }
 
@@ -1107,8 +1345,7 @@ fn underwater_group(
         inner.samplers.as_ref()?,
         gbuffer_position,
         source,
-        None,
-        None,
+        &[],
     )
 }
 
@@ -1120,8 +1357,8 @@ fn screen_group(
     samplers: &WaterSamplers,
     gbuffer_position: &wgpu::TextureView,
     source: &wgpu::TextureView,
-    heightfield: Option<&wgpu::TextureView>,
-    shore_heightfield: Option<&wgpu::TextureView>,
+    // Bilinear maps at bindings 2, 3, ... with their samplers at 10, 11, ...
+    maps: &[&wgpu::TextureView],
 ) -> Option<BindGroup> {
     let mut entries = vec![
         BindGroupEntry {
@@ -1141,26 +1378,15 @@ fn screen_group(
             resource: BindingResource::Sampler(&samplers.point_clamp),
         },
     ];
-    if let Some(heightfield) = heightfield {
+    for (index, &map) in maps.iter().enumerate() {
+        let binding = 2 + index as u32;
         entries.extend([
             BindGroupEntry {
-                binding: 2,
-                resource: BindingResource::TextureView(heightfield),
+                binding,
+                resource: BindingResource::TextureView(map),
             },
             BindGroupEntry {
-                binding: 10,
-                resource: BindingResource::Sampler(&samplers.linear_clamp),
-            },
-        ]);
-    }
-    if let Some(shore_heightfield) = shore_heightfield {
-        entries.extend([
-            BindGroupEntry {
-                binding: 3,
-                resource: BindingResource::TextureView(shore_heightfield),
-            },
-            BindGroupEntry {
-                binding: 11,
+                binding: binding + 8,
                 resource: BindingResource::Sampler(&samplers.linear_clamp),
             },
         ]);
