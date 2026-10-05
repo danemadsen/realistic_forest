@@ -11,6 +11,7 @@ mod day_night;
 mod erosion;
 mod grass;
 mod grass_cull;
+mod grass_stream;
 mod lightning;
 mod matrices;
 mod noise;
@@ -815,6 +816,8 @@ fn shot_scheduling_system(
     automation: Res<AutomationSettings>,
     cache: Res<ErosionCache>,
     vegetation: Res<vegetation::VegetationField>,
+    grass: Res<grass::GrassReadiness>,
+    players: Query<&Player>,
     mut counter: ResMut<FrameCounter>,
     mut requested: ResMut<ShotRequested>,
     mut commands: Commands,
@@ -845,6 +848,14 @@ fn shot_scheduling_system(
     // Likewise the plants: the library loaded, every chunk around the pinned
     // camera scattered, and the latest snapshot on the GPU.
     if !vegetation.ready() {
+        return;
+    }
+    // Grass arrives asynchronously too. Start counting only once every
+    // wanted chunk around this pose has reached the renderer's GPU buffers.
+    let Ok(player) = players.single() else {
+        return;
+    };
+    if !grass.ready([player.position.x, player.position.z]) {
         return;
     }
     counter.0 += 1;
@@ -1058,5 +1069,82 @@ mod global_key_tests {
             app.world().get::<CursorOptions>(cursor).unwrap().grab_mode,
             CursorGrabMode::None,
         );
+    }
+}
+
+#[cfg(test)]
+mod shot_scheduling_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn capture_app(wait_frames: i32) -> (App, Entity) {
+        let mut app = App::new();
+        app.insert_resource(AutomationSettings {
+            shot_path: Some("capture.png".into()),
+            wait_frames,
+            erosion_prewarm: 0,
+            ..default()
+        })
+        .init_resource::<ErosionCache>()
+        .init_resource::<grass::GrassReadiness>()
+        .init_resource::<FrameCounter>()
+        .init_resource::<ShotRequested>()
+        .init_resource::<Time<Real>>()
+        .insert_resource(vegetation::VegetationField::new(
+            Arc::new(NoiseField {
+                samples: Vec::new(),
+            }),
+            false,
+        ))
+        .add_systems(Update, shot_scheduling_system);
+        let player = app.world_mut().spawn(Player::default()).id();
+        (app, player)
+    }
+
+    #[test]
+    fn screenshot_waits_for_uploaded_grass_at_the_current_pose() {
+        let (mut app, player) = capture_app(2);
+        app.update();
+        app.update();
+        assert_eq!(app.world().resource::<FrameCounter>().0, 0);
+        assert!(!app.world().resource::<ShotRequested>().0);
+
+        app.world()
+            .resource::<grass::GrassReadiness>()
+            .set_ready(Some([0, 0]));
+        app.update();
+        assert_eq!(app.world().resource::<FrameCounter>().0, 1);
+        assert!(!app.world().resource::<ShotRequested>().0);
+
+        // An upload for the old pose cannot release a capture after teleporting.
+        app.world_mut()
+            .get_mut::<Player>(player)
+            .unwrap()
+            .position
+            .x = 16.0;
+        app.update();
+        assert_eq!(app.world().resource::<FrameCounter>().0, 1);
+        assert!(!app.world().resource::<ShotRequested>().0);
+
+        app.world()
+            .resource::<grass::GrassReadiness>()
+            .set_ready(Some([16, 0]));
+        app.update();
+        assert!(app.world().resource::<ShotRequested>().0);
+        assert_eq!(
+            app.world_mut()
+                .query::<&Screenshot>()
+                .iter(app.world())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unavailable_grass_assets_do_not_block_screenshots() {
+        let (mut app, _) = capture_app(1);
+        app.world().resource::<grass::GrassReadiness>().disable();
+        app.update();
+        assert!(app.world().resource::<ShotRequested>().0);
     }
 }

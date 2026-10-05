@@ -527,6 +527,11 @@ impl Plugin for ForestRenderPlugin {
         if let Err(error) = &grass_assets {
             error!("Grass assets could not be loaded: {error}");
         }
+        let grass_readiness = crate::grass::GrassReadiness::default();
+        if grass_assets.is_err() {
+            grass_readiness.disable();
+        }
+        app.insert_resource(grass_readiness.clone());
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
@@ -534,6 +539,7 @@ impl Plugin for ForestRenderPlugin {
         if let Ok(assets) = grass_assets {
             render_app.insert_resource(assets);
         }
+        render_app.insert_resource(grass_readiness);
         grass_node::register_grass_systems(render_app);
         vegetation_node::register_vegetation_systems(render_app);
         render_app.insert_resource(bridge);

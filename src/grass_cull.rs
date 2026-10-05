@@ -13,12 +13,14 @@
 //! the ground plane, which holds for any terrain height.
 
 use std::f32::consts::{PI, TAU};
+#[cfg(test)]
 use std::ops::Range;
 
 /// Layers 0 (base) to 3 (foreground carpet): see `GrassInstance::_pad`.
 pub const LAYER_COUNT: usize = 4;
 
 /// A square grid of equally sized chunks, row-major (`z * per_side + x`).
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ChunkGrid {
     /// World XZ of the grid's minimum corner.
@@ -27,6 +29,7 @@ pub struct ChunkGrid {
     pub per_side: usize,
 }
 
+#[cfg(test)]
 impl ChunkGrid {
     pub fn count(&self) -> usize {
         self.per_side * self.per_side
@@ -63,7 +66,11 @@ impl Footprint {
     /// From the column-major view and projection matrices the frame renders
     /// with. Works for any orientation, roll included.
     pub fn new(camera: [f32; 2], view: &[f32; 16], projection: &[f32; 16]) -> Self {
-        let everywhere = Self { camera, heading: 0.0, half_angle: PI };
+        let everywhere = Self {
+            camera,
+            heading: 0.0,
+            half_angle: PI,
+        };
         let (tan_x, tan_y) = (1.0 / projection[0], 1.0 / projection[5]);
         if !(tan_x.is_finite() && tan_y.is_finite() && tan_x > 0.0 && tan_y > 0.0) {
             return everywhere;
@@ -129,6 +136,13 @@ impl Footprint {
         // The disk spans this much of the sky as seen from the camera.
         bearing - (radius / distance).asin() <= self.half_angle
     }
+
+    /// The same conservative range/frustum test for an independently streamed
+    /// chunk, without building a temporary grid or allocating draw runs.
+    pub fn may_draw(&self, centre: [f32; 2], radius: f32, end: f32, blade_extent: f32) -> bool {
+        let distance = (centre[0] - self.camera[0]).hypot(centre[1] - self.camera[1]);
+        distance - radius < end && self.may_see(centre, radius + blade_extent)
+    }
 }
 
 /// Fold an angle into (-PI, PI].
@@ -140,6 +154,7 @@ fn wrap(angle: f32) -> f32 {
 /// Distance from `camera` past which nothing of a layer is drawn, and the
 /// reach of a blade away from its root in any direction. Both come from the
 /// shader's own rules; see `grass.wgsl`.
+#[cfg(test)]
 pub struct Reach {
     pub layer_end: [f32; LAYER_COUNT],
     pub blade_extent: f32,
@@ -148,6 +163,7 @@ pub struct Reach {
 /// For every layer, the runs of consecutive chunk indices that can contribute a
 /// pixel this frame. Consecutive chunks are consecutive in the instance
 /// buffers too, so each run is one draw range.
+#[cfg(test)]
 pub fn visible_runs(
     grid: &ChunkGrid,
     footprint: &Footprint,
@@ -273,10 +289,17 @@ mod tests {
     #[test]
     #[allow(clippy::needless_range_loop)]
     fn runs_cover_exactly_the_visible_chunks_in_reach() {
-        let grid = ChunkGrid { min: [-240.0, -240.0], chunk_size: 16.0, per_side: 30 };
+        let grid = ChunkGrid {
+            min: [-240.0, -240.0],
+            chunk_size: 16.0,
+            per_side: 30,
+        };
         let (view, projection) = camera(0.0, -0.18, 0.0);
         let footprint = Footprint::new([0.0, 0.0], &view, &projection);
-        let reach = Reach { layer_end: [235.0, 200.0, 140.0, 33.0], blade_extent: 1.0 };
+        let reach = Reach {
+            layer_end: [235.0, 200.0, 140.0, 33.0],
+            blade_extent: 1.0,
+        };
         let runs = visible_runs(&grid, &footprint, &reach);
         for layer in 0..LAYER_COUNT {
             let mut covered = vec![false; grid.count()];
@@ -288,6 +311,11 @@ mod tests {
             }
             for chunk in 0..grid.count() {
                 let centre = grid.centre(chunk);
+                assert_eq!(
+                    covered[chunk],
+                    footprint.may_draw(centre, grid.radius(), reach.layer_end[layer], reach.blade_extent),
+                    "streamed visibility differs for layer {layer} chunk {chunk}",
+                );
                 let distance = centre[0].hypot(centre[1]);
                 // Anything that could hold a root inside the layer's reach and
                 // that the view can see must be drawn.

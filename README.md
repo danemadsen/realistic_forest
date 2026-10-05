@@ -141,7 +141,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--camera x,y,z,yawDeg,pitchDeg` | Pin the camera pose and fly, for reproducible shots; with `--shot`, mouse and keyboard input cannot move it |
 | `--shot path.png` | Render, save a screenshot, then exit; the log reports average, p95 and maximum frame time over the `--wait` window, split into frames while erosion tiles stream and settled frames |
 | `--snow-trail x,z,x,z` | Seed one compressed snow segment between the two world XZ positions for reproducible screenshots |
-| `--wait n` | Frames to render before the screenshot, counted once the prewarmed erosion tiles are ready |
+| `--wait n` | Frames to render before the screenshot, counted once the prewarmed erosion tiles, plants and grass are ready |
 | `--erosion-prewarm N` | Simulate the `N` nearest erosion tiles at full budget before streaming (default `4`, the quartet around the player); raise it so a capture shows erosion beyond the player's own lattice cell |
 | `--size W,H` | Window size in points (comma-separated, as the C++'s `sscanf`) |
 | `--probe` | Print terrain and erosion statistics, then exit |
@@ -332,13 +332,21 @@ field of larger clumps. Each tier fades over distance rather than ending at a
 hard ring. Grass fades beyond 213 metres and reaches its draw limit at 235 metres.
 The medium and small clumps dominate the carpet.
 
-About a million candidates surround the camera, so when the 8-metre scatter
-anchor moves the CPU sorts them by model, tier and 16-metre chunk. Each frame
-then draws only the chunks that can reach the screen: those within a tier's
+Grass streams on a permanent 16-metre world grid, with each density tier
+loaded independently. When the 8-metre planning anchor moves, only entering
+chunk tiers are generated and grouped by model on background workers. Nearby
+chunks stay resident through a retention margin, including when the player
+turns back. Four persistent GPU instance arenas recycle vacated chunk slots;
+each frame uploads at most 16 chunk tiers and 2 MiB of instance data. Their
+bounded capacity reserves about 65 MiB, including prefetch and retention space.
+Screenshot runs wait until the current grass stream has been uploaded and drawn.
+
+Each frame draws only the chunks that can reach the screen: those within a tier's
 fade distance (33, 140, 200 and 235 metres) and within the footprint the view
 frustum covers on the ground, which holds at any terrain height. A chunk is
 dropped only when no clump rooted in it can produce a pixel; the vertex shader
-still thins what remains.
+still thins what remains. Visible ranges use batched indirect draws where the
+device supports them, with direct draws as a fallback.
 
 The GPU captures a 512-metre local map of terrain height, grass suitability and
 ground colour, using the terrain's actual snow, sand, soil, rock, gravel and

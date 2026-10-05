@@ -1,15 +1,16 @@
 //! Bounded, instanced vegetation in the terrain G-buffer. No entity per tuft,
 //! CPU erosion readback, or alternative approximation of the biome rules.
 use super::{ExtractedForestView, ForestGlobals, ForestShaderHandles, terrain_node};
-use crate::grass::{self, GrassInstance, GrassTexture, SharedGrassAssets};
-use crate::grass_cull::{self, ChunkGrid, Footprint, LAYER_COUNT, Reach};
+use crate::grass::{self, GrassInstance, GrassReadiness, GrassTexture, SharedGrassAssets};
+use crate::grass_cull::{Footprint, LAYER_COUNT};
+use crate::grass_stream::GrassStream;
 use bevy::mesh::VertexBufferLayout;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
     BindGroup, BindGroupLayoutDescriptor, Buffer, CachedRenderPipelineId, FragmentState,
     PipelineCache, RenderPipelineDescriptor, VertexState,
 };
-use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
+use bevy::render::renderer::{RenderAdapter, RenderContext, RenderDevice, RenderQueue};
 use std::sync::Mutex;
 
 #[repr(C)]
@@ -30,15 +31,33 @@ struct MaterialUniform {
 const _: () = assert!(std::mem::size_of::<GrassFrame>() == 64);
 const _: () = assert!(std::mem::size_of::<MaterialUniform>() == 48);
 
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct GrassDraw {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+}
+const _: () = assert!(std::mem::size_of::<GrassDraw>() == 20);
+
+struct GrassDrawLayer {
+    indirect: Option<Buffer>,
+    /// Reused CPU command capacity; only visibility/counts change each frame.
+    commands: Vec<GrassDraw>,
+}
+
+fn instances_per_slot(layer: usize) -> usize {
+    grass::CHUNK_CELLS as usize * grass::CHUNK_CELLS as usize * grass::LAYER_CANDIDATES[layer]
+}
+
 struct GrassMesh {
     vertices: Buffer,
     indices: Buffer,
     index_count: u32,
     material: BindGroup,
-    /// This model's instances per layer, ordered by chunk; `None` when empty.
-    layers: [Option<Buffer>; LAYER_COUNT],
-    /// Per layer, where each chunk's instances start (`grass::GrassBatch`).
-    chunk_start: [Vec<u32>; LAYER_COUNT],
+    layers: [GrassDrawLayer; LAYER_COUNT],
 }
 struct GrassResources {
     pipeline: CachedRenderPipelineId,
@@ -46,12 +65,13 @@ struct GrassResources {
     frame_buffer: Buffer,
     frame_layout: BindGroupLayoutDescriptor,
     meshes: Vec<GrassMesh>,
-    /// The chunk grid the current instance buffers were scattered on.
-    grid: ChunkGrid,
+    stream: GrassStream,
+    /// Permanent per-layer arenas shared by every model. A chunk occupies one
+    /// fixed-size slot, partitioned by model; leaving chunks recycle the slot.
+    instances: [Buffer; LAYER_COUNT],
     /// The widest root radius and the tallest blade of any model, unscaled.
     widest: f32,
     tallest: f32,
-    anchor: Option<[i64; 2]>,
 }
 #[derive(Resource, Default)]
 pub struct GrassNodeState(Mutex<Option<GrassResources>>);
@@ -142,6 +162,7 @@ fn upload_texture(
 
 fn prepare_grass(
     device: Res<RenderDevice>,
+    adapter: Res<RenderAdapter>,
     queue: Res<RenderQueue>,
     cache: Res<PipelineCache>,
     globals: Res<ForestGlobals>,
@@ -208,6 +229,15 @@ fn prepare_grass(
         .iter()
         .filter(|model| model.name.starts_with("grass-"))
         .collect();
+    let stream = GrassStream::new(active_models.len());
+    let slot_capacities = stream.slot_capacities();
+    let indirect_supported = device
+        .features()
+        .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE)
+        && adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION);
     let textures: Vec<_> = assets
         .0
         .materials
@@ -301,8 +331,18 @@ fn prepare_grass(
                 }),
                 index_count: model.indices.len() as u32,
                 material,
-                layers: Default::default(),
-                chunk_start: Default::default(),
+                layers: std::array::from_fn(|layer| GrassDrawLayer {
+                    indirect: indirect_supported.then(|| {
+                        device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("grass_chunk_draws"),
+                            size: (slot_capacities[layer] * std::mem::size_of::<GrassDraw>())
+                                as u64,
+                            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        })
+                    }),
+                    commands: Vec::with_capacity(slot_capacities[layer]),
+                }),
             }
         })
         .collect();
@@ -370,11 +410,48 @@ fn prepare_grass(
         frame_buffer,
         frame_layout,
         meshes,
-        grid: ChunkGrid { min: [0.0; 2], chunk_size: 1.0, per_side: 0 },
+        stream,
+        instances: std::array::from_fn(|layer| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("grass_chunk_instances"),
+                size: (slot_capacities[layer]
+                    * instances_per_slot(layer)
+                    * std::mem::size_of::<GrassInstance>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        }),
         widest,
         tallest,
-        anchor: None,
     });
+}
+
+/// Poll background generation once and upload only a bounded set of entering
+/// chunk layers. The draw pass never generates candidates or allocates buffers.
+fn prepare_grass_instances(
+    queue: Res<RenderQueue>,
+    view: Res<ExtractedForestView>,
+    state: Res<GrassNodeState>,
+    readiness: Res<GrassReadiness>,
+) {
+    let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(resources) = guard.as_mut() else {
+        return;
+    };
+    let center = [view.player_position[0], view.player_position[2]];
+    for upload in resources.stream.update(center) {
+        let offset = upload.slot
+            * instances_per_slot(upload.key.layer)
+            * std::mem::size_of::<GrassInstance>();
+        queue.write_buffer(
+            &resources.instances[upload.key.layer],
+            offset as u64,
+            bytemuck::cast_slice(&upload.instances),
+        );
+    }
+    if !resources.stream.ready() {
+        readiness.set_ready(None);
+    }
 }
 
 pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
@@ -411,24 +488,6 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
         return;
     };
     let center = [view.player_position[0], view.player_position[2]];
-    let anchor = grass::scatter_anchor(center);
-    if resources.anchor != Some(anchor) {
-        let field = grass::scatter_grass(center, resources.meshes.len());
-        resources.grid = field.grid;
-        for (mesh, batches) in resources.meshes.iter_mut().zip(field.batches) {
-            for (layer, batch) in batches.into_iter().enumerate() {
-                mesh.layers[layer] = (!batch.instances.is_empty()).then(|| {
-                    device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
-                        label: Some("grass_instances"),
-                        contents: bytemuck::cast_slice(&batch.instances),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    })
-                });
-                mesh.chunk_start[layer] = batch.chunk_start;
-            }
-        }
-        resources.anchor = Some(anchor);
-    }
     let elapsed = world
         .get_resource::<super::water_node::ExtractedWater>()
         .map_or(0.0, |w| w.elapsed);
@@ -441,18 +500,54 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
         mapping: gbuffer.grass_habitat_mapping,
         wind: [direction.cos(), direction.sin(), elapsed, wind_strength],
         range: [100.0, grass::SCATTER_RADIUS, 0.0, 0.0],
-        layer_end: [grass::LAYER_END[1], grass::LAYER_END[2], grass::LAYER_END[3], 0.0],
+        layer_end: [
+            grass::LAYER_END[1],
+            grass::LAYER_END[2],
+            grass::LAYER_END[3],
+            0.0,
+        ],
     };
     // Which chunks can reach the screen. A blade strays from its root by at
     // most its widest card, scaled, plus the wind's bend of its tallest tip
     // (grass.wgsl: `offset.x += wind.x * gust * bend * wind.w`, |gust| <= 1).
-    let reach = Reach {
-        layer_end: grass::LAYER_END,
-        blade_extent: grass::MAX_SCALE * (resources.widest + resources.tallest * wind_strength.abs())
-            + 0.25,
-    };
+    let blade_extent =
+        grass::MAX_SCALE * (resources.widest + resources.tallest * wind_strength.abs()) + 0.25;
     let footprint = Footprint::new(center, &globals.globals.view, &globals.globals.projection);
-    let runs = grass_cull::visible_runs(&resources.grid, &footprint, &reach);
+    for mesh in &mut resources.meshes {
+        for layer in &mut mesh.layers {
+            layer.commands.clear();
+        }
+    }
+    for chunk in resources.stream.slots() {
+        let layer = chunk.key.layer;
+        let centre = chunk.key.centre();
+        if !footprint.may_draw(centre, chunk.key.root_radius(), grass::LAYER_END[layer], blade_extent) {
+            continue;
+        }
+        let first_instance = (chunk.slot * instances_per_slot(layer)) as u32;
+        for (model, mesh) in resources.meshes.iter_mut().enumerate() {
+            let start = chunk.model_starts[model];
+            let count = chunk.model_starts[model + 1] - start;
+            if count > 0 {
+                mesh.layers[layer].commands.push(GrassDraw {
+                    index_count: mesh.index_count,
+                    instance_count: count,
+                    first_index: 0,
+                    base_vertex: 0,
+                    first_instance: first_instance + start,
+                });
+            }
+        }
+    }
+    for mesh in &resources.meshes {
+        for layer in &mesh.layers {
+            if let Some(indirect) = &layer.indirect
+                && !layer.commands.is_empty()
+            {
+                queue.write_buffer(indirect, 0, bytemuck::cast_slice(&layer.commands));
+            }
+        }
+    }
     queue.write_buffer(&resources.frame_buffer, 0, bytemuck::bytes_of(&frame));
     // Rebinding the capture view also handles window resize without stale views.
     let sampler = device
@@ -524,24 +619,29 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
         pass.set_bind_group(2, &mesh.material, &[]);
         pass.set_vertex_buffer(0, mesh.vertices.slice(..));
         pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-        for (layer, layer_runs) in runs.iter().enumerate() {
-            let Some(instances) = &mesh.layers[layer] else {
+        for (layer, draws) in mesh.layers.iter().enumerate() {
+            if draws.commands.is_empty() {
                 continue;
-            };
-            let starts = &mesh.chunk_start[layer];
-            let mut bound = false;
-            for run in layer_runs {
-                let range = starts[run.start as usize]..starts[run.end as usize];
-                if range.is_empty() {
-                    continue;
+            }
+            pass.set_vertex_buffer(1, resources.instances[layer].slice(..));
+            if let Some(indirect) = &draws.indirect {
+                pass.multi_draw_indexed_indirect(indirect, 0, draws.commands.len() as u32);
+            } else {
+                for draw in &draws.commands {
+                    pass.draw_indexed(
+                        0..mesh.index_count,
+                        0,
+                        draw.first_instance..draw.first_instance + draw.instance_count,
+                    );
                 }
-                if !bound {
-                    pass.set_vertex_buffer(1, instances.slice(..));
-                    bound = true;
-                }
-                pass.draw_indexed(0..mesh.index_count, 0, range);
             }
         }
+    }
+    drop(pass);
+    if resources.stream.ready()
+        && let Some(readiness) = world.get_resource::<GrassReadiness>()
+    {
+        readiness.set_ready(resources.stream.anchor());
     }
 }
 
@@ -549,7 +649,8 @@ pub fn register_grass_systems(app: &mut bevy::app::SubApp) {
     app.init_resource::<GrassNodeState>();
     app.add_systems(
         bevy::render::Render,
-        prepare_grass
+        (prepare_grass, prepare_grass_instances)
+            .chain()
             .in_set(bevy::render::RenderSystems::Prepare)
             .after(super::prepare_forest_globals),
     );

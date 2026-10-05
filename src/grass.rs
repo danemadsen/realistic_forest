@@ -4,12 +4,15 @@
 //! erosion eligibility are evaluated by the render shader using the same height
 //! and material functions as the terrain itself.
 
-pub use crate::grass_cull::{ChunkGrid, LAYER_COUNT};
+#[cfg(test)]
+pub use crate::grass_cull::ChunkGrid;
+pub use crate::grass_cull::LAYER_COUNT;
 use bevy::prelude::Resource;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 pub const SCATTER_RADIUS: f32 = 235.0;
 pub const SCATTER_CELL_SIZE: f32 = 1.0;
@@ -21,6 +24,14 @@ const CANDIDATE_RADIUS: f32 = 242.0;
 const FAR_MIDDLE_CANDIDATE_RADIUS: f32 = 207.0;
 const CLOSE_MIDDLE_CANDIDATE_RADIUS: f32 = 147.0;
 const CARPET_CANDIDATE_RADIUS: f32 = 40.0;
+pub const LAYER_CANDIDATE_RADIUS: [f32; LAYER_COUNT] = [
+    CANDIDATE_RADIUS,
+    FAR_MIDDLE_CANDIDATE_RADIUS,
+    CLOSE_MIDDLE_CANDIDATE_RADIUS,
+    CARPET_CANDIDATE_RADIUS,
+];
+/// Independent candidates per square metre in each additive density layer.
+pub const LAYER_CANDIDATES: [usize; LAYER_COUNT] = [1, 2, 5, 56];
 
 /// Chunks are square blocks of this many scatter cells. A chunk is the unit
 /// the renderer culls: small enough to follow the view frustum closely, large
@@ -108,6 +119,40 @@ pub struct GrassAssets {
 /// One CPU allocation shared between Bevy's main world and render world.
 #[derive(Resource, Clone)]
 pub struct SharedGrassAssets(pub Arc<GrassAssets>);
+
+#[derive(Default)]
+enum GrassReadyState {
+    #[default]
+    Waiting,
+    Ready([i64; 2]),
+    Disabled,
+}
+
+/// Render upload acknowledgement shared with the main world's capture gate.
+#[derive(Resource, Clone, Default)]
+pub struct GrassReadiness(Arc<Mutex<GrassReadyState>>);
+
+impl GrassReadiness {
+    pub fn ready(&self, center: [f32; 2]) -> bool {
+        if center.iter().any(|value| !value.is_finite() || value.abs() > 1e9) {
+            return false;
+        }
+        match *self.0.lock().unwrap_or_else(|e| e.into_inner()) {
+            GrassReadyState::Ready(anchor) => anchor == scatter_anchor(center),
+            GrassReadyState::Disabled => true,
+            GrassReadyState::Waiting => false,
+        }
+    }
+
+    pub fn set_ready(&self, anchor: Option<[i64; 2]>) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) =
+            anchor.map_or(GrassReadyState::Waiting, GrassReadyState::Ready);
+    }
+
+    pub fn disable(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = GrassReadyState::Disabled;
+    }
+}
 
 impl GrassAssets {
     /// Load the extracted, normalized single-primitive GLBs in stable name order.
@@ -531,8 +576,59 @@ pub fn scatter_anchor(center: [f32; 2]) -> [i64; 2] {
     })
 }
 
+/// Generate one additive layer of a permanent world chunk. No camera-dependent
+/// clipping: a cached chunk remains valid as the player moves, and the shader
+/// applies each layer's fade to its world-anchored candidates.
+pub fn scatter_world_chunk(
+    coordinate: [i64; 2],
+    layer: usize,
+    model_count: usize,
+) -> Vec<Vec<GrassInstance>> {
+    let mut groups = vec![Vec::new(); model_count];
+    if model_count == 0 || layer >= LAYER_COUNT {
+        return groups;
+    }
+    let first = LAYER_CANDIDATES[..layer].iter().sum::<usize>();
+    let end = first + LAYER_CANDIDATES[layer];
+    let low = coordinate.map(|cell| cell * CHUNK_CELLS);
+    for z in low[1]..low[1] + CHUNK_CELLS {
+        for x in low[0]..low[0] + CHUNK_CELLS {
+            let cell_key = cell_hash(x, z);
+            for subcandidate in first..end {
+                let key = if subcandidate == 0 {
+                    cell_key
+                } else {
+                    mix64(cell_key ^ (subcandidate as u64).wrapping_mul(0xa076_1d64_78bd_642f))
+                };
+                let xz = [
+                    (x as f64 + random(key, 0) as f64) as f32 * SCATTER_CELL_SIZE,
+                    (z as f64 + random(key, 1) as f64) as f32 * SCATTER_CELL_SIZE,
+                ];
+                let model = select_model(key, model_count, layer as u32);
+                groups[model].push(make_instance(key, xz, layer));
+            }
+        }
+    }
+    groups
+}
+
+fn make_instance(key: u64, xz: [f32; 2], layer: usize) -> GrassInstance {
+    let patch = 0.72 * patch_noise(xz, 10.0) + 0.28 * patch_noise(xz, 2.7);
+    let patch = ((patch - 0.18) / 0.64).clamp(0.0, 1.0);
+    let density = 0.65 + 0.35 * patch * patch * (3.0 - 2.0 * patch);
+    GrassInstance {
+        xz,
+        rotation: random(key, 2) * std::f32::consts::TAU,
+        scale: MIN_SCALE + random(key, 3) * SCALE_SPAN,
+        tint: 0.88 + random(key, 4) * 0.20,
+        seed: random(key, 5),
+        _pad: [density, layer as f32],
+    }
+}
+
 /// One draw's worth of instances: a single model on a single layer, ordered
 /// chunk by chunk so that any run of neighbouring chunks is one slice.
+#[cfg(test)]
 #[derive(Default)]
 pub struct GrassBatch {
     pub instances: Vec<GrassInstance>,
@@ -541,6 +637,7 @@ pub struct GrassBatch {
 }
 
 /// Every candidate around an anchor, grouped by model, then layer, then chunk.
+#[cfg(test)]
 pub struct GrassField {
     pub grid: ChunkGrid,
     /// `batches[model][layer]`.
@@ -557,6 +654,7 @@ pub struct GrassField {
 /// Candidates come back sorted by model, layer and 16 m chunk, so the renderer
 /// can drop what is out of view or out of a layer's reach without touching
 /// the instances themselves.
+#[cfg(test)]
 pub fn scatter_grass(center: [f32; 2], model_count: usize) -> GrassField {
     let mut field = GrassField {
         grid: ChunkGrid {
@@ -612,6 +710,7 @@ pub fn scatter_grass(center: [f32; 2], model_count: usize) -> GrassField {
 
 /// `generate(0..count)` in order. Chunks are independent, so the work is shared
 /// out over the cores; the result does not depend on how.
+#[cfg(test)]
 fn generate_chunks<F>(count: usize, generate: F) -> Vec<Vec<Vec<GrassInstance>>>
 where
     F: Fn(usize) -> Vec<Vec<GrassInstance>> + Sync,
@@ -647,6 +746,7 @@ where
 
 /// The candidates of the cells `low..=high` (cell coordinates), as
 /// `model * LAYER_COUNT + layer` lists in cell order.
+#[cfg(test)]
 fn scatter_chunk(
     low: [i64; 2],
     high: [i64; 2],
@@ -719,17 +819,11 @@ fn scatter_chunk(
                     continue;
                 }
                 let model = select_model(key, model_count, layer);
-                let patch = 0.72 * patch_noise(xz, 10.0) + 0.28 * patch_noise(xz, 2.7);
-                let patch = ((patch - 0.18) / 0.64).clamp(0.0, 1.0);
-                let density = 0.65 + 0.35 * patch * patch * (3.0 - 2.0 * patch);
-                out[model * LAYER_COUNT + layer as usize].push(GrassInstance {
+                out[model * LAYER_COUNT + layer as usize].push(make_instance(
+                    key,
                     xz,
-                    rotation: random(key, 2) * std::f32::consts::TAU,
-                    scale: MIN_SCALE + random(key, 3) * SCALE_SPAN,
-                    tint: 0.88 + random(key, 4) * 0.20,
-                    seed: random(key, 5),
-                    _pad: [density, layer as f32],
-                });
+                    layer as usize,
+                ));
             }
         }
     }
@@ -1122,6 +1216,53 @@ mod tests {
     }
 
     #[test]
+    fn permanent_chunks_preserve_every_candidate_and_layer_identity() {
+        for coordinate in [[0, 0], [-63, 21], [17, -563]] {
+            let low = coordinate.map(|c| c * CHUNK_CELLS);
+            let high = low.map(|c| c + CHUNK_CELLS - 1);
+            let anchor = low.map(|c| c + CHUNK_CELLS / 2);
+            let original = scatter_chunk(low, high, anchor, anchor, 9);
+            for layer in 0..LAYER_COUNT {
+                let streamed = scatter_world_chunk(coordinate, layer, 9);
+                assert_eq!(
+                    streamed.iter().map(Vec::len).sum::<usize>(),
+                    CHUNK_CELLS as usize * CHUNK_CELLS as usize * LAYER_CANDIDATES[layer],
+                );
+                for (model, instances) in streamed.into_iter().enumerate() {
+                    assert_eq!(instances, original[model * LAYER_COUNT + layer]);
+                    for instance in instances {
+                        assert_eq!(instance._pad[1] as usize, layer);
+                        for axis in 0..2 {
+                            assert!(instance.xz[axis] >= low[axis] as f32);
+                            assert!(instance.xz[axis] <= (high[axis] + 1) as f32);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(scatter_world_chunk([0, 0], 0, 0).is_empty());
+        assert!(
+            scatter_world_chunk([0, 0], LAYER_COUNT, 9)
+                .iter()
+                .all(Vec::is_empty)
+        );
+    }
+
+    #[test]
+    fn capture_waits_for_the_current_anchor_and_handles_missing_assets() {
+        let ready = GrassReadiness::default();
+        assert!(!ready.ready([0.0, 0.0]));
+        ready.set_ready(Some([0, 0]));
+        assert!(ready.ready([3.9, -3.9]));
+        assert!(!ready.ready([f32::NAN, 0.0]));
+        assert!(!ready.ready([4.1, 0.0]));
+        ready.set_ready(None);
+        assert!(!ready.ready([0.0, 0.0]));
+        ready.disable();
+        assert!(ready.ready([100.0, -200.0]));
+    }
+
+    #[test]
     fn chunked_field_holds_exactly_the_original_candidates() {
         for center in [[-1000.0, 350.0], [3.9, 3.9], [12.0, -9000.5]] {
             let reference = reference_scatter_grass(center, 9);
@@ -1209,11 +1350,22 @@ mod tests {
         let clip = |view: &[f32; 16], p: Vec3| {
             let row = |r: usize| view[r] * p.x + view[4 + r] * p.y + view[8 + r] * p.z + view[12 + r];
             let v = [row(0), row(1), row(2), row(3)];
-            let c = |r: usize| projection[r] * v[0] + projection[4 + r] * v[1] + projection[8 + r] * v[2] + projection[12 + r] * v[3];
+            let c = |r: usize| {
+                projection[r] * v[0]
+                    + projection[4 + r] * v[1]
+                    + projection[8 + r] * v[2]
+                    + projection[12 + r] * v[3]
+            };
             let (x, y, w) = (c(0), c(1), c(3));
             w > 0.0 && x.abs() <= w && y.abs() <= w
         };
-        for (yaw, pitch) in [(0.0f32, -0.18f32), (2.0, 0.3), (-1.2, -0.9), (3.0, 0.0), (0.7, 1.2)] {
+        for (yaw, pitch) in [
+            (0.0f32, -0.18f32),
+            (2.0, 0.3),
+            (-1.2, -0.9),
+            (3.0, 0.0),
+            (0.7, 1.2),
+        ] {
             let forward = Vec3::new(
                 yaw.sin() * pitch.cos(),
                 pitch.sin(),
@@ -1221,14 +1373,20 @@ mod tests {
             );
             let view = view_matrix(eye, eye + forward, Vec3::Y);
             let footprint = Footprint::new([eye.x, eye.z], &view, &projection);
-            let reach = Reach { layer_end: LAYER_END, blade_extent: 0.0 };
+            let reach = Reach {
+                layer_end: LAYER_END,
+                blade_extent: 0.0,
+            };
             let runs = visible_runs(&field.grid, &footprint, &reach);
             let (mut in_reach, mut drawn_in_reach, mut seen) = (0usize, 0usize, 0usize);
             for batches in &field.batches {
                 for (layer, batch) in batches.iter().enumerate() {
                     let mut drawn = vec![false; batch.instances.len()];
                     for run in &runs[layer] {
-                        let (low, high) = (batch.chunk_start[run.start as usize], batch.chunk_start[run.end as usize]);
+                        let (low, high) = (
+                            batch.chunk_start[run.start as usize],
+                            batch.chunk_start[run.end as usize],
+                        );
                         drawn[low as usize..high as usize].fill(true);
                     }
                     for (index, instance) in batch.instances.iter().enumerate() {
