@@ -47,10 +47,11 @@ struct StageUniforms {
 @group(1) @binding(13) var atmosphere_sampler: sampler;
 
 // The plants' shadow cascades (src/render/vegetation_shadows.rs): depth from
-// the sun, or from the moon at night, one texture per slice of the view.
+// the sun, or from the moon at night, with nested coverage around the camera's
+// ground position so altitude and viewing direction do not change quality.
 struct VegetationShadows {
     view_projection: array<mat4x4<f32>, 3>, // world -> cascade clip, depth 0 nearest the light
-    splits: vec4<f32>,  // far view depth of each cascade, metres
+    splits: vec4<f32>,  // horizontal radius of each cascade; w far radius, metres
     texel: vec4<f32>,   // world metres per texel of each cascade
     light: vec4<f32>,   // xyz direction the light travels; w 0 off, 1 sun, 2 moon
     params: vec4<f32>,  // blend fraction, strength, terminal fade metres, unused
@@ -795,16 +796,17 @@ fn vegetationShadowCascade(world_position: vec3<f32>, normal_world: vec3<f32>, c
     }
 }
 
-// Light reaching a point through the plants: the cascade covering its view
-// depth, blended into the next over the last stretch of each, and fading out
-// past the last.
-fn vegetationShadow(world_position: vec3<f32>, normal_world: vec3<f32>, view_depth: f32) -> f32 {
-    if (vegetation_shadows.light.w < 0.5 || view_depth >= vegetation_shadows.splits.w) {
+// Light reaching a point through the plants: the cascade covering its horizontal
+// distance from the camera, blended into the next over the last stretch of each,
+// and fading out past the last. Camera height does not lower shadow quality.
+fn vegetationShadow(world_position: vec3<f32>, normal_world: vec3<f32>) -> f32 {
+    let horizontal_distance = length(world_position.xz - globals.camera_position.xz);
+    if (vegetation_shadows.light.w < 0.5 || horizontal_distance >= vegetation_shadows.splits.w) {
         return 1.0;
     }
     var cascade = 2u;
     for (var c = 0u; c < 2u; c++) {
-        if (view_depth < vegetation_shadows.splits[c]) {
+        if (horizontal_distance < vegetation_shadows.splits[c]) {
             cascade = c;
             break;
         }
@@ -815,7 +817,7 @@ fn vegetationShadow(world_position: vec3<f32>, normal_world: vec3<f32>, view_dep
     // Merging the far slices must not move the original terminal fade.
     let band = select((end - start)*vegetation_shadows.params.x,
                       vegetation_shadows.params.z, cascade == 2u);
-    let blend = clamp((view_depth - (end - band))/max(band, 1e-3), 0.0, 1.0);
+    let blend = clamp((horizontal_distance - (end - band))/max(band, 1e-3), 0.0, 1.0);
     if (blend > 0.0) {
         var next = 1.0;
         if (cascade < 2u) {
@@ -1201,7 +1203,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let n_dot_v = max(dot(normal_view, to_camera), 0.0);
     let v_dot_h = max(dot(to_camera, half_vector), 0.0);
     // Plants shade whichever light their cascades were drawn from.
-    let plant_shadow = vegetationShadow(world_position, normal_world, -packed_position.z);
+    let plant_shadow = vegetationShadow(world_position, normal_world);
     let plant_light = vegetation_shadows.light.w;
     var sun_visibility = 1.0;
     if (globals.settings_a.x > 0.01) {

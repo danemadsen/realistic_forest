@@ -1176,7 +1176,7 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
         .zip(shadowing_light(&globals.globals))
         .map(|((targets, pipeline), (direction, moon))| {
             let light = light_basis(direction);
-            let cascades = fit_cascades(&globals.globals.view, &globals.globals.projection, camera, &light);
+            let cascades = fit_cascades(camera, &view.shadow_receiver_heights, &light);
             (targets, pipeline, light, cascades, moon)
         });
 

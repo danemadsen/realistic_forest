@@ -3,15 +3,15 @@
 //! The terrain and the clouds shadow the scene by ray marching in the
 //! composite; a forest needs more than that. The plants are drawn depth-only,
 //! from the sun (or, at night, the moon), into three separate depth
-//! textures: each cascade covers a slice of the view frustum, nearest the
-//! sharpest. The composite then looks each lit pixel up in its slice's
+//! textures: each cascade covers a horizontal radius around the camera,
+//! nearest the sharpest. The composite then looks each lit pixel up in its
 //! cascade and darkens the direct light it receives, so trunks and crowns
 //! shade the ground, the grass, each other and themselves.
 //!
-//! The cascades are stabilised: each is a fixed-size square in light space
-//! around the bounding sphere of its frustum slice, moved only in whole
+//! The cascades are stabilised: each is a metre-rounded square in light space
+//! around the terrain and crowns in that radius, moved only in whole
 //! texels, so shadows neither swim when the camera turns nor shimmer as it
-//! walks. This module fits them on the CPU every frame and owns the depth
+//! walks or flies vertically. This module fits them on the CPU and owns the depth
 //! textures, which the post passes bind when they build the composite's group.
 
 use bevy::prelude::*;
@@ -21,12 +21,11 @@ pub const SHADOW_CASCADES: usize = 3;
 /// Texels along each side of each cascade. The first two retain their
 /// original precision; only the distant forest uses a smaller depth target.
 pub const SHADOW_RESOLUTIONS: [u32; SHADOW_CASCADES] = [2048, 2048, 1536];
-/// View-depth bounds of the cascades, metres: about 2.7 cm, 9 cm and
-/// 3.6 m per texel at the default field of view. The last reaches as far as
+/// Horizontal-distance bounds of the cascades, metres. The last reaches as far as
 /// the trees are drawn, so no distant forest floor shows sunlit through the
 /// canopy.
 pub const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.0, 20.0, 70.0, 2000.0];
-/// How far up-light of a cascade's slice a plant can stand and still be
+/// How far up-light of a cascade's receivers a plant can stand and still be
 /// drawn into it: a 35 m pine's shadow under a sun 3 degrees up.
 pub const CASTER_REACH: f32 = 680.0;
 /// Share of each cascade, at its far end, over which it blends into the next.
@@ -35,6 +34,10 @@ pub const CASCADE_BLEND: f32 = 0.12;
 pub const SHADOW_FADE_BAND: f32 = (2000.0 - 280.0) * CASCADE_BLEND;
 /// Format of the depth targets.
 pub const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Room above the sampled ground for the tallest crowns, including wind.
+const CANOPY_HEIGHT: f32 = 50.0;
+/// Local terrain detail and differences while erosion tiles are revealing.
+const TERRAIN_SLACK: f32 = 12.0;
 /// The light basis projects along +Z, with right × up = forward. A face
 /// pointing toward the light therefore winds clockwise in shadow clip XY.
 pub const SHADOW_FRONT_FACE: wgpu::FrontFace = wgpu::FrontFace::Cw;
@@ -99,50 +102,69 @@ pub struct Cascade {
     pub view_projection: [f32; 16],
 }
 
-/// The smallest sphere around the frustum slice between view depths `near`
-/// and `far`, as (distance of its centre along the view axis, radius), for a
-/// frustum whose corner rays leave the axis at `corner` (the hypotenuse of the
-/// two half-angle tangents).
-pub fn slice_sphere(near: f32, far: f32, corner: f32) -> (f32, f32) {
-    let (n, f, k2) = (near as f64, far as f64, (corner as f64).powi(2));
-    let centre = 0.5 * (f + n) * (1.0 + k2);
-    if centre >= f {
-        (far, (f * k2.sqrt()) as f32)
-    } else {
-        let radius = ((f - centre).powi(2) + f * f * k2).sqrt();
-        (centre as f32, radius as f32)
-    }
+/// Receiver heights for nested ground discs, including crowns and water.
+/// Sample a world-anchored grid around each disc, with spacing-dependent
+/// padding for terrain between samples. Quantise outwards so small height
+/// changes do not continually resize the maps. Neither camera height nor
+/// orientation participates in this fit.
+pub fn receiver_height_bounds(
+    eye: [f32; 3],
+    mut ground_height: impl FnMut(f32, f32) -> f32,
+) -> [[f32; 2]; SHADOW_CASCADES] {
+    let mut inner = [f32::INFINITY, f32::NEG_INFINITY];
+    std::array::from_fn(|index| {
+        let step = SHADOW_SPLITS[index + 1] / 4.0;
+        let anchor = [(eye[0] / step).floor() * step, (eye[2] / step).floor() * step];
+        let mut low = f32::INFINITY;
+        let mut high = f32::NEG_INFINITY;
+        // The extra positive row/column covers the disc even when the eye
+        // lies just short of the next grid point.
+        for z in -4..=5 {
+            for x in -4..=5 {
+                let height = ground_height(anchor[0] + x as f32 * step, anchor[1] + z as f32 * step)
+                    .max(crate::constants::SEA_LEVEL);
+                low = low.min(height);
+                high = high.max(height);
+            }
+        }
+        let padding = TERRAIN_SLACK + step;
+        low = ((low - padding) / 8.0).floor() * 8.0;
+        high = ((high + padding + CANOPY_HEIGHT) / 8.0).ceil() * 8.0;
+        // A coarser grid must never exclude the inner cascade's receivers:
+        // both maps are sampled throughout the blend band.
+        inner = [low.min(inner[0]), high.max(inner[1])];
+        inner
+    })
 }
 
-/// Fits the three cascades for a camera (column-major world-to-view `view`
-/// and the reverse-Z `projection` of `crate::matrices::perspective`) and a
-/// light travelling along `light`.
+/// Fit nested vertical cylinders to the terrain below the camera. Their
+/// horizontal radii match the shaders' distance selection, so even a view
+/// straight down from high altitude keeps the nearby ground in the detailed
+/// maps. The larger cylinders also cover every preceding blend band.
 pub fn fit_cascades(
-    view: &[f32; 16],
-    projection: &[f32; 16],
     eye: [f32; 3],
+    heights: &[[f32; 2]; SHADOW_CASCADES],
     light: &LightBasis,
 ) -> [Cascade; SHADOW_CASCADES] {
-    let tan_x = 1.0 / projection[0].abs().max(1e-6);
-    let tan_y = 1.0 / projection[5].abs().max(1e-6);
-    let corner = tan_x.hypot(tan_y);
-    // The camera looks down its view -Z: the third row of the rotation.
-    let forward = normalize([-view[2] as f64, -view[6] as f64, -view[10] as f64]);
     let (right, up, along) = (widen(light.right), widen(light.up), widen(light.forward));
     std::array::from_fn(|index| {
-        let (depth, radius) = slice_sphere(SHADOW_SPLITS[index], SHADOW_SPLITS[index + 1], corner);
-        // A whole number of metres, so the box only changes size when the
-        // field of view does.
-        let half_extent = (radius as f64 * 1.01).ceil();
+        let [low, high] = heights[index].map(f64::from);
+        let radius = SHADOW_SPLITS[index + 1] as f64;
+        let half_height = (high - low) * 0.5;
+        // Exact support of a vertical cylinder along a light-frame axis.
+        let support = |axis: [f64; 3]| radius * axis[0].hypot(axis[2]) + half_height * axis[1].abs();
+        // Leave room for texel snapping, PCF and the receiver's normal bias.
+        let half_extent = (support(right).max(support(up)) * 1.01).ceil();
         let texel = 2.0 * half_extent / SHADOW_RESOLUTIONS[index] as f64;
-        let centre: [f64; 3] = std::array::from_fn(|axis| eye[axis] as f64 + forward[axis] * depth as f64);
+        let centre = [eye[0] as f64, (low + high) * 0.5, eye[2] as f64];
         // Whole texels across the light, so the rasterised shadow edges stay
         // put while the camera moves.
         let x = (dot(centre, right) / texel).round() * texel;
         let y = (dot(centre, up) / texel).round() * texel;
         let z = dot(centre, along);
-        let near = z - half_extent - CASTER_REACH as f64;
-        let far = z + half_extent;
+        let depth_extent = support(along) + texel * 4.0;
+        let near = z - depth_extent - CASTER_REACH as f64;
+        let far = z + depth_extent;
         let span = far - near;
         let s = 1.0 / half_extent;
         let view_projection = [
@@ -168,7 +190,7 @@ pub fn fit_cascades(
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShadowUniform {
     pub view_projection: [[f32; 16]; SHADOW_CASCADES],
-    /// Far view depths; w repeats the last split for the shared shader cutoff.
+    /// Far horizontal distances; w repeats the last split for the shader cutoff.
     pub splits: [f32; 4],
     /// World metres per texel of each cascade; w is unused.
     pub texel: [f32; 4],
@@ -291,19 +313,18 @@ mod tests {
         std::array::from_fn(|row| m[row] * p[0] + m[4 + row] * p[1] + m[8 + row] * p[2] + m[12 + row])
     }
 
-    fn camera(eye: Vec3, look: Vec3) -> ([f32; 16], [f32; 16]) {
-        (
-            crate::matrices::view_matrix(eye, eye + look, Vec3::Y),
-            crate::matrices::perspective(68.0, 16.0 / 9.0, 0.1, 5800.0),
-        )
+    fn assert_inside(cascade: &Cascade, point: [f32; 3]) {
+        let clip = transform(&cascade.view_projection, point);
+        assert!(clip[0].abs() <= 1.0 && clip[1].abs() <= 1.0, "{point:?}: {clip:?}");
+        assert!((0.0..=1.0).contains(&clip[2]), "{point:?}: depth {}", clip[2]);
     }
 
     #[test]
     fn merged_far_cascade_keeps_near_splits_and_original_terminal_fade() {
-        let eye = Vec3::new(10.0, 30.0, 10.0);
-        let (view, projection) = camera(eye, Vec3::new(0.0, -0.1, -1.0).normalize());
+        let eye = [10.0, 30.0, 10.0];
+        let heights = receiver_height_bounds(eye, |_, _| 14.0);
         let light = light_basis([0.4, -0.5, 0.3]);
-        let cascades = fit_cascades(&view, &projection, eye.to_array(), &light);
+        let cascades = fit_cascades(eye, &heights, &light);
         let uniform = ShadowUniform::new(&cascades, &light, false);
 
         // Both shaders still use w for the fully-lit cutoff. The old final
@@ -321,8 +342,9 @@ mod tests {
 
     #[test]
     fn light_facing_triangles_keep_the_shadow_front_face() {
-        let eye = Vec3::new(812.5, 64.0, -2210.25);
-        let (view, projection) = camera(eye, Vec3::new(0.3, -0.25, -1.0).normalize());
+        let eye = [812.5, 64.0, -2210.25];
+        let heights = receiver_height_bounds(eye, |_, _| 35.0);
+        let projection = crate::matrices::perspective(68.0, 16.0 / 9.0, 0.1, 5800.0);
         let signed_area = |matrix: &[f32; 16], triangle: [Vec3; 3]| {
             let projected = triangle.map(|vertex| {
                 let clip = transform(matrix, vertex.to_array());
@@ -347,7 +369,7 @@ mod tests {
             let reference = if toward_light.y.abs() > 0.9 { Vec3::X } else { Vec3::Y };
             let tangent = reference.cross(toward_light).normalize();
             let bitangent = toward_light.cross(tangent);
-            for cascade in fit_cascades(&view, &projection, eye.to_array(), &light) {
+            for cascade in fit_cascades(eye, &heights, &light) {
                 let centre = Vec3::from_array(light.right) * cascade.centre[0]
                     + Vec3::from_array(light.up) * cascade.centre[1]
                     + Vec3::from_array(light.forward) * (0.5 * (cascade.near + cascade.far));
@@ -377,53 +399,124 @@ mod tests {
     }
 
     #[test]
-    fn the_slice_sphere_holds_the_slice() {
-        for (near, far) in [(0.0, 20.0), (20.0, 70.0), (250.0, 1200.0), (5.0, 6.0)] {
-            let corner = 1.376;
-            let (centre, radius) = slice_sphere(near, far, corner);
-            for depth in [near, far] {
-                let off_axis = depth * corner;
-                let reach = ((depth - centre).powi(2) + off_axis * off_axis).sqrt();
-                assert!(reach <= radius * 1.0001, "slice {near}..{far}: {reach} > {radius}");
+    fn ground_and_crowns_keep_the_same_maps_at_every_camera_height() {
+        let ground = |x: f32, z: f32| 160.0 + 0.35 * x - 0.23 * z;
+        let eye = [812.5, 64.0, -2210.25];
+        let heights = receiver_height_bounds(eye, ground);
+        let light = light_basis([-0.22, -0.62, 0.76]);
+        let cascades = fit_cascades(eye, &heights, &light);
+        for altitude in [-500.0, 1600.0, 20_000.0] {
+            let elevated = [eye[0], altitude, eye[2]];
+            let elevated_heights = receiver_height_bounds(elevated, ground);
+            assert_eq!(elevated_heights, heights);
+            assert_eq!(fit_cascades(elevated, &elevated_heights, &light), cascades);
+        }
+        for (index, cascade) in cascades.iter().enumerate() {
+            let radius = SHADOW_SPLITS[index + 1];
+            for spoke in 0..64 {
+                let angle = std::f32::consts::TAU * spoke as f32 / 64.0;
+                let x = eye[0] + radius * angle.cos();
+                let z = eye[2] + radius * angle.sin();
+                let floor = ground(x, z).max(crate::constants::SEA_LEVEL);
+                assert!(heights[index][0] <= floor);
+                assert!(heights[index][1] >= floor + CANOPY_HEIGHT);
+                assert_inside(cascade, [x, floor, z]);
+                assert_inside(cascade, [x, floor + CANOPY_HEIGHT, z]);
             }
         }
+        // Directly below an airborne camera must use the first map even
+        // when the receiver is kilometres below the original eye position.
+        let floor = ground(eye[0], eye[2]);
+        assert_inside(&cascades[0], [eye[0], floor, eye[2]]);
+        assert_inside(&cascades[0], [eye[0], floor + CANOPY_HEIGHT, eye[2]]);
     }
 
     #[test]
-    fn every_slice_corner_lands_inside_its_cascade() {
-        let eye = Vec3::new(812.5, 64.0, -2210.25);
-        let look = Vec3::new(0.3, -0.25, -1.0).normalize();
-        let (view, projection) = camera(eye, look);
-        let light = light_basis([-0.22, -0.62, 0.76]);
-        let cascades = fit_cascades(&view, &projection, eye.to_array(), &light);
-        let inverse = crate::matrices::invert_affine(&view);
-        let (tan_x, tan_y) = (1.0 / projection[0], 1.0 / projection[5]);
-        for (index, cascade) in cascades.iter().enumerate() {
-            for depth in [SHADOW_SPLITS[index].max(0.1), SHADOW_SPLITS[index + 1]] {
-                for (sx, sy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0), (0.0, 0.0)] {
-                    let view_point = [sx * tan_x * depth, sy * tan_y * depth, -depth];
-                    let world = transform(&inverse, view_point);
-                    let clip = transform(&cascade.view_projection, [world[0], world[1], world[2]]);
-                    assert!(clip[0].abs() <= 1.0 && clip[1].abs() <= 1.0, "cascade {index}: {clip:?}");
-                    assert!((0.0..=1.0).contains(&clip[2]), "cascade {index} depth {}", clip[2]);
-                    // Casters up to the reach toward the light still fit.
-                    let caster: [f32; 3] =
-                        std::array::from_fn(|axis| world[axis] - light.forward[axis] * (CASTER_REACH - 1.0));
-                    let caster_clip = transform(&cascade.view_projection, caster);
-                    assert!(caster_clip[2] >= 0.0, "cascade {index} caster depth {}", caster_clip[2]);
+    fn cylinder_boundaries_and_up_light_casters_fit_for_every_light_direction() {
+        let eye = [812.5, 2000.0, -2210.25];
+        let heights = [[-24.0, 96.0], [-80.0, 160.0], [-520.0, 700.0]];
+        for direction in [
+            [-0.22, -0.62, 0.76],
+            [0.0, -1.0, 0.0],
+            [0.001, -1.0, -0.001],
+            [0.0, 1.0, 0.0],
+            [0.6, 0.7, -0.2],
+            [0.0, -0.0523, -0.9986],
+            [0.0, 0.0, 1.0],
+        ] {
+            let light = light_basis(direction);
+            let cascades = fit_cascades(eye, &heights, &light);
+            for (index, cascade) in cascades.iter().enumerate() {
+                let radius = SHADOW_SPLITS[index + 1];
+                for height in heights[index] {
+                    for spoke in 0..64 {
+                        let angle = std::f32::consts::TAU * spoke as f32 / 64.0;
+                        let receiver = [eye[0] + radius * angle.cos(), height, eye[2] + radius * angle.sin()];
+                        assert_inside(cascade, receiver);
+                        let caster = std::array::from_fn(|axis| receiver[axis] - light.forward[axis] * CASTER_REACH);
+                        assert_inside(cascade, caster);
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn cascades_move_in_whole_texels() {
-        let look = Vec3::new(-0.6, -0.1, 0.8).normalize();
+    fn coarse_height_samples_preserve_inner_hills_and_blend_coverage() {
+        let eye = [10.0, 4000.0, 10.0];
+        // Only the fine grid samples this narrow hill. Its crowns must
+        // remain covered when transitioning into a coarser cascade.
+        let heights = receiver_height_bounds(eye, |x, z| {
+            if (x - 5.0).abs() < 0.5 && (z - 5.0).abs() < 0.5 { 900.0 } else { 24.0 }
+        });
+        assert!(heights[0][1] >= 900.0 + CANOPY_HEIGHT);
+        for [low, high] in heights {
+            assert_eq!(low % 8.0, 0.0);
+            assert_eq!(high % 8.0, 0.0);
+        }
         let light = light_basis([0.4, -0.5, 0.3]);
-        let (view_a, projection) = camera(Vec3::new(10.0, 30.0, 10.0), look);
-        let (view_b, _) = camera(Vec3::new(10.37, 30.0, 9.81), look);
-        let a = fit_cascades(&view_a, &projection, [10.0, 30.0, 10.0], &light);
-        let b = fit_cascades(&view_b, &projection, [10.37, 30.0, 9.81], &light);
+        let cascades = fit_cascades(eye, &heights, &light);
+        for index in 0..SHADOW_CASCADES - 1 {
+            assert!(heights[index + 1][0] <= heights[index][0]);
+            assert!(heights[index + 1][1] >= heights[index][1]);
+            let end = SHADOW_SPLITS[index + 1];
+            let start = end - (end - SHADOW_SPLITS[index]) * CASCADE_BLEND;
+            for radius in [start, (start + end) * 0.5, end] {
+                for height in heights[index] {
+                    for spoke in 0..32 {
+                        let angle = std::f32::consts::TAU * spoke as f32 / 32.0;
+                        let point = [eye[0] + radius * angle.cos(), height, eye[2] + radius * angle.sin()];
+                        assert_inside(&cascades[index], point);
+                        assert_inside(&cascades[index + 1], point);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn underwater_ground_keeps_water_receivers_and_heights_stable_between_grid_steps() {
+        let eye_a = [10.1, 150.0, 10.2];
+        let eye_b = [10.8, 150.0, 10.9];
+        let ground = |x: f32, z: f32| -300.0 + x * 0.01 + z * 0.01;
+        let a = receiver_height_bounds(eye_a, ground);
+        let b = receiver_height_bounds(eye_b, ground);
+        assert_eq!(a, b);
+        for [low, high] in a {
+            assert!(low <= crate::constants::SEA_LEVEL);
+            assert!(high >= crate::constants::SEA_LEVEL + CANOPY_HEIGHT);
+        }
+    }
+
+    #[test]
+    fn cascades_move_in_whole_texels() {
+        let light = light_basis([0.4, -0.5, 0.3]);
+        let eye_a = [10.0, 30.0, 10.0];
+        let eye_b = [10.37, 30.0, 9.81];
+        let heights_a = receiver_height_bounds(eye_a, |_, _| 14.0);
+        let heights_b = receiver_height_bounds(eye_b, |_, _| 14.0);
+        let a = fit_cascades(eye_a, &heights_a, &light);
+        let b = fit_cascades(eye_b, &heights_b, &light);
         for (a, b) in a.iter().zip(&b) {
             assert_eq!(a.half_extent, b.half_extent);
             for axis in 0..2 {

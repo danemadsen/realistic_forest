@@ -492,12 +492,14 @@ moves. Billboards made of single crossed cards remain two-sided.
 Plants are lit by the same composite as the ground, with terrain, cloud and
 volumetric lighting. Foliage shades as one rounded crown rather than a stack
 of flat cards: it darkens toward the trunk and the crown's base, and thin
-leaves let some light through. The plants also cast their own shadows. Four
-cascaded shadow maps (2048² each) are drawn from the sun, or from the moon at
-night, depth-only and alpha-tested. They cover the view out to 20, 70, 280 and
-2000 metres, with texels from about 3 cm near the eye to 2.7 m at the far end.
-Each cascade only moves in whole texels, so shadows stay still as the camera
-turns and walks. Trees shade the ground, the grass, each other and their own
+leaves let some light through. The plants also cast their own shadows. Three
+cascaded shadow maps (2048², 2048² and 1536²) are drawn from the sun, or from
+the moon at night, depth-only and alpha-tested. They cover horizontal radii
+of 20, 70 and 2000 metres around the camera, fitted vertically to the terrain
+and crowns. Shadow detail depends on distance across the ground, so flying
+up and looking down preserves detailed shadows on the plants below. Each
+cascade moves in whole texels, keeping shadows stable as the camera moves.
+Trees shade the ground, the grass, each other and their own
 crowns, out to the far cascade. The cull pass gathers shadow casters even
 behind the camera, at a cheaper LOD per cascade. The tree crowns are also
 laid over the grass's 512-metre capture from above, so the grass thins out and
@@ -1085,7 +1087,7 @@ quality or disable clouds independently if the frame rate becomes too low.
 
 The renderer writes view position, view normal, and albedo to a three-target
 G-buffer: the terrain first, then the plants (after their cull pass), then the
-grass. The plants also draw their four shadow cascades. SSAO is evaluated at half resolution with a 24-sample rotated
+grass. The plants also draw their three shadow cascades. SSAO is evaluated at half resolution with a 24-sample rotated
 hemisphere kernel, followed by a depth/normal-aware bilateral blur. A separate
 half-resolution atmosphere pass supplies combined fog/cloud scattering and
 transmittance to the lighting composite, which also evaluates terrain, cloud

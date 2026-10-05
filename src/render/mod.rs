@@ -104,6 +104,8 @@ impl ForestRender {
 #[derive(Resource, Default)]
 pub struct ExtractedForestView {
     pub player_position: [f32; 3],
+    /// Terrain-to-canopy height bounds for each horizontal shadow radius.
+    pub shadow_receiver_heights: [[f32; 2]; vegetation_shadows::SHADOW_CASCADES],
     pub player_yaw: f32,
     pub player_pitch: f32,
     pub physical_width: u32,
@@ -639,6 +641,13 @@ fn extract_forest_view(
     view.draw_ocean = world.resource::<WorldOptions>().draw_ocean;
     let cache = world.resource::<ErosionCache>();
     view.lookup_minimum = (cache.lookup_minimum.x, cache.lookup_minimum.z);
+    if view.settings.vegetation_enabled && view.settings.vegetation_shadows {
+        let noise = world.resource::<NoiseField>();
+        let eye = view.player_position;
+        view.shadow_receiver_heights = vegetation_shadows::receiver_height_bounds(eye, |x, z| {
+            crate::erosion::sample_eroded_height(cache, noise, x, z, [eye[0], eye[2]])
+        });
+    }
     let snow = world.resource::<crate::snow::SnowState>();
     view.snow_mapping = snow.mapping();
     view.snow_pixels = snow.pixels();

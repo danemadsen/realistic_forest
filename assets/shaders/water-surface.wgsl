@@ -1847,7 +1847,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
 // `VegetationShadows` in composite.wgsl.
 struct VegetationShadows {
     view_projection: array<mat4x4<f32>, 3>,
-    splits: vec4<f32>,
+    splits: vec4<f32>, // horizontal radius of each cascade; w far radius, metres
     texel: vec4<f32>,
     light: vec4<f32>,
     params: vec4<f32>,
@@ -1872,15 +1872,16 @@ fn riverPlantShadowPcf(map: texture_depth_2d, uv: vec2<f32>, depth: f32) -> f32 
 }
 
 // Light reaching a water point through the plants: the cascade covering its
-// view depth, with a 2x2 grid of bilinear comparisons (the composite's
-// 4x4 tent is more than a rippling surface needs).
-fn riverPlantShadow(world_position: vec3<f32>, view_depth: f32) -> f32 {
-    if (vegetation_shadows.light.w < 0.5 || view_depth >= vegetation_shadows.splits.w) {
+// horizontal distance from the camera, with a 2x2 grid of bilinear comparisons
+// (the composite's 4x4 tent is more than a rippling surface needs).
+fn riverPlantShadow(world_position: vec3<f32>) -> f32 {
+    let horizontal_distance = length(world_position.xz - globals.camera_position.xz);
+    if (vegetation_shadows.light.w < 0.5 || horizontal_distance >= vegetation_shadows.splits.w) {
         return 1.0;
     }
     var cascade = 2u;
     for (var c = 0u; c < 2u; c++) {
-        if (view_depth < vegetation_shadows.splits[c]) {
+        if (horizontal_distance < vegetation_shadows.splits[c]) {
             cascade = c;
             break;
         }
@@ -1898,7 +1899,7 @@ fn riverPlantShadow(world_position: vec3<f32>, view_depth: f32) -> f32 {
         case 1u: { lit = riverPlantShadowPcf(vegetation_shadow_map_1, uv, clip.z); }
         default: { lit = riverPlantShadowPcf(vegetation_shadow_map_2, uv, clip.z); }
     }
-    let far_fade = smoothstepf(vegetation_shadows.splits.w*0.85, vegetation_shadows.splits.w, view_depth);
+    let far_fade = smoothstepf(vegetation_shadows.splits.w*0.85, vegetation_shadows.splits.w, horizontal_distance);
     return mix(1.0, mix(lit*0.25, 1.0, far_fade), vegetation_shadows.params.y);
 }
 
@@ -2316,7 +2317,7 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     // --- Light ------------------------------------------------------------------
     // Trees shade the water as they shade its banks: by the sun's cascades
     // by day, the moon's by night.
-    let plant_shadow = riverPlantShadow(in.world_position, -water_view.z);
+    let plant_shadow = riverPlantShadow(in.world_position);
     let sun_plants = select(1.0, plant_shadow, vegetation_shadows.light.w < 1.5);
     let moon_plants = select(1.0, plant_shadow, vegetation_shadows.light.w > 1.5);
     let severity = weatherSeverity(in.world_position.xz);
