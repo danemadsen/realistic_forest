@@ -135,6 +135,26 @@ mod tests {
     }
 
     #[test]
+    fn reveal_changes_within_a_quantum_do_not_move_the_revision() {
+        let revision = TerrainRevision::default();
+        let mut records = vec![0.0f32; 484];
+        records[2] = 0.83;
+        revision.note_lookup(&records);
+        let first = revision.current();
+        // 0.83 and 0.87 quantise to the same 1/8 bucket (6/8): the ramp's
+        // intermediate frames must not re-run the terrain retakes.
+        records[2] = 0.87;
+        revision.note_lookup(&records);
+        assert_eq!(revision.current(), first);
+        records[2] = 0.9; // 7/8: a real step
+        revision.note_lookup(&records);
+        assert_eq!(revision.current(), first + 1);
+        records[2] = 1.0; // ramp completion is 8/8 == 1.0 exactly
+        revision.note_lookup(&records);
+        assert_eq!(revision.current(), first + 2);
+    }
+
+    #[test]
     fn downscale_averages_whole_blocks() {
         // 2x2 source, one value per pixel.
         let src: Vec<u8> = vec![
@@ -367,10 +387,27 @@ impl TerrainRevision {
 
     /// The lookup records are rewritten every frame; only a different set of
     /// records (a tile appearing, a slot moving, a reveal advancing) counts.
+    ///
+    /// Reveal advances every ramp frame for every revealing tile, so hashing
+    /// it at full precision makes the retakes keyed on this counter run once
+    /// per ramp frame. Hashing reveal at `EROSION_REVEAL_HASH_QUANTUM` steps
+    /// instead keeps the retakes to ~8 per 0.9 s ramp. The records themselves
+    /// — and the terrain shaders' visible reveal blend they sample — stay
+    /// full precision: this only changes *when* the retakes run, and each
+    /// retake still renders from the records current at that instant.
     pub fn note_lookup(&self, records: &[f32]) {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        for value in records {
-            hash = (hash ^ u64::from(value.to_bits())).wrapping_mul(0x0000_0100_0000_01b3);
+        for (index, value) in records.iter().enumerate() {
+            // Record layout: per tile [atlas column, atlas row, reveal, mask];
+            // offset 2 is the reveal.
+            let bits = if index % 4 == 2 {
+                ((value * crate::constants::EROSION_REVEAL_HASH_QUANTUM).floor()
+                    / crate::constants::EROSION_REVEAL_HASH_QUANTUM)
+                    .to_bits()
+            } else {
+                value.to_bits()
+            };
+            hash = (hash ^ u64::from(bits)).wrapping_mul(0x0000_0100_0000_01b3);
         }
         if self.lookup_hash.swap(hash, Ordering::Relaxed) != hash {
             self.counter.fetch_add(1, Ordering::Relaxed);
@@ -402,14 +439,6 @@ pub struct GpuWorldTextures {
     pub lookup_view: wgpu::TextureView,
     /// R32 blend mask (bilinear, clamp — the C++ sets CLAMP here).
     pub blend_mask_view: wgpu::TextureView,
-    /// RGBA32F pairs (point) for terrain/water/flux/drainage simulation state.
-    pub sim_terrain: [wgpu::Texture; 2],
-    pub sim_water: [wgpu::Texture; 2],
-    pub sim_flux: [wgpu::Texture; 2],
-    pub sim_drainage: [wgpu::Texture; 2],
-    /// Each cell's drainage-routing normaliser, written by the water pass for
-    /// the terrain pass of the same iteration (R; see erosion-water.wgsl).
-    pub sim_routing: wgpu::Texture,
     pub albedo_array_view: wgpu::TextureView,
     pub normal_rough_array_view: wgpu::TextureView,
     /// Rgba8Unorm 4x4 rotation noise (point, repeat).
@@ -423,27 +452,6 @@ pub struct GpuWorldTextures {
 }
 
 pub const SSAO_NOISE_WIDTH: u32 = 4;
-
-fn sim_texture(device: &RenderDevice, label: &str) -> wgpu::Texture {
-    device
-        .wgpu_device()
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width: SIM_TEXTURE_SIZE,
-                height: SIM_TEXTURE_SIZE,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        })
-}
 
 fn float_texture(
     device: &RenderDevice,
@@ -726,25 +734,6 @@ pub fn prepare_gpu_textures(
     }
     let blend_mask_view = blend_texture.create_view(&Default::default());
 
-    // Simulation target pairs.
-    let sim_terrain = [
-        sim_texture(device, "sim_terrain_0"),
-        sim_texture(device, "sim_terrain_1"),
-    ];
-    let sim_water = [
-        sim_texture(device, "sim_water_0"),
-        sim_texture(device, "sim_water_1"),
-    ];
-    let sim_flux = [
-        sim_texture(device, "sim_flux_0"),
-        sim_texture(device, "sim_flux_1"),
-    ];
-    let sim_drainage = [
-        sim_texture(device, "sim_drainage_0"),
-        sim_texture(device, "sim_drainage_1"),
-    ];
-    let sim_routing = sim_texture(device, "sim_routing");
-
     // PBR texture arrays with CPU-built mip chains (wgpu cannot generate
     // array mips on the GPU), trilinear + repeat + max anisotropy.
     let make_array = |label: &str,
@@ -880,11 +869,6 @@ pub fn prepare_gpu_textures(
         lookup_texture,
         lookup_view,
         blend_mask_view,
-        sim_terrain,
-        sim_water,
-        sim_flux,
-        sim_drainage,
-        sim_routing,
         albedo_array_view,
         normal_rough_array_view,
         ssao_noise_view,

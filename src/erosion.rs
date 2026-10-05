@@ -249,6 +249,37 @@ pub struct IterateCommand {
     pub settings: ErosionSettings,
 }
 
+/// A finished atlas patch crossing from the erosion worker thread to the
+/// render world, waiting for the main world to publish its slot through the
+/// lookup records (`flush_pending_atlas` uploads once it does).
+///
+/// The 260x260 patches keep their Rust float layout across the bridge; the
+/// render side runs them through `write_padded_at`'s `cast_slice` at upload.
+pub struct PendingAtlasPatch {
+    pub key: TileKey,
+    pub atlas_height: Vec<f32>,
+    pub atlas_flow: Vec<f32>,
+    /// Frames spent waiting on the render side; dropped past
+    /// `MAX_PENDING_ATLAS_AGE`, incremented by the render-side flush.
+    pub age: u32,
+}
+
+/// The five erosion WGSL sources, published once by the main world (which
+/// owns the asset server) and taken once by the worker thread, which compiles
+/// them into shader modules on its own device.
+///
+/// As bytes because that is what crosses threads and what
+/// `create_shader_module` takes; every erosion shader is a self-contained
+/// WGSL file, so no preprocessing runs between here and the device.
+#[derive(Clone, Debug)]
+pub struct ErosionShaderSources {
+    pub init: Vec<u8>,
+    pub flux: Vec<u8>,
+    pub water: Vec<u8>,
+    pub terrain: Vec<u8>,
+    pub thermal: Vec<u8>,
+}
+
 /// A finalized tile's data as computed by the render world from its readback.
 ///
 /// The 260x260 atlas patches stay render-side: the C++ wrote them straight
@@ -267,37 +298,112 @@ pub enum ErosionEvent {
     ReadbackFailed(TileKey),
 }
 
-/// Inner state behind the bridge's mutex, shared by both worlds.
-#[derive(Default)]
+/// Inner state behind the bridge's mutex, shared by the main world (tile
+/// scheduling), the render world (lookup writes, atlas uploads), and the
+/// erosion worker thread.
 pub struct BridgeState {
     commands: Option<ErosionFrameCommands>,
     lookup_records: Option<Vec<f32>>,
     events: VecDeque<ErosionEvent>,
+    phase_costs: ErosionPhaseCosts,
+    /// Finished atlas patches the worker published; `flush_pending_atlas`
+    /// drains and uploads them once their tile's slot is published.
+    patches: VecDeque<PendingAtlasPatch>,
+    /// Why the worker thread ended, set only by the worker. `apply_erosion_events`
+    /// panics on consumption: a dead worker is a dead simulation, and the
+    /// render thread never had a way to fail that quietly (it panicked the
+    /// process the same way).
+    worker_dead: Option<String>,
+    /// The five WGSL sources, published once by the main world and taken once
+    /// by the worker spawn; see [`ErosionShaderSources`].
+    shader_sources: Option<ErosionShaderSources>,
 }
 
-/// Shared state between the main world (tile scheduling) and the render
-/// world (GPU pass execution + readbacks).
+impl Default for BridgeState {
+    fn default() -> Self {
+        Self {
+            commands: None,
+            lookup_records: None,
+            events: VecDeque::new(),
+            phase_costs: ErosionPhaseCosts::default(),
+            patches: VecDeque::new(),
+            worker_dead: None,
+            shader_sources: None,
+        }
+    }
+}
+
+/// Cumulative render-node phase costs in microseconds for `--shot` frame-time
+/// attribution: the render node records them each frame, and the main world's
+/// frame-time recorder drains the totals. Both sides only touch this under the
+/// bridge's mutex.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ErosionPhaseCosts {
+    /// Writing the 11x11 lookup records and flushing atlas patches into
+    /// `GpuWorldTextures`.
+    pub lookup_atlas_us: u64,
+    /// `begin_mapping` + `device.poll` (map callbacks fire here).
+    pub poll_us: u64,
+    /// `consume_readback` outside its finalize math: assembling readback
+    /// halves and pushing atlas patches.
+    pub consume_us: u64,
+    /// `finalize_erosion_tile` CPU math (crop, statistics, patch assembly).
+    pub finalize_us: u64,
+    /// Recording the sim frame's commands (init passes, 4 passes per
+    /// iteration, readback copies).
+    pub sim_record_us: u64,
+}
+
+impl std::ops::AddAssign<&ErosionPhaseCosts> for ErosionPhaseCosts {
+    fn add_assign(&mut self, rhs: &Self) {
+        self.lookup_atlas_us += rhs.lookup_atlas_us;
+        self.poll_us += rhs.poll_us;
+        self.consume_us += rhs.consume_us;
+        self.finalize_us += rhs.finalize_us;
+        self.sim_record_us += rhs.sim_record_us;
+    }
+}
+
+/// Shared state between the main world (tile scheduling), the render world
+/// (GPU pass execution + readbacks), and the erosion worker thread.
+///
+/// The condvar is a sibling of the guarded state rather than a field of it:
+/// `MutexGuard` cannot be moved into `Condvar::wait_timeout` while the call's
+/// receiver borrows back into the guarded struct — the pair has to live
+/// side by side, which is also the std docs' pattern.
 #[derive(Clone, Default, Resource)]
-pub struct ErosionBridge(pub std::sync::Arc<std::sync::Mutex<BridgeState>>);
+pub struct ErosionBridge {
+    state: std::sync::Arc<std::sync::Mutex<BridgeState>>,
+    /// Signalled whenever a command set arrives; the worker waits on it when
+    /// there is neither readback work nor a pending command set, and
+    /// `set_frame` notifies inside the lock, so the classic lost-wakeup race
+    /// between a released waiter and a notify cannot happen. An `Arc`: every
+    /// clone of the bridge shares one condvar, so a parked worker sees every
+    /// notify from any holder.
+    work_available: std::sync::Arc<std::sync::Condvar>,
+}
 
 impl ErosionBridge {
+    fn state(&self) -> std::sync::MutexGuard<'_, BridgeState> {
+        self.state.lock().unwrap()
+    }
     pub fn take_commands(&self) -> Option<ErosionFrameCommands> {
-        self.0.lock().unwrap().commands.take()
+        self.state().commands.take()
     }
     pub fn take_lookup(&self) -> Option<Vec<f32>> {
-        self.0.lock().unwrap().lookup_records.take()
+        self.state().lookup_records.take()
     }
     pub fn drain_events(&self) -> VecDeque<ErosionEvent> {
-        std::mem::take(&mut self.0.lock().unwrap().events)
+        std::mem::take(&mut self.state().events)
     }
 
-    /// Hands one frame of work to the render world.
+    /// Hands one frame of work to the erosion worker thread.
     ///
-    /// The render world consumes at most one command set per frame, and only
-    /// once its GPU state exists — for the first frames of the app the node
-    /// returns before `take_commands` while `prepare_erosion_sim` builds the
-    /// pipelines, textures and bind groups. Whatever is still pending when the
-    /// next frame arrives is therefore *merged into* it rather than replaced.
+    /// The worker consumes at most one command set per loop tick, and only
+    /// once its device, pipelines and textures exist — for the first seconds
+    /// of the app the bridge accumulates sets while the worker thread
+    /// compiles its shaders. Whatever is still pending when the next frame
+    /// arrives is therefore *merged into* it rather than replaced.
     ///
     /// Without the merge a dropped frame takes its work with it, and `init` is
     /// the one command that cannot be re-sent: `BeginErosionTile` is called
@@ -310,7 +416,7 @@ impl ErosionBridge {
     /// each frame's count is fresh work) and `finalize` is idempotent, so both
     /// survive the same way.
     pub fn set_frame(&self, mut commands: ErosionFrameCommands, lookup_records: Option<Vec<f32>>) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state();
         // `sim_min` is a bijection of the tile key, so it identifies which tile
         // a command set describes. Work may only be carried across frames that
         // describe the *same* tile: once the main world moves on, its previous
@@ -339,9 +445,86 @@ impl ErosionBridge {
         }
         state.commands = Some(commands);
         state.lookup_records = lookup_records;
+        // The worker may be parked on this condvar with nothing to do; every
+        // frame carries commands unless simulation is paused, and a parked
+        // worker costs two frames of latency per missed wake-up. Notifying
+        // while still holding the lock is deliberate: it makes the wake-up
+        // ordered against this frame's state change.
+        self.work_available.notify_one();
     }
     pub fn push_event(&self, event: ErosionEvent) {
-        self.0.lock().unwrap().events.push_back(event);
+        self.state().events.push_back(event);
+    }
+    /// Hands a finished atlas patch to the render world. The deque is capped:
+    /// a render side that stops draining must not grow the bridge unbounded,
+    /// so the oldest patch is dropped with a warning past
+    /// `EROSION_PENDING_PATCH_CAP` — the tile it belonged to re-streams
+    /// through the normal queue rather than stalling everything behind it.
+    pub fn push_patches(
+        &self,
+        key: TileKey,
+        atlas_height: Vec<f32>,
+        atlas_flow: Vec<f32>,
+    ) {
+        let mut state = self.state();
+        state.patches.push_back(PendingAtlasPatch {
+            key,
+            atlas_height,
+            atlas_flow,
+            age: 0,
+        });
+        while state.patches.len() > EROSION_PENDING_PATCH_CAP {
+            state.patches.pop_front();
+            log::warn!(
+                "EROSION: dropped tile ({}, {})'s atlas patch past the pending cap; the render side is not draining",
+                key.x,
+                key.z
+            );
+        }
+    }
+    /// Drains every pending atlas patch, oldest first.
+    pub fn drain_patches(&self) -> VecDeque<PendingAtlasPatch> {
+        std::mem::take(&mut self.state().patches)
+    }
+    /// Publishes the five WGSL sources; consumed once by the worker spawn.
+    pub fn publish_shader_sources(&self, sources: ErosionShaderSources) {
+        self.state().shader_sources = Some(sources);
+    }
+    pub fn take_shader_sources(&self) -> Option<ErosionShaderSources> {
+        self.state().shader_sources.take()
+    }
+    /// True once the WGSL publisher has run; the render node uses this to
+    /// hold the worker spawn off until the sources exist (the worker treats
+    /// an absence at spawn as a wiring bug and dies loudly).
+    pub fn shader_sources_ready(&self) -> bool {
+        self.state().shader_sources.is_some()
+    }
+    /// Blocks the calling thread up to `timeout`, returning as soon as
+    /// `set_frame` signals work. The worker thread's idle wait: a timed wait
+    /// rather than a bare one, so a notification that raced past a wake
+    /// (spurious, or consumed by an earlier branch) costs at most `timeout`,
+    /// and never the two frames a full sleep round trip would.
+    pub fn wait_for_work(&self, timeout: std::time::Duration) {
+        let state = self.state();
+        let _ = self.work_available.wait_timeout(state, timeout);
+    }
+    /// Records that the worker thread can no longer progress.
+    pub fn set_worker_dead(&self, why: String) {
+        self.state().worker_dead = Some(why);
+    }
+    /// Returns the worker's death reason, once. The consumer panics; see
+    /// [`BridgeState::worker_dead`].
+    pub fn take_worker_dead(&self) -> Option<String> {
+        self.state().worker_dead.take()
+    }
+    /// Adds one render frame's phase costs to the bridge's running totals.
+    pub fn record_phase_costs(&self, costs: ErosionPhaseCosts) {
+        self.state().phase_costs += &costs;
+    }
+    /// Takes the totals accumulated since the last drain (the recorder runs
+    /// once per frame, so this is normally a single frame's worth).
+    pub fn drain_phase_costs(&self) -> ErosionPhaseCosts {
+        std::mem::take(&mut self.state().phase_costs)
     }
 }
 
@@ -390,6 +573,10 @@ pub struct ErosionCache {
     /// The river network in force: tiles simulate over its carved channels
     /// and height queries hold its channels and banks.
     pub rivers: Option<Arc<crate::rivers::network::RiverNetwork>>,
+    /// Frames the live active tile has run without a finalize or failure
+    /// event (armed at begin, incremented in [`apply_erosion_events`], tripping
+    /// `mark_tile_failed` past `EROSION_WORKER_WATCHDOG_FRAMES`).
+    pub watchdog_frames: u32,
 }
 
 impl Default for ErosionCache {
@@ -406,6 +593,7 @@ impl Default for ErosionCache {
             cache_dropped: false,
             force_reveal: None,
             rivers: None,
+            watchdog_frames: 0,
         }
     }
 }
@@ -716,6 +904,9 @@ pub fn begin_prepared_tile(
     }
     cache.active_tile = key;
     cache.has_active_tile = true;
+    // Arms the main-world watchdog: `apply_erosion_events` counts frames with
+    // no delivery from here.
+    cache.watchdog_frames = 0;
     log::info!("EROSION: generating tile ({}, {})", key.x, key.z);
 }
 
@@ -835,15 +1026,56 @@ pub fn update_erosion_cache(
     began_tile
 }
 
-/// Apply events published by the render world after its readbacks.
+/// Marks a tile whose simulation will never deliver a finalize: one strike
+/// against `failed_readbacks`, three of which give up on the tile, and the
+/// active slot is released either way. Shared by the readback-failure event
+/// and the main-world worker watchdog. A re-queued tile re-begins and
+/// re-stamps its init, so it converges to the same simulation as before.
+fn mark_tile_failed(cache: &mut ErosionCache, key: TileKey, why: &str) {
+    if let Some(existing) = cache.tiles.get_mut(&key) {
+        existing.failed_readbacks += 1;
+        let failed = existing.failed_readbacks >= 3;
+        existing.state = if failed {
+            ErosionTileState::Failed
+        } else {
+            ErosionTileState::Queued
+        };
+        existing.completed_iterations = 0;
+        log::warn!(
+            "EROSION: {} for tile ({}, {}), strike {}",
+            why,
+            key.x,
+            key.z,
+            existing.failed_readbacks
+        );
+    }
+    // No tile became Ready, so a pending immediate reveal must not carry over
+    // to whichever tile finalizes next.
+    if cache.force_reveal == Some(key) {
+        cache.force_reveal = None;
+    }
+    cache.has_active_tile = false;
+}
+
+/// Apply events published by the erosion worker, and keep the watchdog
+/// running against its death or stall.
 pub fn apply_erosion_events(cache: &mut ErosionCache, bridge: &ErosionBridge) {
+    // A dead worker is a dead simulation: every later tile would just watch
+    // the watchdog count to three. The render thread never had a quieter
+    // failure mode (a lost device or a validation error panicked the process
+    // the same way), and neither does the worker.
+    if let Some(why) = bridge.take_worker_dead() {
+        panic!("EROSION: worker thread died; the erosion cache cannot continue: {why}");
+    }
+
+    let mut delivery = false;
     for event in bridge.drain_events() {
         match event {
             ErosionEvent::TileFinalized(finalized) => {
                 let key = finalized.key;
-                // The render world sees finalize commands again each frame
-                // until the async readback lands; only the first event of a
-                // simulation may transition the tile.
+                // The worker sees finalize commands again each frame while
+                // the main world still shows the tile active; only the first
+                // event of a simulation may transition the tile.
                 let already_ready = cache
                     .tiles
                     .get(&key)
@@ -878,26 +1110,29 @@ pub fn apply_erosion_events(cache: &mut ErosionCache, bridge: &ErosionBridge) {
                     );
                 }
                 cache.has_active_tile = false;
+                delivery = true;
             }
             ErosionEvent::ReadbackFailed(key) => {
-                if let Some(existing) = cache.tiles.get_mut(&key) {
-                    existing.failed_readbacks += 1;
-                    let failed = existing.failed_readbacks >= 3;
-                    existing.state = if failed {
-                        ErosionTileState::Failed
-                    } else {
-                        ErosionTileState::Queued
-                    };
-                    existing.completed_iterations = 0;
-                    log::warn!("EROSION: readback failed for tile ({}, {})", key.x, key.z);
-                }
-                // No tile became Ready, so a pending immediate reveal must not
-                // carry over to whichever tile finalizes next.
-                if cache.force_reveal == Some(key) {
-                    cache.force_reveal = None;
-                }
-                cache.has_active_tile = false;
+                mark_tile_failed(cache, key, "readback failed");
+                delivery = true;
             }
+        }
+    }
+
+    // The watchdog runs while a tile is active with no delivery this frame:
+    // a live worker finishes every well-formed tile within ~24 frames plus
+    // readback latency, so only a stalled thread reaches the trip.
+    if cache.has_active_tile && !delivery {
+        cache.watchdog_frames = cache.watchdog_frames.saturating_add(1);
+        if cache.watchdog_frames >= crate::constants::EROSION_WORKER_WATCHDOG_FRAMES {
+            cache.watchdog_frames = 0;
+            let key = cache.active_tile;
+            mark_tile_failed(cache, key,
+                &format!(
+                    "no finalize landed within {} frames of beginning; requeueing",
+                    crate::constants::EROSION_WORKER_WATCHDOG_FRAMES
+                ),
+            );
         }
     }
 }
@@ -1139,5 +1374,209 @@ mod tests {
         bridge.set_frame(frame_for([0.0, 0.0], 6, false), None);
         assert!(bridge.take_commands().is_some());
         assert!(bridge.take_commands().is_none());
+    }
+
+    /// A render side that stops draining must not grow the bridge unbounded:
+    /// the oldest patch is dropped past `EROSION_PENDING_PATCH_CAP`, keeping
+    /// the newest ones (which describe tiles the queue reached most recently).
+    #[test]
+    fn pending_patches_are_capped() {
+        let bridge = ErosionBridge::default();
+        let cap = crate::constants::EROSION_PENDING_PATCH_CAP;
+        for index in 0..(cap as i64 + 8) {
+            bridge.push_patches(tile(index, 0), vec![index as f32], vec![index as f32]);
+        }
+        let drained = bridge.drain_patches();
+        assert_eq!(drained.len(), cap, "the cap truncates the deque");
+        // The front (oldest) side is what was dropped: survivors are the last
+        // `cap` tiles pushed.
+        for (slot, patch) in drained.iter().enumerate() {
+            assert_eq!(patch.key.x, index_surviving(cap, slot));
+        }
+    }
+
+    /// The key at drained position `slot` in the cap test above.
+    fn index_surviving(cap: usize, slot: usize) -> i64 {
+        (cap as i64 + 8) - cap as i64 + slot as i64
+    }
+
+    /// Beginning a tile arms the watchdog: `apply_erosion_events` counts one
+    /// frame per call with an active tile and no delivery, and requeues the
+    /// tile at `EROSION_WORKER_WATCHDOG_FRAMES` (a stalled worker's tile
+    /// re-begins); the third consecutive strike gives up on it.
+    #[test]
+    fn watchdog_requeues_an_undelivered_tile_and_the_third_strike_fails_it() {
+        let mut cache = ErosionCache::default();
+        let center = tile(3, 7);
+        ensure_erosion_cache(&mut cache, center);
+        assert!(cache.tiles.contains_key(&center), "the centre tile is registered");
+
+        let bridge = ErosionBridge::default();
+        let prepared = PreparedTile {
+            key: center,
+            base_height: vec![0.0; EROSION_RESOLUTION * EROSION_RESOLUTION],
+            drainage_area: vec![0.0; EROSION_RESOLUTION * EROSION_RESOLUTION],
+            river: vec![0.0; EROSION_RESOLUTION * EROSION_RESOLUTION * 4],
+        };
+
+        let begin = |cache: &mut ErosionCache| {
+            let mut commands = ErosionFrameCommands { sim_min: [0.0, 0.0], init: None, iterate: None, finalize: false };
+            begin_prepared_tile(cache, &mut commands, PreparedTile {
+                key: prepared.key,
+                base_height: prepared.base_height.clone(),
+                drainage_area: prepared.drainage_area.clone(),
+                river: prepared.river.clone(),
+            });
+            assert!(commands.init.is_some(), "begin carries an init command");
+        };
+
+        let strike = |cache: &mut ErosionCache| {
+            let mut frames = 0;
+            while cache.has_active_tile {
+                apply_erosion_events(cache, &bridge);
+                frames += 1;
+            }
+            frames
+        };
+
+        begin(&mut cache);
+        let frames = strike(&mut cache);
+        assert_eq!(frames, crate::constants::EROSION_WORKER_WATCHDOG_FRAMES,
+            "strike one fires after exactly the watchdog interval");
+        let entry = cache.tiles.get(&center).expect("tile entry");
+        assert_eq!(entry.failed_readbacks, 1);
+        assert_eq!(entry.state, ErosionTileState::Queued, "strike one requeues");
+
+        begin(&mut cache);
+        strike(&mut cache);
+        begin(&mut cache);
+        strike(&mut cache);
+        let entry = cache.tiles.get(&center).expect("tile entry");
+        assert_eq!(entry.failed_readbacks, 3);
+        assert_eq!(entry.state, ErosionTileState::Failed, "three strikes retire the tile");
+        assert!(!cache.has_active_tile);
+    }
+
+    /// The failed tile clears a pending immediate reveal: `force_reveal` must
+    /// not carry to whichever tile finalizes next.
+    #[test]
+    fn a_failed_strike_clears_force_reveal() {
+        let mut cache = ErosionCache::default();
+        let key = tile(1, 2);
+        ensure_erosion_cache(&mut cache, key);
+        begin_prepared_tile(&mut cache, &mut ErosionFrameCommands { sim_min: [0.0, 0.0], init: None, iterate: None, finalize: false }, PreparedTile {
+            key,
+            base_height: vec![0.0],
+            drainage_area: vec![0.0],
+            river: vec![0.0],
+        });
+        assert!(cache.has_active_tile);
+        // force_reveal is set by the prewarm/advance path when a finalize is
+        // requested; the failure below must consume it.
+        cache.force_reveal = Some(key);
+
+        let bridge = ErosionBridge::default();
+        bridge.push_event(ErosionEvent::ReadbackFailed(key));
+        apply_erosion_events(&mut cache, &bridge);
+
+        assert_eq!(cache.force_reveal, None, "failed strikes consume force_reveal");
+    }
+
+    /// A readback failure requeues the tile for strikes one and two and
+    /// retires it on strike three, mirroring `mark_tile_failed`'s contract.
+    #[test]
+    fn map_failure_requeues_then_fails_a_tile() {
+        let mut cache = ErosionCache::default();
+        let key = tile(1, 2);
+        ensure_erosion_cache(&mut cache, key);
+        begin_prepared_tile(&mut cache, &mut ErosionFrameCommands { sim_min: [0.0, 0.0], init: None, iterate: None, finalize: false }, PreparedTile {
+            key,
+            base_height: vec![0.0],
+            drainage_area: vec![0.0],
+            river: vec![0.0],
+        });
+
+        let bridge = ErosionBridge::default();
+        for attempt in 1..=3 {
+            // Re-begin only from strike two on: the first strike hits an
+            // active tile.
+            if attempt > 1 {
+                begin_prepared_tile(&mut cache, &mut ErosionFrameCommands { sim_min: [0.0, 0.0], init: None, iterate: None, finalize: false }, PreparedTile {
+                    key,
+                    base_height: vec![0.0],
+                    drainage_area: vec![0.0],
+                    river: vec![0.0],
+                });
+            }
+            bridge.push_event(ErosionEvent::ReadbackFailed(key));
+            apply_erosion_events(&mut cache, &bridge);
+            let entry = cache.tiles.get(&key).expect("tile entry");
+            assert_eq!(entry.failed_readbacks, attempt);
+            assert!(!cache.has_active_tile, "the failing slot releases immediately");
+        }
+        let entry = cache.tiles.get(&key).expect("tile entry");
+        assert_eq!(entry.state, ErosionTileState::Failed, "strike three retires");
+        // A retired tile no longer re-begin: begin_prepared_tile would still
+        // flip it to Simulating (the scheduler never offers failed tiles), but
+        // the state read here is what apply_erosion_events converged to.
+    }
+
+    /// A dead worker kills the simulation loudly (`apply_erosion_events`
+    /// panics on the bridge's death notice) — the render thread failed the
+    /// same way, so the port's failure contract matches.
+    #[test]
+    #[should_panic(expected = "worker thread died")]
+    fn worker_death_panics_apply_erosion_events() {
+        let mut cache = ErosionCache::default();
+        let bridge = ErosionBridge::default();
+        bridge.set_worker_dead("device lost in the drill".to_string());
+        apply_erosion_events(&mut cache, &bridge);
+    }
+
+    /// The WGSL sources publish once and read back exactly once, and the
+    /// readiness flag tracks them for the render node's spawn gate; a clone
+    /// of the bridge (the render app's copy) sees the same publication.
+    #[test]
+    fn shader_sources_publish_once_and_cross_clone() {
+        let bridge = ErosionBridge::default();
+        assert!(!bridge.shader_sources_ready());
+        let sources = ErosionShaderSources {
+            init: b"fn init() {}".to_vec(),
+            flux: b"fn flux() {}".to_vec(),
+            water: b"fn water() {}".to_vec(),
+            terrain: b"fn terrain() {}".to_vec(),
+            thermal: b"fn thermal() {}".to_vec(),
+        };
+        let published = sources.clone();
+        bridge.publish_shader_sources(published);
+        assert!(bridge.shader_sources_ready(), "the render node's clone gate");
+
+        let taken = bridge.clone().take_shader_sources().expect("publish survives");
+        for (taken_field, source_field) in [
+            (&taken.init, &sources.init),
+            (&taken.flux, &sources.flux),
+            (&taken.water, &sources.water),
+            (&taken.terrain, &sources.terrain),
+            (&taken.thermal, &sources.thermal),
+        ] {
+            assert_eq!(taken_field, source_field, "sources arrive byte-identical");
+        }
+        assert!(!bridge.shader_sources_ready(), "consumed once");
+        assert!(bridge.take_shader_sources().is_none(), "take-once");
+    }
+}
+
+#[cfg(test)]
+mod watchdog_frame_limit_check {
+    /// The watchdog interval against the live cache settings: a healthy tile
+    /// finalizes in well under it, so a trip means the worker stalled.
+    #[test]
+    fn watchdog_interval_dwarfs_a_healthy_tile() {
+        let budget = crate::constants::EROSION_ITERATIONS_PER_FRAME.max(1);
+        let frames_for_a_tile = super::super::ErosionSettings::default().iterations.div_ceil(budget);
+        assert!(frames_for_a_tile
+            < crate::constants::EROSION_WORKER_WATCHDOG_FRAMES as usize,
+            "a healthy tile takes {frames_for_a_tile} frames; the watchdog trips at {}",
+            crate::constants::EROSION_WORKER_WATCHDOG_FRAMES);
     }
 }

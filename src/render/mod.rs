@@ -445,11 +445,10 @@ pub struct ForestShaderHandles {
     pub grass_ground_average: Handle<Shader>,
     pub vegetation: Handle<Shader>,
     pub vegetation_cull: Handle<Shader>,
-    pub erosion_init: Handle<Shader>,
-    pub erosion_flux: Handle<Shader>,
-    pub erosion_water: Handle<Shader>,
-    pub erosion_terrain: Handle<Shader>,
-    pub erosion_thermal: Handle<Shader>,
+    // The five erosion sim shaders deliberately have no handles here: their
+    // pipelines compile on the worker thread (src/erosion_worker.rs), which
+    // takes the WGSL text itself from the main world's publisher system
+    // (`publish_erosion_shader_sources` in main.rs) through the bridge.
     pub ssao: Handle<Shader>,
     pub ssao_blur: Handle<Shader>,
     pub composite: Handle<Shader>,
@@ -496,11 +495,6 @@ impl Plugin for ForestRenderPlugin {
                 grass_ground_average: asset_server.load::<Shader>("shaders/grass-ground-average.wgsl"),
                 vegetation: asset_server.load::<Shader>("shaders/vegetation.wgsl"),
                 vegetation_cull: asset_server.load::<Shader>("shaders/vegetation-cull.wgsl"),
-                erosion_init: asset_server.load::<Shader>("shaders/erosion-init.wgsl"),
-                erosion_flux: asset_server.load::<Shader>("shaders/erosion-flux.wgsl"),
-                erosion_water: asset_server.load::<Shader>("shaders/erosion-water.wgsl"),
-                erosion_terrain: asset_server.load::<Shader>("shaders/erosion-terrain.wgsl"),
-                erosion_thermal: asset_server.load::<Shader>("shaders/erosion-thermal.wgsl"),
                 ssao: asset_server.load::<Shader>("shaders/ssao.wgsl"),
                 ssao_blur: asset_server.load::<Shader>("shaders/ssao-blur.wgsl"),
                 composite: asset_server.load::<Shader>("shaders/composite.wgsl"),
@@ -551,7 +545,7 @@ impl Plugin for ForestRenderPlugin {
         render_app.init_resource::<ExtractedForestView>();
         render_app.init_resource::<ForestGlobals>();
         render_app.init_resource::<gpu_textures::GpuWorldTexturesOption>();
-        render_app.init_resource::<erosion_node::ErosionSimState>();
+        render_app.init_resource::<erosion_node::ErosionWorkerState>();
         render_app.init_resource::<terrain_node::TerrainNodeState>();
         render_app.init_resource::<post_nodes::SsaoNodeState>();
         // The vendored ocean. It owns its own extractor, prepare systems and
@@ -560,7 +554,6 @@ impl Plugin for ForestRenderPlugin {
 
         gpu_textures::register_gpu_texture_systems(render_app);
         river_node::register_river_systems(render_app);
-        erosion_node::register_erosion_systems(render_app);
         terrain_node::register_terrain_systems(render_app);
         post_nodes::register_post_systems(render_app);
         cloud_node::register_cloud_systems(render_app);

@@ -9,6 +9,8 @@ mod automation;
 mod constants;
 mod day_night;
 mod erosion;
+mod erosion_finalize;
+mod erosion_worker;
 mod grass;
 mod grass_cull;
 mod grass_stream;
@@ -27,7 +29,9 @@ mod snow;
 
 use crate::automation::AutomationSettings;
 use crate::constants::*;
-use crate::erosion::{ErosionBridge, ErosionCache, IterateCommand, TileKey};
+use crate::erosion::{
+    ErosionBridge, ErosionCache, ErosionShaderSources, IterateCommand, TileKey,
+};
 use crate::noise::NoiseField;
 use crate::player::Player;
 use bevy::camera::primitives::Frustum;
@@ -341,6 +345,12 @@ fn main() {
             draw_ocean: !automation.no_water,
         })
         .insert_resource(ErosionBridge::default())
+        // The render world spawns the erosion worker thread from this bridge
+        // (after the WGSL publisher's sources arrive). The thread is detached
+        // and never joined: every exit path — normal shutdown or `--shot`'s
+        // `std::process::exit`, which skips bevy teardown — simply drops the
+        // Arc'd state it holds, so nothing at exit can block on a worker that
+        // is mid-simulation.
         .insert_resource(erosion::TilePreparation::new(std::sync::Arc::new(noise_field.clone())))
         .insert_resource(vegetation::VegetationField::new(
             std::sync::Arc::new(noise_field.clone()),
@@ -365,6 +375,9 @@ fn main() {
         .add_systems(
             Update,
             (
+                // The worker takes its WGSL from here; publish before any
+                // streaming system can begin a tile.
+                publish_erosion_shader_sources,
                 handle_global_keys,
                 day_night::advance_day_night,
                 weather::advance_weather,
@@ -680,6 +693,64 @@ fn erosion_stream_system(
     }
 }
 
+/// One-shot WGSL publisher for the erosion worker, in `Local` state: loads
+/// the five sim shaders' handles on the first run, then publishes the
+/// sources once `Assets<Shader>` has all of them (the files may take a
+/// frame or two to load).
+#[derive(Default)]
+struct ErosionShaderPublication {
+    handles: Option<[Handle<Shader>; 5]>,
+    published: bool,
+}
+
+/// The main world owns the asset server, so it reads the five sim WGSLs
+/// through bevy's asset root resolution and publishes their bytes; the
+/// worker thread compiles them verbatim on its own device.
+///
+/// The sim shaders are self-contained (no `#import`s, asserted by
+/// `erosion_worker`'s tests), so the asset source's text is what the shaders
+/// need — raw `wgpu::ShaderSource::Wgsl` compilation has no naga_oil
+/// preprocessing step to run them through.
+fn publish_erosion_shader_sources(
+    mut publication: Local<ErosionShaderPublication>,
+    asset_server: Res<AssetServer>,
+    shaders: Res<Assets<Shader>>,
+    bridge: Res<ErosionBridge>,
+) {
+    if publication.published {
+        return;
+    }
+    let handles = publication.handles.get_or_insert_with(|| {
+        ["init", "flux", "water", "terrain", "thermal"].map(|name| {
+            asset_server.load::<Shader>(&format!("shaders/erosion-{name}.wgsl"))
+        })
+    });
+    let Some(sources) = (|| {
+        Some(ErosionShaderSources {
+            init: shader_source_bytes(shaders.get(&handles[0])?)?,
+            flux: shader_source_bytes(shaders.get(&handles[1])?)?,
+            water: shader_source_bytes(shaders.get(&handles[2])?)?,
+            terrain: shader_source_bytes(shaders.get(&handles[3])?)?,
+            thermal: shader_source_bytes(shaders.get(&handles[4])?)?,
+        })
+    })() else {
+        // Still loading; nothing has spawned the worker yet anyway.
+        return;
+    };
+    bridge.publish_shader_sources(sources);
+    publication.published = true;
+}
+
+/// The WGSL text of a bevy `Shader` asset as bytes.
+fn shader_source_bytes(shader: &Shader) -> Option<Vec<u8>> {
+    Some(match &shader.source {
+        bevy::shader::Source::Wgsl(text) | bevy::shader::Source::Wesl(text) => {
+            text.to_string().into_bytes()
+        }
+        _ => return None,
+    })
+}
+
 /// `--measure-overlap` replaces the normal stream/measure pair, exactly as the
 /// C++ `main` returns into `RunOverlapMeasurement` before its render loop.
 fn in_measure_mode(automation: Res<AutomationSettings>) -> bool {
@@ -779,19 +850,31 @@ fn measure_overlap_system(
 struct FrameTimes {
     streaming: Vec<f32>,
     settled: Vec<f32>,
+    erosion_streaming: erosion::ErosionPhaseCosts,
+    erosion_settled: erosion::ErosionPhaseCosts,
 }
 
 impl FrameTimes {
-    fn record(&mut self, seconds: f32, streaming: bool) {
+    fn record(
+        &mut self,
+        seconds: f32,
+        streaming: bool,
+        erosion: erosion::ErosionPhaseCosts,
+    ) {
         if streaming {
             self.streaming.push(seconds);
+            self.erosion_streaming += &erosion;
         } else {
             self.settled.push(seconds);
+            self.erosion_settled += &erosion;
         }
     }
 
     fn log(&self) {
-        for (phase, samples) in [("streaming", &self.streaming), ("settled", &self.settled)] {
+        for (phase, samples, erosion) in [
+            ("streaming", &self.streaming, &self.erosion_streaming),
+            ("settled", &self.settled, &self.erosion_settled),
+        ] {
             if samples.is_empty() {
                 continue;
             }
@@ -806,6 +889,16 @@ impl FrameTimes {
                 sorted[sorted.len() - 1] * 1000.0,
                 sorted.len()
             );
+            let frames = samples.len() as f32;
+            log::info!(
+                "EROSION-PHASE: {phase} lookup+atlas {:.3} ms, poll {:.3} ms, consume {:.3} ms, finalize {:.3} ms, sim-record {:.3} ms per frame over {} frames",
+                erosion.lookup_atlas_us as f32 / frames / 1_000.0,
+                erosion.poll_us as f32 / frames / 1_000.0,
+                erosion.consume_us as f32 / frames / 1_000.0,
+                erosion.finalize_us as f32 / frames / 1_000.0,
+                erosion.sim_record_us as f32 / frames / 1_000.0,
+                samples.len()
+            );
         }
     }
 }
@@ -817,6 +910,7 @@ fn shot_scheduling_system(
     cache: Res<ErosionCache>,
     vegetation: Res<vegetation::VegetationField>,
     grass: Res<grass::GrassReadiness>,
+    bridge: Option<Res<erosion::ErosionBridge>>,
     players: Query<&Player>,
     mut counter: ResMut<FrameCounter>,
     mut requested: ResMut<ShotRequested>,
@@ -870,7 +964,13 @@ fn shot_scheduling_system(
                 erosion::ErosionTileState::Ready | erosion::ErosionTileState::Failed
             )
         });
-        frame_times.record(time.delta_secs(), streaming);
+        frame_times.record(
+            time.delta_secs(),
+            streaming,
+            bridge.map_or_else(erosion::ErosionPhaseCosts::default, |b| {
+                b.drain_phase_costs()
+            }),
+        );
     }
     if requested.0 || counter.0 < automation.wait_frames as u64 {
         // A request already made and not yet captured; AppExit is written by

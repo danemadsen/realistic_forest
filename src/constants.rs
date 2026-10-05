@@ -104,6 +104,32 @@ pub const EROSION_DRAINAGE_SATURATION: f32 = 4000.0;
 pub const TERRAIN_TILE_SIZE: usize = 1024;
 pub const TERRAIN_ATLAS_SLOTS: usize = 8;
 pub const EROSION_REVEAL_SECONDS: f32 = 0.9;
+// The reveal ramps at 1/54 per streamed frame; only the TERRAIN-REVISION hash
+// quantises it — to this many steps across the ramp — so the expensive lighting
+// heightfield, habitat and shore retakes run 8 times per reveal instead of once
+// per frame while the rendered blend in the terrain shaders stays continuous.
+pub const EROSION_REVEAL_HASH_QUANTUM: f32 = 8.0;
+
+// The erosion simulation runs on its own wgpu device behind a dedicated
+// worker thread (see `erosion_worker`), so the render thread stops recording
+// 568-pass prewarm frames head of line. One worker submission still records
+// at most this many flux/water/terrain/thermal iterations — Metal command
+// buffers stay bounded and, being submitted in order, the chunks execute
+// exactly as one long one would.
+pub const EROSION_WORKER_MAX_ITERATIONS_PER_SUBMIT: usize = 24;
+// Frames `apply_erosion_events` will wait after a tile began, without any
+// finalize or failure event, before it requeues the tile like a failed
+// readback. A live worker finishes well inside half of this (six iterations
+// per frame is ~24 frames plus readback latency), so only a stalled or dying
+// worker trips it. A false trip is harmless to results: the re-queued tile
+// re-begins and re-stamps its init, converging to the same simulation.
+pub const EROSION_WORKER_WATCHDOG_FRAMES: u32 = 240;
+// Finished atlas patches cross from the worker thread through
+// `ErosionBridge::push_patches`, then the render world uploads once their
+// tile's slot appears in the lookup records. If the render side stops
+// draining, the oldest patch is dropped with a warning at this many, so the
+// bridge cannot grow unbounded.
+pub const EROSION_PENDING_PATCH_CAP: usize = 32;
 pub const SEA_LEVEL: f32 = 0.0;
 // Centre of the persistent (late-season) snowline, metres above sea level.
 // A smooth altitude band and climate aspect place a uniform pack;

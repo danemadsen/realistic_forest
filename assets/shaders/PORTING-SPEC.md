@@ -41,6 +41,23 @@ missing kind at the bottom if needed, e.g.:
 Only add dummies when the real file is otherwise one-stage; keep real files
 self-contained (post passes include the fullscreen-tri vertex below).
 
+### Sim shaders run on their own device (hot reload does not reach them)
+
+Since the erosion tile simulation moved to a dedicated worker thread
+(`src/erosion_worker.rs`), the four sim WGSLs above (plus `erosion-thermal.wgsl`)
+are compiled by that worker with raw `wgpu` from the source TEXT the main world
+publishes through the erosion bridge — not through bevy's `Shader` asset +
+`RenderPipeline` path. The consequences:
+
+- The worker compiles once at startup, when it opens its own device on the
+  renderer's adapter. Bevy's shader-asset hot reload never runs naga over these
+  files again, so editing an erosion sim shader needs a restart to take effect.
+- The files must stay fully self-contained: no `#import` preprocessing, because
+  the worker takes the raw file bytes (`create_shader_module` on WGSL text).
+- The main world still validates them: `cargo test erosion_sim_shaders` parses
+  all four from `assets/shaders/`, and an end-to-end worker test compiles and
+  runs them on the real GPU.
+
 ## 1. Shared global uniforms — paste this preamble into EVERY file
 
 The vertex-data and the camera matrices come from one uniform buffer bound at
