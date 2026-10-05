@@ -1846,15 +1846,30 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
 // the forest lies in the same shade as its banks. Mirrors
 // `VegetationShadows` in composite.wgsl.
 struct VegetationShadows {
-    view_projection: array<mat4x4<f32>, 4>,
+    view_projection: array<mat4x4<f32>, 3>,
     splits: vec4<f32>,
     texel: vec4<f32>,
     light: vec4<f32>,
     params: vec4<f32>,
 };
-@group(2) @binding(1) var vegetation_shadow_map: texture_depth_2d_array;
+@group(2) @binding(1) var vegetation_shadow_map_0: texture_depth_2d;
+@group(2) @binding(4) var vegetation_shadow_map_1: texture_depth_2d;
+@group(2) @binding(5) var vegetation_shadow_map_2: texture_depth_2d;
 @group(2) @binding(2) var<uniform> vegetation_shadows: VegetationShadows;
 @group(2) @binding(3) var vegetation_shadow_sampler: sampler_comparison;
+
+fn riverPlantShadowPcf(map: texture_depth_2d, uv: vec2<f32>, depth: f32) -> f32 {
+    let step = 1.0/f32(textureDimensions(map).x);
+    var lit = 0.0;
+    for (var y = 0; y < 2; y++) {
+        for (var x = 0; x < 2; x++) {
+            let offset = vec2<f32>(f32(x) - 0.5, f32(y) - 0.5)*step*1.5;
+            lit += textureSampleCompareLevel(map, vegetation_shadow_sampler,
+                                             uv + offset, depth);
+        }
+    }
+    return lit;
+}
 
 // Light reaching a water point through the plants: the cascade covering its
 // view depth, with a 2x2 grid of bilinear comparisons (the composite's
@@ -1863,8 +1878,8 @@ fn riverPlantShadow(world_position: vec3<f32>, view_depth: f32) -> f32 {
     if (vegetation_shadows.light.w < 0.5 || view_depth >= vegetation_shadows.splits.w) {
         return 1.0;
     }
-    var cascade = 3u;
-    for (var c = 0u; c < 3u; c++) {
+    var cascade = 2u;
+    for (var c = 0u; c < 2u; c++) {
         if (view_depth < vegetation_shadows.splits[c]) {
             cascade = c;
             break;
@@ -1877,14 +1892,11 @@ fn riverPlantShadow(world_position: vec3<f32>, view_depth: f32) -> f32 {
     if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || clip.z > 1.0) {
         return 1.0;
     }
-    let step = 1.0/vegetation_shadows.params.z;
     var lit = 0.0;
-    for (var y = 0; y < 2; y++) {
-        for (var x = 0; x < 2; x++) {
-            let offset = vec2<f32>(f32(x) - 0.5, f32(y) - 0.5)*step*1.5;
-            lit += textureSampleCompareLevel(vegetation_shadow_map, vegetation_shadow_sampler,
-                                             uv + offset, i32(cascade), clip.z);
-        }
+    switch cascade {
+        case 0u: { lit = riverPlantShadowPcf(vegetation_shadow_map_0, uv, clip.z); }
+        case 1u: { lit = riverPlantShadowPcf(vegetation_shadow_map_1, uv, clip.z); }
+        default: { lit = riverPlantShadowPcf(vegetation_shadow_map_2, uv, clip.z); }
     }
     let far_fade = smoothstepf(vegetation_shadows.splits.w*0.85, vegetation_shadows.splits.w, view_depth);
     return mix(1.0, mix(lit*0.25, 1.0, far_fade), vegetation_shadows.params.y);

@@ -504,6 +504,17 @@ fn prepare_water(
     if inner.river_stage.is_none()
         && let (Some(stage), Some(shadows)) = (inner.surface_stage.as_ref(), plant_shadows.targets.as_ref())
     {
+        // Each depth cascade has its own extent; bind them at 1 and 4..=5.
+        let shadow_texture = |binding| BindGroupLayoutEntry {
+            binding,
+            visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Texture {
+                sample_type: TextureSampleType::Depth,
+                view_dimension: TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
         let layout = BindGroupLayoutDescriptor::new(
             "forest_river_stage",
             &[
@@ -517,16 +528,7 @@ fn prepare_water(
                     },
                     count: None,
                 },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Depth,
-                        view_dimension: TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
+                shadow_texture(1),
                 BindGroupLayoutEntry {
                     binding: 2,
                     visibility: ShaderStages::FRAGMENT,
@@ -545,6 +547,8 @@ fn prepare_water(
                     ty: BindingType::Sampler(SamplerBindingType::Comparison),
                     count: None,
                 },
+                shadow_texture(4),
+                shadow_texture(5),
             ],
         );
         let group = super::bind_group(
@@ -559,7 +563,7 @@ fn prepare_water(
                 },
                 BindGroupEntry {
                     binding: 1,
-                    resource: BindingResource::TextureView(&shadows.array_view),
+                    resource: BindingResource::TextureView(&shadows.cascade_views[0]),
                 },
                 BindGroupEntry {
                     binding: 2,
@@ -568,6 +572,14 @@ fn prepare_water(
                 BindGroupEntry {
                     binding: 3,
                     resource: BindingResource::Sampler(&shadows.sampler),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: BindingResource::TextureView(&shadows.cascade_views[1]),
+                },
+                BindGroupEntry {
+                    binding: 5,
+                    resource: BindingResource::TextureView(&shadows.cascade_views[2]),
                 },
             ],
         );

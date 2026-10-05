@@ -2,8 +2,8 @@
 //!
 //! The terrain and the clouds shadow the scene by ray marching in the
 //! composite; a forest needs more than that. The plants are drawn depth-only,
-//! from the sun (or, at night, the moon), into four cascades of one depth
-//! array: each cascade covers a slice of the view frustum, nearest the
+//! from the sun (or, at night, the moon), into three separate depth
+//! textures: each cascade covers a slice of the view frustum, nearest the
 //! sharpest. The composite then looks each lit pixel up in its slice's
 //! cascade and darkens the direct light it receives, so trunks and crowns
 //! shade the ground, the grass, each other and themselves.
@@ -12,25 +12,28 @@
 //! around the bounding sphere of its frustum slice, moved only in whole
 //! texels, so shadows neither swim when the camera turns nor shimmer as it
 //! walks. This module fits them on the CPU every frame and owns the depth
-//! array, which the post passes bind when they build the composite's group.
+//! textures, which the post passes bind when they build the composite's group.
 
 use bevy::prelude::*;
 use bevy::render::renderer::RenderDevice;
 
-pub const SHADOW_CASCADES: usize = 4;
-/// Texels along each side of a cascade.
-pub const SHADOW_RESOLUTION: u32 = 2048;
-/// View-depth bounds of the cascades, metres: about 2.7 cm, 9 cm, 38 cm and
-/// 2.7 m per texel at the default field of view. The last reaches as far as
+pub const SHADOW_CASCADES: usize = 3;
+/// Texels along each side of each cascade. The first two retain their
+/// original precision; only the distant forest uses a smaller depth target.
+pub const SHADOW_RESOLUTIONS: [u32; SHADOW_CASCADES] = [2048, 2048, 1536];
+/// View-depth bounds of the cascades, metres: about 2.7 cm, 9 cm and
+/// 3.6 m per texel at the default field of view. The last reaches as far as
 /// the trees are drawn, so no distant forest floor shows sunlit through the
 /// canopy.
-pub const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.0, 20.0, 70.0, 280.0, 2000.0];
+pub const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.0, 20.0, 70.0, 2000.0];
 /// How far up-light of a cascade's slice a plant can stand and still be
 /// drawn into it: a 35 m pine's shadow under a sun 3 degrees up.
 pub const CASTER_REACH: f32 = 680.0;
 /// Share of each cascade, at its far end, over which it blends into the next.
 pub const CASCADE_BLEND: f32 = 0.12;
-/// Format of the depth array.
+/// Preserve the original 1793.6..2000 m terminal fade after merging the far slices.
+pub const SHADOW_FADE_BAND: f32 = (2000.0 - 280.0) * CASCADE_BLEND;
+/// Format of the depth targets.
 pub const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// The light basis projects along +Z, with right × up = forward. A face
 /// pointing toward the light therefore winds clockwise in shadow clip XY.
@@ -111,7 +114,7 @@ pub fn slice_sphere(near: f32, far: f32, corner: f32) -> (f32, f32) {
     }
 }
 
-/// Fits the four cascades for a camera (column-major world-to-view `view`
+/// Fits the three cascades for a camera (column-major world-to-view `view`
 /// and the reverse-Z `projection` of `crate::matrices::perspective`) and a
 /// light travelling along `light`.
 pub fn fit_cascades(
@@ -131,7 +134,7 @@ pub fn fit_cascades(
         // A whole number of metres, so the box only changes size when the
         // field of view does.
         let half_extent = (radius as f64 * 1.01).ceil();
-        let texel = 2.0 * half_extent / SHADOW_RESOLUTION as f64;
+        let texel = 2.0 * half_extent / SHADOW_RESOLUTIONS[index] as f64;
         let centre: [f64; 3] = std::array::from_fn(|axis| eye[axis] as f64 + forward[axis] * depth as f64);
         // Whole texels across the light, so the rasterised shadow edges stay
         // put while the camera moves.
@@ -165,22 +168,22 @@ pub fn fit_cascades(
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShadowUniform {
     pub view_projection: [[f32; 16]; SHADOW_CASCADES],
-    /// Far view depth of each cascade.
+    /// Far view depths; w repeats the last split for the shared shader cutoff.
     pub splits: [f32; 4],
-    /// World metres per texel of each cascade.
+    /// World metres per texel of each cascade; w is unused.
     pub texel: [f32; 4],
     /// xyz the direction the shadowing light travels; w 0 off, 1 sun, 2 moon.
     pub light: [f32; 4],
-    /// x blend band, y strength, z texels per side, w unused.
+    /// x blend fraction, y strength, z terminal fade band in metres, w unused.
     pub params: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<ShadowUniform>() == 320);
+const _: () = assert!(std::mem::size_of::<ShadowUniform>() == 256);
 
 impl ShadowUniform {
     pub fn disabled() -> Self {
         Self {
-            params: [CASCADE_BLEND, 0.0, SHADOW_RESOLUTION as f32, 0.0],
+            params: [CASCADE_BLEND, 0.0, SHADOW_FADE_BAND, 0.0],
             ..Default::default()
         }
     }
@@ -188,25 +191,24 @@ impl ShadowUniform {
     pub fn new(cascades: &[Cascade; SHADOW_CASCADES], light: &LightBasis, moon: bool) -> Self {
         Self {
             view_projection: cascades.map(|cascade| cascade.view_projection),
-            splits: std::array::from_fn(|index| SHADOW_SPLITS[index + 1]),
-            texel: cascades.map(|cascade| cascade.texel),
+            splits: std::array::from_fn(|index| SHADOW_SPLITS[(index + 1).min(SHADOW_CASCADES)]),
+            texel: std::array::from_fn(|index| cascades.get(index).map_or(0.0, |cascade| cascade.texel)),
             light: [
                 light.forward[0],
                 light.forward[1],
                 light.forward[2],
                 if moon { 2.0 } else { 1.0 },
             ],
-            params: [CASCADE_BLEND, 1.0, SHADOW_RESOLUTION as f32, 0.0],
+            params: [CASCADE_BLEND, 1.0, SHADOW_FADE_BAND, 0.0],
         }
     }
 }
 
-/// The depth array, its per-cascade attachment views, the comparison sampler
+/// The per-cascade depth views (both attachments and sampled textures), comparison sampler
 /// and the composite's uniform.
 pub struct ShadowTargets {
-    pub resolution: u32,
-    pub array_view: wgpu::TextureView,
-    pub layer_views: Vec<wgpu::TextureView>,
+    pub resolutions: [u32; SHADOW_CASCADES],
+    pub cascade_views: [wgpu::TextureView; SHADOW_CASCADES],
     pub sampler: wgpu::Sampler,
     pub uniform: wgpu::Buffer,
 }
@@ -217,38 +219,27 @@ pub struct VegetationShadowMaps {
     pub targets: Option<ShadowTargets>,
 }
 
-fn create_targets(device: &RenderDevice, resolution: u32) -> ShadowTargets {
+fn create_targets(device: &RenderDevice, resolutions: [u32; SHADOW_CASCADES]) -> ShadowTargets {
     let device = device.wgpu_device();
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("vegetation_shadow_cascades"),
-        size: wgpu::Extent3d {
-            width: resolution,
-            height: resolution,
-            depth_or_array_layers: SHADOW_CASCADES as u32,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: SHADOW_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
+    // Texture-array layers must share an extent. Separate textures let the
+    // distant cascade shrink without rescaling the near maps or their UVs.
+    let cascade_views = resolutions.map(|resolution| {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("vegetation_shadow_cascade"),
+            size: wgpu::Extent3d {
+                width: resolution,
+                height: resolution,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: SHADOW_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        texture.create_view(&wgpu::TextureViewDescriptor::default())
     });
-    let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
-        label: Some("vegetation_shadow_array"),
-        dimension: Some(wgpu::TextureViewDimension::D2Array),
-        ..Default::default()
-    });
-    let layer_views = (0..SHADOW_CASCADES as u32)
-        .map(|layer| {
-            texture.create_view(&wgpu::TextureViewDescriptor {
-                label: Some("vegetation_shadow_layer"),
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                base_array_layer: layer,
-                array_layer_count: Some(1),
-                ..Default::default()
-            })
-        })
-        .collect();
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: Some("vegetation_shadow_sampler"),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -267,9 +258,8 @@ fn create_targets(device: &RenderDevice, resolution: u32) -> ShadowTargets {
         mapped_at_creation: false,
     });
     ShadowTargets {
-        resolution,
-        array_view,
-        layer_views,
+        resolutions,
+        cascade_views,
         sampler,
         uniform,
     }
@@ -286,8 +276,8 @@ pub fn prepare_vegetation_shadow_maps(
     if maps.targets.is_some() {
         return;
     }
-    let resolution = if extracted.enabled() { SHADOW_RESOLUTION } else { 1 };
-    let targets = create_targets(&device, resolution);
+    let resolutions = if extracted.enabled() { SHADOW_RESOLUTIONS } else { [1; SHADOW_CASCADES] };
+    let targets = create_targets(&device, resolutions);
     queue.write_buffer(&targets.uniform, 0, bytemuck::bytes_of(&ShadowUniform::disabled()));
     maps.targets = Some(targets);
 }
@@ -306,6 +296,27 @@ mod tests {
             crate::matrices::view_matrix(eye, eye + look, Vec3::Y),
             crate::matrices::perspective(68.0, 16.0 / 9.0, 0.1, 5800.0),
         )
+    }
+
+    #[test]
+    fn merged_far_cascade_keeps_near_splits_and_original_terminal_fade() {
+        let eye = Vec3::new(10.0, 30.0, 10.0);
+        let (view, projection) = camera(eye, Vec3::new(0.0, -0.1, -1.0).normalize());
+        let light = light_basis([0.4, -0.5, 0.3]);
+        let cascades = fit_cascades(&view, &projection, eye.to_array(), &light);
+        let uniform = ShadowUniform::new(&cascades, &light, false);
+
+        // Both shaders still use w for the fully-lit cutoff. The old final
+        // slice faded over 206.4 m; using the merged slice's width would
+        // incorrectly start that fade at 1768.4 m instead of 1793.6 m.
+        assert_eq!(uniform.splits, [20.0, 70.0, 2000.0, 2000.0]);
+        assert_eq!(uniform.params[2], 206.4);
+        assert_eq!(uniform.splits[3] - uniform.params[2], 1793.6);
+        assert_eq!(uniform.texel[3], 0.0);
+        assert_eq!(&SHADOW_RESOLUTIONS[..2], &[2048, 2048]);
+        for index in 0..SHADOW_CASCADES {
+            assert_eq!(uniform.texel[index], cascades[index].texel);
+        }
     }
 
     #[test]

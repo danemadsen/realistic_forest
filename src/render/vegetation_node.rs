@@ -83,8 +83,8 @@ struct CullUniform {
     light_up: [f32; 4],
     light_forward: [f32; 4],
     /// Per cascade: light-frame centre across the light, half extent, far
-    /// depth.
-    cascades: [[f32; 4]; SHADOW_CASCADES],
+    /// depth. Keep four slots to match the cull shader's vec4-based contract.
+    cascades: [[f32; 4]; 4],
     /// Per cascade: light-frame near depth.
     cascade_near: [f32; 4],
 }
@@ -130,7 +130,7 @@ const OUTPUT_SLOTS: u64 = LOD_SLOTS + SHADOW_CASCADES as u64;
 /// The LOD each shadow cascade draws a plant with (or its last, if it has
 /// fewer): the near cascades need the crown's gaps, the far ones only its
 /// outline.
-const SHADOW_LOD: [usize; SHADOW_CASCADES] = [1, 2, 3, 3];
+const SHADOW_LOD: [usize; SHADOW_CASCADES] = [1, 2, 3];
 /// Words of one `DrawIndexedIndirectArgs`.
 const ARGS_WORDS: usize = 5;
 const WORKGROUP_SIZE: u32 = 64;
@@ -1171,7 +1171,7 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
     let shadow_pipelines = library.shadow_pipelines.map(|pipeline| cache.get_render_pipeline(pipeline));
     let shadow_pipelines = shadow_pipelines[0].zip(shadow_pipelines[1]).map(|(single, double)| [single, double]);
     let shadows = shadow_targets
-        .filter(|targets| targets.resolution > 1 && view.settings.vegetation_shadows)
+        .filter(|targets| targets.resolutions[0] > 1 && view.settings.vegetation_shadows)
         .zip(shadow_pipelines)
         .zip(shadowing_light(&globals.globals))
         .map(|((targets, pipeline), (direction, moon))| {
@@ -1380,7 +1380,7 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
     let Some((targets, shadow_pipelines, light, cascades, moon)) = shadows else {
         return;
     };
-    for (index, layer) in targets.layer_views.iter().enumerate() {
+    for (index, layer) in targets.cascade_views.iter().enumerate() {
         let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
             label: Some("forest_vegetation_shadow"),
             color_attachments: &[],
@@ -1468,6 +1468,7 @@ mod tests {
         let cull = include_str!("../../assets/shaders/vegetation-cull.wgsl");
         let draw = include_str!("../../assets/shaders/vegetation.wgsl");
         let composite = include_str!("../../assets/shaders/composite.wgsl");
+        let water = include_str!("../../assets/shaders/water-surface.wgsl");
         let model = layout!(
             ModelParams, height, crown_radius, crown_base, bound_radius, lod_end, max_distance, lod_count,
             habitat, region, draw_word, draw_count, shadow_word, shadow_count
@@ -1490,6 +1491,7 @@ mod tests {
             (draw, "VegetationFrame", layout!(FrameUniform, wind, params)),
             (draw, "PlantMaterial", layout!(MaterialUniform, base_color_factor, params, surface)),
             (composite, "VegetationShadows", layout!(ShadowUniform, view_projection, splits, texel, light, params)),
+            (water, "VegetationShadows", layout!(ShadowUniform, view_projection, splits, texel, light, params)),
         ];
         for (source, name, rust) in checks {
             assert_eq!(wgsl_layout(source, name), rust, "{name}");

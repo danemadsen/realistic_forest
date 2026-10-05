@@ -47,15 +47,17 @@ struct StageUniforms {
 @group(1) @binding(13) var atmosphere_sampler: sampler;
 
 // The plants' shadow cascades (src/render/vegetation_shadows.rs): depth from
-// the sun, or from the moon at night, one array layer per slice of the view.
+// the sun, or from the moon at night, one texture per slice of the view.
 struct VegetationShadows {
-    view_projection: array<mat4x4<f32>, 4>, // world -> cascade clip, depth 0 nearest the light
+    view_projection: array<mat4x4<f32>, 3>, // world -> cascade clip, depth 0 nearest the light
     splits: vec4<f32>,  // far view depth of each cascade, metres
     texel: vec4<f32>,   // world metres per texel of each cascade
     light: vec4<f32>,   // xyz direction the light travels; w 0 off, 1 sun, 2 moon
-    params: vec4<f32>,  // blend band, strength, texels per side, unused
+    params: vec4<f32>,  // blend fraction, strength, terminal fade metres, unused
 };
-@group(1) @binding(6) var vegetation_shadow_map: texture_depth_2d_array;
+@group(1) @binding(6) var vegetation_shadow_map_0: texture_depth_2d;
+@group(1) @binding(15) var vegetation_shadow_map_1: texture_depth_2d;
+@group(1) @binding(16) var vegetation_shadow_map_2: texture_depth_2d;
 @group(1) @binding(7) var<uniform> vegetation_shadows: VegetationShadows;
 @group(1) @binding(14) var vegetation_shadow_sampler: sampler_comparison;
 
@@ -755,6 +757,23 @@ fn terrainMapWeight(world_xz: vec2<f32>) -> f32 {
     let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
     return smoothstep(0.0, 0.06, edge);
 }
+fn vegetationShadowPcf(map: texture_depth_2d, uv: vec2<f32>, depth: f32) -> f32 {
+    // A 4x4 grid of bilinear comparisons a texel apart: a smooth tent five
+    // texels wide, about the penumbra the sun's disc gives a branch ten
+    // metres up in the nearest cascade. Sparser taps would stamp every small
+    // sunfleck into a visible grid of copies.
+    let step = 1.0/f32(textureDimensions(map).x);
+    var lit = 0.0;
+    for (var y = 0; y < 4; y++) {
+        for (var x = 0; x < 4; x++) {
+            let offset = vec2<f32>(f32(x) - 1.5, f32(y) - 1.5)*step;
+            lit += textureSampleCompareLevel(map, vegetation_shadow_sampler,
+                                             uv + offset, depth);
+        }
+    }
+    return lit/16.0;
+}
+
 // Light reaching a point through the plants, in one cascade. The lookup is
 // pushed off the surface, along its normal and toward the light, by a
 // little more than a texel, so a lit trunk or crown does not shadow itself
@@ -769,20 +788,11 @@ fn vegetationShadowCascade(world_position: vec3<f32>, normal_world: vec3<f32>, c
     if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || clip.z > 1.0) {
         return 1.0;
     }
-    // A 4x4 grid of bilinear comparisons a texel apart: a smooth tent five
-    // texels wide, about the penumbra the sun's disc gives a branch ten
-    // metres up in the nearest cascade. Sparser taps would stamp every small
-    // sunfleck into a visible grid of copies.
-    let step = 1.0/vegetation_shadows.params.z;
-    var lit = 0.0;
-    for (var y = 0; y < 4; y++) {
-        for (var x = 0; x < 4; x++) {
-            let offset = vec2<f32>(f32(x) - 1.5, f32(y) - 1.5)*step;
-            lit += textureSampleCompareLevel(vegetation_shadow_map, vegetation_shadow_sampler,
-                                             uv + offset, i32(cascade), clip.z);
-        }
+    switch cascade {
+        case 0u: { return vegetationShadowPcf(vegetation_shadow_map_0, uv, clip.z); }
+        case 1u: { return vegetationShadowPcf(vegetation_shadow_map_1, uv, clip.z); }
+        default: { return vegetationShadowPcf(vegetation_shadow_map_2, uv, clip.z); }
     }
-    return lit/16.0;
 }
 
 // Light reaching a point through the plants: the cascade covering its view
@@ -792,8 +802,8 @@ fn vegetationShadow(world_position: vec3<f32>, normal_world: vec3<f32>, view_dep
     if (vegetation_shadows.light.w < 0.5 || view_depth >= vegetation_shadows.splits.w) {
         return 1.0;
     }
-    var cascade = 3u;
-    for (var c = 0u; c < 3u; c++) {
+    var cascade = 2u;
+    for (var c = 0u; c < 2u; c++) {
         if (view_depth < vegetation_shadows.splits[c]) {
             cascade = c;
             break;
@@ -802,11 +812,13 @@ fn vegetationShadow(world_position: vec3<f32>, normal_world: vec3<f32>, view_dep
     var lit = vegetationShadowCascade(world_position, normal_world, cascade);
     let start = select(0.0, vegetation_shadows.splits[max(cascade, 1u) - 1u], cascade > 0u);
     let end = vegetation_shadows.splits[cascade];
-    let band = (end - start)*vegetation_shadows.params.x;
+    // Merging the far slices must not move the original terminal fade.
+    let band = select((end - start)*vegetation_shadows.params.x,
+                      vegetation_shadows.params.z, cascade == 2u);
     let blend = clamp((view_depth - (end - band))/max(band, 1e-3), 0.0, 1.0);
     if (blend > 0.0) {
         var next = 1.0;
-        if (cascade < 3u) {
+        if (cascade < 2u) {
             next = vegetationShadowCascade(world_position, normal_world, cascade + 1u);
         }
         lit = mix(lit, next, blend);
