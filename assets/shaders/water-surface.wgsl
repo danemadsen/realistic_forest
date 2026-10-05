@@ -105,8 +105,10 @@ struct WaterStageUniforms
 // rivers mirror.
 @group(1) @binding(4) var canopy_texture: texture_2d<f32>;
 @group(1) @binding(12) var canopy_sampler: sampler;
-// The sky probe is raymarched once per frame. Waves sample it in their
-// reflected direction, so the complete cloud sky remains visible offscreen.
+// The sky probe is raymarched with a short reuse window (see
+// PROBE_INTEGRATION_PERIOD in src/render/cloud_node.rs). Waves sample it in
+// their reflected direction, so the complete cloud sky remains visible
+// offscreen.
 @group(3) @binding(2) var cloud_sky_probe: texture_2d<f32>;
 @group(3) @binding(3) var cloud_sky_sampler: sampler;
 

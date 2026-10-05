@@ -2,7 +2,7 @@
 //! all-direction cloud reflection probe. The main atmosphere pass uses the
 //! same density and lighting model.
 
-use super::{ForestGlobals, ForestShaderHandles, globals_layout};
+use super::{ForestGlobals, ForestShaderHandles, GlobalUniformsGpu, globals_layout};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
     BindGroup, BindGroupLayoutDescriptor, CachedRenderPipelineId, FragmentState, PipelineCache,
@@ -40,10 +40,180 @@ pub struct CloudGpuResources {
     shadow_pipeline: CachedRenderPipelineId,
 }
 
+/// How many frames the shadow map and sky probe reuse before
+/// re-integrating. Both results are anchored in world space: camera rotation
+/// never invalidates them, and camera translation during a reuse window
+/// slides the sampling across cloud features the way a short walk does — the
+/// default flight speed (38 m/s, [`crate::player`]) covers ~7 m per
+/// two-frame window, under a quarter of one probe texel's 32-m arc at the
+/// 1300 m default base. See [`ProbeSkyState`] for why the stepwise inputs
+/// are latched separately and [`cloud_probe_pass`] for the reuse itself.
+pub const PROBE_INTEGRATION_PERIOD: u32 = 2;
+
+/// Per-frame decision to re-integrate the sky probe, shared between the
+/// Prepare stage and the render pass.
+#[derive(Resource, Default)]
+pub struct CloudProbeSchedule {
+    integrate: bool,
+    frames_since_probe: u32,
+    last_sky_state: Option<ProbeSkyState>,
+}
+
+/// The probe's stepwise inputs, latched against per-field tolerances so one
+/// frame of drift never re-triggers an integration. Wind offsets
+/// (`cloud_motion.xy`), the weather front position (`weather.xy`), the storm
+/// clock (`storm.z`) and the camera are deliberately absent: they advect
+/// continuously and their staleness is bounded by [`PROBE_INTEGRATION_PERIOD`]
+/// instead. The flash is not latched either — it rises too fast for any
+/// cadence window, so [`update_cloud_probe_schedule`] integrates at full rate
+/// while it is lit.
+#[derive(Clone, Copy)]
+struct ProbeSkyState {
+    sun_direction: [f32; 3],
+    moon_direction: [f32; 3],
+    sun_colour: [f32; 4],
+    sun_intensity: f32,
+    daylight: f32,
+    moon_intensity: f32,
+    clouds: [f32; 4],
+    layer_thickness: f32,
+    layer_scale: f32,
+    layer_shadow: f32,
+    layer_quality: f32,
+    detail_strength: f32,
+    march_range: f32,
+    climate_bias: f32,
+    overrides: u32,
+    precip_bias: f32,
+    precip_override: u32,
+    wind_radians: f32,
+    /// Whether the cloud shadow map's usage gate currently passes. The gate's
+    /// conditions (raymarch toggle, sun intensity, layer opacity, sun height)
+    /// ramp through thresholds narrower than the field tolerances above, so
+    /// their crossings latch here: a flip forces the shadow map's first usable
+    /// frame to rebuild instead of reading content from before the gate went
+    /// dark.
+    shadow_gate: bool,
+}
+
+impl ProbeSkyState {
+    fn from_globals(g: &GlobalUniformsGpu) -> Self {
+        Self {
+            sun_direction: [g.sun_direction[0], g.sun_direction[1], g.sun_direction[2]],
+            moon_direction: [
+                g.moon_direction[0],
+                g.moon_direction[1],
+                g.moon_direction[2],
+            ],
+            sun_colour: g.sun_colour,
+            sun_intensity: g.settings_a[0],
+            daylight: g.atmosphere[0],
+            moon_intensity: g.atmosphere[1],
+            clouds: g.clouds,
+            layer_thickness: g.cloud_layer[0],
+            layer_scale: g.cloud_layer[1],
+            layer_shadow: g.cloud_layer[2],
+            layer_quality: g.cloud_layer[3],
+            detail_strength: g.cloud_motion[2],
+            march_range: g.cloud_motion[3],
+            climate_bias: g.weather[2],
+            overrides: g.weather[3] as u32,
+            precip_bias: g.storm[0],
+            precip_override: g.storm[1] as u32,
+            wind_radians: g.storm[3],
+            // Mirrors the shadow map's rebuild gate in cloud_probe_pass; the
+            // two must stay in sync.
+            shadow_gate: g.raymarch[1] >= 0.5
+                && g.atmosphere[3] > 0.0
+                && g.settings_a[0] > 0.01
+                && g.clouds[0] >= 0.5
+                && g.clouds[2] > 0.001
+                && g.cloud_layer[2] > 0.001
+                && g.sun_direction[1] < 0.0,
+        }
+    }
+
+    /// Tolerances sit just above live drift and below one user step: a
+    /// scrubbed slider or a teleported sun exceeds them, a 75 s weather
+    /// easing and the sun's 0.0042°/s drift do not.
+    fn changed_beyond(&self, next: &Self) -> bool {
+        fn moved(a: [f32; 3], b: [f32; 3], limit: f32) -> bool {
+            (a[0] - b[0]).abs() > limit
+                || (a[1] - b[1]).abs() > limit
+                || (a[2] - b[2]).abs() > limit
+        }
+        fn differs(a: f32, b: f32, limit: f32) -> bool {
+            (a - b).abs() > limit
+        }
+        // One probe texel spans ~1.4° of direction.
+        moved(self.sun_direction, next.sun_direction, 0.02)
+            || moved(
+                self.moon_direction,
+                next.moon_direction,
+                0.02,
+            )
+            || differs(self.sun_colour[0], next.sun_colour[0], 0.02)
+            || differs(self.sun_colour[1], next.sun_colour[1], 0.02)
+            || differs(self.sun_colour[2], next.sun_colour[2], 0.02)
+            || differs(self.sun_colour[3], next.sun_colour[3], 0.02)
+            || differs(self.sun_intensity, next.sun_intensity, 0.02)
+            || differs(self.daylight, next.daylight, 0.02)
+            || differs(self.moon_intensity, next.moon_intensity, 0.02)
+            // Toggles and scrubbed sliders step, they never drift.
+            || self.clouds[0] != next.clouds[0]
+            || differs(self.clouds[1], next.clouds[1], 0.02)
+            || differs(self.clouds[2], next.clouds[2], 0.02)
+            || differs(self.clouds[3], next.clouds[3], 50.0)
+            || differs(self.layer_thickness, next.layer_thickness, 20.0)
+            || differs(self.layer_scale, next.layer_scale, 20.0)
+            || differs(self.layer_shadow, next.layer_shadow, 0.02)
+            // Quality steps are 1.0 apart (0/1/2).
+            || differs(self.layer_quality, next.layer_quality, 0.5)
+            || differs(self.detail_strength, next.detail_strength, 0.02)
+            || differs(self.march_range, next.march_range, 500.0)
+            || differs(self.climate_bias, next.climate_bias, 0.05)
+            || self.overrides != next.overrides
+            || differs(self.precip_bias, next.precip_bias, 0.05)
+            || self.precip_override != next.precip_override
+            || differs(self.wind_radians, next.wind_radians, 0.05)
+            // The shadow gate crossed a threshold: rebuild the map on its
+            // first usable frame.
+            || self.shadow_gate != next.shadow_gate
+    }
+}
+
+/// Runs in Prepare before [`cloud_probe_pass`]: decides whether this frame
+/// re-integrates the cloud passes or lets consumers read their persistent
+/// textures.
+fn update_cloud_probe_schedule(
+    mut schedule: ResMut<CloudProbeSchedule>,
+    globals: Res<ForestGlobals>,
+) {
+    let state = ProbeSkyState::from_globals(&globals.globals);
+    // While a strike lights the clouds the flash rises over ~20 ms, faster
+    // than any cadence window; keep the probe at full rate until it clears.
+    let changed = schedule
+        .last_sky_state
+        .map_or(true, |previous| previous.changed_beyond(&state));
+    let integrate = globals.globals.lightning[3] > 0.001
+        || changed
+        || schedule.frames_since_probe >= PROBE_INTEGRATION_PERIOD;
+    if integrate {
+        schedule.frames_since_probe = 0;
+        schedule.last_sky_state = Some(state);
+    } else {
+        schedule.frames_since_probe += 1;
+    }
+    schedule.integrate = integrate;
+}
+
 /// Renders the cloud shadow map, then the raymarched all-direction cloud
 /// reflection probe. Both bind the noise group in slot 3 rather than the
 /// resource group: sampling a texture while it is the active attachment is
-/// invalid.
+/// invalid. Both passes skip on reuse frames ([`CloudProbeSchedule`]) and
+/// their textures keep the previous integration: the map is world-anchored
+/// like the LUT, and its consumers re-derive the lookup origin from the
+/// current camera and sun each frame.
 pub fn cloud_probe_pass(world: &World, mut ctx: RenderContext) {
     let Some(resources) = world
         .get_resource::<CloudRenderState>()
@@ -55,8 +225,16 @@ pub fn cloud_probe_pass(world: &World, mut ctx: RenderContext) {
     // Until its pipeline compiles the map keeps its -1 fill, which the
     // shaders read as "march the clouds instead".
     let lighting = &world.resource::<ForestGlobals>().globals;
+    let reuse = !world
+        .get_resource::<CloudProbeSchedule>()
+        .is_some_and(|schedule| schedule.integrate);
     // Only the volumetric sunlight paths read this map. When those paths
-    // become active again, rebuild it before their first lookup this frame.
+    // become active again, rebuild it before their first lookup this frame:
+    // the same chain is mirrored in ProbeSkyState::shadow_gate, and a gate
+    // flip latches a re-integration. The map is a world-space entry-point
+    // lattice whose lookups re-derive their origin from the current camera
+    // and sun each frame, so reuse windows show only the sub-texel wind
+    // drift, like the probe below.
     if lighting.raymarch[1] >= 0.5
         && lighting.atmosphere[3] > 0.0
         && lighting.settings_a[0] > 0.01
@@ -65,6 +243,7 @@ pub fn cloud_probe_pass(world: &World, mut ctx: RenderContext) {
         && lighting.cloud_layer[2] > 0.001
         && lighting.sun_direction[1] < 0.0
         && let Some(pipeline) = cache.get_render_pipeline(resources.shadow_pipeline)
+        && !reuse
     {
         let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
             label: Some("forest_cloud_shadow_map"),
@@ -90,37 +269,44 @@ pub fn cloud_probe_pass(world: &World, mut ctx: RenderContext) {
         pass.set_bind_group(3, &resources.noise_group, &[]);
         pass.draw(0..3, 0..1);
     }
+    // Between re-integrations the probe keeps the previous frame's LUT —
+    // world-anchored, changing a fraction of one texel per reuse window. The
+    // shadow map above skips on the same cadence: `reuse` reads the same
+    // schedule flag, so re-integration frames are the ones the shadow map
+    // built on.
     let Some(pipeline) = cache.get_render_pipeline(resources.pipeline) else {
         return;
     };
-    let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
-        label: Some("forest_cloud_sky_probe"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: &resources.probe,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                }),
-                store: wgpu::StoreOp::Store,
-            },
-        })],
-        depth_stencil_attachment: None,
-        timestamp_writes: None,
-        occlusion_query_set: None,
-        multiview_mask: None,
-    });
-    pass.set_render_pipeline(pipeline);
-    pass.set_bind_group(0, &resources.globals_group, &[]);
-    pass.set_bind_group(1, &resources.empty_group, &[]);
-    pass.set_bind_group(2, &resources.empty_group, &[]);
-    // This group omits the probe: sampling an active attachment is invalid.
-    pass.set_bind_group(3, &resources.noise_group, &[]);
-    pass.draw(0..3, 0..1);
+    if !reuse {
+        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+            label: Some("forest_cloud_sky_probe"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &resources.probe,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_render_pipeline(pipeline);
+        pass.set_bind_group(0, &resources.globals_group, &[]);
+        pass.set_bind_group(1, &resources.empty_group, &[]);
+        pass.set_bind_group(2, &resources.empty_group, &[]);
+        // This group omits the probe: sampling an active attachment is invalid.
+        pass.set_bind_group(3, &resources.noise_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
 }
 
 fn texture_layout(
@@ -465,9 +651,11 @@ fn prepare_clouds(
 
 pub fn register_cloud_systems(render_app: &mut bevy::app::SubApp) {
     render_app.init_resource::<CloudRenderState>();
+    render_app.init_resource::<CloudProbeSchedule>();
     render_app.add_systems(
         bevy::render::Render,
-        prepare_clouds
+        (prepare_clouds, update_cloud_probe_schedule)
+            .chain()
             .in_set(bevy::render::RenderSystems::Prepare)
             .after(super::prepare_forest_globals),
     );
@@ -610,5 +798,54 @@ mod tests {
                 assert!((worley(p, 8) - worley(repeated, 8)).abs() < 1e-5);
             }
         }
+    }
+
+    /// Continuous advection must never wake the probe — it would cancel the
+    /// cadence — while scrubbed settings and teleported lighting always do.
+    #[test]
+    fn probe_reuse_is_latched_only_by_stepwise_inputs() {
+        let base = ProbeSkyState {
+            sun_direction: [0.9, -0.4, 0.2],
+            moon_direction: [0.0, 1.0, 0.1],
+            sun_colour: [1.0, 0.95, 0.85, 1.1],
+            sun_intensity: 1.0,
+            daylight: 0.8,
+            moon_intensity: 0.05,
+            clouds: [1.0, 0.4, 0.55, 1300.0],
+            layer_thickness: 700.0,
+            layer_scale: 1.0,
+            layer_shadow: 0.35,
+            layer_quality: 1.0,
+            detail_strength: 1.0,
+            march_range: 40000.0,
+            climate_bias: 0.3,
+            overrides: 0,
+            precip_bias: 0.2,
+            precip_override: 0,
+            wind_radians: 1.1,
+            shadow_gate: true,
+        };
+        let drift = |delta: &dyn Fn(&mut ProbeSkyState)| {
+            let mut next = base;
+            delta(&mut next);
+            base.changed_beyond(&next)
+        };
+        // Steady wind rotation and a weather easing stay under tolerance.
+        assert!(!drift(&|s: &mut ProbeSkyState| s.wind_radians += 0.01));
+        assert!(!drift(&|s: &mut ProbeSkyState| s.climate_bias += 0.01));
+        assert!(!drift(&|s: &mut ProbeSkyState| s.sun_direction[1] -= 0.005));
+        // One probe texel of direction, one user step of a setting: visible.
+        assert!(drift(&|s: &mut ProbeSkyState| s.sun_direction[0] += 0.05));
+        assert!(drift(&|s: &mut ProbeSkyState| s.clouds[1] += 0.05));
+        assert!(drift(&|s: &mut ProbeSkyState| s.layer_quality = 2.0));
+        assert!(drift(&|s: &mut ProbeSkyState| s.overrides = 4));
+        assert!(drift(&|s: &mut ProbeSkyState| s.sun_colour = [1.0, 0.6, 0.3, 1.1]));
+        // Toggles wake the latch exactly, so a re-enabled deck can't pop.
+        assert!(drift(&|s: &mut ProbeSkyState| s.clouds[0] = 0.0));
+        assert!(drift(&|s: &mut ProbeSkyState| s.detail_strength = 1.4));
+        assert!(drift(&|s: &mut ProbeSkyState| s.precip_override = 2));
+        // The shadow map's gate flipping rebuilds it on the first usable
+        // frame instead of reading content from before the gate went dark.
+        assert!(drift(&|s: &mut ProbeSkyState| s.shadow_gate = false));
     }
 }
