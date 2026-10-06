@@ -3073,7 +3073,7 @@ fn submerged_transition(
     wet: &impl Fn([f32; 2], f32) -> bool,
 ) {
     let Some(node) = path.first() else { return };
-    if path.len() < 2 || !wet(node.position, node.water) {
+    if path.len() < 2 {
         return;
     }
     let room: f32 = path
@@ -3086,6 +3086,15 @@ fn submerged_transition(
         .sum();
     let reach = (2.0 * node.half_width).clamp(3.0, 10.0).min(0.4 * room);
     if reach < 0.5 {
+        return;
+    }
+    let mut entered_water = wet(node.position, node.water);
+    let shore_cut_reach = if node.lake {
+        node.half_width.min(reach)
+    } else {
+        0.0
+    };
+    if !entered_water && shore_cut_reach <= 0.0 {
         return;
     }
     let mut points = vec![(node.position, 0.0, true)];
@@ -3102,13 +3111,17 @@ fn submerged_transition(
         for step in 1..=steps {
             let advance = step_run * step as f32 / steps as f32;
             let p = [a[0] + d[0] * advance / length, a[1] + d[1] * advance / length];
-            if !wet(p, node.water) {
+            let in_water = wet(p, node.water);
+            let sampled_run = run + advance;
+            if in_water {
+                entered_water = true;
+            } else if entered_water || sampled_run > shore_cut_reach {
                 break 'course;
             }
             // Probe the shore finely, but only routed corners become
             // geometry. Dense carve sections overflow the shared CPU/GPU
             // candidate budget where several outlets are close together.
-            points.push((p, run + advance, step == steps));
+            points.push((p, sampled_run, step == steps));
         }
         run += step_run;
         if run >= reach - 1e-4 {
@@ -3116,7 +3129,7 @@ fn submerged_transition(
         }
     }
     let actual_reach = points.last().map_or(0.0, |p| p.1);
-    if actual_reach < 0.5 {
+    if actual_reach < 0.5 || !entered_water {
         return;
     }
     // At a pond's rim the existing outlet has already opened a channel
@@ -3487,7 +3500,7 @@ mod tests {
     fn reported_pond_outlets_keep_their_full_opening_through_the_rim() {
         let noise = NoiseField::new();
         let network = generate(&noise, [0, 0]);
-        for target in [[-765.3, 941.7], [757.7, 1335.2]] {
+        for target in [[-765.3, 941.7], [757.7, 1335.2], [710.0, 1256.9]] {
             let candidates = network.rivers.iter().flat_map(|river| {
                 river.nodes.windows(2).enumerate()
                     .filter(|(_, pair)| pair[0].lake && !pair[1].lake)
@@ -3529,6 +3542,93 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn pond_outlets_with_interior_room_keep_their_shore_connectors_open() {
+        let noise = NoiseField::new();
+        let network = generate(&noise, [0, 0]);
+        let mut checked = 0;
+        let mut above_water = 0;
+        for river in &network.rivers {
+            for (index, pair) in river.nodes.windows(2).enumerate() {
+                let shore = pair[0];
+                if !shore.lake || pair[1].lake || index == 0 {
+                    continue;
+                }
+                let first = (0..=index).rev()
+                    .take_while(|&i| river.nodes[i].lake)
+                    .last().unwrap();
+                let room = shore.along - river.nodes[first].along;
+                let reach = (2.0 * shore.half_width).clamp(3.0, 10.0).min(0.4 * room);
+                if room <= 2.0 * shore.half_width || reach < 2.5 {
+                    continue;
+                }
+                let connector = network.segments.iter().find(|segment| {
+                    segment.b == shore.position && segment.water == [shore.water; 2]
+                }).expect("every roomy pond outlet must connect back into its pond");
+                assert_eq!(connector.half_width[1], shore.half_width);
+                assert_eq!(connector.depth[1], shore.depth);
+                let natural = base_height(&noise, shore.position[0], shore.position[1]);
+                if natural >= shore.water {
+                    above_water += 1;
+                    assert_eq!(connector.bank, shore.bank);
+                }
+                let inside = river.nodes[index - 1].position;
+                let dx = inside[0] - shore.position[0];
+                let dz = inside[1] - shore.position[1];
+                let length = dx.hypot(dz);
+                let direction = [dx / length, dz / length];
+                let normal = [-direction[1], direction[0]];
+                for run in [0.0, 0.4, 1.0] {
+                    let centre = [
+                        shore.position[0] + direction[0] * run,
+                        shore.position[1] + direction[1] * run,
+                    ];
+                    let local_section = network.segments.iter().find_map(|segment| {
+                        if segment.water != [shore.water; 2] {
+                            return None;
+                        }
+                        let dx = segment.b[0] - segment.a[0];
+                        let dz = segment.b[1] - segment.a[1];
+                        let t = ((centre[0] - segment.a[0]) * dx
+                            + (centre[1] - segment.a[1]) * dz)
+                            / (dx * dx + dz * dz).max(1e-6);
+                        if !(0.0..=1.0).contains(&t) {
+                            return None;
+                        }
+                        let q = [segment.a[0] + dx * t, segment.a[1] + dz * t];
+                        if (q[0] - centre[0]).hypot(q[1] - centre[1]) > 0.05 {
+                            return None;
+                        }
+                        let width = segment.half_width[0]
+                            + (segment.half_width[1] - segment.half_width[0]) * t;
+                        let depth = segment.depth[0]
+                            + (segment.depth[1] - segment.depth[0]) * t;
+                        Some((width, depth))
+                    });
+                    let Some((width, depth)) = local_section else { continue };
+                    if width < 0.1 || depth < 0.1 {
+                        continue;
+                    }
+                    for side in [-0.65, 0.0, 0.65] {
+                        let offset = side * width;
+                        let p = [
+                            centre[0] + normal[0] * offset,
+                            centre[1] + normal[1] * offset,
+                        ];
+                        let natural = base_height(&noise, p[0], p[1]);
+                        let carved = network.envelope(p[0], p[1]).clamp(natural);
+                        assert!(carved < shore.water - 0.03,
+                            "pond outlet {:?} is blocked at {p:?}: {carved} >= {}",
+                            shore.position, shore.water);
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 100);
+        assert!(above_water > 20, "above-water shore sources must be covered");
     }
 
     /// Channels are as deep and as fast as real ones of their size.
@@ -3705,6 +3805,45 @@ mod tests {
             assert_eq!(pair[0].depth[1], pair[1].depth[0]);
         }
         assert_eq!(fan[0].half_width[0], 0.0);
+    }
+
+    #[test]
+    fn a_pond_connector_crosses_an_initial_dry_sill_then_requires_wet_interior() {
+        let mut path = uniform_channel(&[true; 7]);
+        for node in &mut path {
+            node.bank = 0.28;
+        }
+        for rise in [0.0, 0.4, 2.0] {
+            let ground = |p: [f32; 2]| {
+                if p[0] < 0.9 { 5.0 + rise } else { 4.8 }
+            };
+            let wet = |p: [f32; 2], level: f32| ground(p) < level;
+            let mut fan = Vec::new();
+            submerged_transition(&mut fan, &path, true, &ground, &wet);
+            let connection = fan.last().expect("the initial sill should join real pond water");
+            assert_eq!(connection.b, path[0].position);
+            assert_eq!(connection.half_width[1], path[0].half_width);
+            assert_eq!(connection.depth[1], path[0].depth);
+            assert_eq!(connection.bank, path[0].bank);
+            let p = [0.4, 0.65 * path[0].half_width];
+            let mut envelope = super::super::carve::Envelope::NONE;
+            for segment in &fan {
+                super::super::carve::combine(&mut envelope,
+                    &super::super::carve::segment_envelope(segment, p));
+            }
+            assert!(envelope.clamp(ground(p)) < path[0].water - 0.1);
+        }
+        let mut fan = Vec::new();
+        submerged_transition(&mut fan, &path, true, &|_| 5.4, &|_, _| false);
+        assert!(fan.is_empty(), "a connector must reach actual pond water");
+        let ground = |p: [f32; 2]| {
+            if (0.8..2.4).contains(&p[0]) { 4.8 } else { 5.4 }
+        };
+        let wet = |p: [f32; 2], level: f32| ground(p) < level;
+        submerged_transition(&mut fan, &path, true, &ground, &wet);
+        assert!(!fan.is_empty());
+        assert!(fan.iter().all(|segment| segment.a[0] < 2.4 && segment.b[0] < 2.4),
+            "once inside the pond, a later dry bank must stop the transition");
     }
 
     #[test]
