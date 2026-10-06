@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-bevy = "0.19.1"
+# `system_clipboard` turns on bevy_clipboard's arboard backend; without it the
+# `Clipboard` resource only writes an in-process buffer, so the P pose-copy
+# would never reach the actual pasteboard. arboard and its objc2 bindings are
+# already in the lock via bevy_egui, so no versions move.
+bevy = { version = "0.19.1", features = ["system_clipboard"] }
 bevy_egui = "0.42.0"
 quick-noise = "0.2.0"
 bytemuck = { version = "1", features = ["derive"] }

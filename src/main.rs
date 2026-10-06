@@ -38,6 +38,7 @@ use bevy::camera::primitives::Frustum;
 use bevy::camera::visibility::VisibleEntities;
 use bevy::camera::{Camera, ClearColorConfig, PerspectiveProjection, Projection};
 use bevy::audio::AddAudioSource;
+use bevy::clipboard::Clipboard;
 use bevy::prelude::*;
 use bevy::render::camera::CameraRenderGraph;
 use bevy::render::settings::{RenderCreation, WgpuSettings};
@@ -542,11 +543,13 @@ fn setup_cursor_and_player(
 
 /// 2 toggles the trainer and pointer capture; 3 toggles passive debug text.
 /// F12 saves a timestamped screenshot.
+#[allow(clippy::too_many_arguments)]
 fn handle_global_keys(
     mut settings: ResMut<AppSettings>,
     mut player: Query<&mut Player>,
     mut cursor_options: Query<(&mut CursorOptions,), With<PrimaryWindow>>,
     keyboard: Res<ButtonInput<KeyCode>>,
+    mut clipboard: ResMut<Clipboard>,
     mut commands: Commands,
     automation: Option<Res<AutomationSettings>>,
     egui_wants_input: Option<Res<EguiWantsInput>>,
@@ -582,6 +585,24 @@ fn handle_global_keys(
                 if capture_mouse {
                     player.mouse_warmup_frames = 3;
                 }
+            }
+        }
+    }
+    // P copies the current pose to the clipboard in `--camera` form, so a
+    // view you are looking at can be pasted straight into a render invocation.
+    if !editing_menu && keyboard.just_pressed(KeyCode::KeyP) {
+        if let Ok(player) = player.single() {
+            let pose = format!(
+                "--camera {:.3},{:.3},{:.3},{:.3},{:.3}",
+                player.position.x,
+                player.position.y,
+                player.position.z,
+                player.yaw.to_degrees(),
+                player.pitch.to_degrees(),
+            );
+            match clipboard.set_text(pose.as_str()) {
+                Ok(()) => log::info!("POSE: copied to clipboard: {pose}"),
+                Err(error) => log::error!("POSE: clipboard write failed: {error}"),
             }
         }
     }
@@ -1022,6 +1043,9 @@ mod global_key_tests {
         let mut app = App::new();
         app.insert_resource(AppSettings::default());
         app.insert_resource(ButtonInput::<KeyCode>::default());
+        // ClipboardPlugin ships in DefaultPlugins; the bare test app must
+        // insert the resource itself, as handle_global_keys needs it.
+        app.init_resource::<Clipboard>();
         app.add_systems(Update, handle_global_keys);
         let player = app.world_mut().spawn(Player::default()).id();
         let cursor_bundle = (
@@ -1159,6 +1183,28 @@ mod global_key_tests {
         assert!(app.world().get::<Player>(player).unwrap().mouse_captured);
         press(&mut app, KeyCode::Digit3);
         assert!(app.world().resource::<AppSettings>().show_debug);
+    }
+
+    #[test]
+    fn p_copies_the_pose_in_camera_flag_form_to_the_clipboard() {
+        let (mut app, player, _) = input_app();
+        app.world_mut()
+            .get_mut::<Player>(player)
+            .unwrap()
+            .teleport(Vec3::new(137.5, 64.0, -912.375));
+        app.world_mut().get_mut::<Player>(player).unwrap().yaw = 1.25;
+        app.world_mut().get_mut::<Player>(player).unwrap().pitch = -0.4;
+        press(&mut app, KeyCode::KeyP);
+        let expected = "--camera 137.500,64.000,-912.375,71.620,-22.918";
+        let read = app
+            .world_mut()
+            .resource_mut::<Clipboard>()
+            .fetch_text();
+        let text = read
+            .poll_result()
+            .expect("desktop clipboard reads are immediate")
+            .expect("clipboard write should have succeeded");
+        assert_eq!(text, expected);
     }
 
     #[test]
