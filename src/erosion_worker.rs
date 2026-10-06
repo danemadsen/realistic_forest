@@ -1681,6 +1681,7 @@ mod worker_tests {
     /// same frame — driven through the real thread, its own device, the
     /// full 140-iteration chunked submission and the readback maps. The tile
     /// must finalize with finite diagnostics and land one atlas patch.
+    #[ignore = "requires a GPU adapter"]
     #[test]
     fn worker_delivers_a_tile_end_to_end() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

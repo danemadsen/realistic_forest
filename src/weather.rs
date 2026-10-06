@@ -308,15 +308,12 @@ pub struct WeatherOverrides {
     pub thickness: bool,
 }
 
+/// Cloud coverage, density, base height, thickness, shadow strength and sun
+/// intensity resolve in the cloud and sky shaders from the weather profile
+/// (`cloudFrontProfile`), so this struct carries only CPU-side consumers.
 #[derive(Clone, Copy, Debug)]
 pub struct WeatherConditions {
-    pub cloud_coverage: f32,
-    pub cloud_density: f32,
-    pub cloud_base_height: f32,
-    pub cloud_thickness: f32,
-    pub cloud_shadow_strength: f32,
     pub fog_density: f32,
-    pub sun_intensity: f32,
     pub sky_overcast: f32,
     pub wind_speed: f32,
     pub rain_intensity: f32,
@@ -718,37 +715,10 @@ impl WeatherState {
 
     pub fn conditions(&self, settings: &AppSettings) -> WeatherConditions {
         let profile = self.current;
-        let cloud_coverage = if self.overrides.coverage {
-            settings.cloud_coverage
-        } else {
-            settings.cloud_coverage + profile.coverage_delta
-        };
-        let cloud_density = if self.overrides.density {
-            settings.cloud_density
-        } else {
-            settings.cloud_density * profile.density_multiplier
-        };
-        let cloud_base_height = if self.overrides.base {
-            settings.cloud_base_height
-        } else {
-            settings.cloud_base_height + profile.base_offset
-        };
-        let cloud_thickness = if self.overrides.thickness {
-            settings.cloud_thickness
-        } else {
-            settings.cloud_thickness * profile.thickness_multiplier
-        };
         WeatherConditions {
-            cloud_coverage: cloud_coverage.clamp(0.0, 1.0),
-            cloud_density: cloud_density.clamp(0.0, 4.0),
-            cloud_base_height: cloud_base_height.max(100.0),
-            cloud_thickness: cloud_thickness.max(100.0),
-            cloud_shadow_strength: (settings.cloud_shadow_strength * profile.shadow_multiplier)
-                .clamp(0.0, 1.0),
             // Zero remains zero for --no-fog and an explicitly disabled fog
             // slider, even during a fog/whiteout weather event.
             fog_density: settings.fog_density.max(0.0) * profile.fog_multiplier,
-            sun_intensity: settings.sun_intensity.max(0.0) * profile.sun_multiplier,
             sky_overcast: profile.sky_overcast,
             wind_speed: settings.cloud_wind_speed.max(0.0) * profile.wind_multiplier,
             rain_intensity: self.local_precipitation.rain,
@@ -1022,22 +992,29 @@ mod tests {
     fn presets_change_the_whole_environment_and_preserve_cloudy_baseline() {
         let settings = AppSettings::default();
         let cloudy = WeatherState::default().conditions(&settings);
-        assert_eq!(cloudy.cloud_coverage, settings.cloud_coverage);
-        assert_eq!(cloudy.cloud_density, settings.cloud_density);
-        assert_eq!(cloudy.cloud_base_height, settings.cloud_base_height);
-        assert_eq!(cloudy.cloud_thickness, settings.cloud_thickness);
         assert_eq!(cloudy.fog_density, settings.fog_density);
-        assert_eq!(cloudy.sun_intensity, settings.sun_intensity);
+        assert_eq!(cloudy.wind_speed, settings.cloud_wind_speed);
+
+        // Cloud and sun values resolve in the shaders; the profile table is
+        // what carries a preset's cloud tendencies.
+        let cloudy_profile = WeatherProfile::for_preset(WeatherPreset::Cloudy);
+        assert_eq!(cloudy_profile.coverage_delta, 0.0);
+        assert_eq!(cloudy_profile.density_multiplier, 1.0);
+        assert_eq!(cloudy_profile.base_offset, 0.0);
+        assert_eq!(cloudy_profile.thickness_multiplier, 1.0);
+        assert_eq!(cloudy_profile.shadow_multiplier, 1.0);
+        let clear_profile = WeatherProfile::for_preset(WeatherPreset::Clear);
+        let overcast_profile = WeatherProfile::for_preset(WeatherPreset::Overcast);
+        assert!(clear_profile.coverage_delta < cloudy_profile.coverage_delta);
+        assert!(overcast_profile.coverage_delta > cloudy_profile.coverage_delta);
+        assert!(overcast_profile.sun_multiplier < cloudy_profile.sun_multiplier);
+        assert!(overcast_profile.shadow_multiplier < cloudy_profile.shadow_multiplier);
 
         let clear = WeatherState::from_preset(WeatherPreset::Clear, false).conditions(&settings);
         let overcast =
             WeatherState::from_preset(WeatherPreset::Overcast, false).conditions(&settings);
         let fog = WeatherState::from_preset(WeatherPreset::Fog, false).conditions(&settings);
-        assert!(clear.cloud_coverage < cloudy.cloud_coverage);
         assert!(clear.fog_density < cloudy.fog_density);
-        assert!(overcast.cloud_coverage > cloudy.cloud_coverage);
-        assert!(overcast.sun_intensity < cloudy.sun_intensity);
-        assert!(overcast.cloud_shadow_strength < cloudy.cloud_shadow_strength);
         assert!(fog.fog_density > overcast.fog_density * 10.0);
         assert!(fog.sky_overcast > overcast.sky_overcast);
         assert!(fog.wind_speed < cloudy.wind_speed);
@@ -1075,17 +1052,13 @@ mod tests {
             base: true,
             thickness: true,
         };
+        // The shader resolves cloud values from these bits (bit 0 coverage,
+        // 1 density, 2 base, 3 thickness); they must map exactly.
+        assert_eq!(weather.override_bits(), 0b1111);
         let mut settings = AppSettings::default();
-        settings.cloud_coverage = 0.11;
-        settings.cloud_density = 0.4;
-        settings.cloud_base_height = 2500.0;
-        settings.cloud_thickness = 300.0;
         settings.fog_density = 0.0;
+        // --no-fog stays fog-free whatever the weather profile is.
         let resolved = weather.conditions(&settings);
-        assert_eq!(resolved.cloud_coverage, 0.11);
-        assert_eq!(resolved.cloud_density, 0.4);
-        assert_eq!(resolved.cloud_base_height, 2500.0);
-        assert_eq!(resolved.cloud_thickness, 300.0);
         assert_eq!(resolved.fog_density, 0.0);
     }
 
