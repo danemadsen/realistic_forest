@@ -814,10 +814,10 @@ fn vegetationShadow(world_position: vec3<f32>, normal_world: vec3<f32>) -> f32 {
     var lit = vegetationShadowCascade(world_position, normal_world, cascade);
     let start = select(0.0, vegetation_shadows.splits[max(cascade, 1u) - 1u], cascade > 0u);
     let end = vegetation_shadows.splits[cascade];
-    // Merging the far slices must not move the original terminal fade.
+    // The distant fade has its own width, independent of cascade transitions.
     let band = select((end - start)*vegetation_shadows.params.x,
                       vegetation_shadows.params.z, cascade == 2u);
-    let blend = clamp((horizontal_distance - (end - band))/max(band, 1e-3), 0.0, 1.0);
+    let blend = smoothstep(0.0, 1.0, (horizontal_distance - (end - band))/max(band, 1e-3));
     if (blend > 0.0) {
         var next = 1.0;
         if (cascade < 2u) {

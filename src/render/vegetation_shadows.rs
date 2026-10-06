@@ -18,20 +18,20 @@ use bevy::prelude::*;
 use bevy::render::renderer::RenderDevice;
 
 pub const SHADOW_CASCADES: usize = 3;
-/// Texels along each side of each cascade. The first two retain their
-/// original precision; only the distant forest uses a smaller depth target.
+/// Texels along each side of each cascade. Only the distant forest uses a
+/// smaller depth target.
 pub const SHADOW_RESOLUTIONS: [u32; SHADOW_CASCADES] = [2048, 2048, 1536];
-/// Horizontal-distance bounds of the cascades, metres. The last reaches as far as
-/// the trees are drawn, so no distant forest floor shows sunlit through the
-/// canopy.
-pub const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.0, 20.0, 70.0, 2000.0];
+/// Horizontal-distance bounds of the cascades, metres. Keep detailed shadows
+/// across the nearby forest before switching to the 2 km map; its larger
+/// texels are only suitable for distant canopy silhouettes.
+pub const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.0, 40.0, 250.0, 2000.0];
 /// How far up-light of a cascade's receivers a plant can stand and still be
 /// drawn into it: a 35 m pine's shadow under a sun 3 degrees up.
 pub const CASTER_REACH: f32 = 680.0;
 /// Share of each cascade, at its far end, over which it blends into the next.
-pub const CASCADE_BLEND: f32 = 0.12;
-/// Preserve the original 1793.6..2000 m terminal fade after merging the far slices.
-pub const SHADOW_FADE_BAND: f32 = (2000.0 - 280.0) * CASCADE_BLEND;
+pub const CASCADE_BLEND: f32 = 0.25;
+/// Keep the 1793.6..2000 m terminal fade independent of the cascade blends.
+pub const SHADOW_FADE_BAND: f32 = 206.4;
 /// Format of the depth targets.
 pub const SHADOW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// Room above the sampled ground for the tallest crowns, including wind.
@@ -320,21 +320,20 @@ mod tests {
     }
 
     #[test]
-    fn merged_far_cascade_keeps_near_splits_and_original_terminal_fade() {
+    fn extended_detail_ranges_keep_the_terminal_fade_and_texture_budget() {
         let eye = [10.0, 30.0, 10.0];
         let heights = receiver_height_bounds(eye, |_, _| 14.0);
         let light = light_basis([0.4, -0.5, 0.3]);
         let cascades = fit_cascades(eye, &heights, &light);
         let uniform = ShadowUniform::new(&cascades, &light, false);
 
-        // Both shaders still use w for the fully-lit cutoff. The old final
-        // slice faded over 206.4 m; using the merged slice's width would
-        // incorrectly start that fade at 1768.4 m instead of 1793.6 m.
-        assert_eq!(uniform.splits, [20.0, 70.0, 2000.0, 2000.0]);
+        // Wider crossfades must not bring the terminal fade closer as well.
+        assert_eq!(uniform.splits, [40.0, 250.0, 2000.0, 2000.0]);
+        assert_eq!(uniform.params[0], 0.25);
         assert_eq!(uniform.params[2], 206.4);
         assert_eq!(uniform.splits[3] - uniform.params[2], 1793.6);
         assert_eq!(uniform.texel[3], 0.0);
-        assert_eq!(&SHADOW_RESOLUTIONS[..2], &[2048, 2048]);
+        assert_eq!(SHADOW_RESOLUTIONS, [2048, 2048, 1536]);
         for index in 0..SHADOW_CASCADES {
             assert_eq!(uniform.texel[index], cascades[index].texel);
         }
@@ -467,7 +466,7 @@ mod tests {
         // Only the fine grid samples this narrow hill. Its crowns must
         // remain covered when transitioning into a coarser cascade.
         let heights = receiver_height_bounds(eye, |x, z| {
-            if (x - 5.0).abs() < 0.5 && (z - 5.0).abs() < 0.5 { 900.0 } else { 24.0 }
+            if (x - 10.0).abs() < 0.5 && (z - 10.0).abs() < 0.5 { 900.0 } else { 24.0 }
         });
         assert!(heights[0][1] >= 900.0 + CANOPY_HEIGHT);
         for [low, high] in heights {

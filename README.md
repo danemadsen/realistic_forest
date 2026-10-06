@@ -495,8 +495,10 @@ of flat cards: it darkens toward the trunk and the crown's base, and thin
 leaves let some light through. The plants also cast their own shadows. Three
 cascaded shadow maps (2048², 2048² and 1536²) are drawn from the sun, or from
 the moon at night, depth-only and alpha-tested. They cover horizontal radii
-of 20, 70 and 2000 metres around the camera, fitted vertically to the terrain
-and crowns. Shadow detail depends on distance across the ground, so flying
+of 40, 250 and 2000 metres around the camera, fitted vertically to the terrain
+and crowns. Cascades blend smoothly over the last quarter of each detail
+band, keeping the coarsest map out of the nearby forest. Shadow detail
+depends on distance across the ground, so flying
 up and looking down preserves detailed shadows on the plants below. Each
 cascade moves in whole texels, keeping shadows stable as the camera moves.
 Trees shade the ground, the grass, each other and their own

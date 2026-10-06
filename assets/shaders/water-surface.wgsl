@@ -1871,9 +1871,25 @@ fn riverPlantShadowPcf(map: texture_depth_2d, uv: vec2<f32>, depth: f32) -> f32 
     return lit;
 }
 
+fn riverPlantShadowCascade(world_position: vec3<f32>, cascade: u32) -> f32 {
+    let texel = vegetation_shadows.texel[cascade];
+    let lookup = world_position + vec3<f32>(0.0, texel*1.5, 0.0) - vegetation_shadows.light.xyz*texel*1.5;
+    let clip = vegetation_shadows.view_projection[cascade]*vec4<f32>(lookup, 1.0);
+    let uv = vec2<f32>(0.5 + 0.5*clip.x, 0.5 - 0.5*clip.y);
+    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || clip.z > 1.0) {
+        return 1.0;
+    }
+    switch cascade {
+        case 0u: { return riverPlantShadowPcf(vegetation_shadow_map_0, uv, clip.z)*0.25; }
+        case 1u: { return riverPlantShadowPcf(vegetation_shadow_map_1, uv, clip.z)*0.25; }
+        default: { return riverPlantShadowPcf(vegetation_shadow_map_2, uv, clip.z)*0.25; }
+    }
+}
+
 // Light reaching a water point through the plants: the cascade covering its
-// horizontal distance from the camera, with a 2x2 grid of bilinear comparisons
-// (the composite's 4x4 tent is more than a rippling surface needs).
+// horizontal distance from the camera, blended into the next as on the banks,
+// with a 2x2 grid of bilinear comparisons (the composite's 4x4 tent is more
+// than a rippling surface needs).
 fn riverPlantShadow(world_position: vec3<f32>) -> f32 {
     let horizontal_distance = length(world_position.xz - globals.camera_position.xz);
     if (vegetation_shadows.light.w < 0.5 || horizontal_distance >= vegetation_shadows.splits.w) {
@@ -1886,21 +1902,18 @@ fn riverPlantShadow(world_position: vec3<f32>) -> f32 {
             break;
         }
     }
-    let texel = vegetation_shadows.texel[cascade];
-    let lookup = world_position + vec3<f32>(0.0, texel*1.5, 0.0) - vegetation_shadows.light.xyz*texel*1.5;
-    let clip = vegetation_shadows.view_projection[cascade]*vec4<f32>(lookup, 1.0);
-    let uv = vec2<f32>(0.5 + 0.5*clip.x, 0.5 - 0.5*clip.y);
-    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || clip.z > 1.0) {
-        return 1.0;
-    }
-    var lit = 0.0;
-    switch cascade {
-        case 0u: { lit = riverPlantShadowPcf(vegetation_shadow_map_0, uv, clip.z); }
-        case 1u: { lit = riverPlantShadowPcf(vegetation_shadow_map_1, uv, clip.z); }
-        default: { lit = riverPlantShadowPcf(vegetation_shadow_map_2, uv, clip.z); }
+    var lit = riverPlantShadowCascade(world_position, cascade);
+    if (cascade < 2u) {
+        let start = select(0.0, vegetation_shadows.splits[max(cascade, 1u) - 1u], cascade > 0u);
+        let end = vegetation_shadows.splits[cascade];
+        let band = (end - start)*vegetation_shadows.params.x;
+        let blend = smoothstep(0.0, 1.0, (horizontal_distance - (end - band))/max(band, 1e-3));
+        if (blend > 0.0) {
+            lit = mix(lit, riverPlantShadowCascade(world_position, cascade + 1u), blend);
+        }
     }
     let far_fade = smoothstepf(vegetation_shadows.splits.w*0.85, vegetation_shadows.splits.w, horizontal_distance);
-    return mix(1.0, mix(lit*0.25, 1.0, far_fade), vegetation_shadows.params.y);
+    return mix(1.0, mix(lit, 1.0, far_fade), vegetation_shadows.params.y);
 }
 
 // Forest stream water: clear, but stained the colour of weak tea by the
