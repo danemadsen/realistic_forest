@@ -4,7 +4,7 @@
 //! the terrain from above and below near its centreline:
 //!
 //! - **Upper envelope.** Inside the wetted width the bed follows a skewed
-//!   parabola below the water surface, deepest toward the outer bank of a
+//!   bowl below the water surface, deepest toward the outer bank of a
 //!   bend. Beyond the waterline a bank cone rises at the bank slope, then
 //!   ever more steeply, so ground that stands above it (a spur a meander
 //!   swings into, the saddle a channel breaches) is cut back into a bank.
@@ -26,11 +26,10 @@
 //! same uploaded segments, so the drawn ground, the player's footing, the
 //! seated plants and the erosion simulation all see one channel.
 
-/// Beyond this many metres past the waterline a segment no longer shapes the
-/// ground. The bank cone has risen some 30 m above the water by then.
+/// Ordinary banks stop shaping the ground this far past the waterline.
+/// Shelving banks at still-water junctions spread over up to twice this run.
 pub const BANK_REACH: f32 = 12.0;
-/// Curvature of the bank cone: its rise grows by this times the square of
-/// the distance past the waterline.
+/// Curvature of an ordinary bank cone; shelving banks stretch its run.
 pub const BANK_CURVE: f32 = 0.16;
 /// Segments a lookup reads from one grid cell at most, here and on the GPU.
 pub const MAX_CANDIDATES: usize = 64;
@@ -89,10 +88,17 @@ pub struct RiverSegment {
 const _: () = assert!(std::mem::size_of::<RiverSegment>() == 64);
 
 impl RiverSegment {
+    /// Low, shelving banks need a broad shoulder as well as a gentle slope
+    /// at the waterline. Stretching the same bank cone keeps its quadratic
+    /// term from turning the mouth's softened banks straight back into walls.
+    pub fn bank_run(&self) -> f32 {
+        2.0 - smoothstep(0.2, 0.55, self.bank)
+    }
+
     /// Largest distance from the centreline at which the segment shapes the
     /// ground.
     pub fn reach(&self) -> f32 {
-        self.half_width[0].max(self.half_width[1]) + BANK_REACH
+        self.half_width[0].max(self.half_width[1]) + BANK_REACH * self.bank_run()
     }
 }
 
@@ -157,7 +163,6 @@ impl Envelope {
         }
     }
 
-    /// Apply the envelope to a terrain height.
     /// Apply the envelope to a terrain height, with the creases where the
     /// carve meets the natural ground rounded off: a bank's top curves over
     /// into the land above it, and a levee's foot into the land below.
@@ -195,7 +200,9 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
     let distance = (offset[0] * offset[0] + offset[1] * offset[1]).sqrt();
     let half_width = mix(segment.half_width[0], segment.half_width[1], t).max(0.05);
     let past_bank = distance - half_width;
-    if past_bank > BANK_REACH {
+    let bank_run = segment.bank_run();
+    let bank_reach = BANK_REACH * bank_run;
+    if past_bank >= bank_reach {
         return Envelope::NONE;
     }
     let water = mix(segment.water[0], segment.water[1], t);
@@ -236,7 +243,13 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
         // Cut banks stand steep on the outside of a bend; point bars slope
         // gently into the water on the inside.
         let bank = segment.bank * (1.0 + 0.75 * skew * side).max(0.3);
-        envelope.upper = water + bank * past_bank + BANK_CURVE * past_bank * past_bank;
+        let shoulder = past_bank / bank_run;
+        // Relax both constraints before their finite lookup support ends.
+        // Otherwise a high terrace (or deep hollow under a levee) jumps
+        // straight back to its uncarved height at the reach boundary.
+        let edge = smoothstep(0.5 * bank_reach, bank_reach, past_bank);
+        let release = bank_reach * edge * edge / (1.0 - edge).max(1e-5);
+        envelope.upper = water + bank * past_bank + BANK_CURVE * shoulder * shoulder + release;
         let freeboard = 0.1 + 0.25 * depth;
         let levee_width = 0.8 + 0.3 * half_width;
         // Past the segment's end its levee falls on as its water does: down
@@ -246,9 +259,16 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
         // a half width of the end, the outside of a bend's waterline, it
         // keeps its freeboard, or the water there would have no bank.
         let fall = (segment.water[0] - segment.water[1]).max(0.0) / length * (beyond - half_width).max(0.0);
-        envelope.lower = water - fall + (bank * past_bank).min(freeboard)
-            - (past_bank - levee_width).max(0.0) * LEVEE_OUTER_SLOPE
-            - (1.0 - segment.levee) * 1.0e4;
+        // Lower a fading levee gradually into the ground. A fixed 10 km
+        // offset made almost any value below 1 switch it off immediately,
+        // leaving a step where a channel approached a lake or the sea.
+        if segment.levee > 0.0 {
+            let retreat = 1.0 - segment.levee;
+            let levee_release = (depth + 0.25) * retreat * retreat / segment.levee.max(1e-5);
+            envelope.lower = water - fall + (bank * past_bank).min(freeboard)
+                - (past_bank - levee_width).max(0.0) * LEVEE_OUTER_SLOPE
+                - levee_release - release;
+        }
         envelope.velocity = [0.0, 0.0];
     }
     envelope
@@ -588,6 +608,73 @@ mod tests {
     }
 
     #[test]
+    fn shelving_junction_banks_have_broad_gentle_shoulders() {
+        let ordinary = straight([10.0, 10.0]);
+        let mut junction = ordinary;
+        junction.bank = 0.2;
+        junction.levee = 0.0;
+        // Across a four-metre shore the low junction rises less than half
+        // as far as the ordinary bank, without turning into a steep wall.
+        let shore = [5.0, 6.0];
+        let ordinary_rise = segment_envelope(&ordinary, shore).upper - 10.0;
+        let junction_rise = segment_envelope(&junction, shore).upper - 10.0;
+        assert!(junction_rise > 0.0 && junction_rise < ordinary_rise * 0.5);
+        let distant = [5.0, 2.0 + BANK_REACH + 2.0];
+        assert!(segment_envelope(&ordinary, distant).is_none());
+        assert!(!segment_envelope(&junction, distant).is_none());
+        let grid = SegmentGrid::build([-32.0, -32.0], 4, &[junction]);
+        assert_eq!(envelope_at(&[junction], &grid, distant), segment_envelope(&junction, distant));
+    }
+
+    #[test]
+    fn carve_returns_to_high_and_low_ground_before_its_support_ends() {
+        for bank in [0.2, 0.8] {
+            let mut segment = straight([10.0, 10.0]);
+            segment.bank = bank;
+            let edge = segment.reach();
+            for ground in [-30.0, 100.0] {
+                // Both sides of the lookup boundary are exactly the natural
+                // terrain, including its slope: no vertical cut or levee step.
+                for offset in [-0.1, -0.01, 0.01, 0.1] {
+                    let natural = ground + offset * 0.2;
+                    let envelope = segment_envelope(&segment, [5.0, edge + offset]);
+                    assert!((envelope.clamp(natural) - natural).abs() < 1e-5, "{bank} {ground} {offset}: {envelope:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn levees_retreat_gradually_as_the_channel_meets_still_water() {
+        let mut segment = straight([10.0, 10.0]);
+        let p = [5.0, 2.8];
+        let ground = 9.0;
+        let full = segment_envelope(&segment, p).clamp(ground);
+        segment.levee = 0.99;
+        let almost_full = segment_envelope(&segment, p).clamp(ground);
+        assert!((full - almost_full).abs() < 0.002, "{full} {almost_full}");
+        segment.levee = 0.5;
+        let halfway = segment_envelope(&segment, p).clamp(ground);
+        assert!(halfway > ground + 0.2 && halfway < full - 0.2, "{ground} {halfway} {full}");
+        let mut previous = full;
+        for i in (0..100).rev() {
+            segment.levee = i as f32 / 100.0;
+            let height = segment_envelope(&segment, p).clamp(ground);
+            assert!(height <= previous && previous - height < 0.08, "{i}: {previous} -> {height}");
+            previous = height;
+        }
+        assert_eq!(previous, ground);
+    }
+
+    #[test]
+    fn broader_junction_shoulders_fit_the_segment_lookup_budget() {
+        let noise = crate::noise::NoiseField::new();
+        let network = crate::rivers::network::generate(&noise, [0, 0]);
+        let busiest = network.grid.cells.iter().map(|cell| cell[1] as usize).max().unwrap_or(0);
+        assert!(busiest <= MAX_CANDIDATES, "junction support needs {busiest} candidates, lookup handles {MAX_CANDIDATES}");
+    }
+
+    #[test]
     fn grid_finds_every_segment_that_reaches_a_point() {
         let offset_segment = |i: i32| {
             let mut s = straight([10.0, 10.0]);
@@ -669,6 +756,18 @@ mod gpu_tests {
         for node in sampled_nodes {
             for offset in [-6.0f32, -2.0, -0.7, 0.0, 0.4, 1.3, 3.0, 9.0] {
                 points.push([node.position[0] + offset, node.position[1] - offset * 0.5]);
+            }
+        }
+        // Also cover the broader junction shoulders and their return to
+        // untouched terrain, on both sides of the finite support boundary.
+        for segment in payload.segments.iter().step_by(19).take(2000) {
+            let d = [segment.b[0] - segment.a[0], segment.b[1] - segment.a[1]];
+            let length = d[0].hypot(d[1]).max(1e-3);
+            let centre = [0.5 * (segment.a[0] + segment.b[0]), 0.5 * (segment.a[1] + segment.b[1])];
+            let width = 0.5 * (segment.half_width[0] + segment.half_width[1]);
+            for fraction in [0.45, 0.75, 0.98, 1.02] {
+                let offset = width + super::BANK_REACH * segment.bank_run() * fraction;
+                points.push([centre[0] - d[1] / length * offset, centre[1] + d[0] / length * offset]);
             }
         }
         // ...and over the lakes, their shores and the surface past them,

@@ -517,7 +517,10 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
     let centreDistance = length(offset);
     let halfWidth = max(mix(segment.half_width.x, segment.half_width.y, t), 0.05);
     let pastBank = centreDistance - halfWidth;
-    if (pastBank > RIVER_BANK_REACH) { return riverNone(); }
+    // Low junction banks spread their shoulders over a broader run.
+    let bankRun = 2.0 - smoothstep(0.2, 0.55, segment.bank);
+    let bankReach = RIVER_BANK_REACH*bankRun;
+    if (pastBank >= bankReach) { return riverNone(); }
     let water = mix(segment.water.x, segment.water.y, t);
     let depth = mix(segment.depth.x, segment.depth.y, t);
     let segmentLength = sqrt(lengthSquared);
@@ -548,16 +551,28 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
         // Cut banks stand steep on the outside of a bend; point bars slope
         // gently into the water on the inside.
         let bank = segment.bank*max(1.0 + 0.75*skew*side, 0.3);
-        envelope.upper = water + bank*pastBank + RIVER_BANK_CURVE*pastBank*pastBank;
+        let shoulder = pastBank/bankRun;
+        // Fade both constraints before their finite support ends: a high
+        // terrace or low hollow must not jump back to its uncarved height.
+        let edge = smoothstep(0.5*bankReach, bankReach, pastBank);
+        let release = bankReach*edge*edge/max(1.0 - edge, 1e-5);
+        envelope.upper = water + bank*pastBank + RIVER_BANK_CURVE*shoulder*shoulder + release;
         let freeboard = 0.1 + 0.25*depth;
         let leveeWidth = 0.8 + 0.3*halfWidth;
         // Past the segment's end (beyond a half width, the outside of a
         // bend's waterline) its levee falls on as its water does, or down a
         // rapid each end would hold a ledge up beside the next.
         let fall = max(segment.water.x - segment.water.y, 0.0)/segmentLength*max(beyond - halfWidth, 0.0);
-        envelope.lower = water - fall + min(bank*pastBank, freeboard)
-                       - max(pastBank - leveeWidth, 0.0)*RIVER_LEVEE_OUTER_SLOPE
-                       - (1.0 - segment.levee)*1.0e4;
+        // A fading levee retreats gradually instead of switching off as
+        // soon as its strength is a little below one.
+        if (segment.levee > 0.0)
+        {
+            let retreat = 1.0 - segment.levee;
+            let leveeRelease = (depth + 0.25)*retreat*retreat/max(segment.levee, 1e-5);
+            envelope.lower = water - fall + min(bank*pastBank, freeboard)
+                           - max(pastBank - leveeWidth, 0.0)*RIVER_LEVEE_OUTER_SLOPE
+                           - leveeRelease - release;
+        }
         envelope.velocity = vec2<f32>(0.0);
     }
     return envelope;
@@ -695,6 +710,14 @@ fn riverClamp(envelope: RiverEnvelope, height: f32) -> f32
 // water; ground near no water reads 40, as frag_river's bank does.
 const RIVER_SHORE_LAKE_SCALE: f32 = 0.9;
 
+// Smooth sediment handover where a channel crosses a pond's margin. Both
+// stages use the same blend so the silt/gravel boundary does not move with LOD.
+fn riverLakeShare(envelope: RiverEnvelope, height: f32) -> f32
+{
+    let lakeBank = (height - envelope.lake)*RIVER_LAKE_SHORE_RUN;
+    return smoothstep(-2.0, 2.0, envelope.bank_distance - lakeBank);
+}
+
 fn riverShoreRun(envelope: RiverEnvelope, height: f32, groundNormal: vec3<f32>) -> f32
 {
     let tangent = sqrt(max(1.0 - groundNormal.y*groundNormal.y, 0.0))/max(groundNormal.y, 0.05);
@@ -704,7 +727,11 @@ fn riverShoreRun(envelope: RiverEnvelope, height: f32, groundNormal: vec3<f32>) 
     let lakeRise = height - envelope.lake;
     let lakeRun = max(lakeRise/max(tangent, 0.01), lakeRise*RIVER_LAKE_SHORE_RUN)
                 / RIVER_SHORE_LAKE_SCALE;
-    return clamp(min(riverRun, lakeRun), -40.0, 40.0);
+    // Round the meeting of the pond margin and channel bank. A hard minimum
+    // leaves a crease through the material bands at a flared inlet/outlet.
+    // Bound both distances first so absent water fields stay numerically safe.
+    return clamp(riverSmoothMin(clamp(riverRun, -40.0, 40.0),
+                                clamp(lakeRun, -40.0, 40.0), 1.5), -40.0, 40.0);
 }
 // END SHORE RUN
 
@@ -759,11 +786,11 @@ fn terrainVertex(vertexPosition: vec3<f32>, deformSnow: bool) -> VsOutput
     // A lake's still water and silted bed take over where its shore is
     // nearer than any river's bank.
     let bank = riverBankAt(river, height);
-    let still = bank < river.bank_distance;
+    let lakeShare = riverLakeShare(river, height);
     output.frag_river = vec4<f32>(clamp(bank, -40.0, 40.0),
-                                  select(river.bend, 0.0, still),
-                                  select(river.turbulence, 0.0, still),
-                                  select(length(river.velocity), 0.0, still));
+                                  river.bend*(1.0 - lakeShare),
+                                  river.turbulence*(1.0 - lakeShare),
+                                  length(river.velocity)*(1.0 - lakeShare));
 
     // Evaluate normals at a world-space interval appropriate to this LOD. This
     // avoids the high-frequency shimmer produced by differentiating the mesh.

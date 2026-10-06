@@ -95,7 +95,10 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
     let centreDistance = length(offset);
     let halfWidth = max(mix(segment.half_width.x, segment.half_width.y, t), 0.05);
     let pastBank = centreDistance - halfWidth;
-    if (pastBank > RIVER_BANK_REACH) { return riverNone(); }
+    // Low junction banks spread their shoulders over a broader run.
+    let bankRun = 2.0 - smoothstep(0.2, 0.55, segment.bank);
+    let bankReach = RIVER_BANK_REACH*bankRun;
+    if (pastBank >= bankReach) { return riverNone(); }
     let water = mix(segment.water.x, segment.water.y, t);
     let depth = mix(segment.depth.x, segment.depth.y, t);
     let segmentLength = sqrt(lengthSquared);
@@ -126,16 +129,28 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
         // Cut banks stand steep on the outside of a bend; point bars slope
         // gently into the water on the inside.
         let bank = segment.bank*max(1.0 + 0.75*skew*side, 0.3);
-        envelope.upper = water + bank*pastBank + RIVER_BANK_CURVE*pastBank*pastBank;
+        let shoulder = pastBank/bankRun;
+        // Fade both constraints before their finite support ends: a high
+        // terrace or low hollow must not jump back to its uncarved height.
+        let edge = smoothstep(0.5*bankReach, bankReach, pastBank);
+        let release = bankReach*edge*edge/max(1.0 - edge, 1e-5);
+        envelope.upper = water + bank*pastBank + RIVER_BANK_CURVE*shoulder*shoulder + release;
         let freeboard = 0.1 + 0.25*depth;
         let leveeWidth = 0.8 + 0.3*halfWidth;
         // Past the segment's end (beyond a half width, the outside of a
         // bend's waterline) its levee falls on as its water does, or down a
         // rapid each end would hold a ledge up beside the next.
         let fall = max(segment.water.x - segment.water.y, 0.0)/segmentLength*max(beyond - halfWidth, 0.0);
-        envelope.lower = water - fall + min(bank*pastBank, freeboard)
-                       - max(pastBank - leveeWidth, 0.0)*RIVER_LEVEE_OUTER_SLOPE
-                       - (1.0 - segment.levee)*1.0e4;
+        // A fading levee retreats gradually instead of switching off as
+        // soon as its strength is a little below one.
+        if (segment.levee > 0.0)
+        {
+            let retreat = 1.0 - segment.levee;
+            let leveeRelease = (depth + 0.25)*retreat*retreat/max(segment.levee, 1e-5);
+            envelope.lower = water - fall + min(bank*pastBank, freeboard)
+                           - max(pastBank - leveeWidth, 0.0)*RIVER_LEVEE_OUTER_SLOPE
+                           - leveeRelease - release;
+        }
         envelope.velocity = vec2<f32>(0.0);
     }
     return envelope;

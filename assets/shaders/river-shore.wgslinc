@@ -18,6 +18,14 @@
 // water; ground near no water reads 40, as frag_river's bank does.
 const RIVER_SHORE_LAKE_SCALE: f32 = 0.9;
 
+// Smooth sediment handover where a channel crosses a pond's margin. Both
+// stages use the same blend so the silt/gravel boundary does not move with LOD.
+fn riverLakeShare(envelope: RiverEnvelope, height: f32) -> f32
+{
+    let lakeBank = (height - envelope.lake)*RIVER_LAKE_SHORE_RUN;
+    return smoothstep(-2.0, 2.0, envelope.bank_distance - lakeBank);
+}
+
 fn riverShoreRun(envelope: RiverEnvelope, height: f32, groundNormal: vec3<f32>) -> f32
 {
     let tangent = sqrt(max(1.0 - groundNormal.y*groundNormal.y, 0.0))/max(groundNormal.y, 0.05);
@@ -27,6 +35,10 @@ fn riverShoreRun(envelope: RiverEnvelope, height: f32, groundNormal: vec3<f32>) 
     let lakeRise = height - envelope.lake;
     let lakeRun = max(lakeRise/max(tangent, 0.01), lakeRise*RIVER_LAKE_SHORE_RUN)
                 / RIVER_SHORE_LAKE_SCALE;
-    return clamp(min(riverRun, lakeRun), -40.0, 40.0);
+    // Round the meeting of the pond margin and channel bank. A hard minimum
+    // leaves a crease through the material bands at a flared inlet/outlet.
+    // Bound both distances first so absent water fields stay numerically safe.
+    return clamp(riverSmoothMin(clamp(riverRun, -40.0, 40.0),
+                                clamp(lakeRun, -40.0, 40.0), 1.5), -40.0, 40.0);
 }
 // END SHORE RUN

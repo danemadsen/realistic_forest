@@ -787,7 +787,7 @@ water a metre deep (on the coarse routing grid and again on the fine one,
 through water at least 0.3 m deep), so a hollow on a beach that dips just
 below the sea's level fills and spills like any basin instead of swallowing
 the river. Where the land drops to the sea down a beach's face the river is
-graded down to it along a chord from its surface 120 m above the shore,
+graded down to it along a smooth profile from its surface 120 m upstream of the shore,
 cutting a notch at most 3 m deep through the beach and the dune behind it;
 from where its water reaches the sea's level, the sea fills its channel out
 to the open water. Nothing holds the ground up beside a river's last stretch
@@ -822,10 +822,14 @@ it; over its first 40 m it gathers into a runnel and only then into broken
 water. A spring in a hollow lower than the lake, sea or river its water runs
 to rises where its water first lies under the ground, and the hollow above
 stays dry rather than holding a trickle over it. A river that rises in a
-lake is its outlet, full from the start. Where it runs into a lake
-or the sea it spreads and slows into it, as a mouth does, and an estuary is
-scoured a little deeper; where it leaves a lake over its sill it widens only
-a little and keeps its pace. The thalweg hugs the outside of every bend.
+lake is its outlet, full from the start. Mouths flare gradually over a reach
+scaled to the channel's width: at least 60 m before the sea, 28 m before a
+lake inlet and 32 m around an outlet. An estuary opens to 2.2 times its
+upstream width and stays open seaward; lake inlets and outlets widen to
+1.85 and 1.7 times their channel width. Their banks soften into broad
+shoulders, with submerged bed transitions into the pond or seabed. The
+current slows as its cross-section expands, and accelerates again below
+an outlet's sill. The thalweg hugs the outside of every bend.
 
 Every choice is keyed by world position or by a river's head cell, so two
 regions that both see a whole catchment agree on it; when the player moves
@@ -869,6 +873,11 @@ a rapid steeper than the levee's outer slope, an end held up at its own water
 would stand over the next segment's lower levee, a ledge at every segment and
 a flight of steps down the bank.
 
+Gentle junction banks spread their shoulders over up to twice the ordinary
+bank run. Both carve bounds relax smoothly before the lookup's support ends,
+so a cut into high ground cannot stop in a vertical wall at that boundary.
+Levees also retreat continuously as the channel approaches still water.
+
 The same arithmetic runs on the CPU (`src/rivers/carve.rs`) and in the shared
 `assets/shaders/river-functions.wgslinc`, over the same uploaded segments and
 a 32 m lookup grid, so the drawn ground, the player's footing, the seated
@@ -903,6 +912,12 @@ current stays under about 0.3 m/s (lake beds, pools and the slack water along
 the banks), gravel through runs and riffles, bedrock under rapids. Under the
 water it is darkened by its film of algae and settled silt, and it is matte:
 the water's surface carries the reflections.
+
+The precise material lookup covers the full shoreline fringe. Pond silt
+blends gradually into outlet gravel, and coastal sand blends across both
+the channel and its banks. Sand, soil and gravel retain broad texture
+crossfades at these junctions, with the same shore measurements in both
+terrain shader stages so the transitions stay consistent across terrain LODs.
 
 Out of the water every river and lake is edged with bare earth, as the sea is
 with its beach. The band is measured up the shore (`river-shore.wgslinc`,
