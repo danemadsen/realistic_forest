@@ -21,13 +21,13 @@ const NOISE_RESOLUTION: usize = 1024;
 fn main() {
     let mut samples = vec![0.0f32; NOISE_RESOLUTION * NOISE_RESOLUTION];
     let grid = Grid::<2, StaticArch>::new(NOISE_RESOLUTION, NOISE_RESOLUTION);
-    BatchNoise::<2, Fbm, Simplex>::builder(grid.x_iter(), grid.y_iter())
-        .seed(1337)
-        .octaves(5)
-        .frequency(0.0085)
-        .lacunarity(2.02)
-        .persistence(0.5)
-        .fill(samples.as_mut_slice());
+    let mut noise_builder = BatchNoise::<2, Fbm, Simplex>::builder(grid.x_iter(), grid.y_iter());
+    noise_builder = noise_builder.seed(1337);
+    noise_builder = noise_builder.octaves(5);
+    noise_builder = noise_builder.frequency(0.0085);
+    noise_builder = noise_builder.lacunarity(2.02);
+    noise_builder = noise_builder.persistence(0.5);
+    noise_builder.fill(samples.as_mut_slice());
     for sample in samples.iter_mut() {
         *sample = *sample * 0.5 + 0.5;
     }

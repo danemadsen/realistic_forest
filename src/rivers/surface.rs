@@ -268,33 +268,31 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
         // narrows to a point and lies under the ground there.
         let spring = !nodes[0].lake;
         // Each row's vertices across the channel.
-        let rows: Vec<Vec<[f32; 2]>> = (0..=end)
-            .map(|i| {
-                let node = &nodes[i];
-                let tangent = direction(i);
-                let normal = [-tangent[1], tangent[0]];
-                let half_width = if spring && i == 0 { 0.1 } else { node.half_width.max(0.25) };
-                offsets
-                    .iter()
-                    .map(|&across| {
-                        [node.position[0] + normal[0] * across * half_width, node.position[1] + normal[1] * across * half_width]
-                    })
-                    .collect()
-            })
-            .collect();
+        let row_positions = |i: usize| {
+            let node = &nodes[i];
+            let tangent = direction(i);
+            let normal = [-tangent[1], tangent[0]];
+            let half_width = if spring && i == 0 { 0.1 } else { node.half_width.max(0.25) };
+            offsets
+                .iter()
+                .map(|&across| {
+                    [node.position[0] + normal[0] * across * half_width, node.position[1] + normal[1] * across * half_width]
+                })
+                .collect()
+        };
+        let rows: Vec<Vec<[f32; 2]>> = (0..=end).map(row_positions).collect();
         // How far along the river each row lies from still water: a lake's
         // sheet, or the sea past the river's mouth. Neither is lifted in the
         // distance, so the ribbon must not be lifted where it meets them.
-        let touches: Vec<bool> = (0..=end)
-            .map(|i| {
-                let water = nodes[i].water;
-                water <= SEA_LEVEL + 0.03
-                    || (river.end == RiverEnd::Sea && i >= river.surface_end)
-                    || rows[i].iter().any(|&p| {
-                        sheets.level(p).is_some_and(|lake| water <= lake + LEVEL_TIE && water >= lake - SHEET_BAND)
-                    })
-            })
-            .collect();
+        let node_touches_still_water = |i: usize| {
+            let water = nodes[i].water;
+            water <= SEA_LEVEL + 0.03
+                || (river.end == RiverEnd::Sea && i >= river.surface_end)
+                || rows[i].iter().any(|&p| {
+                    sheets.level(p).is_some_and(|lake| water <= lake + LEVEL_TIE && water >= lake - SHEET_BAND)
+                })
+        };
+        let touches: Vec<bool> = (0..=end).map(node_touches_still_water).collect();
         let mut from_still = vec![f32::INFINITY; end + 1];
         let mut seen: Option<f32> = None;
         for ((node, &touch), near) in nodes[..=end].iter().zip(&touches).zip(from_still.iter_mut()) {
@@ -306,7 +304,8 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
             }
         }
         seen = None;
-        for ((node, &touch), near) in nodes[..=end].iter().zip(&touches).zip(from_still.iter_mut()).rev() {
+        let near_slots = nodes[..=end].iter().zip(&touches).zip(from_still.iter_mut());
+        for ((node, &touch), near) in near_slots.rev() {
             if touch {
                 seen = Some(node.along);
             }
@@ -363,7 +362,7 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
                 };
                 hidden &= deep;
                 let speed = node.speed * lateral(across);
-                vertices.push(SurfaceVertex {
+                let vertex = SurfaceVertex {
                     position: [p[0], level, p[1]],
                     velocity: [tangent[0] * speed, tangent[1] * speed],
                     across,
@@ -373,7 +372,8 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
                     half_width: node.half_width.max(0.25),
                     foam: foam[i],
                     sea,
-                });
+                };
+                vertices.push(vertex);
             }
             if let Some((previous, previous_hidden)) = previous_row
                 && !(hidden && previous_hidden)
@@ -400,12 +400,13 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
                 maximum[axis] = maximum[axis].max(p[axis]);
             }
         }
-        chunks.push(SurfaceChunk {
+        let chunk = SurfaceChunk {
             minimum,
             maximum,
             first_index: indices.len() as u32,
             index_count: triangles.len() as u32,
-        });
+        };
+        chunks.push(chunk);
         indices.extend_from_slice(&triangles);
     }
     SurfaceMesh {
@@ -460,15 +461,16 @@ fn sea_blends(rivers: &[River]) -> Vec<(f32, f32, f32)> {
             (None, RiverEnd::Confluence(parent, _)) if depth < 8 && parent < rivers.len() => {
                 let (share, along, ramp) = resolve(rivers, ends, parent, depth + 1);
                 // The parent's node nearest where the tributary ends.
+                let closer_to_last = |a: &&super::network::RiverNode, b: &&super::network::RiverNode| {
+                    let d = |n: &&super::network::RiverNode| {
+                        (n.position[0] - last.position[0]).hypot(n.position[1] - last.position[1])
+                    };
+                    d(a).total_cmp(&d(b))
+                };
                 let here = rivers[parent]
                     .nodes
                     .iter()
-                    .min_by(|a, b| {
-                        let d = |n: &&super::network::RiverNode| {
-                            (n.position[0] - last.position[0]).hypot(n.position[1] - last.position[1])
-                        };
-                        d(a).total_cmp(&d(b))
-                    })
+                    .min_by(closer_to_last)
                     .map_or(f32::NEG_INFINITY, |n| n.along);
                 let share = share * (1.0 - smoothstep(0.0, ramp, along - here));
                 (share, last.along, ramp_to(river, river.nodes.len() - 1))
@@ -494,7 +496,7 @@ fn add_lake(
     let current: HashMap<[i32; 2], [f32; 2]> = lake.current.iter().copied().collect();
     let mut corner_index = HashMap::new();
     let mut corner = |vertices: &mut Vec<SurfaceVertex>, x: i32, z: i32| -> u32 {
-        *corner_index.entry((x, z)).or_insert_with(|| {
+        let push_vertex = || {
             let height = sunk.get(&[x, z]).map_or(lake.level, |&h| h.min(lake.level));
             vertices.push(SurfaceVertex {
                 position: [x as f32 * LAKE_CELL, height, z as f32 * LAKE_CELL],
@@ -510,7 +512,8 @@ fn add_lake(
                 sea: 0.0,
             });
             vertices.len() as u32 - 1
-        })
+        };
+        *corner_index.entry((x, z)).or_insert_with(push_vertex)
     };
     for &[x, z] in lake.cells.iter().chain(&lake.shore) {
         let i00 = corner(vertices, x, z);
@@ -545,21 +548,20 @@ mod tests {
         let cells: Vec<[i32; 2]> = (0..12).flat_map(|x| (-4..4).map(move |z| [x, z])).collect();
         let lake = Lake { level, cells, shore: Vec::new(), edge: Vec::new(), current: Vec::new() };
         let water_at = |x: f32| if x < 48.0 { level } else { level - 0.02 * (x - 48.0) };
-        let nodes: Vec<RiverNode> = (0..=40)
-            .map(|k| {
-                let x = -20.0 + 2.5 * k as f32;
-                RiverNode {
-                    position: [x, 1.0],
-                    water: water_at(x),
-                    half_width: 1.2,
-                    depth: 0.4,
-                    speed: 0.6,
-                    along: x + 20.0,
-                    lake: (0.0..48.0).contains(&x),
-                    ..Default::default()
-                }
-            })
-            .collect();
+        let river_node = |k: i32| {
+            let x = -20.0 + 2.5 * k as f32;
+            RiverNode {
+                position: [x, 1.0],
+                water: water_at(x),
+                half_width: 1.2,
+                depth: 0.4,
+                speed: 0.6,
+                along: x + 20.0,
+                lake: (0.0..48.0).contains(&x),
+                ..Default::default()
+            }
+        };
+        let nodes: Vec<RiverNode> = (0..=40).map(river_node).collect();
         let river = River { nodes, end: RiverEnd::Edge, surface_end: 40 };
         let mesh = build(&[river], &[lake]);
         // The ribbon's 41 rows of three vertices come first, then the sheet.
@@ -597,18 +599,17 @@ mod tests {
     /// never runs upstream. A ribbon carries its own frame; a lake none.
     #[test]
     fn whitewater_foam_drifts_downstream_and_fades() {
-        let nodes: Vec<RiverNode> = (0..=20)
-            .map(|k| RiverNode {
-                position: [5.0 * k as f32, 0.0],
-                water: 10.0 - 0.01 * k as f32,
-                half_width: 2.0,
-                depth: 0.5,
-                speed: 1.0,
-                along: 5.0 * k as f32,
-                turbulence: if k == 5 { 0.8 } else { 0.0 },
-                ..Default::default()
-            })
-            .collect();
+        let river_node = |k: i32| RiverNode {
+            position: [5.0 * k as f32, 0.0],
+            water: 10.0 - 0.01 * k as f32,
+            half_width: 2.0,
+            depth: 0.5,
+            speed: 1.0,
+            along: 5.0 * k as f32,
+            turbulence: if k == 5 { 0.8 } else { 0.0 },
+            ..Default::default()
+        };
+        let nodes: Vec<RiverNode> = (0..=20).map(river_node).collect();
         let river = River { nodes, end: RiverEnd::Edge, surface_end: 20 };
         let cells: Vec<[i32; 2]> = vec![[100, 100]];
         let lake = Lake { level: 3.0, cells, shore: Vec::new(), edge: Vec::new(), current: Vec::new() };
@@ -635,17 +636,16 @@ mod tests {
         // Water falling a centimetre a metre, down to the sea's level at
         // x = 150 m, then on at the sea's level out to x = 200 m.
         let water_at = |x: f32| (SEA_LEVEL + 0.01 * (150.0 - x)).max(SEA_LEVEL);
-        let nodes: Vec<RiverNode> = (0..=40)
-            .map(|k| RiverNode {
-                position: [5.0 * k as f32, 0.0],
-                water: water_at(5.0 * k as f32),
-                half_width: 2.0,
-                depth: 0.5,
-                speed: 0.8,
-                along: 5.0 * k as f32,
-                ..Default::default()
-            })
-            .collect();
+        let river_node = |k: i32| RiverNode {
+            position: [5.0 * k as f32, 0.0],
+            water: water_at(5.0 * k as f32),
+            half_width: 2.0,
+            depth: 0.5,
+            speed: 0.8,
+            along: 5.0 * k as f32,
+            ..Default::default()
+        };
+        let nodes: Vec<RiverNode> = (0..=40).map(river_node).collect();
         let river = River { nodes, end: RiverEnd::Sea, surface_end: 38 };
         let mesh = build(&[river], &[]);
         // Five columns a row; the coast is the first node at the sea's level.

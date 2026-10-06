@@ -440,9 +440,8 @@ impl LightningEvent {
             }
         }
         let leader = (age / self.leader_seconds.max(0.001)).clamp(0.0, 1.0);
-        let last = self.strokes[..self.stroke_count]
-            .iter()
-            .rev()
+        let mut reversed_strokes = self.strokes[..self.stroke_count].iter().rev();
+        let last = reversed_strokes
             .find(|stroke| stroke.time <= age)
             .map(|stroke| stroke.time);
         let afterglow = last.map_or(0.0, |time| 0.08 * (-(age - time) / AFTERGLOW_SECONDS).exp());

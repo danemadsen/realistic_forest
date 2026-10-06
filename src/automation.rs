@@ -235,23 +235,19 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                 if let Some(next) = next {
                     index += 1;
                     // atoi semantics: junk parses to zero, clamped up to 1.
-                    automation.wait_frames = next
-                        .parse::<f32>()
-                        .map(|value| value as i32)
-                        .unwrap_or(0)
-                        .max(1);
+                    let parsed_frames = next.parse::<f32>().map(|value| value as i32);
+                    automation.wait_frames = parsed_frames.unwrap_or(0).max(1);
                 }
             }
             "--erosion-prewarm" => {
                 if let Some(next) = next {
                     index += 1;
                     // The 9x9 streaming cache holds at most 81 tiles.
-                    automation.erosion_prewarm = next
-                        .parse::<f32>()
-                        .ok()
+                    let parsed_value = next.parse::<f32>().ok();
+                    let clamped_prewarm = parsed_value
                         .filter(|value| value.is_finite())
-                        .map(|value| value.clamp(1.0, 81.0) as u32)
-                        .unwrap_or(DEFAULT_EROSION_PREWARM);
+                        .map(|value| value.clamp(1.0, 81.0) as u32);
+                    automation.erosion_prewarm = clamped_prewarm.unwrap_or(DEFAULT_EROSION_PREWARM);
                 }
             }
             "--probe" => automation.probe = true,
@@ -390,16 +386,16 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                 }
             }
             "--time-of-day" | "--day-length" => {
-                let parsed = next
+                let finite_value = next
                     .and_then(|value| value.parse::<f32>().ok())
-                    .filter(|value| value.is_finite())
-                    .filter(|value| {
-                        if flag == "--time-of-day" {
-                            (0.0..24.0).contains(value)
-                        } else {
-                            *value > 0.0
-                        }
-                    });
+                    .filter(|value| value.is_finite());
+                let parsed = finite_value.filter(|value| {
+                    if flag == "--time-of-day" {
+                        (0.0..24.0).contains(value)
+                    } else {
+                        *value > 0.0
+                    }
+                });
                 if let Some(value) = parsed {
                     if flag == "--time-of-day" {
                         automation.time_of_day = value;

@@ -20,67 +20,68 @@ pub fn render(noise: &NoiseField, network: &RiverNetwork, centre: [f64; 2], exte
         let results = std::sync::Mutex::new(vec![Vec::new(); pixels]);
         let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         std::thread::scope(|scope| {
-            for _ in 0..workers {
-                scope.spawn(|| loop {
-                    let row = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if row >= pixels {
-                        break;
-                    }
-                    let z = (origin[1] + (row as f64 + 0.5) * metres_per_pixel) as f32;
-                    let mut out = Vec::with_capacity(pixels);
-                    for column in 0..pixels {
-                        let x = (origin[0] + (column as f64 + 0.5) * metres_per_pixel) as f32;
-                        let step = metres_per_pixel as f32;
-                        let (h, envelope) = carved_height(noise, network, x, z);
-                        let (hx, _) = carved_height(noise, network, x + step, z);
-                        let (hz, _) = carved_height(noise, network, x, z + step);
-                        let normal = [-(hx - h) / step, 1.0, -(hz - h) / step];
-                        let length = (normal[0] * normal[0] + 1.0 + normal[2] * normal[2]).sqrt();
-                        let light = [-0.5f32, 0.7, -0.5];
-                        let shade = ((normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2]) / length / 0.995)
-                            .clamp(0.15, 1.0);
-                        let colour: [f32; 3] = if h < SEA_LEVEL {
-                            let depth = (-h / 60.0).min(1.0);
-                            [30.0 - 20.0 * depth, 90.0 - 50.0 * depth, 150.0 - 60.0 * depth]
-                        } else if h < envelope.lake {
-                            let depth = ((envelope.lake - h) / 12.0).min(1.0);
-                            [50.0 - 25.0 * depth, 120.0 - 50.0 * depth, 190.0 - 40.0 * depth]
-                        } else if envelope.bank_distance < 0.0 && h < envelope.water {
-                            if envelope.turbulence > 0.6 {
-                                [200.0, 230.0, 245.0]
-                            } else {
-                                [40.0, 110.0, 200.0]
-                            }
+            let render_row = || loop {
+                let row = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if row >= pixels {
+                    break;
+                }
+                let z = (origin[1] + (row as f64 + 0.5) * metres_per_pixel) as f32;
+                let mut out = Vec::with_capacity(pixels);
+                for column in 0..pixels {
+                    let x = (origin[0] + (column as f64 + 0.5) * metres_per_pixel) as f32;
+                    let step = metres_per_pixel as f32;
+                    let (h, envelope) = carved_height(noise, network, x, z);
+                    let (hx, _) = carved_height(noise, network, x + step, z);
+                    let (hz, _) = carved_height(noise, network, x, z + step);
+                    let normal = [-(hx - h) / step, 1.0, -(hz - h) / step];
+                    let length = (normal[0] * normal[0] + 1.0 + normal[2] * normal[2]).sqrt();
+                    let light = [-0.5f32, 0.7, -0.5];
+                    let shade = ((normal[0] * light[0] + normal[1] * light[1] + normal[2] * light[2]) / length / 0.995)
+                        .clamp(0.15, 1.0);
+                    let colour: [f32; 3] = if h < SEA_LEVEL {
+                        let depth = (-h / 60.0).min(1.0);
+                        [30.0 - 20.0 * depth, 90.0 - 50.0 * depth, 150.0 - 60.0 * depth]
+                    } else if h < envelope.lake {
+                        let depth = ((envelope.lake - h) / 12.0).min(1.0);
+                        [50.0 - 25.0 * depth, 120.0 - 50.0 * depth, 190.0 - 40.0 * depth]
+                    } else if envelope.bank_distance < 0.0 && h < envelope.water {
+                        if envelope.turbulence > 0.6 {
+                            [200.0, 230.0, 245.0]
                         } else {
-                            let t = (h / 160.0).clamp(0.0, 1.0);
-                            let lowland = [110.0, 140.0, 80.0];
-                            let upland = [150.0, 135.0, 110.0];
-                            let peak = [235.0, 235.0, 235.0];
-                            if t < 0.6 {
-                                let u = t / 0.6;
-                                [
-                                    lowland[0] + (upland[0] - lowland[0]) * u,
-                                    lowland[1] + (upland[1] - lowland[1]) * u,
-                                    lowland[2] + (upland[2] - lowland[2]) * u,
-                                ]
-                            } else {
-                                let u = (t - 0.6) / 0.4;
-                                [
-                                    upland[0] + (peak[0] - upland[0]) * u,
-                                    upland[1] + (peak[1] - upland[1]) * u,
-                                    upland[2] + (peak[2] - upland[2]) * u,
-                                ]
-                            }
-                        };
-                        let lit = if h < SEA_LEVEL { 1.0 } else { shade };
-                        out.push([
-                            (colour[0] * lit) as u8,
-                            (colour[1] * lit) as u8,
-                            (colour[2] * lit) as u8,
-                        ]);
-                    }
-                    results.lock().unwrap()[row] = out;
-                });
+                            [40.0, 110.0, 200.0]
+                        }
+                    } else {
+                        let t = (h / 160.0).clamp(0.0, 1.0);
+                        let lowland = [110.0, 140.0, 80.0];
+                        let upland = [150.0, 135.0, 110.0];
+                        let peak = [235.0, 235.0, 235.0];
+                        if t < 0.6 {
+                            let u = t / 0.6;
+                            [
+                                lowland[0] + (upland[0] - lowland[0]) * u,
+                                lowland[1] + (upland[1] - lowland[1]) * u,
+                                lowland[2] + (upland[2] - lowland[2]) * u,
+                            ]
+                        } else {
+                            let u = (t - 0.6) / 0.4;
+                            [
+                                upland[0] + (peak[0] - upland[0]) * u,
+                                upland[1] + (peak[1] - upland[1]) * u,
+                                upland[2] + (peak[2] - upland[2]) * u,
+                            ]
+                        }
+                    };
+                    let lit = if h < SEA_LEVEL { 1.0 } else { shade };
+                    out.push([
+                        (colour[0] * lit) as u8,
+                        (colour[1] * lit) as u8,
+                        (colour[2] * lit) as u8,
+                    ]);
+                }
+                results.lock().unwrap()[row] = out;
+            };
+            for _ in 0..workers {
+                scope.spawn(render_row);
             }
         });
         results.into_inner().unwrap()
@@ -417,7 +418,7 @@ pub fn junctions(noise: &NoiseField, network: &RiverNetwork) -> Junctions {
             // across ground (as carved) no higher than the sea.
             let b = nodes[nodes.len() - 1].position;
             let reach = 3.0 * nodes[nodes.len() - 1].half_width + 12.0;
-            let open = (0..24).any(|k| {
+            let ray_reaches_open_sea = |k: i32| {
                 let angle = k as f32 / 24.0 * std::f32::consts::TAU;
                 let direction = [angle.cos(), angle.sin()];
                 let mut t = 0.0;
@@ -433,7 +434,8 @@ pub fn junctions(noise: &NoiseField, network: &RiverNetwork) -> Junctions {
                     t += 0.5;
                 }
                 false
-            });
+            };
+            let open = (0..24).any(ray_reaches_open_sea);
             if !open {
                 junctions.cut_off_mouths.push(b);
             }
@@ -504,10 +506,11 @@ impl<'a> SurfaceIndex<'a> {
         let mesh = &network.surface;
         let counts: Vec<usize> = network.lakes.iter().map(|lake| super::surface::build(&[], std::slice::from_ref(lake)).vertices.len()).collect();
         let first_lake = mesh.vertices.len() - counts.iter().sum::<usize>();
-        let lake_starts: Vec<usize> = counts.iter().scan(first_lake, |start, &count| {
+        let advance_start = |start: &mut usize, &count: &usize| {
             *start += count;
             Some(*start)
-        }).collect();
+        };
+        let lake_starts: Vec<usize> = counts.iter().scan(first_lake, advance_start).collect();
         let mut buckets: std::collections::HashMap<[i32; 2], Vec<u32>> = Default::default();
         for (t, triangle) in mesh.indices.chunks(3).enumerate() {
             let v: [[f32; 3]; 3] = [0, 1, 2].map(|k| mesh.vertices[triangle[k] as usize].position);
@@ -711,14 +714,15 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
         .iter()
         .flat_map(|r| {
             let nodes = &r.nodes;
-            (0..nodes.len()).map(move |i| {
+            let heading_at = move |i: usize| {
                 let (a, b) = (&nodes[i.saturating_sub(1)], &nodes[(i + 1).min(nodes.len() - 1)]);
                 let heading = (b.position[0] - a.position[0])
                     .atan2(a.position[1] - b.position[1])
                     .to_degrees()
                     .rem_euclid(360.0);
                 (&nodes[i], heading)
-            })
+            };
+            (0..nodes.len()).map(heading_at)
         })
         .map(|(n, heading)| ((n.position[0] - centre[0] as f32).hypot(n.position[1] - centre[1] as f32), n, heading))
         .collect();
@@ -895,12 +899,13 @@ mod tests {
                     if height <= super::super::carve::NO_LAKE {
                         continue;
                     }
-                    let open = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dz)| {
+                    let corner_is_open = |&(dx, dz): &(i32, i32)| {
                         let (nx, nz) = (x as i32 + dx, z as i32 + dz);
                         (0..across as i32).contains(&nx)
                             && (0..across as i32).contains(&nz)
                             && record.corner(nz as usize * across + nx as usize) <= super::super::carve::NO_LAKE
-                    });
+                    };
+                    let open = [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)].iter().any(corner_is_open);
                     if open {
                         edges += 1;
                         let p = [origin[0] + x as f32 * fine, origin[1] + z as f32 * fine];

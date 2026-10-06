@@ -150,25 +150,27 @@ fn prepare_precipitation(
     }
     if inner.wind_layout.is_none() {
         let size = std::mem::size_of::<PrecipitationFrameGpu>() as u64;
+        let wind_entries = [wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(size),
+            },
+            count: None,
+        }];
         let layout = BindGroupLayoutDescriptor::new(
             "forest_precipitation_wind_layout",
-            &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(size),
-                },
-                count: None,
-            }],
+            &wind_entries,
         );
-        let buffer = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+        let buffer_descriptor = wgpu::BufferDescriptor {
             label: Some("forest_precipitation_wind"),
             size,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        };
+        let buffer = device.wgpu_device().create_buffer(&buffer_descriptor);
         let group = super::bind_group(
             &device,
             &cache,
@@ -233,24 +235,23 @@ pub fn forest_precipitation_pass(
     // reaching the player. Sample their extent as well as the local reading
     // so a leading edge remains visible and moves across the landscape.
     let reach = [-PRECIPITATION_REACH, -24.0, 0.0, 24.0, PRECIPITATION_REACH];
+    let sample_has_rain = |dx: f32, dz: f32| {
+        let sample = crate::weather::sample_precipitation(
+            [extracted.player_position[0] + dx, extracted.player_position[2] + dz],
+            extracted.player_position[1] - 8.0,
+            extracted.weather_offset,
+            extracted.weather.climate_bias,
+            extracted.weather.precipitation_bias,
+            extracted.weather.precipitation_override(),
+            extracted.settings.cloud_base_height,
+            extracted.weather.overrides.base,
+            extracted.settings.cloud_wind_direction_degrees.to_radians(),
+        );
+        sample.intensity() > 0.001
+    };
+    let row_has_rain = |dx: f32| reach.into_iter().any(|dz| sample_has_rain(dx, dz));
     let nearby_precipitation = extracted.weather.local_precipitation.intensity() > 0.001
-        || reach.into_iter().any(|dx| {
-            reach.into_iter().any(|dz| {
-                crate::weather::sample_precipitation(
-                    [extracted.player_position[0] + dx, extracted.player_position[2] + dz],
-                    extracted.player_position[1] - 8.0,
-                    extracted.weather_offset,
-                    extracted.weather.climate_bias,
-                    extracted.weather.precipitation_bias,
-                    extracted.weather.precipitation_override(),
-                    extracted.settings.cloud_base_height,
-                    extracted.weather.overrides.base,
-                    extracted.settings.cloud_wind_direction_degrees.to_radians(),
-                )
-                .intensity()
-                    > 0.001
-            })
-        });
+        || reach.into_iter().any(row_has_rain);
     if !nearby_precipitation {
         return;
     }
@@ -309,27 +310,28 @@ pub fn forest_precipitation_pass(
         return;
     };
     let post_process = view.post_process_write();
+    let screen_entries = [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(post_process.source),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: wgpu::BindingResource::TextureView(&gbuffer.position_view),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: wgpu::BindingResource::TextureView(&gbuffer.normal_view),
+        },
+    ];
     let screen_group = super::bind_group(
         device,
         cache,
         "forest_precipitation_screen",
         screen_layout,
-        &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(post_process.source),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&gbuffer.position_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(&gbuffer.normal_view),
-            },
-        ],
+        &screen_entries,
     );
-    let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+    let precipitation_pass_descriptor = wgpu::RenderPassDescriptor {
         label: Some("forest_precipitation_pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view: post_process.destination,
@@ -344,7 +346,8 @@ pub fn forest_precipitation_pass(
         timestamp_writes: None,
         occlusion_query_set: None,
         multiview_mask: None,
-    });
+    };
+    let mut pass = ctx.begin_tracked_render_pass(precipitation_pass_descriptor);
     pass.set_viewport(
         0.0,
         0.0,

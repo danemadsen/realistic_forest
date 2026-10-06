@@ -155,7 +155,7 @@ fn push_points(
             return;
         }
         let length = pair[0].distance(pair[1]);
-        segments.push(BoltSegment {
+        let segment = BoltSegment {
             start: pair[0].to_array(),
             end: pair[1].to_array(),
             width,
@@ -165,7 +165,8 @@ fn push_points(
                 (walked * arrival_scale).min(1.0),
                 ((walked + length) * arrival_scale).min(1.0),
             ],
-        });
+        };
+        segments.push(segment);
         walked += length;
     }
 }
@@ -369,7 +370,8 @@ pub fn crawler_bolt(seed: f32, centre: [f32; 3], cloud_base: f32) -> Vec<BoltSeg
     }
     for (fork, heading, length, remaining) in forks {
         let side = if random.next() < 0.5 { -1.0 } else { 1.0 };
-        let heading = turn(Vec3::new(heading.x, 0.0, heading.z).normalize_or(Vec3::X), side * random.range(0.5, 1.1));
+        let flat_heading = Vec3::new(heading.x, 0.0, heading.z).normalize_or(Vec3::X);
+        let heading = turn(flat_heading, side * random.range(0.5, 1.1));
         let reach = remaining.min(random.range(200.0, 600.0));
         let arm = crawl(&mut random, fork, heading, reach, (40.0, 80.0), cloud_base);
         if arm.len() >= 2 {
@@ -390,7 +392,8 @@ mod tests {
     const TOP: [f32; 3] = [1400.0, 1350.0, -650.0];
 
     fn main_channel(segments: &[BoltSegment]) -> Vec<BoltSegment> {
-        segments.iter().copied().filter(|segment| segment.order == 0).collect()
+        let all_segments = segments.iter().copied();
+        all_segments.filter(|segment| segment.order == 0).collect()
     }
 
     #[test]

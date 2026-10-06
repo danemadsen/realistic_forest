@@ -515,73 +515,72 @@ fn prepare_water(
             },
             count: None,
         };
-        let layout = BindGroupLayoutDescriptor::new(
-            "forest_river_stage",
-            &[
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::VERTEX_FRAGMENT,
-                    ty: BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: BufferSize::new(std::mem::size_of::<WaterStageUniforms>() as u64),
-                    },
-                    count: None,
+        let stage_layout_entries = [
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX_FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(std::mem::size_of::<WaterStageUniforms>() as u64),
                 },
-                shadow_texture(1),
-                BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: BufferSize::new(std::mem::size_of::<
-                            crate::render::vegetation_shadows::ShadowUniform,
-                        >() as u64),
-                    },
-                    count: None,
+                count: None,
+            },
+            shadow_texture(1),
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: BufferSize::new(std::mem::size_of::<
+                        crate::render::vegetation_shadows::ShadowUniform,
+                    >() as u64),
                 },
-                BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Comparison),
-                    count: None,
-                },
-                shadow_texture(4),
-                shadow_texture(5),
-            ],
-        );
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Comparison),
+                count: None,
+            },
+            shadow_texture(4),
+            shadow_texture(5),
+        ];
+        let layout = BindGroupLayoutDescriptor::new("forest_river_stage", &stage_layout_entries);
+        let river_stage_entries = [
+            BindGroupEntry {
+                binding: 0,
+                resource: stage.buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::TextureView(&shadows.cascade_views[0]),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: shadows.uniform.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::Sampler(&shadows.sampler),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: BindingResource::TextureView(&shadows.cascade_views[1]),
+            },
+            BindGroupEntry {
+                binding: 5,
+                resource: BindingResource::TextureView(&shadows.cascade_views[2]),
+            },
+        ];
         let group = super::bind_group(
             &device,
             &pipeline_cache,
             "forest_river_stage",
             &layout,
-            &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: stage.buffer.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::TextureView(&shadows.cascade_views[0]),
-                },
-                BindGroupEntry {
-                    binding: 2,
-                    resource: shadows.uniform.as_entire_binding(),
-                },
-                BindGroupEntry {
-                    binding: 3,
-                    resource: BindingResource::Sampler(&shadows.sampler),
-                },
-                BindGroupEntry {
-                    binding: 4,
-                    resource: BindingResource::TextureView(&shadows.cascade_views[1]),
-                },
-                BindGroupEntry {
-                    binding: 5,
-                    resource: BindingResource::TextureView(&shadows.cascade_views[2]),
-                },
-            ],
+            &river_stage_entries,
         );
         inner.river_stage = Some((layout, group));
     }
@@ -913,7 +912,7 @@ pub fn forest_water_surface_pass(
 
     let width = extracted.physical_width.max(1) as f32;
     let height = extracted.physical_height.max(1) as f32;
-    let mut render_pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+    let surface_pass_descriptor = wgpu::RenderPassDescriptor {
         label: Some("forest_water_surface_pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view: destination,
@@ -939,7 +938,8 @@ pub fn forest_water_surface_pass(
         timestamp_writes: None,
         occlusion_query_set: None,
         multiview_mask: None,
-    });
+    };
+    let mut render_pass = ctx.begin_tracked_render_pass(surface_pass_descriptor);
     render_pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
     render_pass.set_bind_group(0, globals_group, &[]);
     render_pass.set_bind_group(1, &group, &[]);
@@ -1285,7 +1285,7 @@ pub fn forest_underwater_pass(view: ViewQuery<&ViewTarget>, world: &World, mut c
 
     let width = extracted.physical_width.max(1) as f32;
     let height = extracted.physical_height.max(1) as f32;
-    let mut render_pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+    let underwater_pass_descriptor = wgpu::RenderPassDescriptor {
         label: Some("forest_water_underwater_pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view: destination,
@@ -1302,7 +1302,8 @@ pub fn forest_underwater_pass(view: ViewQuery<&ViewTarget>, world: &World, mut c
         timestamp_writes: None,
         occlusion_query_set: None,
         multiview_mask: None,
-    });
+    };
+    let mut render_pass = ctx.begin_tracked_render_pass(underwater_pass_descriptor);
     render_pass.set_render_pipeline(pipeline);
     render_pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
     render_pass.set_bind_group(0, globals_group, &[]);
@@ -1450,27 +1451,31 @@ fn screen_layout(label: &'static str, filterable: &[bool]) -> BindGroupLayoutDes
 
 fn create_samplers(device: &RenderDevice) -> WaterSamplers {
     let wgpu_device = device.wgpu_device();
+    let linear_clamp_descriptor = wgpu::SamplerDescriptor {
+        label: Some("forest_water_linear_clamp"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..Default::default()
+    };
+    let point_clamp_descriptor = wgpu::SamplerDescriptor {
+        label: Some("forest_water_point_clamp"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
+    };
+    let linear_clamp = wgpu_device.create_sampler(&linear_clamp_descriptor);
+    let point_clamp = wgpu_device.create_sampler(&point_clamp_descriptor);
     WaterSamplers {
-        linear_clamp: wgpu_device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("forest_water_linear_clamp"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..Default::default()
-        }),
-        point_clamp: wgpu_device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("forest_water_point_clamp"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        }),
+        linear_clamp,
+        point_clamp,
     }
 }
 
@@ -1538,11 +1543,8 @@ pub fn register_water_systems(render_app: &mut bevy::app::SubApp) {
     // the render world, and `extract_water` reads the main world. This is the
     // same schedule `extract_forest_view` and the texture extractors use.
     render_app.add_systems(ExtractSchedule, extract_water);
-    render_app.add_systems(
-        Render,
-        (prepare_water_meshes, prepare_water_rings, prepare_water)
-            .chain()
-            .in_set(RenderSystems::Prepare)
-            .after(crate::render::prepare_forest_globals),
-    );
+    let mut config = (prepare_water_meshes, prepare_water_rings, prepare_water).chain();
+    config = config.in_set(RenderSystems::Prepare);
+    config = config.after(crate::render::prepare_forest_globals);
+    render_app.add_systems(Render, config);
 }

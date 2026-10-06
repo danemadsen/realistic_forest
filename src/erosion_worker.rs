@@ -260,7 +260,7 @@ impl WorkerErosionSim {
 
         // group(0): the declared-but-unread globals uniform. Buffers are
         // zero-initialized by wgpu; nothing ever writes the dummy.
-        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let globals_layout_descriptor = wgpu::BindGroupLayoutDescriptor {
             label: Some("erosion_worker_globals_layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -273,24 +273,27 @@ impl WorkerErosionSim {
                 },
                 count: None,
             }],
-        });
-        let globals_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        };
+        let globals_layout = device.create_bind_group_layout(&globals_layout_descriptor);
+        let globals_buffer_descriptor = wgpu::BufferDescriptor {
             label: Some("erosion_worker_globals"),
             size: size_of::<GlobalUniformsGpu>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
-        let globals = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        };
+        let globals_buffer = device.create_buffer(&globals_buffer_descriptor);
+        let globals_descriptor = wgpu::BindGroupDescriptor {
             label: Some("erosion_worker_globals"),
             layout: &globals_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: globals_buffer.as_entire_binding(),
             }],
-        });
+        };
+        let globals = device.create_bind_group(&globals_descriptor);
 
         // group(2): one uniform buffer.
-        let stage_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let stage_layout_descriptor = wgpu::BindGroupLayoutDescriptor {
             label: Some("erosion_worker_stage_layout"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -302,7 +305,8 @@ impl WorkerErosionSim {
                 },
                 count: None,
             }],
-        });
+        };
+        let stage_layout = device.create_bind_group_layout(&stage_layout_descriptor);
         let init_inputs_layout = sim_inputs_layout(device, "erosion_init_inputs_layout", 1);
         let flux_inputs_layout = sim_inputs_layout(device, "erosion_flux_inputs_layout", 3);
         let water_inputs_layout = sim_inputs_layout(device, "erosion_water_inputs_layout", 3);
@@ -353,7 +357,7 @@ impl WorkerErosionSim {
         ];
         let routing_view = routing_target.create_view(&Default::default());
 
-        let base_texture = device.create_texture(&wgpu::TextureDescriptor {
+        let base_texture_descriptor = wgpu::TextureDescriptor {
             label: Some("erosion_base_height"),
             size: wgpu::Extent3d {
                 width: SIM_TEXTURE_SIZE,
@@ -366,7 +370,8 @@ impl WorkerErosionSim {
             format: wgpu::TextureFormat::Rgba32Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
-        });
+        };
+        let base_texture = device.create_texture(&base_texture_descriptor);
         let base_view = base_texture.create_view(&Default::default());
         let init_inputs = make_bind_group(
             device,
@@ -1146,14 +1151,15 @@ fn worker_thread_body(
     // (`unsafe { ExperimentalFeatures::enabled() }` in bevy_render); the
     // adapter reports those capability bits and a plain request would refuse
     // a device the render device was happily handed.
-    let requested = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+    let device_descriptor = wgpu::DeviceDescriptor {
         label: Some("erosion_worker"),
         required_features: features,
         required_limits: limits,
         experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
         memory_hints: Default::default(),
         trace: Default::default(),
-    }));
+    };
+    let requested = block_on(adapter.request_device(&device_descriptor));
     let (device, queue) = match requested {
         Ok(pair) => pair,
         Err(err) => {
@@ -1183,15 +1189,16 @@ fn worker_thread_body(
     // before any module, pipeline or texture is created: invalid WGSL lands
     // in the slot instead of killing an arbitrary thread.
     let error_slot: ErrorSlot = Arc::new(Mutex::new(None));
-    device.on_uncaptured_error({
+    let error_handler = {
         let error_slot = error_slot.clone();
-        Arc::new(move |error| {
+        Arc::new(move |error: wgpu::Error| {
             let Ok(mut slot) = error_slot.lock() else {
                 return;
             };
             slot.get_or_insert_with(|| error.to_string());
         })
-    });
+    };
+    device.on_uncaptured_error(error_handler);
 
     let mut sim = match WorkerErosionSim::build(&device, &queue, &sources) {
         Ok(sim) => sim,
@@ -1334,7 +1341,7 @@ fn create_sim_module(
 /// One RGBA32F simulation target, as `InitializeErosionTextures` created them
 /// (RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC).
 fn sim_texture(device: &wgpu::Device, label: &'static str) -> wgpu::Texture {
-    device.create_texture(&wgpu::TextureDescriptor {
+    let texture_descriptor = wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
             width: SIM_TEXTURE_SIZE,
@@ -1349,7 +1356,8 @@ fn sim_texture(device: &wgpu::Device, label: &'static str) -> wgpu::Texture {
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
-    })
+    };
+    device.create_texture(&texture_descriptor)
 }
 
 fn sim_inputs_layout(device: &wgpu::Device, label: &'static str, count: usize) -> wgpu::BindGroupLayout {
@@ -1411,7 +1419,7 @@ fn make_bind_group(
 /// `SetTextureFilter(base, TEXTURE_FILTER_POINT)`: the simulation state is
 /// always fetched by texel, never filtered.
 fn make_sim_sampler(device: &wgpu::Device) -> wgpu::Sampler {
-    device.create_sampler(&wgpu::SamplerDescriptor {
+    let sampler_descriptor = wgpu::SamplerDescriptor {
         label: Some("erosion_sim_sampler"),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -1420,18 +1428,20 @@ fn make_sim_sampler(device: &wgpu::Device) -> wgpu::Sampler {
         min_filter: wgpu::FilterMode::Nearest,
         mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         ..Default::default()
-    })
+    };
+    device.create_sampler(&sampler_descriptor)
 }
 
 fn stage_buffer(device: &wgpu::Device, label: &'static str) -> wgpu::Buffer {
     // Large enough for every erosion stage struct (the terrain pass's 88
     // bytes is the largest).
-    device.create_buffer(&wgpu::BufferDescriptor {
+    let buffer_descriptor = wgpu::BufferDescriptor {
         label: Some(label),
         size: 128,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
-    })
+    };
+    device.create_buffer(&buffer_descriptor)
 }
 
 fn make_stage_group(
@@ -1440,14 +1450,15 @@ fn make_stage_group(
     layout: &wgpu::BindGroupLayout,
     buffer: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let bind_group_descriptor = wgpu::BindGroupDescriptor {
         label: Some(label),
         layout,
         entries: &[wgpu::BindGroupEntry {
             binding: 0,
             resource: buffer.as_entire_binding(),
         }],
-    })
+    };
+    device.create_bind_group(&bind_group_descriptor)
 }
 
 /// Builds one simulation pipeline: a full-screen triangle into `targets`
@@ -1478,7 +1489,7 @@ fn make_pipeline(
             })
         })
         .collect();
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    let pipeline_descriptor = wgpu::RenderPipelineDescriptor {
         label: Some(label),
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
@@ -1509,7 +1520,8 @@ fn make_pipeline(
         }),
         multiview_mask: None,
         cache: None,
-    })
+    };
+    device.create_render_pipeline(&pipeline_descriptor)
 }
 
 fn record_erosion_pass(
@@ -1550,14 +1562,15 @@ fn record_erosion_pass_targets(
             })
         })
         .collect();
-    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+    let pass_descriptor = wgpu::RenderPassDescriptor {
         label: Some("erosion_pass"),
         color_attachments: &color_attachments,
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,
         multiview_mask: None,
-    });
+    };
+    let mut pass = encoder.begin_render_pass(&pass_descriptor);
     pass.set_pipeline(pipeline);
     pass.set_bind_group(0, globals, &[]);
     pass.set_bind_group(1, inputs, &[]);
@@ -1575,12 +1588,13 @@ fn take_staging_buffer(device: &wgpu::Device, pool: &Mutex<Vec<wgpu::Buffer>>) -
             return buffer;
         }
     }
-    device.create_buffer(&wgpu::BufferDescriptor {
+    let buffer_descriptor = wgpu::BufferDescriptor {
         label: Some("erosion_readback_staging"),
         size: SIM_READBACK_BYTES,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
-    })
+    };
+    device.create_buffer(&buffer_descriptor)
 }
 
 /// Maps one staging buffer and hands the pixels to the slots. wgpu invokes
@@ -1595,7 +1609,7 @@ fn map_readback(
     half: ReadbackHalf,
 ) {
     let callback_buffer = buffer.clone();
-    buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+    let on_mapped = move |result| {
         let outcome = match result {
             Ok(()) => {
                 let pixels = {
@@ -1619,7 +1633,8 @@ fn map_readback(
         }
         // Last, so a zero count means every half is already stored.
         in_flight.fetch_sub(1, Ordering::SeqCst);
-    });
+    };
+    buffer.map_async(wgpu::MapMode::Read, .., on_mapped);
 }
 
 #[cfg(test)]
@@ -1692,20 +1707,18 @@ mod worker_tests {
         ));
 
         let key = tile(1, 2);
-        bridge.set_frame(
-            ErosionFrameCommands {
-                sim_min: tile_simulation_minimum(key),
-                init: Some(InitTileCommand {
-                    key,
-                    base_height: vec![24.0; SIM_PIXELS],
-                    drainage_area: vec![1.0; SIM_PIXELS],
-                    river: vec![0.0; SIM_PIXELS],
-                }),
-                iterate: None,
-                finalize: true,
-            },
-            None,
-        );
+        let frame_commands = ErosionFrameCommands {
+            sim_min: tile_simulation_minimum(key),
+            init: Some(InitTileCommand {
+                key,
+                base_height: vec![24.0; SIM_PIXELS],
+                drainage_area: vec![1.0; SIM_PIXELS],
+                river: vec![0.0; SIM_PIXELS],
+            }),
+            iterate: None,
+            finalize: true,
+        };
+        bridge.set_frame(frame_commands, None);
 
         for _ in 0..3000 {
             if let Some(why) = bridge.take_worker_dead() {

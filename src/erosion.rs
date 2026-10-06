@@ -599,7 +599,7 @@ impl Default for ErosionCache {
 }
 
 pub fn ensure_erosion_cache(cache: &mut ErosionCache, center: TileKey) {
-    cache.tiles.retain(|key, existing| {
+    let keep_tile = |key: &TileKey, existing: &mut ErosionTile| -> bool {
         let outside = (key.x - center.x).abs() > EROSION_STREAMING_RADIUS
             || (key.z - center.z).abs() > EROSION_STREAMING_RADIUS;
         let active = cache.has_active_tile && *key == cache.active_tile;
@@ -609,7 +609,8 @@ pub fn ensure_erosion_cache(cache: &mut ErosionCache, center: TileKey) {
         } else {
             true
         }
-    });
+    };
+    cache.tiles.retain(keep_tile);
     for z in -EROSION_STREAMING_RADIUS..=EROSION_STREAMING_RADIUS {
         for x in -EROSION_STREAMING_RADIUS..=EROSION_STREAMING_RADIUS {
             let key = tile(center.x + x, center.z + z);
@@ -1216,23 +1217,21 @@ mod tests {
     #[test]
     fn set_frame_carries_a_pending_init_to_the_next_frame() {
         let bridge = ErosionBridge::default();
-        bridge.set_frame(
-            ErosionFrameCommands {
-                sim_min: [0.0, 0.0],
-                init: Some(InitTileCommand {
-                    key: tile(0, 0),
-                    base_height: vec![1.0, 2.0],
-                    drainage_area: vec![1.0, 1.0],
-                    river: vec![0.0, 0.0],
-                }),
-                iterate: Some(IterateCommand {
-                    count: 6,
-                    settings: ErosionSettings::default(),
-                }),
-                finalize: false,
-            },
-            None,
-        );
+        let with_pending_init = ErosionFrameCommands {
+            sim_min: [0.0, 0.0],
+            init: Some(InitTileCommand {
+                key: tile(0, 0),
+                base_height: vec![1.0, 2.0],
+                drainage_area: vec![1.0, 1.0],
+                river: vec![0.0, 0.0],
+            }),
+            iterate: Some(IterateCommand {
+                count: 6,
+                settings: ErosionSettings::default(),
+            }),
+            finalize: false,
+        };
+        bridge.set_frame(with_pending_init, None);
         // Nothing consumed it, and the next frame carries no init of its own.
         bridge.set_frame(frame_for([0.0, 0.0], 6, false), None);
 
@@ -1282,19 +1281,18 @@ mod tests {
     #[test]
     fn base_drainage_conserves_area_into_the_valley_and_the_sea() {
         let resolution = 9;
-        let heights: Vec<f32> = (0..resolution * resolution)
-            .map(|cell| {
-                let x = (cell % resolution) as f32;
-                let z = (cell / resolution) as f32;
-                // A V valley along x = 4 falling toward a flat strand at
-                // z = 7 that only drains into the sea row at z = 8.
-                match z as usize {
-                    8 => -5.0,
-                    7 => 1.0,
-                    _ => 40.0 + (x - 4.0).abs() * 3.0 - z,
-                }
-            })
-            .collect();
+        let valley_height = |cell| {
+            let x = (cell % resolution) as f32;
+            let z = (cell / resolution) as f32;
+            // A V valley along x = 4 falling toward a flat strand at
+            // z = 7 that only drains into the sea row at z = 8.
+            match z as usize {
+                8 => -5.0,
+                7 => 1.0,
+                _ => 40.0 + (x - 4.0).abs() * 3.0 - z,
+            }
+        };
+        let heights: Vec<f32> = (0..resolution * resolution).map(valley_height).collect();
         let area = route_base_drainage(&heights, resolution, 4.0);
         let land_cells = resolution * (resolution - 1);
         // The strand cells exchange nothing among themselves, so their areas
@@ -1314,18 +1312,17 @@ mod tests {
     fn base_drainage_matches_highest_first_routing() {
         let resolution = 96;
         let mut seed = 0x2545_f491u32;
-        let heights: Vec<f32> = (0..resolution * resolution)
-            .map(|cell| {
-                seed ^= seed << 13;
-                seed ^= seed >> 17;
-                seed ^= seed << 5;
-                let x = (cell % resolution) as f32;
-                let z = (cell / resolution) as f32;
-                let relief = 30.0 * (x * 0.11).sin() * (z * 0.07).cos() + 0.4 * z - 12.0;
-                // Quantised noise leaves exact ties (flats) between neighbours.
-                ((relief + (seed % 3) as f32 * 0.1) * 4.0).round() * 0.25
-            })
-            .collect();
+        let quantized_height = |cell| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let x = (cell % resolution) as f32;
+            let z = (cell / resolution) as f32;
+            let relief = 30.0 * (x * 0.11).sin() * (z * 0.07).cos() + 0.4 * z - 12.0;
+            // Quantised noise leaves exact ties (flats) between neighbours.
+            ((relief + (seed % 3) as f32 * 0.1) * 4.0).round() * 0.25
+        };
+        let heights: Vec<f32> = (0..resolution * resolution).map(quantized_height).collect();
         let routed = route_base_drainage(&heights, resolution, 4.0);
         let reference = highest_first_drainage(&heights, resolution, 4.0);
         for (cell, (a, b)) in routed.iter().zip(&reference).enumerate() {
@@ -1421,12 +1418,13 @@ mod tests {
 
         let begin = |cache: &mut ErosionCache| {
             let mut commands = ErosionFrameCommands { sim_min: [0.0, 0.0], init: None, iterate: None, finalize: false };
-            begin_prepared_tile(cache, &mut commands, PreparedTile {
+            let prepared_tile = PreparedTile {
                 key: prepared.key,
                 base_height: prepared.base_height.clone(),
                 drainage_area: prepared.drainage_area.clone(),
                 river: prepared.river.clone(),
-            });
+            };
+            begin_prepared_tile(cache, &mut commands, prepared_tile);
             assert!(commands.init.is_some(), "begin carries an init command");
         };
 
@@ -1464,12 +1462,14 @@ mod tests {
         let mut cache = ErosionCache::default();
         let key = tile(1, 2);
         ensure_erosion_cache(&mut cache, key);
-        begin_prepared_tile(&mut cache, &mut ErosionFrameCommands { sim_min: [0.0, 0.0], init: None, iterate: None, finalize: false }, PreparedTile {
+        let mut commands = ErosionFrameCommands { sim_min: [0.0, 0.0], init: None, iterate: None, finalize: false };
+        let prepared_tile = PreparedTile {
             key,
             base_height: vec![0.0],
             drainage_area: vec![0.0],
             river: vec![0.0],
-        });
+        };
+        begin_prepared_tile(&mut cache, &mut commands, prepared_tile);
         assert!(cache.has_active_tile);
         // force_reveal is set by the prewarm/advance path when a finalize is
         // requested; the failure below must consume it.
@@ -1489,24 +1489,28 @@ mod tests {
         let mut cache = ErosionCache::default();
         let key = tile(1, 2);
         ensure_erosion_cache(&mut cache, key);
-        begin_prepared_tile(&mut cache, &mut ErosionFrameCommands { sim_min: [0.0, 0.0], init: None, iterate: None, finalize: false }, PreparedTile {
+        let mut commands = ErosionFrameCommands { sim_min: [0.0, 0.0], init: None, iterate: None, finalize: false };
+        let prepared_tile = PreparedTile {
             key,
             base_height: vec![0.0],
             drainage_area: vec![0.0],
             river: vec![0.0],
-        });
+        };
+        begin_prepared_tile(&mut cache, &mut commands, prepared_tile);
 
         let bridge = ErosionBridge::default();
         for attempt in 1..=3 {
             // Re-begin only from strike two on: the first strike hits an
             // active tile.
             if attempt > 1 {
-                begin_prepared_tile(&mut cache, &mut ErosionFrameCommands { sim_min: [0.0, 0.0], init: None, iterate: None, finalize: false }, PreparedTile {
+                let mut commands = ErosionFrameCommands { sim_min: [0.0, 0.0], init: None, iterate: None, finalize: false };
+                let prepared_tile = PreparedTile {
                     key,
                     base_height: vec![0.0],
                     drainage_area: vec![0.0],
                     river: vec![0.0],
-                });
+                };
+                begin_prepared_tile(&mut cache, &mut commands, prepared_tile);
             }
             bridge.push_event(ErosionEvent::ReadbackFailed(key));
             apply_erosion_events(&mut cache, &bridge);

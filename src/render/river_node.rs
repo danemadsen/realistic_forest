@@ -106,7 +106,7 @@ fn upload_rivers(
         return;
     }
     rivers.uploaded = rivers.generation;
-    rivers.surface = rivers.network.as_ref().and_then(|network| {
+    let surface_from_network = |network: &Arc<RiverNetwork>| {
         let mesh = &network.surface;
         if mesh.indices.is_empty() {
             return None;
@@ -124,7 +124,8 @@ fn upload_rivers(
             }),
             chunks: mesh.chunks.clone(),
         })
-    });
+    };
+    rivers.surface = rivers.network.as_ref().and_then(surface_from_network);
     let Some(network) = rivers.network.as_ref() else {
         // No rivers: a zero resolution in the header switches them off.
         queue.write_buffer(&textures.river_grid, 0, bytemuck::cast_slice(&[0u32; 8]));
@@ -145,13 +146,12 @@ fn upload_rivers(
 }
 
 pub fn register_river_systems(render_app: &mut bevy::app::SubApp) {
-    render_app
-        .init_resource::<ExtractedRivers>()
-        .add_systems(ExtractSchedule, extract_rivers)
-        .add_systems(
-            Render,
-            upload_rivers
-                .in_set(RenderSystems::Prepare)
-                .after(crate::render::gpu_textures::prepare_gpu_textures),
-        );
+    render_app.init_resource::<ExtractedRivers>();
+    render_app.add_systems(ExtractSchedule, extract_rivers);
+    render_app.add_systems(
+        Render,
+        upload_rivers
+            .in_set(RenderSystems::Prepare)
+            .after(crate::render::gpu_textures::prepare_gpu_textures),
+    );
 }

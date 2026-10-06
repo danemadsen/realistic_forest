@@ -1,7 +1,7 @@
 //! Bounded grass candidates, evaluated once per root in compute, then
 //! compacted into prepared instance arenas and drawn indirectly in the G-buffer.
 use super::{ExtractedForestView, ForestGlobals, ForestShaderHandles, terrain_node};
-use crate::grass::{self, GrassInstance, GrassReadiness, GrassTexture, SharedGrassAssets};
+use crate::grass::{self, GrassInstance, GrassModel, GrassReadiness, GrassTexture, SharedGrassAssets};
 use crate::grass_cull::{Footprint, LAYER_COUNT};
 use crate::grass_stream::GrassStream;
 use bevy::mesh::VertexBufferLayout;
@@ -190,26 +190,25 @@ fn upload_texture(
     cutoff: Option<f32>,
 ) -> wgpu::TextureView {
     let levels = source.mip_chain(srgb, cutoff);
-    let texture = device
-        .wgpu_device()
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("grass_material_texture"),
-            size: wgpu::Extent3d {
-                width: source.width,
-                height: source.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: levels.len() as u32,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: if srgb {
-                wgpu::TextureFormat::Rgba8UnormSrgb
-            } else {
-                wgpu::TextureFormat::Rgba8Unorm
-            },
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+    let texture_descriptor = wgpu::TextureDescriptor {
+        label: Some("grass_material_texture"),
+        size: wgpu::Extent3d {
+            width: source.width,
+            height: source.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: levels.len() as u32,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: if srgb {
+            wgpu::TextureFormat::Rgba8UnormSrgb
+        } else {
+            wgpu::TextureFormat::Rgba8Unorm
+        },
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    };
+    let texture = device.wgpu_device().create_texture(&texture_descriptor);
     for (level, mip) in levels.iter().enumerate() {
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -293,7 +292,7 @@ fn prepare_grass(
             storage_entry(3, false),
         ],
     );
-    let cull_pipeline = cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    let cull_pipeline_descriptor = ComputePipelineDescriptor {
         label: Some("forest_grass_cull_pipeline".into()),
         layout: vec![cull_layout.clone(), frame_layout.clone()],
         immediate_size: 0,
@@ -301,7 +300,8 @@ fn prepare_grass(
         shader_defs: vec![],
         entry_point: Some("cull_grass".into()),
         zero_initialize_workgroup_memory: false,
-    });
+    };
+    let cull_pipeline = cache.queue_compute_pipeline(cull_pipeline_descriptor);
     let material_layout = BindGroupLayoutDescriptor::new(
         "grass_material_layout",
         &[
@@ -320,24 +320,24 @@ fn prepare_grass(
         &global_layout,
         &super::globals_bind_group_entries(global_buffer),
     );
-    let frame_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+    let frame_buffer_descriptor = wgpu::BufferDescriptor {
         label: Some("grass_frame"),
         size: std::mem::size_of::<GrassFrame>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
-    });
-    let sampler = device
-        .wgpu_device()
-        .create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("grass_material_sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: 8,
-            ..Default::default()
-        });
+    };
+    let frame_buffer = device.create_buffer(&frame_buffer_descriptor);
+    let sampler_descriptor = wgpu::SamplerDescriptor {
+        label: Some("grass_material_sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        anisotropy_clamp: 8,
+        ..Default::default()
+    };
+    let sampler = device.wgpu_device().create_sampler(&sampler_descriptor);
     // The nine short grass models supply this dense meadow.
     let active_models: Vec<_> = assets
         .0
@@ -350,105 +350,105 @@ fn prepare_grass(
     let indirect_first_instance = device
         .features()
         .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE);
-    let textures: Vec<_> = assets
-        .0
-        .materials
-        .iter()
-        .enumerate()
+    let textures_with_index = assets.0.materials.iter().enumerate();
+    let textures: Vec<_> = textures_with_index
         .map(|(index, m)| {
-            active_models
+            let active = active_models
                 .iter()
-                .any(|model| model.material == index)
-                .then(|| {
-                    [
-                        upload_texture(
-                            &device,
-                            &queue,
-                            &m.base_color,
-                            true,
-                            Some(m.alpha_cutoff / m.base_color_factor[3].max(0.001)),
-                        ),
-                        upload_texture(&device, &queue, &m.normal, false, None),
-                        upload_texture(&device, &queue, &m.orm, false, None),
-                    ]
-                })
+                .any(|model| model.material == index);
+            active.then(|| {
+                [
+                    upload_texture(
+                        &device,
+                        &queue,
+                        &m.base_color,
+                        true,
+                        Some(m.alpha_cutoff / m.base_color_factor[3].max(0.001)),
+                    ),
+                    upload_texture(&device, &queue, &m.normal, false, None),
+                    upload_texture(&device, &queue, &m.orm, false, None),
+                ]
+            })
         })
         .collect();
+    let build_mesh = |model: &GrassModel| {
+        let m = &assets.0.materials[model.material];
+        let params = MaterialUniform {
+            colour: m.base_color_factor,
+            pbr: [
+                m.alpha_cutoff,
+                m.normal_scale,
+                m.metallic_factor,
+                m.roughness_factor,
+            ],
+            shape: [
+                model.height,
+                model.radius,
+                m.occlusion_strength,
+                m.base_color
+                    .visible_mean_luminance(m.base_color_factor, m.alpha_cutoff),
+            ],
+        };
+        let material_buffer_descriptor = wgpu::util::BufferInitDescriptor {
+            label: Some("grass_material_uniform"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        };
+        let buffer = device.create_buffer_with_data(&material_buffer_descriptor);
+        let views = textures[model.material]
+            .as_ref()
+            .expect("active grass material uploaded");
+        let material_entries = [
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&views[0]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&views[1]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&views[2]),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::Sampler(&sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: buffer.as_entire_binding(),
+            },
+        ];
+        let material = super::bind_group(
+            &device,
+            &cache,
+            "grass_material",
+            &material_layout,
+            &material_entries,
+        );
+        GrassMesh {
+            vertices: device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
+                label: Some(&model.name),
+                contents: bytemuck::cast_slice(&model.vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
+            indices: device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
+                label: Some("grass_indices"),
+                contents: bytemuck::cast_slice(&model.indices),
+                usage: wgpu::BufferUsages::INDEX,
+            }),
+            index_count: model.indices.len() as u32,
+            radius: model.radius,
+            material,
+            draws: std::array::from_fn(|_| 0..0),
+        }
+    };
     let meshes = active_models
         .iter()
-        .map(|model| {
-            let m = &assets.0.materials[model.material];
-            let params = MaterialUniform {
-                colour: m.base_color_factor,
-                pbr: [
-                    m.alpha_cutoff,
-                    m.normal_scale,
-                    m.metallic_factor,
-                    m.roughness_factor,
-                ],
-                shape: [
-                    model.height,
-                    model.radius,
-                    m.occlusion_strength,
-                    m.base_color
-                        .visible_mean_luminance(m.base_color_factor, m.alpha_cutoff),
-                ],
-            };
-            let buffer = device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
-                label: Some("grass_material_uniform"),
-                contents: bytemuck::bytes_of(&params),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let views = textures[model.material]
-                .as_ref()
-                .expect("active grass material uploaded");
-            let material = super::bind_group(
-                &device,
-                &cache,
-                "grass_material",
-                &material_layout,
-                &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&views[0]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&views[1]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&views[2]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: buffer.as_entire_binding(),
-                    },
-                ],
-            );
-            GrassMesh {
-                vertices: device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
-                    label: Some(&model.name),
-                    contents: bytemuck::cast_slice(&model.vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-                indices: device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
-                    label: Some("grass_indices"),
-                    contents: bytemuck::cast_slice(&model.indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
-                index_count: model.indices.len() as u32,
-                radius: model.radius,
-                material,
-                draws: std::array::from_fn(|_| 0..0),
-            }
-        })
+        .map(|model| build_mesh(model))
         .collect();
-    let pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
+    let grass_pipeline_descriptor = RenderPipelineDescriptor {
         label: Some("forest_grass_pipeline".into()),
         layout: vec![global_layout, frame_layout.clone(), material_layout],
         immediate_size: 0,
@@ -500,10 +500,11 @@ fn prepare_grass(
             .to_vec(),
         }),
         zero_initialize_workgroup_memory: false,
-    });
+    };
+    let pipeline = cache.queue_render_pipeline(grass_pipeline_descriptor);
     let widest = active_models.iter().map(|model| model.radius).fold(0.0, f32::max);
     let tallest = active_models.iter().map(|model| model.height).fold(0.0, f32::max);
-    *state = Some(GrassResources {
+    let grass_resources = GrassResources {
         pipeline,
         cull_pipeline,
         globals: global_group,
@@ -521,12 +522,13 @@ fn prepare_grass(
                     + active_models.len().saturating_sub(1));
             assert!(job_capacity <= device.limits().max_compute_workgroups_per_dimension as usize);
             let buffer = |label, size, usage| {
-                device.create_buffer(&wgpu::BufferDescriptor {
+                let layer_buffer_descriptor = wgpu::BufferDescriptor {
                     label: Some(label),
                     size,
                     usage,
                     mapped_at_creation: false,
-                })
+                };
+                device.create_buffer(&layer_buffer_descriptor)
             };
             let candidates = buffer(
                 "grass_chunk_candidates",
@@ -548,17 +550,18 @@ fn prepare_grass(
                 (job_capacity * std::mem::size_of::<GrassCullJob>()) as u64,
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             );
+            let cull_entries = [
+                wgpu::BindGroupEntry { binding: 0, resource: candidates.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: jobs_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: visible.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: indirect.as_entire_binding() },
+            ];
             let cull_group = super::bind_group(
                 &device,
                 &cache,
                 "grass_cull_buffers",
                 &cull_layout,
-                &[
-                    wgpu::BindGroupEntry { binding: 0, resource: candidates.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: jobs_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: visible.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: indirect.as_entire_binding() },
-                ],
+                &cull_entries,
             );
             GrassLayer {
                 candidates,
@@ -580,7 +583,8 @@ fn prepare_grass(
         }),
         widest,
         tallest,
-    });
+    };
+    *state = Some(grass_resources);
 }
 
 /// Poll background generation once and upload only a bounded set of entering
@@ -722,29 +726,30 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
     }
     queue.write_buffer(&resources.frame_buffer, 0, bytemuck::bytes_of(&frame));
     // Rebinding the capture view also handles window resize without stale views.
+    let frame_entries = [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&gbuffer.grass_habitat_view),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: wgpu::BindingResource::Sampler(&resources.habitat_sampler),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: resources.frame_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: wgpu::BindingResource::TextureView(&gbuffer.grass_ground_average_view),
+        },
+    ];
     let frame_group = super::bind_group(
         device,
         cache,
         "grass_frame",
         &resources.frame_layout,
-        &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&gbuffer.grass_habitat_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&resources.habitat_sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: resources.frame_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: wgpu::BindingResource::TextureView(&gbuffer.grass_ground_average_view),
-            },
-        ],
+        &frame_entries,
     );
     {
         // This pass follows the habitat and tree-canopy captures and precedes
@@ -779,7 +784,7 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
             },
         })
     });
-    let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+    let gbuffer_pass_descriptor = wgpu::RenderPassDescriptor {
         label: Some("forest_grass_gbuffer"),
         color_attachments: &attachments,
         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -793,7 +798,8 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
         timestamp_writes: None,
         occlusion_query_set: None,
         multiview_mask: None,
-    });
+    };
+    let mut pass = ctx.begin_tracked_render_pass(gbuffer_pass_descriptor);
     pass.set_render_pipeline(pipeline);
     pass.set_bind_group(0, &resources.globals, &[]);
     pass.set_bind_group(1, &frame_group, &[]);
@@ -835,11 +841,8 @@ mod tests;
 
 pub fn register_grass_systems(app: &mut bevy::app::SubApp) {
     app.init_resource::<GrassNodeState>();
-    app.add_systems(
-        bevy::render::Render,
-        (prepare_grass, prepare_grass_instances)
-            .chain()
-            .in_set(bevy::render::RenderSystems::Prepare)
-            .after(super::prepare_forest_globals),
-    );
+    let mut systems = (prepare_grass, prepare_grass_instances).chain();
+    systems = systems.in_set(bevy::render::RenderSystems::Prepare);
+    systems = systems.after(super::prepare_forest_globals);
+    app.add_systems(bevy::render::Render, systems);
 }

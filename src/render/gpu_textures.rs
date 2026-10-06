@@ -20,7 +20,8 @@ fn asset_path(relative: &str) -> PathBuf {
 }
 
 fn load_image_rgba(path: &PathBuf) -> Option<(Vec<u8>, usize)> {
-    let decoded = image::ImageReader::open(path).ok()?.decode().ok()?;
+    let reader = image::ImageReader::open(path).ok()?;
+    let decoded = reader.decode().ok()?;
     let size = decoded.width() as usize;
     Some((decoded.to_rgba8().into_raw(), size))
 }
@@ -331,12 +332,11 @@ fn build_terrain_layers(
         layers[index] = Some(MipChain8 { levels: chain });
     }
 
-    layers
+    let filled_layers = layers
         .into_iter()
         .map(|layer| layer.unwrap_or_else(MipChain8::blank))
-        .collect::<Vec<_>>()
-        .try_into()
-        .expect("fixed slot count")
+        .collect::<Vec<_>>();
+    filled_layers.try_into().expect("fixed slot count")
 }
 
 /// `LoadTerrainTextures` — decode every material folder twice (the albedo
@@ -462,22 +462,23 @@ fn float_texture(
     mips: u32,
     usage: wgpu::TextureUsages,
 ) -> wgpu::Texture {
+    let descriptor = wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage,
+        view_formats: &[],
+    };
     device
         .wgpu_device()
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: mips,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage,
-            view_formats: &[],
-        })
+        .create_texture(&descriptor)
 }
 
 /// Default SSAO 4x4 rotation-noise pixels, ported from `CreateSSAONoise`.
@@ -739,27 +740,23 @@ pub fn prepare_gpu_textures(
     let make_array = |label: &str,
                       layers: &Box<[MipChain8; TERRAIN_ATLAS_SLOTS]>,
                       format: wgpu::TextureFormat| {
-        let max_levels = layers
-            .iter()
-            .map(|layer| layer.levels.len())
-            .max()
-            .unwrap_or(1) as u32;
-        let texture = device
-            .wgpu_device()
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width: TERRAIN_TILE_SIZE as u32,
-                    height: TERRAIN_TILE_SIZE as u32,
-                    depth_or_array_layers: TERRAIN_ATLAS_SLOTS as u32,
-                },
-                mip_level_count: max_levels,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
+        let level_counts = layers.iter().map(|layer| layer.levels.len());
+        let max_levels = level_counts.max().unwrap_or(1) as u32;
+        let array_descriptor = wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: TERRAIN_TILE_SIZE as u32,
+                height: TERRAIN_TILE_SIZE as u32,
+                depth_or_array_layers: TERRAIN_ATLAS_SLOTS as u32,
+            },
+            mip_level_count: max_levels,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        };
+        let texture = device.wgpu_device().create_texture(&array_descriptor);
         for level in 0..max_levels as usize {
             let size = (TERRAIN_TILE_SIZE >> level).max(1) as u32;
             // Layers contiguous, each row padded to 256.
@@ -819,22 +816,21 @@ pub fn prepare_gpu_textures(
     );
 
     // SSAO 4x4 rotation noise (point, repeat).
-    let ssao_noise_texture = device
-        .wgpu_device()
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("ssao_noise"),
-            size: wgpu::Extent3d {
-                width: SSAO_NOISE_WIDTH,
-                height: SSAO_NOISE_WIDTH,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+    let noise_descriptor = wgpu::TextureDescriptor {
+        label: Some("ssao_noise"),
+        size: wgpu::Extent3d {
+            width: SSAO_NOISE_WIDTH,
+            height: SSAO_NOISE_WIDTH,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    };
+    let ssao_noise_texture = device.wgpu_device().create_texture(&noise_descriptor);
     write_padded(
         queue,
         &ssao_noise_texture,
@@ -847,12 +843,13 @@ pub fn prepare_gpu_textures(
     let ssao_noise_view = ssao_noise_texture.create_view(&Default::default());
 
     let river_buffer = |label: &str, bytes: usize| {
-        device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+        let river_descriptor = wgpu::BufferDescriptor {
             label: Some(label),
             size: bytes as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        })
+        };
+        device.wgpu_device().create_buffer(&river_descriptor)
     };
     let river_grid = river_buffer("river_grid", crate::rivers::GPU_GRID_WORDS * 4);
     let river_segments = river_buffer(
@@ -860,7 +857,7 @@ pub fn prepare_gpu_textures(
         crate::rivers::GPU_SEGMENTS * std::mem::size_of::<crate::rivers::carve::RiverSegment>(),
     );
 
-    option.0 = Some(Box::new(GpuWorldTextures {
+    let world_textures = GpuWorldTextures {
         revision: TerrainRevision::default(),
         noise_texture,
         noise_view,
@@ -874,7 +871,8 @@ pub fn prepare_gpu_textures(
         ssao_noise_view,
         river_grid,
         river_segments,
-    }));
+    };
+    option.0 = Some(Box::new(world_textures));
 }
 
 /// Render-app registration: extract systems and the resources they fill.
@@ -882,12 +880,11 @@ pub fn prepare_gpu_textures(
 /// which owns the `Render`-schedule ordering it shares with
 /// `prepare_forest_globals`.
 pub fn register_gpu_texture_systems(render_app: &mut bevy::app::SubApp) {
-    render_app
-        .init_resource::<TerrainLayerDataSlot>()
-        .init_resource::<BlendMaskData>()
-        .init_resource::<GpuWorldTexturesOption>()
-        .add_systems(
-            ExtractSchedule,
-            (extract_terrain_layers, extract_blend_mask),
-        );
+    render_app.init_resource::<TerrainLayerDataSlot>();
+    render_app.init_resource::<BlendMaskData>();
+    render_app.init_resource::<GpuWorldTexturesOption>();
+    render_app.add_systems(
+        ExtractSchedule,
+        (extract_terrain_layers, extract_blend_mask),
+    );
 }

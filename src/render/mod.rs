@@ -518,10 +518,9 @@ impl Plugin for ForestRenderPlugin {
         // borrowed below.
         water_node::register_water_main_world(app);
 
-        let grass_assets = crate::grass::GrassAssets::load(
-            std::path::PathBuf::from(crate::resolve_asset_root()).join("models"),
-        )
-        .map(|assets| crate::grass::SharedGrassAssets(std::sync::Arc::new(assets)));
+        let models_directory = std::path::PathBuf::from(crate::resolve_asset_root()).join("models");
+        let grass_assets = crate::grass::GrassAssets::load(models_directory)
+            .map(|assets| crate::grass::SharedGrassAssets(std::sync::Arc::new(assets)));
         if let Err(error) = &grass_assets {
             error!("Grass assets could not be loaded: {error}");
         }
@@ -574,34 +573,32 @@ impl Plugin for ForestRenderPlugin {
         // rather than a node in a render graph; the camera opts in through
         // `CameraRenderGraph::new(ForestRender)` in `spawn_scene`.
         render_app.add_schedule(ForestRender::base_schedule());
-        render_app.add_systems(
-            ForestRender,
+        let forest_passes = (
+            erosion_node::forest_erosion_pass.in_set(ForestRenderSystems::Erosion),
+            terrain_node::forest_terrain_pass.in_set(ForestRenderSystems::Terrain),
+            vegetation_node::forest_vegetation_pass.in_set(ForestRenderSystems::Vegetation),
+            grass_node::forest_grass_pass.in_set(ForestRenderSystems::Grass),
+            post_nodes::forest_ssao_pass.in_set(ForestRenderSystems::Ssao),
+            post_nodes::forest_blur_pass.in_set(ForestRenderSystems::Blur),
+            cloud_node::cloud_probe_pass.in_set(ForestRenderSystems::Clouds),
+            post_nodes::forest_composite_pass.in_set(ForestRenderSystems::Composite),
+            water_node::forest_water_surface_pass.in_set(ForestRenderSystems::WaterSurface),
+            water_node::forest_underwater_pass.in_set(ForestRenderSystems::WaterUnderwater),
+            lightning_node::forest_lightning_pass.in_set(ForestRenderSystems::Lightning),
+            precipitation_node::forest_precipitation_pass.in_set(ForestRenderSystems::Precipitation),
+            post_nodes::forest_fxaa_pass.in_set(ForestRenderSystems::Fxaa),
+            // bevy_egui draws through `egui_pass`, with `prepare_egui_pass`
+            // immediately before it to resolve paint callbacks. bevy_egui
+            // wires the same pair into its own Core2d/Core3d schedules.
             (
-                erosion_node::forest_erosion_pass.in_set(ForestRenderSystems::Erosion),
-                terrain_node::forest_terrain_pass.in_set(ForestRenderSystems::Terrain),
-                vegetation_node::forest_vegetation_pass.in_set(ForestRenderSystems::Vegetation),
-                grass_node::forest_grass_pass.in_set(ForestRenderSystems::Grass),
-                post_nodes::forest_ssao_pass.in_set(ForestRenderSystems::Ssao),
-                post_nodes::forest_blur_pass.in_set(ForestRenderSystems::Blur),
-                cloud_node::cloud_probe_pass.in_set(ForestRenderSystems::Clouds),
-                post_nodes::forest_composite_pass.in_set(ForestRenderSystems::Composite),
-                water_node::forest_water_surface_pass.in_set(ForestRenderSystems::WaterSurface),
-                water_node::forest_underwater_pass.in_set(ForestRenderSystems::WaterUnderwater),
-                lightning_node::forest_lightning_pass.in_set(ForestRenderSystems::Lightning),
-                precipitation_node::forest_precipitation_pass.in_set(ForestRenderSystems::Precipitation),
-                post_nodes::forest_fxaa_pass.in_set(ForestRenderSystems::Fxaa),
-                // bevy_egui draws through `egui_pass`, with `prepare_egui_pass`
-                // immediately before it to resolve paint callbacks. bevy_egui
-                // wires the same pair into its own Core2d/Core3d schedules.
-                (
-                    bevy_egui::render::prepare_egui_pass,
-                    bevy_egui::render::egui_pass,
-                )
-                    .chain()
-                    .in_set(ForestRenderSystems::Egui),
-                bevy::core_pipeline::upscaling::upscaling.in_set(ForestRenderSystems::Upscale),
-            ),
+                bevy_egui::render::prepare_egui_pass,
+                bevy_egui::render::egui_pass,
+            )
+                .chain()
+                .in_set(ForestRenderSystems::Egui),
+            bevy::core_pipeline::upscaling::upscaling.in_set(ForestRenderSystems::Upscale),
         );
+        render_app.add_systems(ForestRender, forest_passes);
     }
 }
 

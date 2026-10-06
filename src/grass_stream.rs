@@ -101,11 +101,9 @@ impl Residency {
         // allocating the corners of a large enclosing square for each layer.
         let capacities = std::array::from_fn(|layer| {
             let radius = retained_radius(layer);
-            [[0, 0], [8, 0], [0, 8], [8, 8]]
-                .map(|anchor| keys_in_radius(anchor, layer, radius).len())
-                .into_iter()
-                .max()
-                .unwrap()
+            let corner_counts = [[0, 0], [8, 0], [0, 8], [8, 8]]
+                .map(|anchor| keys_in_radius(anchor, layer, radius).len());
+            corner_counts.into_iter().max().unwrap()
         });
         Self {
             anchor: None,
@@ -215,16 +213,13 @@ fn retained_radius(layer: usize) -> f64 {
 /// Nearest distance to the closed root AABB. A point on a chunk edge may
 /// contribute to either neighbour, so including both is conservative.
 fn distance_squared(coordinate: [i64; 2], anchor: [i64; 2]) -> f64 {
-    coordinate
-        .into_iter()
-        .zip(anchor)
-        .map(|(chunk, value)| {
-            let low = chunk as f64 * CHUNK_METRES;
-            let high = low + CHUNK_METRES;
-            let value = value as f64;
-            (low - value).max(value - high).max(0.0).powi(2)
-        })
-        .sum()
+    let axis_terms = coordinate.into_iter().zip(anchor).map(|(chunk, value)| {
+        let low = chunk as f64 * CHUNK_METRES;
+        let high = low + CHUNK_METRES;
+        let value = value as f64;
+        (low - value).max(value - high).max(0.0).powi(2)
+    });
+    axis_terms.sum()
 }
 
 fn keys_in_radius(anchor: [i64; 2], layer: usize, radius: f64) -> Vec<GrassChunkKey> {
@@ -422,12 +417,11 @@ mod tests {
             .map(|(key, resident)| (*key, resident.ticket.slot))
             .collect();
         residency.plan([8, 0]);
-        let entering: HashSet<_> = residency
+        let entering_keys = residency
             .wanted
             .iter()
-            .filter(|key| !old.contains_key(key))
-            .copied()
-            .collect();
+            .filter(|key| !old.contains_key(key));
+        let entering: HashSet<_> = entering_keys.copied().collect();
         let queued: HashSet<_> = residency.queued.iter().map(|ticket| ticket.key).collect();
         assert_eq!(queued, entering);
         assert!(!queued.is_empty());

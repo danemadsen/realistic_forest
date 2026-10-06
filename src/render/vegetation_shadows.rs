@@ -112,7 +112,7 @@ pub fn receiver_height_bounds(
     mut ground_height: impl FnMut(f32, f32) -> f32,
 ) -> [[f32; 2]; SHADOW_CASCADES] {
     let mut inner = [f32::INFINITY, f32::NEG_INFINITY];
-    std::array::from_fn(|index| {
+    let bounds_for_cascade = |index: usize| {
         let step = SHADOW_SPLITS[index + 1] / 4.0;
         let anchor = [(eye[0] / step).floor() * step, (eye[2] / step).floor() * step];
         let mut low = f32::INFINITY;
@@ -134,7 +134,8 @@ pub fn receiver_height_bounds(
         // both maps are sampled throughout the blend band.
         inner = [low.min(inner[0]), high.max(inner[1])];
         inner
-    })
+    };
+    std::array::from_fn(bounds_for_cascade)
 }
 
 /// Fit nested vertical cylinders to the terrain below the camera. Their
@@ -147,7 +148,7 @@ pub fn fit_cascades(
     light: &LightBasis,
 ) -> [Cascade; SHADOW_CASCADES] {
     let (right, up, along) = (widen(light.right), widen(light.up), widen(light.forward));
-    std::array::from_fn(|index| {
+    let cascade_for_index = |index: usize| {
         let [low, high] = heights[index].map(f64::from);
         let radius = SHADOW_SPLITS[index + 1] as f64;
         let half_height = (high - low) * 0.5;
@@ -182,7 +183,8 @@ pub fn fit_cascades(
             texel: texel as f32,
             view_projection,
         }
-    })
+    };
+    std::array::from_fn(cascade_for_index)
 }
 
 /// `VegetationShadows` in composite.wgsl.
@@ -245,8 +247,8 @@ fn create_targets(device: &RenderDevice, resolutions: [u32; SHADOW_CASCADES]) ->
     let device = device.wgpu_device();
     // Texture-array layers must share an extent. Separate textures let the
     // distant cascade shrink without rescaling the near maps or their UVs.
-    let cascade_views = resolutions.map(|resolution| {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
+    let build_cascade_view = |resolution: u32| {
+        let texture_descriptor = wgpu::TextureDescriptor {
             label: Some("vegetation_shadow_cascade"),
             size: wgpu::Extent3d {
                 width: resolution,
@@ -259,10 +261,12 @@ fn create_targets(device: &RenderDevice, resolutions: [u32; SHADOW_CASCADES]) ->
             format: SHADOW_FORMAT,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        });
+        };
+        let texture = device.create_texture(&texture_descriptor);
         texture.create_view(&wgpu::TextureViewDescriptor::default())
-    });
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+    };
+    let cascade_views = resolutions.map(build_cascade_view);
+    let sampler_descriptor = wgpu::SamplerDescriptor {
         label: Some("vegetation_shadow_sampler"),
         address_mode_u: wgpu::AddressMode::ClampToEdge,
         address_mode_v: wgpu::AddressMode::ClampToEdge,
@@ -272,13 +276,15 @@ fn create_targets(device: &RenderDevice, resolutions: [u32; SHADOW_CASCADES]) ->
         mipmap_filter: wgpu::MipmapFilterMode::Nearest,
         compare: Some(wgpu::CompareFunction::LessEqual),
         ..Default::default()
-    });
-    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+    };
+    let sampler = device.create_sampler(&sampler_descriptor);
+    let uniform_descriptor = wgpu::BufferDescriptor {
         label: Some("vegetation_shadow_uniform"),
         size: std::mem::size_of::<ShadowUniform>() as u64,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
-    });
+    };
+    let uniform = device.create_buffer(&uniform_descriptor);
     ShadowTargets {
         resolutions,
         cascade_views,
@@ -300,7 +306,8 @@ pub fn prepare_vegetation_shadow_maps(
     }
     let resolutions = if extracted.enabled() { SHADOW_RESOLUTIONS } else { [1; SHADOW_CASCADES] };
     let targets = create_targets(&device, resolutions);
-    queue.write_buffer(&targets.uniform, 0, bytemuck::bytes_of(&ShadowUniform::disabled()));
+    let initial_uniform = ShadowUniform::disabled();
+    queue.write_buffer(&targets.uniform, 0, bytemuck::bytes_of(&initial_uniform));
     maps.targets = Some(targets);
 }
 

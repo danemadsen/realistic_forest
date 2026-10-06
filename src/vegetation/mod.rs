@@ -147,23 +147,22 @@ pub struct VegetationField {
 
 impl VegetationField {
     pub fn new(noise: Arc<NoiseField>, enabled: bool) -> Self {
-        let loading = enabled.then(|| {
-            AsyncComputeTaskPool::get().spawn(async move {
-                let start = std::time::Instant::now();
-                let assets = VegetationAssets::load(map::model_directory());
-                if let Ok(assets) = &assets {
-                    log::info!(
-                        "VEGETATION: {} models, {} textures ({:.0} MiB), {} triangles loaded in {:.1?}",
-                        assets.models.len(),
-                        assets.textures.len(),
-                        assets.texture_bytes() as f64 / (1024.0 * 1024.0),
-                        assets.indices.len() / 3,
-                        start.elapsed()
-                    );
-                }
-                assets
-            })
-        });
+        let load_library = async move {
+            let start = std::time::Instant::now();
+            let assets = VegetationAssets::load(map::model_directory());
+            if let Ok(assets) = &assets {
+                log::info!(
+                    "VEGETATION: {} models, {} textures ({:.0} MiB), {} triangles loaded in {:.1?}",
+                    assets.models.len(),
+                    assets.textures.len(),
+                    assets.texture_bytes() as f64 / (1024.0 * 1024.0),
+                    assets.indices.len() / 3,
+                    start.elapsed()
+                );
+            }
+            assets
+        };
+        let loading = enabled.then(|| AsyncComputeTaskPool::get().spawn(load_library));
         Self {
             enabled,
             noise,
@@ -282,14 +281,15 @@ pub fn stream_vegetation(
     field.since_publish += time.delta_secs();
 
     // Collect finished levels.
+    let store_level = |(key, plants): (([i64; 2], u8), Vec<PlantInstance>)| {
+        field.chunks.entry(key.0).or_default()[key.1 as usize] = Some(Arc::new(plants));
+        key
+    };
     let finished: Vec<([i64; 2], u8)> = field
         .tasks
         .iter_mut()
         .filter_map(|(key, task)| block_on(poll_once(task)).map(|plants| (*key, plants)))
-        .map(|(key, plants)| {
-            field.chunks.entry(key.0).or_default()[key.1 as usize] = Some(Arc::new(plants));
-            key
-        })
+        .map(store_level)
         .collect();
     for key in &finished {
         field.tasks.remove(key);

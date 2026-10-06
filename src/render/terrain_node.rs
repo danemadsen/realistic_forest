@@ -514,7 +514,7 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
             terrain_revision,
         );
         if gbuffer.lighting_heightfield_key != Some(key) {
-            let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+            let lighting_pass_descriptor = wgpu::RenderPassDescriptor {
                 label: Some("forest_lighting_heightfield"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &gbuffer.heightfield_view,
@@ -529,7 +529,8 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
-            });
+            };
+            let mut pass = ctx.begin_tracked_render_pass(lighting_pass_descriptor);
             pass.set_render_pipeline(pipeline);
             pass.set_bind_group(0, &resources.globals, &[]);
             pass.set_bind_group(1, &resources.terrain_textures, &[]);
@@ -552,21 +553,22 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
                 world.get_resource::<RenderDevice>(),
             )
         {
+            let highest_entries = [
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&gbuffer.heightfield_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: resources.highest_buffer.as_entire_binding(),
+                },
+            ];
             let group = super::bind_group(
                 device,
                 pipeline_cache,
                 "forest_heightfield_highest",
                 &resources.highest_layout,
-                &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&gbuffer.heightfield_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: resources.highest_buffer.as_entire_binding(),
-                    },
-                ],
+                &highest_entries,
             );
             let encoder = ctx.command_encoder();
             encoder.clear_buffer(&resources.highest_buffer, 0, None);
@@ -610,7 +612,7 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         let mut local_globals = globals.globals;
         local_globals.heightfield = shore_mapping;
         queue.write_buffer(&resources.shore_globals.buffer, 0, bytemuck::bytes_of(&local_globals));
-        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        let shore_pass_descriptor = wgpu::RenderPassDescriptor {
             label: Some("forest_shore_heightfield"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &gbuffer.shore_heightfield_view,
@@ -625,7 +627,8 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
-        });
+        };
+        let mut pass = ctx.begin_tracked_render_pass(shore_pass_descriptor);
         pass.set_render_pipeline(pipeline);
         pass.set_bind_group(0, &resources.shore_globals.bind_group, &[]);
         pass.set_bind_group(1, &resources.terrain_textures, &[]);
@@ -655,42 +658,45 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
     {
         gbuffer.grass_habitat_ready = false;
         // A crest bound protects roots even when the user increases the sea state.
-        let crest = water.map(|water| {
+        let crest_bound = |water: &super::water_node::ExtractedWater| {
             let spectrum = crate::water::waves::build(
                 water.settings.sea_state_amplitude,
                 water.settings.wind_direction_degrees.to_radians(),
             );
             crate::water::displacement_bounds(&spectrum, water.settings.flat_surface) + 0.10
-        });
+        };
+        let crest = water.map(crest_bound);
         let habitat_globals = habitat_capture_globals(&globals.globals, mapping, crest);
         queue.write_buffer(&resources.habitat_globals.buffer, 0, bytemuck::bytes_of(&habitat_globals));
-        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        let habitat_attachments = [
+            Some(wgpu::RenderPassColorAttachment {
+                view: &gbuffer.grass_habitat_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            }),
+            Some(wgpu::RenderPassColorAttachment {
+                view: &gbuffer.grass_ground_albedo_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            }),
+        ];
+        let habitat_pass_descriptor = wgpu::RenderPassDescriptor {
             label: Some("forest_grass_habitat"),
-            color_attachments: &[
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &gbuffer.grass_habitat_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                }),
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &gbuffer.grass_ground_albedo_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                }),
-            ],
+            color_attachments: &habitat_attachments,
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
-        });
+        };
+        let mut pass = ctx.begin_tracked_render_pass(habitat_pass_descriptor);
         pass.set_render_pipeline(pipeline);
         pass.set_bind_group(0, &resources.habitat_globals.bind_group, &[]);
         pass.set_bind_group(1, &resources.terrain_textures, &[]);
@@ -715,7 +721,7 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         if let Some(average_pipeline) = pipeline_cache
             .get_render_pipeline(resources.grass_ground_average_pipeline)
         {
-            let mut average_pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+            let average_pass_descriptor = wgpu::RenderPassDescriptor {
                 label: Some("forest_grass_ground_average"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &gbuffer.grass_ground_base_view,
@@ -730,7 +736,8 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
-            });
+            };
+            let mut average_pass = ctx.begin_tracked_render_pass(average_pass_descriptor);
             average_pass.set_render_pipeline(average_pipeline);
             average_pass.set_bind_group(0, &gbuffer.grass_ground_average_bind_group, &[]);
             average_pass.draw(0..3, 0..1);
@@ -1165,18 +1172,19 @@ fn make_sampler(
     filter: wgpu::FilterMode,
     address: wgpu::AddressMode,
 ) -> wgpu::Sampler {
+    let sampler_descriptor = wgpu::SamplerDescriptor {
+        label: Some(label),
+        address_mode_u: address,
+        address_mode_v: address,
+        address_mode_w: address,
+        mag_filter: filter,
+        min_filter: filter,
+        mipmap_filter: mipmap_mode(filter),
+        ..Default::default()
+    };
     device
         .wgpu_device()
-        .create_sampler(&wgpu::SamplerDescriptor {
-            label: Some(label),
-            address_mode_u: address,
-            address_mode_v: address,
-            address_mode_w: address,
-            mag_filter: filter,
-            min_filter: filter,
-            mipmap_filter: mipmap_mode(filter),
-            ..Default::default()
-        })
+        .create_sampler(&sampler_descriptor)
 }
 
 /// `make_sampler` plus the anisotropic clamp the PBR arrays carry. wgpu
@@ -1188,19 +1196,20 @@ fn make_anisotropic_sampler(
     filter: wgpu::FilterMode,
     address: wgpu::AddressMode,
 ) -> wgpu::Sampler {
+    let sampler_descriptor = wgpu::SamplerDescriptor {
+        label: Some(label),
+        address_mode_u: address,
+        address_mode_v: address,
+        address_mode_w: address,
+        mag_filter: filter,
+        min_filter: filter,
+        mipmap_filter: mipmap_mode(filter),
+        anisotropy_clamp: TERRAIN_ANISOTROPY_CLAMP,
+        ..Default::default()
+    };
     device
         .wgpu_device()
-        .create_sampler(&wgpu::SamplerDescriptor {
-            label: Some(label),
-            address_mode_u: address,
-            address_mode_v: address,
-            address_mode_w: address,
-            mag_filter: filter,
-            min_filter: filter,
-            mipmap_filter: mipmap_mode(filter),
-            anisotropy_clamp: TERRAIN_ANISOTROPY_CLAMP,
-            ..Default::default()
-        })
+        .create_sampler(&sampler_descriptor)
 }
 
 fn build_terrain_samplers(device: &RenderDevice) -> TerrainSamplers {
@@ -1324,7 +1333,7 @@ fn queue_gbuffer_pipeline(
     vertex_buffers: Vec<VertexBufferLayout>,
     layouts: Vec<BindGroupLayoutDescriptor>,
 ) -> CachedRenderPipelineId {
-    cache.queue_render_pipeline(RenderPipelineDescriptor {
+    let descriptor = RenderPipelineDescriptor {
         label: Some(label.into()),
         layout: layouts,
         immediate_size: 0,
@@ -1394,7 +1403,8 @@ fn queue_gbuffer_pipeline(
             ],
         }),
         zero_initialize_workgroup_memory: false,
-    })
+    };
+    cache.queue_render_pipeline(descriptor)
 }
 
 // ---------------------------------------------------------------------------
@@ -1445,7 +1455,7 @@ fn prepare_terrain(
     // group(1): the world textures; group(2): the per-draw stage blocks.
     let terrain_textures_layout = terrain_texture_layout();
     let samplers = build_terrain_samplers(device);
-    let snow_texture = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+    let snow_texture_descriptor = wgpu::TextureDescriptor {
         label: Some("forest_snow_compression"),
         size: wgpu::Extent3d {
             width: crate::snow::SNOW_MAP_SIZE as u32,
@@ -1458,7 +1468,8 @@ fn prepare_terrain(
         format: wgpu::TextureFormat::R8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
-    });
+    };
+    let snow_texture = device.wgpu_device().create_texture(&snow_texture_descriptor);
     let snow_view = snow_texture.create_view(&Default::default());
     let snow_uniform = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("forest_snow_mapping"),
@@ -1482,24 +1493,26 @@ fn prepare_terrain(
 
     // terrain-vs + terrain-fs over a plain vec3 position, into the same three
     // colour targets the other G-buffer passes use.
+    let terrain_vertex_buffers = vec![VertexBufferLayout {
+        array_stride: TERRAIN_VERTEX_STRIDE,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: TERRAIN_VERTEX_ATTRIBUTES.to_vec(),
+    }];
+    let terrain_pipeline_layouts = vec![
+        globals_layout.clone(),
+        terrain_textures_layout.clone(),
+        terrain_stage_layout.clone(),
+    ];
     let terrain_pipeline = queue_gbuffer_pipeline(
         &pipeline_cache,
         "forest_terrain_pipeline",
         shaders.terrain_vs.clone(),
         shaders.terrain_fs.clone(),
-        vec![VertexBufferLayout {
-            array_stride: TERRAIN_VERTEX_STRIDE,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: TERRAIN_VERTEX_ATTRIBUTES.to_vec(),
-        }],
-        vec![
-            globals_layout.clone(),
-            terrain_textures_layout.clone(),
-            terrain_stage_layout.clone(),
-        ],
+        terrain_vertex_buffers,
+        terrain_pipeline_layouts,
     );
 
-    let habitat_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+    let habitat_pipeline_descriptor = RenderPipelineDescriptor {
         label: Some("forest_grass_habitat_pipeline".into()),
         layout: vec![globals_layout.clone(), terrain_textures_layout.clone(), terrain_stage_layout.clone()],
         immediate_size: 0,
@@ -1534,9 +1547,10 @@ fn prepare_terrain(
             ],
         }),
         zero_initialize_workgroup_memory: false,
-    });
+    };
+    let habitat_pipeline = pipeline_cache.queue_render_pipeline(habitat_pipeline_descriptor);
 
-    let grass_ground_average_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+    let ground_average_pipeline_descriptor = RenderPipelineDescriptor {
         label: Some("forest_grass_ground_average_pipeline".into()),
         layout: vec![grass_ground_average_layout()],
         immediate_size: 0,
@@ -1560,9 +1574,11 @@ fn prepare_terrain(
             })],
         }),
         zero_initialize_workgroup_memory: false,
-    });
+    };
+    let grass_ground_average_pipeline =
+        pipeline_cache.queue_render_pipeline(ground_average_pipeline_descriptor);
 
-    let heightfield_pipeline = pipeline_cache.queue_render_pipeline(RenderPipelineDescriptor {
+    let heightfield_pipeline_descriptor = RenderPipelineDescriptor {
         label: Some("forest_lighting_heightfield_pipeline".into()),
         layout: vec![globals_layout.clone(), terrain_textures_layout, terrain_stage_layout.clone()],
         immediate_size: 0,
@@ -1586,34 +1602,37 @@ fn prepare_terrain(
             })],
         }),
         zero_initialize_workgroup_memory: false,
-    });
+    };
+    let heightfield_pipeline =
+        pipeline_cache.queue_render_pipeline(heightfield_pipeline_descriptor);
 
+    let highest_layout_entries = [
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        },
+        wgpu::BindGroupLayoutEntry {
+            binding: 1,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(4),
+            },
+            count: None,
+        },
+    ];
     let highest_layout = BindGroupLayoutDescriptor::new(
         "forest_heightfield_highest_layout",
-        &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(4),
-                },
-                count: None,
-            },
-        ],
+        &highest_layout_entries,
     );
-    let highest_pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    let compute_pipeline_descriptor = ComputePipelineDescriptor {
         label: Some("forest_heightfield_highest_pipeline".into()),
         layout: vec![highest_layout.clone()],
         immediate_size: 0,
@@ -1621,7 +1640,8 @@ fn prepare_terrain(
         shader_defs: vec![],
         entry_point: Some("reduce_highest".into()),
         zero_initialize_workgroup_memory: false,
-    });
+    };
+    let highest_pipeline = pipeline_cache.queue_compute_pipeline(compute_pipeline_descriptor);
     let highest_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("forest_heightfield_highest"),
         size: 4,
@@ -1639,7 +1659,7 @@ fn prepare_terrain(
         )
     });
 
-    *resources = Some(TerrainResources {
+    let terrain_resources = TerrainResources {
         globals: globals_bind_group,
         terrain_textures,
         snow_texture,
@@ -1666,7 +1686,8 @@ fn prepare_terrain(
         center_mesh: build_clip_mesh(device, false),
         ring_mesh: build_clip_mesh(device, true),
         levels,
-    });
+    };
+    *resources = Some(terrain_resources);
 
     // `samplers` and the standalone layouts are deliberately not stored: a
     // wgpu bind group keeps its bound resources alive, and the
@@ -1727,7 +1748,7 @@ pub(crate) fn resize_gbuffer(
         // CreateGBuffer: RGBA32F position, RGBA16F normal, RGBA8 albedo, then
         // rlLoadTextureDepth(w, h, true). Each view keeps its own texture
         // alive, so the wgpu texture handles are not stored.
-        let position_texture = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+        let position_texture_descriptor = wgpu::TextureDescriptor {
             label: Some("forest_gbuffer_position"),
             size,
             mip_level_count: 1,
@@ -1736,8 +1757,9 @@ pub(crate) fn resize_gbuffer(
             format: wgpu::TextureFormat::Rgba32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        });
-        let normal_texture = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+        };
+        let position_texture = device.wgpu_device().create_texture(&position_texture_descriptor);
+        let normal_texture_descriptor = wgpu::TextureDescriptor {
             label: Some("forest_gbuffer_normal"),
             size,
             mip_level_count: 1,
@@ -1746,8 +1768,9 @@ pub(crate) fn resize_gbuffer(
             format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        });
-        let albedo_texture = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+        };
+        let normal_texture = device.wgpu_device().create_texture(&normal_texture_descriptor);
+        let albedo_texture_descriptor = wgpu::TextureDescriptor {
             label: Some("forest_gbuffer_albedo"),
             size,
             mip_level_count: 1,
@@ -1756,8 +1779,9 @@ pub(crate) fn resize_gbuffer(
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        });
-        let depth_texture = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+        };
+        let albedo_texture = device.wgpu_device().create_texture(&albedo_texture_descriptor);
+        let depth_texture_descriptor = wgpu::TextureDescriptor {
             label: Some("forest_gbuffer_depth"),
             size,
             mip_level_count: 1,
@@ -1766,9 +1790,10 @@ pub(crate) fn resize_gbuffer(
             format: wgpu::TextureFormat::Depth32Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        });
+        };
+        let depth_texture = device.wgpu_device().create_texture(&depth_texture_descriptor);
 
-        let grass_ground_albedo_view = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+        let grass_ground_albedo_descriptor = wgpu::TextureDescriptor {
             label: Some("forest_grass_ground_albedo"),
             size: wgpu::Extent3d {
                 width: GRASS_HABITAT_SIZE, height: GRASS_HABITAT_SIZE, depth_or_array_layers: 1,
@@ -1779,7 +1804,10 @@ pub(crate) fn resize_gbuffer(
             format: wgpu::TextureFormat::Rgba16Float,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
-        }).create_view(&Default::default());
+        };
+        let grass_ground_albedo_texture =
+            device.wgpu_device().create_texture(&grass_ground_albedo_descriptor);
+        let grass_ground_albedo_view = grass_ground_albedo_texture.create_view(&Default::default());
         let grass_ground_average_bind_group = super::bind_group(
             &device,
             &pipeline_cache,
@@ -1790,7 +1818,7 @@ pub(crate) fn resize_gbuffer(
                 resource: wgpu::BindingResource::TextureView(&grass_ground_albedo_view),
             }],
         );
-        let grass_ground_base_view = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+        let grass_ground_base_descriptor = wgpu::TextureDescriptor {
             label: Some("forest_grass_ground_base"),
             size: wgpu::Extent3d {
                 width: GRASS_GROUND_AVERAGE_SIZE, height: GRASS_GROUND_AVERAGE_SIZE,
@@ -1804,8 +1832,11 @@ pub(crate) fn resize_gbuffer(
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
-        }).create_view(&Default::default());
-        let grass_ground_average_view = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+        };
+        let grass_ground_base_texture =
+            device.wgpu_device().create_texture(&grass_ground_base_descriptor);
+        let grass_ground_base_view = grass_ground_base_texture.create_view(&Default::default());
+        let grass_ground_average_descriptor = wgpu::TextureDescriptor {
             label: Some("forest_grass_ground_average"),
             size: wgpu::Extent3d {
                 width: GRASS_GROUND_AVERAGE_SIZE, height: GRASS_GROUND_AVERAGE_SIZE,
@@ -1819,53 +1850,69 @@ pub(crate) fn resize_gbuffer(
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
-        }).create_view(&Default::default());
+        };
+        let grass_ground_average_texture =
+            device.wgpu_device().create_texture(&grass_ground_average_descriptor);
+        let grass_ground_average_view =
+            grass_ground_average_texture.create_view(&Default::default());
 
-        *gbuffer = Some(GbufferTargets {
+        let heightfield_texture_descriptor = wgpu::TextureDescriptor {
+            label: Some("forest_lighting_heightfield"),
+            size: wgpu::Extent3d {
+                width: LIGHTING_HEIGHTFIELD_SIZE,
+                height: LIGHTING_HEIGHTFIELD_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        let heightfield_texture =
+            device.wgpu_device().create_texture(&heightfield_texture_descriptor);
+        let heightfield_view =
+            heightfield_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let shore_texture_descriptor = wgpu::TextureDescriptor {
+            label: Some("forest_shore_heightfield"),
+            size: wgpu::Extent3d {
+                width: SHORE_HEIGHTFIELD_SIZE,
+                height: SHORE_HEIGHTFIELD_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        let shore_texture = device.wgpu_device().create_texture(&shore_texture_descriptor);
+        let shore_heightfield_view = shore_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let grass_habitat_texture_descriptor = wgpu::TextureDescriptor {
+            label: Some("forest_grass_habitat"),
+            size: wgpu::Extent3d {
+                width: GRASS_HABITAT_SIZE, height: GRASS_HABITAT_SIZE, depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        let grass_habitat_texture =
+            device.wgpu_device().create_texture(&grass_habitat_texture_descriptor);
+        let grass_habitat_view = grass_habitat_texture.create_view(&Default::default());
+        let gbuffer_targets = GbufferTargets {
             position_view: position_texture.create_view(&wgpu::TextureViewDescriptor::default()),
             normal_view: normal_texture.create_view(&wgpu::TextureViewDescriptor::default()),
             albedo_view: albedo_texture.create_view(&wgpu::TextureViewDescriptor::default()),
             depth_view: depth_texture.create_view(&wgpu::TextureViewDescriptor::default()),
-            heightfield_view: device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
-                label: Some("forest_lighting_heightfield"),
-                size: wgpu::Extent3d {
-                    width: LIGHTING_HEIGHTFIELD_SIZE,
-                    height: LIGHTING_HEIGHTFIELD_SIZE,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R32Float,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            }).create_view(&wgpu::TextureViewDescriptor::default()),
-            shore_heightfield_view: device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
-                label: Some("forest_shore_heightfield"),
-                size: wgpu::Extent3d {
-                    width: SHORE_HEIGHTFIELD_SIZE,
-                    height: SHORE_HEIGHTFIELD_SIZE,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R32Float,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            }).create_view(&wgpu::TextureViewDescriptor::default()),
-            grass_habitat_view: device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
-                label: Some("forest_grass_habitat"),
-                size: wgpu::Extent3d {
-                    width: GRASS_HABITAT_SIZE, height: GRASS_HABITAT_SIZE, depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba32Float,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            }).create_view(&Default::default()),
+            heightfield_view,
+            shore_heightfield_view,
+            grass_habitat_view,
             grass_ground_albedo_view,
             grass_ground_base_view,
             grass_ground_average_view,
@@ -1880,7 +1927,8 @@ pub(crate) fn resize_gbuffer(
             shore_heightfield_ready: false,
             width,
             height,
-        });
+        };
+        *gbuffer = Some(gbuffer_targets);
     }
 
 }
@@ -1890,16 +1938,13 @@ pub(crate) fn resize_gbuffer(
 /// and after the shared globals buffer exists. The world-texture dependency is
 /// covered by the guard inside [`prepare_terrain`].
 pub fn register_terrain_systems(render_app: &mut bevy::app::SubApp) {
-    render_app.add_systems(
-        bevy::render::Render,
-        (resize_gbuffer, prepare_terrain)
-            .chain()
-            .in_set(bevy::render::RenderSystems::Prepare)
-            .after(crate::render::prepare_forest_globals)
-            // Textures before the first frame rather than the second; the
-            // guard in `prepare_terrain` still covers a reordering.
-            .after(crate::render::gpu_textures::prepare_gpu_textures),
-    );
+    let mut config = (resize_gbuffer, prepare_terrain).chain();
+    config = config.in_set(bevy::render::RenderSystems::Prepare);
+    config = config.after(crate::render::prepare_forest_globals);
+    // Textures before the first frame rather than the second; the
+    // guard in `prepare_terrain` still covers a reordering.
+    config = config.after(crate::render::gpu_textures::prepare_gpu_textures);
+    render_app.add_systems(bevy::render::Render, config);
 }
 
 #[cfg(test)]
@@ -2205,10 +2250,11 @@ mod heightfield_cache_tests {
         let source = include_str!("../../assets/shaders/terrain-vs.wgsl");
         let module = naga::front::wgsl::parse_str(source)
             .unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)));
-        let mut pending: Vec<&naga::Function> = module
+        let heightfield_entries = module
             .entry_points
             .iter()
-            .filter(|entry| matches!(entry.name.as_str(), "vs_heightfield" | "fs_heightfield"))
+            .filter(|entry| matches!(entry.name.as_str(), "vs_heightfield" | "fs_heightfield"));
+        let mut pending: Vec<&naga::Function> = heightfield_entries
             .map(|entry| &entry.function)
             .collect();
         assert_eq!(pending.len(), 2, "the capture's entry points moved");
@@ -2254,11 +2300,10 @@ mod heightfield_cache_tests {
         };
         let uses = |block: &str| -> BTreeSet<String> {
             let prefix = format!("{block}.");
-            members
+            let used_members = members
                 .iter()
-                .filter_map(|member| member.strip_prefix(&prefix))
-                .map(str::to_string)
-                .collect()
+                .filter_map(|member| member.strip_prefix(&prefix));
+            used_members.map(str::to_string).collect()
         };
 
         // The two uniform blocks below; the base noise and blend mask,

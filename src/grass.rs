@@ -160,8 +160,9 @@ impl GrassAssets {
     /// rocks and other models that share the directory.
     pub fn load(models_directory: impl AsRef<Path>) -> Result<Self, String> {
         let directory = models_directory.as_ref();
-        let mut paths = std::fs::read_dir(directory)
-            .map_err(|e| format!("Reading grass directory {}: {e}", directory.display()))?
+        let entries = std::fs::read_dir(directory)
+            .map_err(|e| format!("Reading grass directory {}: {e}", directory.display()))?;
+        let mut paths = entries
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("Reading grass directory entry: {e}"))?;
@@ -214,11 +215,10 @@ impl GrassAssets {
             .ok_or("Missing positions")?
             .collect();
         let normals: Vec<_> = reader.read_normals().ok_or("Missing normals")?.collect();
-        let uvs: Vec<_> = reader
+        let tex_coords = reader
             .read_tex_coords(0)
-            .ok_or("Missing UV0")?
-            .into_f32()
-            .collect();
+            .ok_or("Missing UV0")?;
+        let uvs: Vec<_> = tex_coords.into_f32().collect();
         let indices: Vec<u32> = reader
             .read_indices()
             .map(|indices| indices.into_u32().collect())
@@ -250,12 +250,13 @@ impl GrassAssets {
             })
             .collect();
         if vertices.iter().any(|v| {
-            v.position
+            let mut components = v
+                .position
                 .iter()
                 .chain(&v.normal)
                 .chain(&v.uv)
-                .chain(&v.tangent)
-                .any(|v| !v.is_finite())
+                .chain(&v.tangent);
+            components.any(|v| !v.is_finite())
         }) {
             return Err("Non-finite grass vertex data".into());
         }
@@ -294,7 +295,7 @@ impl GrassAssets {
             index
         } else {
             let index = self.materials.len();
-            self.materials.push(GrassMaterial {
+            let grass_material = GrassMaterial {
                 base_color: load_texture(base_image, path, blob, [255, 255, 255, 255])?,
                 normal: load_texture(normal_image, path, blob, [128, 128, 255, 255])?,
                 orm: load_texture(orm_image, path, blob, [255, 255, 0, 255])?,
@@ -304,7 +305,8 @@ impl GrassAssets {
                 metallic_factor: pbr.metallic_factor(),
                 roughness_factor: pbr.roughness_factor(),
                 occlusion_strength,
-            });
+            };
+            self.materials.push(grass_material);
             materials_by_key.insert(key, index);
             index
         };
@@ -317,30 +319,28 @@ impl GrassAssets {
             .iter()
             .map(|p| p[0].hypot(p[2]))
             .fold(0.0, f32::max);
-        self.models.push(GrassModel {
-            name: path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
+        let stem = path.file_stem().unwrap_or_default();
+        let name = stem.to_string_lossy().into_owned();
+        let model = GrassModel {
+            name,
             vertices,
             indices,
             material: material_index,
             height: maximum_y - minimum_y,
             radius,
-        });
+        };
+        self.models.push(model);
         Ok(())
     }
 }
 
 fn image_key(image: Option<&gltf::Image<'_>>, model: &Path) -> String {
     match image.map(|image| image.source()) {
-        Some(gltf::image::Source::Uri { uri, .. }) => model
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(uri)
-            .to_string_lossy()
-            .into_owned(),
+        Some(gltf::image::Source::Uri { uri, .. }) => {
+            let model_directory = model.parent().unwrap_or(Path::new("."));
+            let texture_path = model_directory.join(uri);
+            texture_path.to_string_lossy().into_owned()
+        }
         Some(gltf::image::Source::View { view, .. }) => {
             format!("{}#{}", model.display(), view.index())
         }
@@ -410,7 +410,7 @@ pub(crate) fn generate_tangents(
             }
         }
     }
-    normals
+    let vertex_tangents = normals
         .iter()
         .enumerate()
         .map(|(i, normal)| {
@@ -424,8 +424,8 @@ pub(crate) fn generate_tangents(
                 1.0
             };
             [tangent.x, tangent.y, tangent.z, handedness]
-        })
-        .collect()
+        });
+    vertex_tangents.collect()
 }
 
 impl GrassTexture {
@@ -680,7 +680,7 @@ pub fn scatter_grass(center: [f32; 2], model_count: usize) -> GrassField {
     field.grid.min = first_cell.map(|cell| cell as f32 * SCATTER_CELL_SIZE);
     field.grid.per_side = per_side;
 
-    let produced = generate_chunks(per_side * per_side, |chunk| {
+    let generate_chunk = |chunk| {
         let (chunk_x, chunk_z) = ((chunk % per_side) as i64, (chunk / per_side) as i64);
         let low = [
             first_cell[0] + chunk_x * CHUNK_CELLS,
@@ -691,7 +691,8 @@ pub fn scatter_grass(center: [f32; 2], model_count: usize) -> GrassField {
             (low[1] + CHUNK_CELLS - 1).min(anchor_cells[1] + cells),
         ];
         scatter_chunk(low, high, anchor, anchor_cells, model_count)
-    });
+    };
+    let produced = generate_chunks(per_side * per_side, generate_chunk);
     for (model, batches) in field.batches.iter_mut().enumerate() {
         for (layer, batch) in batches.iter_mut().enumerate() {
             let slot = model * LAYER_COUNT + layer;

@@ -63,13 +63,13 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
 pub fn generate_noise_samples() -> Vec<f32> {
     let mut samples = vec![0.0f32; NOISE_RESOLUTION * NOISE_RESOLUTION];
     let grid = Grid::<2, StaticArch>::new(NOISE_RESOLUTION, NOISE_RESOLUTION);
-    BatchNoise::<2, Fbm, Simplex>::builder(grid.x_iter(), grid.y_iter())
-        .seed(1337)
-        .octaves(5)
-        .frequency(0.0085)
-        .lacunarity(2.02)
-        .persistence(0.5)
-        .fill(samples.as_mut_slice());
+    let mut batch_builder = BatchNoise::<2, Fbm, Simplex>::builder(grid.x_iter(), grid.y_iter());
+    batch_builder = batch_builder.seed(1337);
+    batch_builder = batch_builder.octaves(5);
+    batch_builder = batch_builder.frequency(0.0085);
+    batch_builder = batch_builder.lacunarity(2.02);
+    batch_builder = batch_builder.persistence(0.5);
+    batch_builder.fill(samples.as_mut_slice());
     for sample in samples.iter_mut() {
         *sample = *sample * 0.5 + 0.5;
     }
@@ -203,10 +203,12 @@ pub fn base_height(noise: &NoiseField, x: f32, z: f32) -> f32 {
         + shape_elevation((macro_height - SEA_LEVEL) * LANDFORM_VERTICAL_SCALE)
         + fine_height * LANDFORM_VERTICAL_SCALE;
     let safe_height = SEA_LEVEL + 14.0 + plains * 1.8 + detail * 0.35;
+    let spawn_blend = smoothstep(22.0, 90.0, distance_from_spawn);
+    let blended_height = lerp(safe_height, height, spawn_blend);
     // The push goes on last, after the spawn blend, so the stabilised patch and
     // the open landscape are shaped by the same function and no artificial
     // ring appears at the blend's edge.
-    push_from_waterline(lerp(safe_height, height, smoothstep(22.0, 90.0, distance_from_spawn)))
+    push_from_waterline(blended_height)
 }
 
 /// The terrain shader's grass line: `grassHeight` in terrain-fs.wgsl, the
@@ -359,49 +361,55 @@ mod tests {
              }}",
             &terrain[start..end],
         );
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let module_descriptor = wgpu::ShaderModuleDescriptor {
             label: Some("terrain altitude regression"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        };
+        let shader = device.create_shader_module(module_descriptor);
+        let pipeline_descriptor = wgpu::ComputePipelineDescriptor {
             label: Some("terrain altitude regression"),
             layout: None,
             module: &shader,
             entry_point: Some("evaluate"),
             compilation_options: Default::default(),
             cache: None,
-        });
+        };
+        let pipeline = device.create_compute_pipeline(&pipeline_descriptor);
         let parameters: Vec<f32> = parameters.iter().map(|(_, value)| *value).collect();
-        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let uniform_descriptor = wgpu::util::BufferInitDescriptor {
             label: Some("terrain profile parameters"),
             contents: bytemuck::cast_slice(&parameters),
             usage: wgpu::BufferUsages::UNIFORM,
-        });
+        };
+        let uniform = device.create_buffer_init(&uniform_descriptor);
         let heights = [
             -1000.0, -500.0, -300.0, -180.0, -100.0, -90.0, -89.0, -88.0,
             -50.0, -20.0, -2.0, -0.1, -0.001, 0.0, 0.001, 0.1, 2.0, 20.0,
             50.0, 88.0, 89.0, 90.0, 100.0, 180.0, 300.0, 500.0, 1000.0,
         ];
         let samples: Vec<[f32; 4]> = heights.iter().map(|&h| [h, 0.0, 0.0, 0.0]).collect();
-        let output = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let output_descriptor = wgpu::util::BufferInitDescriptor {
             label: Some("terrain profile samples"),
             contents: bytemuck::cast_slice(&samples),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        });
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        };
+        let output = device.create_buffer_init(&output_descriptor);
+        let readback_descriptor = wgpu::BufferDescriptor {
             label: Some("terrain profile readback"),
             size: output.size(),
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
-        });
-        let bindings = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        };
+        let readback = device.create_buffer(&readback_descriptor);
+        let bind_group_descriptor = wgpu::BindGroupDescriptor {
             label: Some("terrain altitude regression"),
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: output.as_entire_binding() },
             ],
-        });
+        };
+        let bindings = device.create_bind_group(&bind_group_descriptor);
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_compute_pass(&Default::default());

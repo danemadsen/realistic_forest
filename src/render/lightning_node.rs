@@ -122,25 +122,27 @@ fn prepare_lightning(
         ));
     }
     if inner.bolt_layout.is_none() {
+        let bolt_entries = [wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(BOLT_UNIFORM_BYTES),
+            },
+            count: None,
+        }];
         let layout = BindGroupLayoutDescriptor::new(
             "forest_lightning_bolt_layout",
-            &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(BOLT_UNIFORM_BYTES),
-                },
-                count: None,
-            }],
+            &bolt_entries,
         );
-        let buffer = device.wgpu_device().create_buffer(&wgpu::BufferDescriptor {
+        let buffer_descriptor = wgpu::BufferDescriptor {
             label: Some("forest_lightning_bolt"),
             size: BOLT_UNIFORM_BYTES,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        };
+        let buffer = device.wgpu_device().create_buffer(&buffer_descriptor);
         let group = super::bind_group(
             &device,
             &cache,
@@ -157,7 +159,8 @@ fn prepare_lightning(
     }
     if bolt_visible(&view) {
         if let Some(buffer) = inner.bolt_buffer.as_ref() {
-            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&bolt_uniforms(&view)));
+            let uniforms = bolt_uniforms(&view);
+            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&uniforms));
         }
     }
 }
@@ -253,23 +256,24 @@ pub fn forest_lightning_pass(
         return;
     };
     let post_process = view.post_process_write();
+    let screen_entries = [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(post_process.source),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: wgpu::BindingResource::TextureView(&gbuffer.position_view),
+        },
+    ];
     let screen_group = super::bind_group(
         device,
         cache,
         "forest_lightning_screen",
         screen_layout,
-        &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(post_process.source),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::TextureView(&gbuffer.position_view),
-            },
-        ],
+        &screen_entries,
     );
-    let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+    let lightning_pass_descriptor = wgpu::RenderPassDescriptor {
         label: Some("forest_lightning_pass"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view: post_process.destination,
@@ -284,7 +288,8 @@ pub fn forest_lightning_pass(
         timestamp_writes: None,
         occlusion_query_set: None,
         multiview_mask: None,
-    });
+    };
+    let mut pass = ctx.begin_tracked_render_pass(lightning_pass_descriptor);
     pass.set_viewport(
         0.0,
         0.0,

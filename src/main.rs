@@ -207,7 +207,8 @@ fn main() {
     // streams: the first erosion tiles, the plants and the player's footing
     // all carve and avoid their channels.
     let river_field = {
-        let mut field = rivers::RiverField::new(std::sync::Arc::new(noise_field.clone()), !automation.no_rivers);
+        let river_noise = std::sync::Arc::new(noise_field.clone());
+        let mut field = rivers::RiverField::new(river_noise, !automation.no_rivers);
         let spawn = if automation.has_camera { automation.position } else { [0.0, 0.0, 0.0] };
         field.build_blocking(spawn[0], spawn[2]);
         // Bevy's logger does not exist yet; the summary goes straight out.
@@ -228,179 +229,182 @@ fn main() {
     let (screen_width, screen_height) =
         clamp_to_primary_work_area(automation.width as u32, automation.height as u32);
 
-    App::new()
-        .add_plugins(
-            bevy::DefaultPlugins
-                .set(bevy::window::WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "Forest - Infinite Procedural Terrain".into(),
-                        resizable: true,
-                        // InitWindow(screen_width, screen_height, ...) — the
-                        // clamped request, see clamp_to_primary_work_area.
-                        // Those are the C++'s *screen* (logical) dimensions:
-                        // it passes FLAG_WINDOW_HIGHDPI (main.cpp:2253), so
-                        // rcore_desktop_glfw.c scales the render size by
-                        // GetWindowScaleDPI() and ResizeSSAO/GetRenderWidth
-                        // (main.cpp:2233-2234, 2332) then run every 3D pass
-                        // and the screenshot at that doubled size. Leaving
-                        // scale_factor_override unset reproduces the request:
-                        // WindowResolution keeps the requested numbers as its
-                        // physical fields while its scale factor stays 1.0, so
-                        // width() is W and bevy_winit passes winit a
-                        // LogicalSize(W, H) — exactly raylib's W x H screen
-                        // points, which macOS backs with a 2W x 2H framebuffer
-                        // on a Retina panel.
-                        //
-                        // Overriding to 1.0 instead takes bevy_winit's
-                        // to_physical branch and asks winit for a
-                        // PhysicalSize(W, H), i.e. a window W/2 by H/2 points
-                        // on a 2x panel — half raylib's screen size, and a
-                        // request raylib never makes. It does NOT change the
-                        // captured pixels: bevy_winit calls
-                        // set_scale_factor_and_apply_to_physical_size right
-                        // after creating the window (bevy_window/src/
-                        // window.rs:1017-1021 multiplies physical_width and
-                        // physical_height by the OS scale factor), and the
-                        // render targets and camera are sized from
-                        // physical_size(), so a 2x panel gave 2W x 2H either
-                        // way — measured with both binaries on this Retina
-                        // panel: --size 400,300 wrote 800x600 PNGs and the
-                        // default size 2940x1782 from both. The override was
-                        // therefore a window-geometry error, not a capture
-                        // error, and removing it is what makes the two
-                        // binaries agree on the window they ask for.
-                        resolution: WindowResolution::new(screen_width, screen_height),
-                        ..default()
-                    }),
-                    exit_condition: bevy::window::ExitCondition::OnPrimaryClosed,
-                    close_when_requested: true,
-                    ..default()
-                })
-                .set(bevy::asset::AssetPlugin {
-                    file_path: resolve_asset_root(),
-                    ..default()
-                })
-                // The port filters R32Float (the noise field) and Rgba32Float
-                // (the erosion atlases and the G-buffer position target)
-                // through linear samplers; wgpu only permits that when the
-                // device advertises float32 filtering, which bevy does not
-                // request by default. TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
-                // is bevy's own default and must be kept alongside it.
-                .set(RenderPlugin {
-                    render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
-                        features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
-                            | wgpu::Features::FLOAT32_FILTERABLE,
-                        ..default()
-                    })),
-                    ..default()
-                }),
+    let window = Window {
+        title: "Forest - Infinite Procedural Terrain".into(),
+        resizable: true,
+        // InitWindow(screen_width, screen_height, ...) — the
+        // clamped request, see clamp_to_primary_work_area.
+        // Those are the C++'s *screen* (logical) dimensions:
+        // it passes FLAG_WINDOW_HIGHDPI (main.cpp:2253), so
+        // rcore_desktop_glfw.c scales the render size by
+        // GetWindowScaleDPI() and ResizeSSAO/GetRenderWidth
+        // (main.cpp:2233-2234, 2332) then run every 3D pass
+        // and the screenshot at that doubled size. Leaving
+        // scale_factor_override unset reproduces the request:
+        // WindowResolution keeps the requested numbers as its
+        // physical fields while its scale factor stays 1.0, so
+        // width() is W and bevy_winit passes winit a
+        // LogicalSize(W, H) — exactly raylib's W x H screen
+        // points, which macOS backs with a 2W x 2H framebuffer
+        // on a Retina panel.
+        //
+        // Overriding to 1.0 instead takes bevy_winit's
+        // to_physical branch and asks winit for a
+        // PhysicalSize(W, H), i.e. a window W/2 by H/2 points
+        // on a 2x panel — half raylib's screen size, and a
+        // request raylib never makes. It does NOT change the
+        // captured pixels: bevy_winit calls
+        // set_scale_factor_and_apply_to_physical_size right
+        // after creating the window (bevy_window/src/
+        // window.rs:1017-1021 multiplies physical_width and
+        // physical_height by the OS scale factor), and the
+        // render targets and camera are sized from
+        // physical_size(), so a 2x panel gave 2W x 2H either
+        // way — measured with both binaries on this Retina
+        // panel: --size 400,300 wrote 800x600 PNGs and the
+        // default size 2940x1782 from both. The override was
+        // therefore a window-geometry error, not a capture
+        // error, and removing it is what makes the two
+        // binaries agree on the window they ask for.
+        resolution: WindowResolution::new(screen_width, screen_height),
+        ..default()
+    };
+    let window_plugin = bevy::window::WindowPlugin {
+        primary_window: Some(window),
+        exit_condition: bevy::window::ExitCondition::OnPrimaryClosed,
+        close_when_requested: true,
+        ..default()
+    };
+    // The port filters R32Float (the noise field) and Rgba32Float
+    // (the erosion atlases and the G-buffer position target)
+    // through linear samplers; wgpu only permits that when the
+    // device advertises float32 filtering, which bevy does not
+    // request by default. TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+    // is bevy's own default and must be kept alongside it.
+    let render_plugin = RenderPlugin {
+        render_creation: RenderCreation::Automatic(Box::new(WgpuSettings {
+            features: wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES
+                | wgpu::Features::FLOAT32_FILTERABLE,
+            ..default()
+        })),
+        ..default()
+    };
+    let mut default_plugins = bevy::DefaultPlugins.build();
+    default_plugins = default_plugins.set(window_plugin);
+    default_plugins = default_plugins.set(bevy::asset::AssetPlugin {
+        file_path: resolve_asset_root(),
+        ..default()
+    });
+    default_plugins = default_plugins.set(render_plugin);
+
+    let mut app = App::new();
+    app.add_plugins(default_plugins);
+    app.add_plugins(EguiPlugin::default());
+    // Developer teleports update the camera during the egui pass. Run
+    // that pass before propagation so visibility sees the same pose.
+    app.configure_sets(
+        PostUpdate,
+        EguiPostUpdateSet::EndPass.before(bevy::transform::TransformSystems::Propagate),
+    );
+    // Installs the render-world state the flow-atlas paint callback builds
+    // its pipeline into (see FlowPreviewRenderState in src/ui.rs).
+    app.add_plugins(ui::UiRenderPlugin);
+    app.insert_resource(startup_settings);
+    app.insert_resource(day_night::DayNightCycle {
+        time_hours: automation.time_of_day,
+        paused: automation.pause_time,
+        day_length_minutes: automation.day_length_minutes,
+    });
+    app.init_resource::<weather::WeatherMotion>();
+    app.init_resource::<lightning::ActiveBolt>();
+    app.init_resource::<thunder::ThunderQueue>();
+    app.add_audio_source::<thunder::ThunderSound>();
+    let mut weather = weather::WeatherState::from_preset(
+        automation.weather_preset,
+        !automation.static_weather,
+    );
+    weather.overrides = weather::WeatherOverrides {
+        coverage: automation.cloud_coverage_override,
+        density: automation.cloud_density_override,
+        base: automation.cloud_base_override,
+        thickness: automation.cloud_thickness_override,
+    };
+    app.insert_resource(weather);
+    app.insert_resource(ErosionCache {
+        rivers: river_field.network().cloned(),
+        ..Default::default()
+    });
+    app.insert_resource(river_field);
+    app.init_resource::<snow::SnowState>();
+    app.insert_resource(ErosionSettings::default());
+    app.insert_resource(AppliedErosionSettings(ErosionSettings::default()));
+    app.insert_resource(RerunErosion::default());
+    app.insert_resource(PrewarmRemaining(automation.erosion_prewarm));
+    app.insert_resource(FrameCounter::default());
+    app.insert_resource(ShotRequested::default());
+    app.init_resource::<player::UiWantsInput>();
+    app.insert_resource(WorldOptions {
+        draw_ocean: !automation.no_water,
+    });
+    app.insert_resource(ErosionBridge::default());
+    // The render world spawns the erosion worker thread from this bridge
+    // (after the WGSL publisher's sources arrive). The thread is detached
+    // and never joined: every exit path — normal shutdown or `--shot`'s
+    // `std::process::exit`, which skips bevy teardown — simply drops the
+    // Arc'd state it holds, so nothing at exit can block on a worker that
+    // is mid-simulation.
+    let worker_noise = std::sync::Arc::new(noise_field.clone());
+    app.insert_resource(erosion::TilePreparation::new(worker_noise));
+    let vegetation_noise = std::sync::Arc::new(noise_field.clone());
+    app.insert_resource(vegetation::VegetationField::new(
+        vegetation_noise,
+        !automation.no_vegetation,
+    ));
+    app.insert_resource(noise_field.clone());
+    app.insert_resource(automation.clone());
+    // The render plugin lifts the shared noise field and erosion bridge
+    // into the render sub-app at build time, so they must exist first.
+    app.add_plugins(render::ForestRenderPlugin::new(noise_field.clone()));
+    app.add_systems(Startup, spawn_scene);
+    app.add_systems(
+        Startup,
+        (
+            setup_blend_mask,
+            setup_cursor_and_player,
         )
-        .add_plugins(EguiPlugin::default())
-        // Developer teleports update the camera during the egui pass. Run
-        // that pass before propagation so visibility sees the same pose.
-        .configure_sets(
-            PostUpdate,
-            EguiPostUpdateSet::EndPass.before(bevy::transform::TransformSystems::Propagate),
+            // The player entity must exist before the pose is pinned.
+            .chain()
+            .after(spawn_scene),
+    );
+    app.add_systems(
+        Update,
+        (
+            // The worker takes its WGSL from here; publish before any
+            // streaming system can begin a tile.
+            publish_erosion_shader_sources,
+            handle_global_keys,
+            day_night::advance_day_night,
+            weather::advance_weather,
+            thunder::queue_thunder,
+            thunder::play_thunder,
+            ui::ui_wants_input_system,
+            rivers::stream_rivers,
+            // --measure-overlap replaces normal streaming with its own
+            // driver, mirroring the C++ short-circuit in main().
+            erosion_stream_system.run_if(not_in_measure_mode),
+            player::update_player_system,
+            player::sync_player_camera_transform,
+            vegetation::stream_vegetation,
+            measure_overlap_system.run_if(in_measure_mode),
+            shot_scheduling_system,
         )
-        // Installs the render-world state the flow-atlas paint callback builds
-        // its pipeline into (see FlowPreviewRenderState in src/ui.rs).
-        .add_plugins(ui::UiRenderPlugin)
-        .insert_resource(startup_settings)
-        .insert_resource(day_night::DayNightCycle {
-            time_hours: automation.time_of_day,
-            paused: automation.pause_time,
-            day_length_minutes: automation.day_length_minutes,
-        })
-        .init_resource::<weather::WeatherMotion>()
-        .init_resource::<lightning::ActiveBolt>()
-        .init_resource::<thunder::ThunderQueue>()
-        .add_audio_source::<thunder::ThunderSound>()
-        .insert_resource({
-            let mut weather = weather::WeatherState::from_preset(
-                automation.weather_preset,
-                !automation.static_weather,
-            );
-            weather.overrides = weather::WeatherOverrides {
-                coverage: automation.cloud_coverage_override,
-                density: automation.cloud_density_override,
-                base: automation.cloud_base_override,
-                thickness: automation.cloud_thickness_override,
-            };
-            weather
-        })
-        .insert_resource(ErosionCache {
-            rivers: river_field.network().cloned(),
-            ..Default::default()
-        })
-        .insert_resource(river_field)
-        .init_resource::<snow::SnowState>()
-        .insert_resource(ErosionSettings::default())
-        .insert_resource(AppliedErosionSettings(ErosionSettings::default()))
-        .insert_resource(RerunErosion::default())
-        .insert_resource(PrewarmRemaining(automation.erosion_prewarm))
-        .insert_resource(FrameCounter::default())
-        .insert_resource(ShotRequested::default())
-        .init_resource::<player::UiWantsInput>()
-        .insert_resource(WorldOptions {
-            draw_ocean: !automation.no_water,
-        })
-        .insert_resource(ErosionBridge::default())
-        // The render world spawns the erosion worker thread from this bridge
-        // (after the WGSL publisher's sources arrive). The thread is detached
-        // and never joined: every exit path — normal shutdown or `--shot`'s
-        // `std::process::exit`, which skips bevy teardown — simply drops the
-        // Arc'd state it holds, so nothing at exit can block on a worker that
-        // is mid-simulation.
-        .insert_resource(erosion::TilePreparation::new(std::sync::Arc::new(noise_field.clone())))
-        .insert_resource(vegetation::VegetationField::new(
-            std::sync::Arc::new(noise_field.clone()),
-            !automation.no_vegetation,
-        ))
-        .insert_resource(noise_field.clone())
-        .insert_resource(automation.clone())
-        // The render plugin lifts the shared noise field and erosion bridge
-        // into the render sub-app at build time, so they must exist first.
-        .add_plugins(render::ForestRenderPlugin::new(noise_field.clone()))
-        .add_systems(Startup, spawn_scene)
-        .add_systems(
-            Startup,
-            (
-                setup_blend_mask,
-                setup_cursor_and_player,
-            )
-                // The player entity must exist before the pose is pinned.
-                .chain()
-                .after(spawn_scene),
-        )
-        .add_systems(
-            Update,
-            (
-                // The worker takes its WGSL from here; publish before any
-                // streaming system can begin a tile.
-                publish_erosion_shader_sources,
-                handle_global_keys,
-                day_night::advance_day_night,
-                weather::advance_weather,
-                thunder::queue_thunder,
-                thunder::play_thunder,
-                ui::ui_wants_input_system,
-                rivers::stream_rivers,
-                // --measure-overlap replaces normal streaming with its own
-                // driver, mirroring the C++ short-circuit in main().
-                erosion_stream_system.run_if(not_in_measure_mode),
-                player::update_player_system,
-                player::sync_player_camera_transform,
-                vegetation::stream_vegetation,
-                measure_overlap_system.run_if(in_measure_mode),
-                shot_scheduling_system,
-            )
-                .chain(),
-        )
-        .add_systems(
-            EguiPrimaryContextPass,
-            (ui::draw_diagnostics_ui, player::sync_player_camera_transform).chain(),
-        )
-        .run();
+            .chain(),
+    );
+    app.add_systems(
+        EguiPrimaryContextPass,
+        (ui::draw_diagnostics_ui, player::sync_player_camera_transform).chain(),
+    );
+    app.run();
 }
 
 /// The asset root the C++ used: `AssetPath` resolved `assets/` against the
@@ -433,7 +437,7 @@ fn resolve_asset_root() -> String {
 /// bevy_egui's auto-creation attaches the primary egui context to it.
 fn spawn_scene(mut commands: Commands) {
     commands.spawn(Player::default());
-    commands.spawn((
+    let camera_bundle = (
         Transform::default(),
         Projection::Perspective(PerspectiveProjection {
             fov: 68.0_f32.to_radians(),
@@ -449,7 +453,8 @@ fn spawn_scene(mut commands: Commands) {
         Frustum::default(),
         VisibleEntities::default(),
         Msaa::Off,
-    ));
+    );
+    commands.spawn(camera_bundle);
 }
 
 /// The CPU half of `CreateErosionBlendMask`: the per-texel mask that erosion
@@ -981,30 +986,31 @@ fn shot_scheduling_system(
     requested.0 = true;
     // The observer outlives this system, so it owns the path rather than
     // borrowing the resource.
+    let save_and_exit = move |trigger: On<ScreenshotCaptured>| {
+        let saved = write_png(&trigger.image, Path::new(&shot_path));
+        if saved {
+            log::info!("SCREENSHOT: saved {shot_path}");
+        }
+        // End the process here instead of letting an `AppExit` unwind the
+        // app: Bevy 0.17.3's pipelined-rendering teardown can park forever,
+        // and has been caught doing it. It is a race, not a plain deadlock
+        // — a sampled hung run showed the main thread parked in
+        // `World::clear_all` -> `RenderAppChannels::drop` ->
+        // `render_to_app_receiver.recv_blocking()`, while the render thread
+        // sat inside `RenderApp::update()` waiting on a
+        // main-thread-executor task that only the main schedule runs, and
+        // that schedule has already stopped. Neither a runner override
+        // (WinitPlugin owns the runner and needs it for the event loop) nor
+        // waiting longer helps, and nothing is left to tear down: the PNG
+        // is closed by `std::fs::write`, and the log line above is already
+        // on stderr. The C++'s automation path likewise just returns out of
+        // `main`, and this way a failed capture reports through the exit
+        // code rather than looking like a success.
+        std::process::exit(if saved { 0 } else { 1 });
+    };
     commands
         .spawn(Screenshot::primary_window())
-        .observe(move |trigger: On<ScreenshotCaptured>| {
-            let saved = write_png(&trigger.image, Path::new(&shot_path));
-            if saved {
-                log::info!("SCREENSHOT: saved {shot_path}");
-            }
-            // End the process here instead of letting an `AppExit` unwind the
-            // app: Bevy 0.17.3's pipelined-rendering teardown can park forever,
-            // and has been caught doing it. It is a race, not a plain deadlock
-            // — a sampled hung run showed the main thread parked in
-            // `World::clear_all` -> `RenderAppChannels::drop` ->
-            // `render_to_app_receiver.recv_blocking()`, while the render thread
-            // sat inside `RenderApp::update()` waiting on a
-            // main-thread-executor task that only the main schedule runs, and
-            // that schedule has already stopped. Neither a runner override
-            // (WinitPlugin owns the runner and needs it for the event loop) nor
-            // waiting longer helps, and nothing is left to tear down: the PNG
-            // is closed by `std::fs::write`, and the log line above is already
-            // on stderr. The C++'s automation path likewise just returns out of
-            // `main`, and this way a failed capture reports through the exit
-            // code rather than looking like a success.
-            std::process::exit(if saved { 0 } else { 1 });
-        });
+        .observe(save_and_exit);
 }
 
 #[cfg(test)]
@@ -1014,21 +1020,19 @@ mod global_key_tests {
 
     fn input_app() -> (App, Entity, Entity) {
         let mut app = App::new();
-        app.insert_resource(AppSettings::default())
-            .insert_resource(ButtonInput::<KeyCode>::default())
-            .add_systems(Update, handle_global_keys);
+        app.insert_resource(AppSettings::default());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.add_systems(Update, handle_global_keys);
         let player = app.world_mut().spawn(Player::default()).id();
-        let cursor = app
-            .world_mut()
-            .spawn((
-                PrimaryWindow,
-                CursorOptions {
-                    grab_mode: CursorGrabMode::Locked,
-                    visible: false,
-                    ..default()
-                },
-            ))
-            .id();
+        let cursor_bundle = (
+            PrimaryWindow,
+            CursorOptions {
+                grab_mode: CursorGrabMode::Locked,
+                visible: false,
+                ..default()
+            },
+        );
+        let cursor = app.world_mut().spawn(cursor_bundle).id();
         (app, player, cursor)
     }
 
@@ -1120,12 +1124,13 @@ mod global_key_tests {
         let ctx = context.get_mut();
         ctx.begin_pass(egui::RawInput::default());
         let mut coordinate = String::new();
+        let text_edit_field = |ui: &mut egui::Ui| {
+            let response = ui.text_edit_singleline(&mut coordinate);
+            response.request_focus();
+            response.id
+        };
         let field = egui::Area::new(egui::Id::new("coordinate_input_test"))
-            .show(ctx, |ui| {
-                let response = ui.text_edit_singleline(&mut coordinate);
-                response.request_focus();
-                response.id
-            })
+            .show(ctx, text_edit_field)
             .inner;
         let mut output = ctx.end_pass();
         output.textures_delta.clear();
@@ -1142,9 +1147,11 @@ mod global_key_tests {
             assert!(settings.show_trainer);
             assert!(!settings.show_debug);
         }
-        app.world_mut()
+        let mut stored_context = app
+            .world_mut()
             .get_mut::<EguiContext>(context_entity)
-            .unwrap()
+            .unwrap();
+        stored_context
             .get_mut()
             .memory_mut(|memory| memory.surrender_focus(field));
         press(&mut app, KeyCode::Digit2);
@@ -1157,11 +1164,12 @@ mod global_key_tests {
     #[test]
     fn closing_trainer_does_not_capture_mouse_during_pinned_screenshot() {
         let (mut app, player, cursor) = input_app();
-        app.insert_resource(AutomationSettings {
+        let automation = AutomationSettings {
             has_camera: true,
             shot_path: Some("capture.png".into()),
             ..default()
-        });
+        };
+        app.insert_resource(automation);
         press(&mut app, KeyCode::Digit2);
         press(&mut app, KeyCode::Digit2);
         assert!(!app.world().get::<Player>(player).unwrap().mouse_captured);
@@ -1179,24 +1187,26 @@ mod shot_scheduling_tests {
 
     fn capture_app(wait_frames: i32) -> (App, Entity) {
         let mut app = App::new();
-        app.insert_resource(AutomationSettings {
+        let automation = AutomationSettings {
             shot_path: Some("capture.png".into()),
             wait_frames,
             erosion_prewarm: 0,
             ..default()
-        })
-        .init_resource::<ErosionCache>()
-        .init_resource::<grass::GrassReadiness>()
-        .init_resource::<FrameCounter>()
-        .init_resource::<ShotRequested>()
-        .init_resource::<Time<Real>>()
-        .insert_resource(vegetation::VegetationField::new(
-            Arc::new(NoiseField {
-                samples: Vec::new(),
-            }),
+        };
+        app.insert_resource(automation);
+        app.init_resource::<ErosionCache>();
+        app.init_resource::<grass::GrassReadiness>();
+        app.init_resource::<FrameCounter>();
+        app.init_resource::<ShotRequested>();
+        app.init_resource::<Time<Real>>();
+        let empty_noise = NoiseField {
+            samples: Vec::new(),
+        };
+        app.insert_resource(vegetation::VegetationField::new(
+            Arc::new(empty_noise),
             false,
-        ))
-        .add_systems(Update, shot_scheduling_system);
+        ));
+        app.add_systems(Update, shot_scheduling_system);
         let player = app.world_mut().spawn(Player::default()).id();
         (app, player)
     }

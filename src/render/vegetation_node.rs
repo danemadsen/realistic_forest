@@ -339,7 +339,7 @@ fn storage_entry(binding: u32, visibility: wgpu::ShaderStages, read_only: bool) 
 }
 
 fn sampler(device: &RenderDevice, label: &str, address: wgpu::AddressMode, anisotropy: u16) -> wgpu::Sampler {
-    device.wgpu_device().create_sampler(&wgpu::SamplerDescriptor {
+    let sampler_descriptor = wgpu::SamplerDescriptor {
         label: Some(label),
         address_mode_u: address,
         address_mode_v: address,
@@ -349,7 +349,10 @@ fn sampler(device: &RenderDevice, label: &str, address: wgpu::AddressMode, aniso
         mipmap_filter: wgpu::MipmapFilterMode::Linear,
         anisotropy_clamp: anisotropy,
         ..Default::default()
-    })
+    };
+    device
+        .wgpu_device()
+        .create_sampler(&sampler_descriptor)
 }
 
 /// Paired billboard cards already have separate front and back faces. Cull
@@ -364,7 +367,7 @@ fn sided_pipelines(cache: &PipelineCache, descriptor: RenderPipelineDescriptor) 
 }
 
 fn upload_texture(device: &RenderDevice, queue: &RenderQueue, source: &PreparedTexture) -> wgpu::TextureView {
-    let texture = device.wgpu_device().create_texture(&wgpu::TextureDescriptor {
+    let texture_descriptor = wgpu::TextureDescriptor {
         label: Some(&source.label),
         size: wgpu::Extent3d {
             width: source.width,
@@ -381,7 +384,8 @@ fn upload_texture(device: &RenderDevice, queue: &RenderQueue, source: &PreparedT
         },
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
-    });
+    };
+    let texture = device.wgpu_device().create_texture(&texture_descriptor);
     for (level, data) in source.levels.iter().enumerate() {
         let width = (source.width >> level).max(1);
         let height = (source.height >> level).max(1);
@@ -504,29 +508,30 @@ fn build_library(
                 contents: bytemuck::bytes_of(&uniform),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
+            let material_entries = [
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&views[material.base_color]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&views[material.detail]),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&material_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buffer.as_entire_binding(),
+                },
+            ];
             let bind_group = super::bind_group(
                 device,
                 cache,
                 "vegetation_material",
                 &material_layout,
-                &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&views[material.base_color]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&views[material.detail]),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&material_sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: buffer.as_entire_binding(),
-                    },
-                ],
+                &material_entries,
             );
             MaterialResources { bind_group, double_sided: material.double_sided }
         })
@@ -666,7 +671,7 @@ fn build_library(
             storage_entry(2, wgpu::ShaderStages::VERTEX, true),
         ],
     );
-    let cull_pipeline = cache.queue_compute_pipeline(ComputePipelineDescriptor {
+    let cull_pipeline_descriptor = ComputePipelineDescriptor {
         label: Some("forest_vegetation_cull_pipeline".into()),
         layout: vec![cull_globals_layout.clone(), terrain_layout.clone(), cull_layout.clone()],
         immediate_size: 0,
@@ -674,7 +679,8 @@ fn build_library(
         shader_defs: vec![],
         entry_point: Some("cull_plants".into()),
         zero_initialize_workgroup_memory: false,
-    });
+    };
+    let cull_pipeline = cache.queue_compute_pipeline(cull_pipeline_descriptor);
     let vertex_attributes =
         wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2, 3 => Float32x4];
     let instance_attributes = wgpu::vertex_attr_array![
@@ -693,7 +699,7 @@ fn build_library(
         },
     ];
     let draw_globals_layout = super::globals_layout();
-    let draw_pipelines = sided_pipelines(cache, RenderPipelineDescriptor {
+    let draw_pipeline_descriptor = RenderPipelineDescriptor {
         label: Some("forest_vegetation_pipeline".into()),
         layout: vec![draw_globals_layout.clone(), frame_layout.clone(), material_layout.clone()],
         immediate_size: 0,
@@ -732,7 +738,8 @@ fn build_library(
             .to_vec(),
         }),
         zero_initialize_workgroup_memory: false,
-    });
+    };
+    let draw_pipelines = sided_pipelines(cache, draw_pipeline_descriptor);
     // Shadows: depth only, from the light, with the same wind as the view.
     let cascade_layout = BindGroupLayoutDescriptor::new(
         "vegetation_cascade_layout",
@@ -742,7 +749,7 @@ fn build_library(
             std::mem::size_of::<CascadeUniform>() as u64,
         )],
     );
-    let shadow_pipelines = sided_pipelines(cache, RenderPipelineDescriptor {
+    let shadow_pipeline_descriptor = RenderPipelineDescriptor {
         label: Some("forest_vegetation_shadow_pipeline".into()),
         layout: vec![cascade_layout.clone(), frame_layout.clone(), material_layout],
         immediate_size: 0,
@@ -771,10 +778,11 @@ fn build_library(
             targets: vec![],
         }),
         zero_initialize_workgroup_memory: false,
-    });
+    };
+    let shadow_pipelines = sided_pipelines(cache, shadow_pipeline_descriptor);
     // Crowns from above over the grass capture: multiplies the alpha of its
     // ground-colour texture by the light each crown lets through.
-    let canopy_pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
+    let canopy_pipeline_descriptor = RenderPipelineDescriptor {
         label: Some("forest_vegetation_canopy_pipeline".into()),
         layout: vec![draw_globals_layout.clone(), frame_layout.clone()],
         immediate_size: 0,
@@ -805,7 +813,8 @@ fn build_library(
             })],
         }),
         zero_initialize_workgroup_memory: false,
-    });
+    };
+    let canopy_pipeline = cache.queue_render_pipeline(canopy_pipeline_descriptor);
     let cascade_buffers: Vec<Buffer> = (0..SHADOW_CASCADES)
         .map(|_| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -915,7 +924,7 @@ fn build_snapshot(
     }
     queue.write_buffer(&library.models, 0, bytemuck::cast_slice(&library.params));
     let placeholder = [PlantInstance::default()];
-    let plants = device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
+    let plants_descriptor = wgpu::util::BufferInitDescriptor {
         label: Some("vegetation_plants"),
         contents: bytemuck::cast_slice(if snapshot.plants.is_empty() {
             &placeholder
@@ -923,66 +932,70 @@ fn build_snapshot(
             &snapshot.plants
         }),
         usage: wgpu::BufferUsages::STORAGE,
-    });
+    };
+    let plants = device.create_buffer_with_data(&plants_descriptor);
     let visible = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("vegetation_visible"),
         size: (OUTPUT_SLOTS * plant_count.max(1) as u64 * INSTANCE_STRIDE).max(INSTANCE_STRIDE),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX,
         mapped_at_creation: false,
     });
+    let cull_entries = [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: library.cull_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: plants.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: library.models.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: visible.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 4,
+            resource: library.args.as_entire_binding(),
+        },
+    ];
     let cull_group = super::bind_group(
         device,
         cache,
         "vegetation_cull",
         &library.cull_layout,
-        &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: library.cull_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: plants.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: library.models.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: visible.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: library.args.as_entire_binding(),
-            },
-        ],
+        &cull_entries,
     );
+    let frame_entries = [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: library.frame_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: library.models.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: plants.as_entire_binding(),
+        },
+    ];
     let frame_group = super::bind_group(
         device,
         cache,
         "vegetation_frame",
         &library.frame_layout,
-        &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: library.frame_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: library.models.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: plants.as_entire_binding(),
-            },
-        ],
+        &frame_entries,
     );
     let offsets = |draws: &[Draw]| -> Vec<(usize, u64)> {
-        draws
+        let visible_draws = draws
             .iter()
             .enumerate()
-            .filter(|(_, draw)| counts[draw.model as usize] > 0)
+            .filter(|(_, draw)| counts[draw.model as usize] > 0);
+        visible_draws
             .map(|(index, draw)| {
                 let model = &library.params[draw.model as usize];
                 let offset = (draw.slot as u64 * plant_count as u64 + model.region as u64) * INSTANCE_STRIDE;
@@ -991,13 +1004,14 @@ fn build_snapshot(
             .collect()
     };
     let active = offsets(&library.draws);
-    let shadow_active = std::array::from_fn(|cascade| {
+    let shadow_offsets = |cascade: usize| -> Vec<(usize, u64)> {
         let slot = LOD_SLOTS as u32 + cascade as u32;
         offsets(&library.shadow_draws)
             .into_iter()
             .filter(|&(index, _)| library.shadow_draws[index].slot == slot)
             .collect()
-    });
+    };
+    let shadow_active = std::array::from_fn(shadow_offsets);
     let region_bytes = counts.iter().map(|&count| count as u64 * INSTANCE_STRIDE).collect();
     SnapshotResources {
         generation: snapshot.generation,
@@ -1170,15 +1184,17 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
     ];
     let shadow_pipelines = library.shadow_pipelines.map(|pipeline| cache.get_render_pipeline(pipeline));
     let shadow_pipelines = shadow_pipelines[0].zip(shadow_pipelines[1]).map(|(single, double)| [single, double]);
-    let shadows = shadow_targets
-        .filter(|targets| targets.resolutions[0] > 1 && view.settings.vegetation_shadows)
+    let wanted_shadow_targets = shadow_targets
+        .filter(|targets| targets.resolutions[0] > 1 && view.settings.vegetation_shadows);
+    let shadow_inputs = wanted_shadow_targets
         .zip(shadow_pipelines)
-        .zip(shadowing_light(&globals.globals))
-        .map(|((targets, pipeline), (direction, moon))| {
-            let light = light_basis(direction);
-            let cascades = fit_cascades(camera, &view.shadow_receiver_heights, &light);
-            (targets, pipeline, light, cascades, moon)
-        });
+        .zip(shadowing_light(&globals.globals));
+    let assemble_shadows = |((targets, pipeline), (direction, moon))| {
+        let light = light_basis(direction);
+        let cascades = fit_cascades(camera, &view.shadow_receiver_heights, &light);
+        (targets, pipeline, light, cascades, moon)
+    };
+    let shadows = shadow_inputs.map(assemble_shadows);
 
     // Per-frame uniforms.
     let eye = view.player_position;
@@ -1232,61 +1248,62 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
 
     // The terrain inputs, rebound each frame: the habitat capture is
     // recreated with the G-buffer on resize.
+    let terrain_entries = [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&textures.noise_view),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: wgpu::BindingResource::Sampler(&library.noise_sampler),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: wgpu::BindingResource::TextureView(&textures.height_atlas_view),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: wgpu::BindingResource::Sampler(&library.atlas_sampler),
+        },
+        wgpu::BindGroupEntry {
+            binding: 4,
+            resource: wgpu::BindingResource::TextureView(&textures.lookup_view),
+        },
+        wgpu::BindGroupEntry {
+            binding: 5,
+            resource: wgpu::BindingResource::TextureView(&textures.blend_mask_view),
+        },
+        wgpu::BindGroupEntry {
+            binding: 6,
+            resource: wgpu::BindingResource::Sampler(&library.mask_sampler),
+        },
+        wgpu::BindGroupEntry {
+            binding: 7,
+            resource: library.stage_buffer.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 8,
+            resource: wgpu::BindingResource::TextureView(&gbuffer.grass_habitat_view),
+        },
+        wgpu::BindGroupEntry {
+            binding: 9,
+            resource: wgpu::BindingResource::Sampler(&library.habitat_sampler),
+        },
+        wgpu::BindGroupEntry {
+            binding: 10,
+            resource: textures.river_grid.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 11,
+            resource: textures.river_segments.as_entire_binding(),
+        },
+    ];
     let terrain_group = super::bind_group(
         device,
         cache,
         "vegetation_terrain",
         &library.terrain_layout,
-        &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&textures.noise_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&library.noise_sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(&textures.height_atlas_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: wgpu::BindingResource::Sampler(&library.atlas_sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(&textures.lookup_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: wgpu::BindingResource::TextureView(&textures.blend_mask_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: wgpu::BindingResource::Sampler(&library.mask_sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: library.stage_buffer.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 8,
-                resource: wgpu::BindingResource::TextureView(&gbuffer.grass_habitat_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 9,
-                resource: wgpu::BindingResource::Sampler(&library.habitat_sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 10,
-                resource: textures.river_grid.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 11,
-                resource: textures.river_segments.as_entire_binding(),
-            },
-        ],
+        &terrain_entries,
     );
 
     {
@@ -1315,7 +1332,7 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
                 },
             })
         });
-        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        let gbuffer_pass_descriptor = wgpu::RenderPassDescriptor {
             label: Some("forest_vegetation_gbuffer"),
             color_attachments: &attachments,
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -1329,7 +1346,8 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
-        });
+        };
+        let mut pass = ctx.begin_tracked_render_pass(gbuffer_pass_descriptor);
         pass.set_bind_group(0, &library.draw_globals, &[]);
         pass.set_bind_group(1, &snapshot.frame_group, &[]);
         pass.set_vertex_buffer(0, library.vertices.slice(..));
@@ -1354,7 +1372,7 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
         && let Some(canopy_pipeline) = cache.get_render_pipeline(library.canopy_pipeline)
     {
         terrain_node::copy_ground_average(ctx.command_encoder(), gbuffer);
-        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        let canopy_pass_descriptor = wgpu::RenderPassDescriptor {
             label: Some("forest_vegetation_canopy"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &gbuffer.grass_ground_average_view,
@@ -1369,7 +1387,8 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
-        });
+        };
+        let mut pass = ctx.begin_tracked_render_pass(canopy_pass_descriptor);
         pass.set_render_pipeline(canopy_pipeline);
         pass.set_bind_group(0, &library.draw_globals, &[]);
         pass.set_bind_group(1, &snapshot.frame_group, &[]);
@@ -1381,7 +1400,7 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
         return;
     };
     for (index, layer) in targets.cascade_views.iter().enumerate() {
-        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        let shadow_pass_descriptor = wgpu::RenderPassDescriptor {
             label: Some("forest_vegetation_shadow"),
             color_attachments: &[],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -1395,7 +1414,8 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
-        });
+        };
+        let mut pass = ctx.begin_tracked_render_pass(shadow_pass_descriptor);
         pass.set_bind_group(0, &library.cascade_groups[index], &[]);
         pass.set_bind_group(1, &snapshot.frame_group, &[]);
         pass.set_vertex_buffer(0, library.vertices.slice(..));

@@ -245,7 +245,7 @@ pub fn cloud_probe_pass(world: &World, mut ctx: RenderContext) {
         && let Some(pipeline) = cache.get_render_pipeline(resources.shadow_pipeline)
         && !reuse
     {
-        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        let shadow_pass_descriptor = wgpu::RenderPassDescriptor {
             label: Some("forest_cloud_shadow_map"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &resources.shadow_map,
@@ -261,7 +261,8 @@ pub fn cloud_probe_pass(world: &World, mut ctx: RenderContext) {
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
-        });
+        };
+        let mut pass = ctx.begin_tracked_render_pass(shadow_pass_descriptor);
         pass.set_render_pipeline(pipeline);
         pass.set_bind_group(0, &resources.globals_group, &[]);
         pass.set_bind_group(1, &resources.empty_group, &[]);
@@ -278,7 +279,7 @@ pub fn cloud_probe_pass(world: &World, mut ctx: RenderContext) {
         return;
     };
     if !reuse {
-        let mut pass = ctx.begin_tracked_render_pass(wgpu::RenderPassDescriptor {
+        let probe_pass_descriptor = wgpu::RenderPassDescriptor {
             label: Some("forest_cloud_sky_probe"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &resources.probe,
@@ -298,7 +299,8 @@ pub fn cloud_probe_pass(world: &World, mut ctx: RenderContext) {
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
-        });
+        };
+        let mut pass = ctx.begin_tracked_render_pass(probe_pass_descriptor);
         pass.set_render_pipeline(pipeline);
         pass.set_bind_group(0, &resources.globals_group, &[]);
         pass.set_bind_group(1, &resources.empty_group, &[]);
@@ -349,22 +351,21 @@ fn prepare_clouds(
         return;
     };
 
-    let noise = device
-        .wgpu_device()
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("forest_cloud_density_noise"),
-            size: wgpu::Extent3d {
-                width: NOISE_SIZE,
-                height: NOISE_SIZE,
-                depth_or_array_layers: NOISE_SIZE,
-            },
-            mip_level_count: NOISE_MIP_COUNT,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D3,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+    let noise_descriptor = wgpu::TextureDescriptor {
+        label: Some("forest_cloud_density_noise"),
+        size: wgpu::Extent3d {
+            width: NOISE_SIZE,
+            height: NOISE_SIZE,
+            depth_or_array_layers: NOISE_SIZE,
+        },
+        mip_level_count: NOISE_MIP_COUNT,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D3,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    };
+    let noise = device.wgpu_device().create_texture(&noise_descriptor);
     // Average each 3D octave into a mip chain. Long, near-horizontal rays
     // otherwise alias the small Worley cells into visible depth slices.
     let mut noise_data = build_noise();
@@ -395,36 +396,34 @@ fn prepare_clouds(
         }
     }
     let noise_view = noise.create_view(&default());
-    let repeat = device
-        .wgpu_device()
-        .create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("forest_cloud_noise_repeat"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            ..default()
-        });
-    let probe_texture = device
-        .wgpu_device()
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("forest_cloud_reflection_probe"),
-            size: wgpu::Extent3d {
-                width: PROBE_WIDTH,
-                height: PROBE_HEIGHT,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+    let repeat_sampler_descriptor = wgpu::SamplerDescriptor {
+        label: Some("forest_cloud_noise_repeat"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..default()
+    };
+    let repeat = device.wgpu_device().create_sampler(&repeat_sampler_descriptor);
+    let probe_texture_descriptor = wgpu::TextureDescriptor {
+        label: Some("forest_cloud_reflection_probe"),
+        size: wgpu::Extent3d {
+            width: PROBE_WIDTH,
+            height: PROBE_HEIGHT,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    };
+    let probe_texture = device.wgpu_device().create_texture(&probe_texture_descriptor);
     // Transparent cloud radiance before the first asynchronous pipeline compile.
     let initial: Vec<u16> = (0..PROBE_WIDTH * PROBE_HEIGHT)
         .flat_map(|_| [0, 0, 0, 0x3c00])
@@ -445,34 +444,32 @@ fn prepare_clouds(
         probe_texture.size(),
     );
     let probe = probe_texture.create_view(&default());
-    let probe_sampler = device
-        .wgpu_device()
-        .create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("forest_cloud_probe_sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..default()
-        });
-    let shadow_texture = device
-        .wgpu_device()
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some("forest_cloud_shadow_map"),
-            size: wgpu::Extent3d {
-                width: 2 * SHADOW_MAP_LEVEL_TEXELS,
-                height: SHADOW_MAP_LEVEL_TEXELS,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: SHADOW_MAP_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
+    let probe_sampler_descriptor = wgpu::SamplerDescriptor {
+        label: Some("forest_cloud_probe_sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..default()
+    };
+    let probe_sampler = device.wgpu_device().create_sampler(&probe_sampler_descriptor);
+    let shadow_texture_descriptor = wgpu::TextureDescriptor {
+        label: Some("forest_cloud_shadow_map"),
+        size: wgpu::Extent3d {
+            width: 2 * SHADOW_MAP_LEVEL_TEXELS,
+            height: SHADOW_MAP_LEVEL_TEXELS,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: SHADOW_MAP_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    };
+    let shadow_texture = device.wgpu_device().create_texture(&shadow_texture_descriptor);
     // -1 marks "not built yet": the shaders march the clouds instead.
     let unbuilt: Vec<f32> = vec![-1.0; (2 * SHADOW_MAP_LEVEL_TEXELS * SHADOW_MAP_LEVEL_TEXELS) as usize];
     queue.write_texture(
@@ -491,16 +488,15 @@ fn prepare_clouds(
         shadow_texture.size(),
     );
     let shadow_map = shadow_texture.create_view(&default());
-    let shadow_sampler = device
-        .wgpu_device()
-        .create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("forest_cloud_shadow_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..default()
-        });
+    let shadow_sampler_descriptor = wgpu::SamplerDescriptor {
+        label: Some("forest_cloud_shadow_sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..default()
+    };
+    let shadow_sampler = device.wgpu_device().create_sampler(&shadow_sampler_descriptor);
     let noise_entries = [
         texture_layout(0, wgpu::TextureViewDimension::D3),
         sampler_layout(1),
@@ -534,31 +530,32 @@ fn prepare_clouds(
         &noise_layout,
         &noise_bindings,
     );
+    let resource_entries = [
+        noise_bindings[0].clone(),
+        noise_bindings[1].clone(),
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: wgpu::BindingResource::TextureView(&probe),
+        },
+        wgpu::BindGroupEntry {
+            binding: 3,
+            resource: wgpu::BindingResource::Sampler(&probe_sampler),
+        },
+        wgpu::BindGroupEntry {
+            binding: 4,
+            resource: wgpu::BindingResource::TextureView(&shadow_map),
+        },
+        wgpu::BindGroupEntry {
+            binding: 5,
+            resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+        },
+    ];
     let group = super::bind_group(
         &device,
         &cache,
         "forest_cloud_resources",
         &layout,
-        &[
-            noise_bindings[0].clone(),
-            noise_bindings[1].clone(),
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(&probe),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: wgpu::BindingResource::Sampler(&probe_sampler),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: wgpu::BindingResource::TextureView(&shadow_map),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: wgpu::BindingResource::Sampler(&shadow_sampler),
-            },
-        ],
+        &resource_entries,
     );
     let global_layout = globals_layout();
     let globals_group = super::bind_group(
@@ -576,7 +573,7 @@ fn prepare_clouds(
         &empty_layout,
         &[],
     );
-    let shadow_pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
+    let shadow_pipeline_descriptor = RenderPipelineDescriptor {
         label: Some("forest_cloud_shadow_map_pipeline".into()),
         layout: vec![
             global_layout.clone(),
@@ -605,8 +602,9 @@ fn prepare_clouds(
             })],
         }),
         zero_initialize_workgroup_memory: false,
-    });
-    let pipeline = cache.queue_render_pipeline(RenderPipelineDescriptor {
+    };
+    let shadow_pipeline = cache.queue_render_pipeline(shadow_pipeline_descriptor);
+    let probe_pipeline_descriptor = RenderPipelineDescriptor {
         label: Some("forest_cloud_probe_pipeline".into()),
         layout: vec![
             global_layout,
@@ -635,7 +633,8 @@ fn prepare_clouds(
             })],
         }),
         zero_initialize_workgroup_memory: false,
-    });
+    };
+    let pipeline = cache.queue_render_pipeline(probe_pipeline_descriptor);
     state.resources = Some(CloudGpuResources {
         layout,
         group,
@@ -652,13 +651,10 @@ fn prepare_clouds(
 pub fn register_cloud_systems(render_app: &mut bevy::app::SubApp) {
     render_app.init_resource::<CloudRenderState>();
     render_app.init_resource::<CloudProbeSchedule>();
-    render_app.add_systems(
-        bevy::render::Render,
-        (prepare_clouds, update_cloud_probe_schedule)
-            .chain()
-            .in_set(bevy::render::RenderSystems::Prepare)
-            .after(super::prepare_forest_globals),
-    );
+    let mut systems = (prepare_clouds, update_cloud_probe_schedule).chain();
+    systems = systems.in_set(bevy::render::RenderSystems::Prepare);
+    systems = systems.after(super::prepare_forest_globals);
+    render_app.add_systems(bevy::render::Render, systems);
 }
 
 fn hash(x: i32, y: i32, z: i32, seed: u32) -> f32 {

@@ -265,7 +265,9 @@ impl SiteSampler {
                 // stands above its water: the ground as the channels carve
                 // it, as the GPU cull measures it.
                 let envelope = network.envelope(wx as f32, wz as f32);
-                let bank = envelope.bank_at(envelope.clamp(self.fine.sample(wx, wz))).min(RIVER_SEARCH);
+                let ground_height = self.fine.sample(wx, wz);
+                let clamped = envelope.clamp(ground_height);
+                let bank = envelope.bank_at(clamped).min(RIVER_SEARCH);
                 any |= bank < RIVER_SEARCH;
                 heights.push(bank);
             }

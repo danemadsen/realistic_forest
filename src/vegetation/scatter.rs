@@ -154,13 +154,12 @@ impl Catalog {
             .filter(|band| height >= band.2 && height <= band.3)
             .collect();
         let band = fitting[((random(key, 40) * fitting.len() as f32) as usize).min(fitting.len() - 1)];
-        let variants: Vec<usize> = self
+        let matching_models = self
             .models
             .iter()
             .enumerate()
-            .filter(|(_, model)| model.species == species && model.form == band.1)
-            .map(|(index, _)| index)
-            .collect();
+            .filter(|(_, model)| model.species == species && model.form == band.1);
+        let variants: Vec<usize> = matching_models.map(|(index, _)| index).collect();
         if variants.is_empty() {
             return None;
         }
@@ -804,11 +803,12 @@ pub fn generate_level(
 
     // Regeneration: kept clear of the canopy trunks and crowns' cores.
     let (regen_min, regen_max) = grow(context_min, context_max, 8.0);
-    let regeneration = CandidateGrid::build(&REGENERATION, regen_min, regen_max, |x, z, key| {
+    let assign_regeneration = |x: f64, z: f64, key: u64| -> Option<(f32, f32, u32, f32)> {
         let candidate = regeneration_candidate(catalog, &habitats, x, z, key)?;
         (!trees.blocks(x, z, candidate.1 * 0.6, 0.62) && dry(x, z, Layer::Regeneration, candidate.2, candidate.3))
             .then_some(candidate)
-    });
+    };
+    let regeneration = CandidateGrid::build(&REGENERATION, regen_min, regen_max, assign_regeneration);
     let young_trees = regeneration.survivors(REGENERATION.overlap, 2.5, context_min, context_max);
     for tree in &young_trees {
         trees.insert(tree.x, tree.z, tree.reach);
@@ -829,11 +829,12 @@ pub fn generate_level(
         LEVEL_SHRUBS => {
             let (shrub_min, shrub_max) = grow(minimum, maximum, 6.0);
             // Shrubs grow under crown edges but not against a trunk.
-            let shrubs = CandidateGrid::build(&SHRUB, shrub_min, shrub_max, |x, z, key| {
+            let assign_shrub = |x: f64, z: f64, key: u64| -> Option<(f32, f32, u32, f32)> {
                 let candidate = shrub_candidate(catalog, &habitats, x, z, key)?;
                 (!trees.blocks(x, z, candidate.1 * 0.45, 0.30) && dry(x, z, Layer::Shrub, candidate.2, candidate.3))
                     .then_some(candidate)
-            });
+            };
+            let shrubs = CandidateGrid::build(&SHRUB, shrub_min, shrub_max, assign_shrub);
             out.extend(
                 shrubs
                     .survivors(SHRUB.overlap, 2.4, minimum, maximum)
@@ -843,11 +844,12 @@ pub fn generate_level(
         }
         _ => {
             let (shrub_min, shrub_max) = grow(minimum, maximum, 10.0);
-            let shrubs = CandidateGrid::build(&SHRUB, shrub_min, shrub_max, |x, z, key| {
+            let assign_shrub = |x: f64, z: f64, key: u64| -> Option<(f32, f32, u32, f32)> {
                 let candidate = shrub_candidate(catalog, &habitats, x, z, key)?;
                 (!trees.blocks(x, z, candidate.1 * 0.45, 0.30) && dry(x, z, Layer::Shrub, candidate.2, candidate.3))
                     .then_some(candidate)
-            });
+            };
+            let shrubs = CandidateGrid::build(&SHRUB, shrub_min, shrub_max, assign_shrub);
             let mut cover = Occupancy::new(4.0);
             let (near_min, near_max) = grow(minimum, maximum, 4.0);
             for shrub in shrubs.survivors(SHRUB.overlap, 2.4, near_min, near_max) {
@@ -857,14 +859,15 @@ pub fn generate_level(
             // needs open sky; both keep room between their own plants.
             let herb_margin = (HERB.overlap * 2.0 * MAX_BROADLEAF_REACH) as f64 + 0.5;
             let (herb_min, herb_max) = grow(minimum, maximum, herb_margin);
-            let herbs = CandidateGrid::build(&HERB, herb_min, herb_max, |x, z, key| {
+            let assign_herb = |x: f64, z: f64, key: u64| -> Option<(f32, f32, u32, f32)> {
                 let candidate = herb_candidate(catalog, &habitats, x, z, key)?;
                 (!trees.blocks(x, z, 0.5, 0.12)
                     && !cover.blocks(x, z, 0.1, 0.6)
                     && dry(x, z, Layer::Herb, candidate.2, candidate.3)
                     && sampler.river_bank(x, z) >= RIVER_CLEARANCE[Layer::Herb as usize] + candidate.1 * 0.5)
                     .then_some(candidate)
-            });
+            };
+            let herbs = CandidateGrid::build(&HERB, herb_min, herb_max, assign_herb);
             out.extend(
                 herbs
                     .survivors(HERB.overlap, MAX_BROADLEAF_REACH, minimum, maximum)
@@ -873,11 +876,12 @@ pub fn generate_level(
             );
             let tuft_margin = (LAVENDER.overlap * 2.0 * MAX_LAVENDER_REACH) as f64 + 0.5;
             let (tuft_min, tuft_max) = grow(minimum, maximum, tuft_margin);
-            let lavender = CandidateGrid::build(&LAVENDER, tuft_min, tuft_max, |x, z, key| {
+            let assign_lavender = |x: f64, z: f64, key: u64| -> Option<(f32, f32, u32, f32)> {
                 let candidate = lavender_candidate(catalog, &habitats, x, z, key)?;
                 (!trees.blocks(x, z, 0.4, 0.85) && !cover.blocks(x, z, 0.2, 0.9) && dry(x, z, Layer::Lavender, candidate.2, candidate.3))
                     .then_some(candidate)
-            });
+            };
+            let lavender = CandidateGrid::build(&LAVENDER, tuft_min, tuft_max, assign_lavender);
             out.extend(
                 lavender
                     .survivors(LAVENDER.overlap, MAX_LAVENDER_REACH, minimum, maximum)

@@ -21,16 +21,17 @@ pub fn scatter_region(noise: &NoiseField, catalog: &Catalog, minimum: [f64; 2], 
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(Vec::new());
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let worker = || loop {
+        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(&(chunk, level)) = jobs.get(index) else {
+            break;
+        };
+        let plants = scatter::generate_level(noise, catalog, None, chunk, level);
+        results.lock().unwrap().extend(plants);
+    };
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(|| loop {
-                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(&(chunk, level)) = jobs.get(index) else {
-                    break;
-                };
-                let plants = scatter::generate_level(noise, catalog, None, chunk, level);
-                results.lock().unwrap().extend(plants);
-            });
+            scope.spawn(worker);
         }
     });
     let mut plants = results.into_inner().unwrap();
@@ -351,11 +352,12 @@ pub fn render(
             background[row * cols + col] = colour.map(|v| v.clamp(0.0, 255.0) as u8);
         }
     }
-    let mut image = image::RgbImage::from_fn(width, height, |px, py| {
+    let background_pixel = |px: u32, py: u32| -> image::Rgb<u8> {
         let col = ((px as f64 * metres_per_pixel) / step) as usize;
         let row = ((((height - 1 - py) as f64) * metres_per_pixel) / step) as usize;
         image::Rgb(background[row.min(rows - 1) * cols + col.min(cols - 1)])
-    });
+    };
+    let mut image = image::RgbImage::from_fn(width, height, background_pixel);
     // Ground layers first, canopy last, as seen from above.
     let mut order: Vec<&PlantInstance> = plants.iter().collect();
     order.sort_by_key(|p| std::cmp::Reverse(p.layer));

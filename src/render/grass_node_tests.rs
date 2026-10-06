@@ -37,7 +37,7 @@ fn assert_layout(source: &str, name: &str, size: usize, members: &[(&str, usize)
 
 #[test]
 fn grass_compute_and_vertex_records_share_the_host_abi() {
-    assert_layout(CULL_SHADER, "GrassCullJob", size_of::<GrassCullJob>(), &[
+    let job_members = [
         ("input_first", offset_of!(GrassCullJob, input_first)),
         ("count", offset_of!(GrassCullJob, count)),
         ("output_first", offset_of!(GrassCullJob, output_first)),
@@ -46,16 +46,18 @@ fn grass_compute_and_vertex_records_share_the_host_abi() {
         ("_pad0", offset_of!(GrassCullJob, _pad)),
         ("_pad1", offset_of!(GrassCullJob, _pad) + 4),
         ("_pad2", offset_of!(GrassCullJob, _pad) + 8),
-    ]);
-    assert_layout(CULL_SHADER, "GrassInstance", size_of::<GrassInstance>(), &[
+    ];
+    assert_layout(CULL_SHADER, "GrassCullJob", size_of::<GrassCullJob>(), &job_members);
+    let instance_members = [
         ("xz", offset_of!(GrassInstance, xz)),
         ("rotation", offset_of!(GrassInstance, rotation)),
         ("scale", offset_of!(GrassInstance, scale)),
         ("tint", offset_of!(GrassInstance, tint)),
         ("seed", offset_of!(GrassInstance, seed)),
         ("scatter_data", offset_of!(GrassInstance, _pad)),
-    ]);
-    assert_layout(CULL_SHADER, "GrassDrawInstance", size_of::<GrassDrawInstance>(), &[
+    ];
+    assert_layout(CULL_SHADER, "GrassInstance", size_of::<GrassInstance>(), &instance_members);
+    let draw_instance_members = [
         ("xz", offset_of!(GrassDrawInstance, xz)),
         ("rotation", offset_of!(GrassDrawInstance, rotation)),
         ("scale", offset_of!(GrassDrawInstance, scale)),
@@ -65,14 +67,16 @@ fn grass_compute_and_vertex_records_share_the_host_abi() {
         ("slope_x", offset_of!(GrassDrawInstance, ground) + 4),
         ("ground_average", offset_of!(GrassDrawInstance, ground_colour)),
         ("slope_z", offset_of!(GrassDrawInstance, ground_colour) + 12),
-    ]);
+    ];
+    assert_layout(CULL_SHADER, "GrassDrawInstance", size_of::<GrassDrawInstance>(), &draw_instance_members);
     for source in [CULL_SHADER, include_str!("../../assets/shaders/grass.wgsl")] {
-        assert_layout(source, "GrassFrame", size_of::<GrassFrame>(), &[
+        let frame_members = [
             ("mapping", offset_of!(GrassFrame, mapping)),
             ("wind", offset_of!(GrassFrame, wind)),
             ("range", offset_of!(GrassFrame, range)),
             ("layer_end", offset_of!(GrassFrame, layer_end)),
-        ]);
+        ];
+        assert_layout(source, "GrassFrame", size_of::<GrassFrame>(), &frame_members);
     }
     assert_eq!(size_of::<GrassDraw>(), 20);
     assert_eq!(offset_of!(GrassDraw, instance_count), 4);
@@ -145,7 +149,7 @@ fn grass_cull_jobs_cover_each_candidate_once_and_share_a_bounded_output_region()
 }
 
 fn test_texture(device: &wgpu::Device, queue: &wgpu::Queue, bytes: &[u8]) -> wgpu::Texture {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
+    let texture_descriptor = wgpu::TextureDescriptor {
         label: Some("grass culling fixture"),
         size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
         mip_level_count: 1,
@@ -154,7 +158,8 @@ fn test_texture(device: &wgpu::Device, queue: &wgpu::Queue, bytes: &[u8]) -> wgp
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
-    });
+    };
+    let texture = device.create_texture(&texture_descriptor);
     write_test_texture(queue, &texture, bytes);
     texture
 }
@@ -292,7 +297,7 @@ fn grass_gpu_compacts_habitat_survivors_and_resets_indirect_counts() {
     });
     let prepared_readback = create_readback(&prepared);
     let arguments_readback = create_readback(&arguments);
-    let inputs = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let inputs_descriptor = wgpu::BindGroupDescriptor {
         label: Some("grass regression inputs"), layout: &pipeline.get_bind_group_layout(0),
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: candidates_buffer.as_entire_binding() },
@@ -300,8 +305,9 @@ fn grass_gpu_compacts_habitat_survivors_and_resets_indirect_counts() {
             wgpu::BindGroupEntry { binding: 2, resource: prepared.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: arguments.as_entire_binding() },
         ],
-    });
-    let environment = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    };
+    let inputs = device.create_bind_group(&inputs_descriptor);
+    let environment_descriptor = wgpu::BindGroupDescriptor {
         label: Some("grass regression environment"), layout: &pipeline.get_bind_group_layout(1),
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&habitat_view) },
@@ -309,7 +315,8 @@ fn grass_gpu_compacts_habitat_survivors_and_resets_indirect_counts() {
             wgpu::BindGroupEntry { binding: 2, resource: frame_buffer.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&colour_view) },
         ],
-    });
+    };
+    let environment = device.create_bind_group(&environment_descriptor);
     let dispatch_and_read = || {
         let mut encoder = device.create_command_encoder(&Default::default());
         {

@@ -441,17 +441,16 @@ impl SegmentGrid {
                 }
             }
         }
-        self.lakes = heights
-            .into_iter()
-            .map(|(index, heights)| {
-                let top = heights.iter().copied().fold(NO_LAKE, f32::max);
-                let depths = heights.map(|h| {
-                    let depth = ((top - h) / LAKE_DEPTH_UNIT).round();
-                    if h <= NO_LAKE || depth >= LAKE_NO_CORNER as f32 { LAKE_NO_CORNER } else { depth as u16 }
-                });
-                (index, LakeRecord { top, depths })
-            })
-            .collect();
+        let lake_record = |(index, heights): (u32, [f32; LAKE_CORNERS])| {
+            let top = heights.iter().copied().fold(NO_LAKE, f32::max);
+            let corner_depth = |h: f32| {
+                let depth = ((top - h) / LAKE_DEPTH_UNIT).round();
+                if h <= NO_LAKE || depth >= LAKE_NO_CORNER as f32 { LAKE_NO_CORNER } else { depth as u16 }
+            };
+            let depths = heights.map(corner_depth);
+            (index, LakeRecord { top, depths })
+        };
+        self.lakes = heights.into_iter().map(lake_record).collect();
     }
 
     /// The surface of the lakes reaching `p`, or `NO_LAKE`.
@@ -590,14 +589,13 @@ mod tests {
 
     #[test]
     fn grid_finds_every_segment_that_reaches_a_point() {
-        let segments: Vec<RiverSegment> = (0..20)
-            .map(|i| {
-                let mut s = straight([10.0, 10.0]);
-                s.a = [i as f32 * 10.0, 3.0 * i as f32];
-                s.b = [i as f32 * 10.0 + 10.0, 3.0 * i as f32 + 3.0];
-                s
-            })
-            .collect();
+        let offset_segment = |i: i32| {
+            let mut s = straight([10.0, 10.0]);
+            s.a = [i as f32 * 10.0, 3.0 * i as f32];
+            s.b = [i as f32 * 10.0 + 10.0, 3.0 * i as f32 + 3.0];
+            s
+        };
+        let segments: Vec<RiverSegment> = (0..20).map(offset_segment).collect();
         let grid = SegmentGrid::build([-100.0, -100.0], 16, &segments);
         for z in -60..120 {
             for x in -60..260 {
@@ -666,7 +664,9 @@ mod gpu_tests {
         });
         // Points along and across the channels near spawn.
         let mut points = Vec::new();
-        for node in network.rivers.iter().flat_map(|r| &r.nodes).step_by(7).take(4000) {
+        let channel_nodes = network.rivers.iter().flat_map(|r| &r.nodes);
+        let sampled_nodes = channel_nodes.step_by(7).take(4000);
+        for node in sampled_nodes {
             for offset in [-6.0f32, -2.0, -0.7, 0.0, 0.4, 1.3, 3.0, 9.0] {
                 points.push([node.position[0] + offset, node.position[1] - offset * 0.5]);
             }

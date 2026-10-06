@@ -235,20 +235,17 @@ fn parallel_map<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) ->
     let next = std::sync::atomic::AtomicUsize::new(0);
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16);
     let mut done: Vec<(usize, R)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                scope.spawn(|| {
-                    let mut out = Vec::new();
-                    loop {
-                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if index >= items.len() {
-                            break out;
-                        }
-                        out.push((index, work(&items[index])));
-                    }
-                })
-            })
-            .collect();
+        let worker_loop = || {
+            let mut out = Vec::new();
+            loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if index >= items.len() {
+                    break out;
+                }
+                out.push((index, work(&items[index])));
+            }
+        };
+        let handles: Vec<_> = (0..workers).map(|_| scope.spawn(worker_loop)).collect();
         handles.into_iter().flat_map(|handle| handle.join().unwrap()).collect()
     });
     done.sort_by_key(|(index, _)| *index);
@@ -282,13 +279,14 @@ pub fn rainfall(height: f32) -> f32 {
 fn route(noise: &NoiseField, region: [i64; 2]) -> Routing {
     let origin = routing_origin(region);
     let resolution = ROUTING_RESOLUTION;
-    let heights: Vec<f32> = parallel_rows(resolution, resolution, |z, row: &mut [f32]| {
+    let sample_row = |z: usize, row: &mut [f32]| {
         let wz = origin[1] + (z as f64 + 0.5) * ROUTING_CELL;
         for (x, value) in row.iter_mut().enumerate() {
             let wx = origin[0] + (x as f64 + 0.5) * ROUTING_CELL;
             *value = base_height(noise, wx as f32, wz as f32);
         }
-    });
+    };
+    let heights: Vec<f32> = parallel_rows(resolution, resolution, sample_row);
     let count = resolution * resolution;
     let open_sea = open_sea_cells(&heights, resolution);
     let mut receiver = vec![NONE; count];
@@ -626,15 +624,14 @@ fn arc_lengths(points: &[PathPoint]) -> Vec<f64> {
 /// Unit tangent at every point (central differences).
 fn tangents(points: &[PathPoint]) -> Vec<[f64; 2]> {
     let n = points.len();
-    (0..n)
-        .map(|i| {
-            let a = points[i.saturating_sub(1)].p;
-            let b = points[(i + 1).min(n - 1)].p;
-            let d = [b[0] - a[0], b[1] - a[1]];
-            let length = d[0].hypot(d[1]).max(1e-9);
-            [d[0] / length, d[1] / length]
-        })
-        .collect()
+    let tangent_at = |i: usize| -> [f64; 2] {
+        let a = points[i.saturating_sub(1)].p;
+        let b = points[(i + 1).min(n - 1)].p;
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let length = d[0].hypot(d[1]).max(1e-9);
+        [d[0] / length, d[1] / length]
+    };
+    (0..n).map(tangent_at).collect()
 }
 
 /// Smooth a falling profile with a Gaussian of `sigma` samples, carrying
@@ -657,18 +654,17 @@ fn smooth_falling(values: &[f64], sigma: f64) -> Vec<f64> {
         }
     };
     let radius = (sigma * 3.0).ceil() as i64;
-    (0..n as i64)
-        .map(|i| {
-            let mut sum = 0.0;
-            let mut total = 0.0;
-            for k in -radius..=radius {
-                let w = (-0.5 * (k as f64 / sigma).powi(2)).exp();
-                sum += at(i + k) * w;
-                total += w;
-            }
-            sum / total
-        })
-        .collect()
+    let smooth_at = |i: i64| -> f64 {
+        let mut sum = 0.0;
+        let mut total = 0.0;
+        for k in -radius..=radius {
+            let w = (-0.5 * (k as f64 / sigma).powi(2)).exp();
+            sum += at(i + k) * w;
+            total += w;
+        }
+        sum / total
+    };
+    (0..n as i64).map(smooth_at).collect()
 }
 
 /// Smooth a scalar sequence with a Gaussian of `sigma` samples.
@@ -678,19 +674,18 @@ fn smooth_values(values: &[f64], sigma: f64) -> Vec<f64> {
         return values.to_vec();
     }
     let radius = (sigma * 3.0).ceil() as i64;
-    (0..n)
-        .map(|i| {
-            let mut sum = 0.0;
-            let mut total = 0.0;
-            for k in -radius..=radius {
-                let j = (i as i64 + k).clamp(0, n as i64 - 1) as usize;
-                let w = (-0.5 * (k as f64 / sigma).powi(2)).exp();
-                sum += values[j] * w;
-                total += w;
-            }
-            sum / total
-        })
-        .collect()
+    let smooth_at = |i: usize| -> f64 {
+        let mut sum = 0.0;
+        let mut total = 0.0;
+        for k in -radius..=radius {
+            let j = (i as i64 + k).clamp(0, n as i64 - 1) as usize;
+            let w = (-0.5 * (k as f64 / sigma).powi(2)).exp();
+            sum += values[j] * w;
+            total += w;
+        }
+        sum / total
+    };
+    (0..n).map(smooth_at).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -823,7 +818,8 @@ impl Corridor {
     fn new(noise: &NoiseField, points: &[[f64; 2]], reach: f64, extra: &[[i64; 2]]) -> Self {
         let mut minimum = [f64::INFINITY; 2];
         let mut maximum = [f64::NEG_INFINITY; 2];
-        for p in points.iter().copied().chain(extra.iter().map(|&c| Self::centre(c))) {
+        let extra_centres = extra.iter().map(|&c| Self::centre(c));
+        for p in points.iter().copied().chain(extra_centres) {
             for axis in 0..2 {
                 minimum[axis] = minimum[axis].min(p[axis] - reach);
                 maximum[axis] = maximum[axis].max(p[axis] + reach);
@@ -988,25 +984,23 @@ impl Outlets {
         // narrower than a routing cell can still cut a hollow off from it.
         let joined = (!deep.is_empty()).then(|| flood(&deep, &|index| corridor.ground[index] < SEA_LEVEL));
         let mut open = vec![false; corridor.ground.len()];
-        let mut queue: std::collections::VecDeque<usize> = (0..corridor.ground.len())
-            .filter(|&index| {
-                corridor.ground[index] < SEA_LEVEL - OPEN_SEA_DEPTH
-                    || (corridor.ground[index] < SEA_LEVEL
-                        && in_mouth(index)
-                        && joined.as_ref().is_none_or(|joined| joined[index]))
-            })
-            .collect();
+        let is_open_water = |&index: &usize| -> bool {
+            corridor.ground[index] < SEA_LEVEL - OPEN_SEA_DEPTH
+                || (corridor.ground[index] < SEA_LEVEL
+                    && in_mouth(index)
+                    && joined.as_ref().is_none_or(|joined| joined[index]))
+        };
+        let mut queue: std::collections::VecDeque<usize> = (0..corridor.ground.len()).filter(is_open_water).collect();
         if queue.is_empty() {
-            queue = (0..corridor.ground.len())
-                .filter(|&index| {
-                    below(index) && {
-                        let cell = corridor.cell_at(index);
-                        [(1, 0), (-1, 0), (0, 1), (0, -1)]
-                            .iter()
-                            .any(|&(dx, dz)| corridor.inside([cell[0] + dx, cell[1] + dz]).is_none())
-                    }
-                })
-                .collect();
+            let is_edge_water = |&index: &usize| -> bool {
+                below(index) && {
+                    let cell = corridor.cell_at(index);
+                    [(1, 0), (-1, 0), (0, 1), (0, -1)]
+                        .iter()
+                        .any(|&(dx, dz)| corridor.inside([cell[0] + dx, cell[1] + dz]).is_none())
+                }
+            };
+            queue = (0..corridor.ground.len()).filter(is_edge_water).collect();
         }
         if queue.is_empty() {
             // No open water in reach at all: whatever lies under the sea.
@@ -1249,13 +1243,14 @@ impl Lakes {
         for &cell in &cells {
             self.cells.insert(cell, index);
         }
-        self.lakes.push(Lake {
+        let new_lake = Lake {
             level,
             cells: cells.iter().map(|c| [c[0] as i32, c[1] as i32]).collect(),
             shore: Vec::new(),
             edge: Vec::new(),
             current: Vec::new(),
-        });
+        };
+        self.lakes.push(new_lake);
         Filled::Lake
     }
 }
@@ -1411,10 +1406,11 @@ fn trim_steep_head(noise: &NoiseField, points: &mut Vec<PathPoint>) -> bool {
     let n = points.len();
     let s = arc_lengths(points);
     let ground: Vec<f64> = points.iter().map(|p| base_height(noise, p.p[0] as f32, p.p[1] as f32) as f64).collect();
-    let start = (0..n).find(|&i| {
+    let ground_eases = |&i: &usize| -> bool {
         let j = s.partition_point(|&v| v < s[i] + 30.0).min(n - 1);
         j <= i || (ground[i] - ground[j]) / (s[j] - s[i]).max(1.0) < HEAD_SLOPE
-    });
+    };
+    let start = (0..n).find(ground_eases);
     match start {
         Some(start) if n - start >= 2 => {
             points.drain(..start);
@@ -1620,15 +1616,14 @@ fn grade_to_parent(water: &mut [f32], s: &[f64], floor: &[f32], lake: Option<(us
 /// The water surface's slope at each point over a few channel widths.
 fn reach_slopes(points: &[PathPoint], s: &[f64], water: &[f32]) -> Vec<f32> {
     let n = water.len();
-    (0..n)
-        .map(|i| {
-            let width = 2.0 * half_width(points[i].area as f32) as f64;
-            let span = (width * 4.0).max(24.0);
-            let a = s.partition_point(|&v| v < s[i] - span).min(n - 1);
-            let b = s.partition_point(|&v| v <= s[i] + span).saturating_sub(1).max(a);
-            if b > a { ((water[a] - water[b]) / (s[b] - s[a]) as f32).max(4e-4) } else { 4e-4 }
-        })
-        .collect()
+    let slope_at = |i: usize| -> f32 {
+        let width = 2.0 * half_width(points[i].area as f32) as f64;
+        let span = (width * 4.0).max(24.0);
+        let a = s.partition_point(|&v| v < s[i] - span).min(n - 1);
+        let b = s.partition_point(|&v| v <= s[i] + span).saturating_sub(1).max(a);
+        if b > a { ((water[a] - water[b]) / (s[b] - s[a]) as f32).max(4e-4) } else { 4e-4 }
+    };
+    (0..n).map(slope_at).collect()
 }
 
 /// How widely, in nodes, the water surface is smoothed down a steep reach,
@@ -1679,7 +1674,8 @@ fn water_profile(noise: &NoiseField, points: Vec<PathPoint>, end_level: Option<f
     let shore = if sea {
         // Past the last lake: a coastal lagoon's bed is not the shore.
         let past_lakes = (0..n).rev().find(|&i| points[i].lake.is_finite()).map_or(0, |i| i + 1);
-        let run = (0..n).rev().find(|&i| ground[i] >= SEA_LEVEL + MOUTH_BAR).map_or(0, |i| i + 1).max(past_lakes);
+        let above_the_bar = (0..n).rev().find(|&i| ground[i] >= SEA_LEVEL + MOUTH_BAR);
+        let run = above_the_bar.map_or(0, |i| i + 1).max(past_lakes);
         (run..n).find(|&i| ground[i] < SEA_LEVEL + 0.25)
     } else {
         None
@@ -1768,8 +1764,10 @@ fn water_profile(noise: &NoiseField, points: Vec<PathPoint>, end_level: Option<f
             .collect();
         smooth_values(&spread, STEEP_SMOOTHING)
     };
-    let steepness = widest(&slope.iter().map(|&v| smoothstep(0.03, 0.12, v) as f64).collect::<Vec<_>>());
-    let held = widest(&outlet.iter().map(|o| if o.is_some() { 1.0 } else { 0.0 }).collect::<Vec<_>>());
+    let steep_weights: Vec<f64> = slope.iter().map(|&v| smoothstep(0.03, 0.12, v) as f64).collect();
+    let steepness = widest(&steep_weights);
+    let outlet_weights: Vec<f64> = outlet.iter().map(|o| if o.is_some() { 1.0 } else { 0.0 }).collect();
+    let held = widest(&outlet_weights);
     for i in 0..n.saturating_sub(1) {
         if i == 0 {
             continue;
@@ -1851,11 +1849,12 @@ fn build_nodes(
     // and the hollow above stays dry rather than holding a trickle over it.
     if !profile.points[0].lake.is_finite() {
         let n = profile.points.len();
-        let under = (0..n).find(|&i| {
+        let is_covered = |&i: &usize| -> bool {
             let p = profile.points[i].p;
             profile.points[i].lake.is_finite()
                 || profile.water[i] <= base_height(noise, p[0] as f32, p[1] as f32) - SPRING_FREEBOARD
-        });
+        };
+        let under = (0..n).find(is_covered);
         if let Some(start) = under.filter(|&start| start > 0 && n - start >= 2) {
             profile.points.drain(..start);
             profile.water.drain(..start);
@@ -1865,36 +1864,33 @@ fn build_nodes(
             profile.s.iter_mut().for_each(|v| *v -= first);
         }
     }
-    let mut nodes: Vec<RiverNode> = (0..profile.points.len())
-        .map(|i| {
-            let point = &profile.points[i];
-            RiverNode {
-                position: [point.p[0] as f32, point.p[1] as f32],
-                water: profile.water[i],
-                half_width: half_width(point.area as f32),
-                depth: 0.0,
-                speed: 0.0,
-                discharge: discharge(point.area as f32),
-                area: point.area as f32,
-                bank: 0.0,
-                skew: 0.0,
-                turbulence: 0.0,
-                slope: profile.slope[i],
-                along: profile.s[i] as f32,
-                lake: point.lake.is_finite(),
-            }
-        })
-        .collect();
+    let node_at = |i: usize| -> RiverNode {
+        let point = &profile.points[i];
+        RiverNode {
+            position: [point.p[0] as f32, point.p[1] as f32],
+            water: profile.water[i],
+            half_width: half_width(point.area as f32),
+            depth: 0.0,
+            speed: 0.0,
+            discharge: discharge(point.area as f32),
+            area: point.area as f32,
+            bank: 0.0,
+            skew: 0.0,
+            turbulence: 0.0,
+            slope: profile.slope[i],
+            along: profile.s[i] as f32,
+            lake: point.lake.is_finite(),
+        }
+    };
+    let mut nodes: Vec<RiverNode> = (0..profile.points.len()).map(node_at).collect();
 
     // Hydraulics and whitewater. A channel answers to the slope of its
     // valley over a long reach, not to every steeper or gentler stretch, so
     // it widens and narrows gradually.
     let count = nodes.len();
     let mean_spacing = ((nodes[count - 1].along - nodes[0].along) as f64 / (count - 1).max(1) as f64).max(0.5);
-    let reach_slope = smooth_values(
-        &nodes.iter().map(|node| node.slope as f64).collect::<Vec<_>>(),
-        (40.0 / mean_spacing).clamp(2.0, 20.0),
-    );
+    let node_slopes: Vec<f64> = nodes.iter().map(|node| node.slope as f64).collect();
+    let reach_slope = smooth_values(&node_slopes, (40.0 / mean_spacing).clamp(2.0, 20.0));
     for (node, &reach) in nodes.iter_mut().zip(&reach_slope) {
         let (half_width, depth, _) = channel(node.discharge, reach as f32);
         node.half_width = half_width;
@@ -2126,26 +2122,25 @@ fn lake_crossings(nodes: &[RiverNode]) -> Vec<(usize, usize)> {
 
 fn signed_curvature(nodes: &[RiverNode]) -> Vec<f64> {
     let n = nodes.len();
-    (0..n)
-        .map(|i| {
-            if i == 0 || i + 1 >= n {
-                return 0.0;
-            }
-            let a = nodes[i - 1].position;
-            let b = nodes[i].position;
-            let c = nodes[i + 1].position;
-            let ab = [(b[0] - a[0]) as f64, (b[1] - a[1]) as f64];
-            let bc = [(c[0] - b[0]) as f64, (c[1] - b[1]) as f64];
-            let la = ab[0].hypot(ab[1]);
-            let lb = bc[0].hypot(bc[1]);
-            if la < 0.2 || lb < 0.2 {
-                return 0.0;
-            }
-            let cross = ab[0] * bc[1] - ab[1] * bc[0];
-            let dot = ab[0] * bc[0] + ab[1] * bc[1];
-            cross.atan2(dot) / ((la + lb) * 0.5)
-        })
-        .collect()
+    let curvature_at = |i: usize| -> f64 {
+        if i == 0 || i + 1 >= n {
+            return 0.0;
+        }
+        let a = nodes[i - 1].position;
+        let b = nodes[i].position;
+        let c = nodes[i + 1].position;
+        let ab = [(b[0] - a[0]) as f64, (b[1] - a[1]) as f64];
+        let bc = [(c[0] - b[0]) as f64, (c[1] - b[1]) as f64];
+        let la = ab[0].hypot(ab[1]);
+        let lb = bc[0].hypot(bc[1]);
+        if la < 0.2 || lb < 0.2 {
+            return 0.0;
+        }
+        let cross = ab[0] * bc[1] - ab[1] * bc[0];
+        let dot = ab[0] * bc[0] + ab[1] * bc[1];
+        cross.atan2(dot) / ((la + lb) * 0.5)
+    };
+    (0..n).map(curvature_at).collect()
 }
 
 /// The finished network of one region.
@@ -2190,10 +2185,11 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
 
     // The natural ground along every river's coarse path, sampled in
     // parallel: no corridor depends on another.
-    let corridors: Vec<Corridor> = parallel_map(&paths, |path| {
+    let corridor_of = |path: &CellPath| -> Corridor {
         let points: Vec<[f64; 2]> = path.cells.iter().map(|&cell| routing.centre(cell as usize)).collect();
         Corridor::new(noise, &points, FLOW_CORRIDOR, &[])
-    });
+    };
+    let corridors: Vec<Corridor> = parallel_map(&paths, corridor_of);
 
     // Tributaries read their parent's finished centreline.
     let mut rivers: Vec<Option<River>> = vec![None; paths.len()];
@@ -2370,9 +2366,8 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
                 // channel, across the beach and any bar, out to the open
                 // water its course ended in. Nothing is cut off: past the
                 // shore the course is the mouth's channel.
-                surface_end = nodes
-                    .iter()
-                    .position(|node| node.water <= SEA_LEVEL + 0.03)
+                let first_at_sea = nodes.iter().position(|node| node.water <= SEA_LEVEL + 0.03);
+                surface_end = first_at_sea
                     .map_or(nodes.len() - 1, |first| first.saturating_sub(1))
                     .clamp(1, nodes.len() - 1);
             }
@@ -2462,13 +2457,14 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
     let grid_origin = [origin[0] as f32, origin[1] as f32];
     let mut grid = SegmentGrid::build(grid_origin, resolution, &segments);
     let lakes = lakes.lakes;
-    let lakes: Vec<Lake> = parallel_map(&lakes, |lake| {
+    let lake_with_surface = |lake: &Lake| -> Lake {
         let mut lake = lake.clone();
         lake.shore = shore_cells(noise, &segments, &grid, &lake);
         lake.edge = sheet_edge(noise, &segments, &grid, &lake);
         lake.current = sheet_current(&segments, &grid, &lake);
         lake
-    });
+    };
+    let lakes: Vec<Lake> = parallel_map(&lakes, lake_with_surface);
     // The lakes' surfaces: a drawn sheet's corner wherever there is one (the
     // highest sheet's where two meet), and past the sheets the highest field.
     let surfaces = parallel_map(&lakes, |lake| lake_surface(noise, &segments, &grid, lake));
@@ -2544,7 +2540,7 @@ impl<'a> LakeGround<'a> {
 
     fn cell(&mut self, cell: [i64; 2]) -> CellGround {
         let (noise, segments, grid, level) = (self.noise, self.segments, self.grid, self.level);
-        *self.cells.entry(cell).or_insert_with(|| {
+        let cell_ground = || -> CellGround {
             let c = Corridor::centre(cell);
             let p = [c[0] as f32, c[1] as f32];
             let envelope = super::carve::envelope_at(segments, grid, p);
@@ -2553,7 +2549,8 @@ impl<'a> LakeGround<'a> {
                 carved: envelope.clamp(natural),
                 channel: (envelope.bank_distance < 0.0).then_some(envelope.water >= level - 0.02),
             }
-        })
+        };
+        *self.cells.entry(cell).or_insert_with(cell_ground)
     }
 
     fn in_channel(&mut self, cell: [i64; 2]) -> bool {
@@ -2867,16 +2864,15 @@ fn sheet_edge(noise: &NoiseField, segments: &[RiverSegment], grid: &SegmentGrid,
             // The edge's two corners, from one end to the other.
             let a = [x + i32::from(dx > 0) , z + i32::from(dz > 0)];
             let b = [a[0] + dz.abs(), a[1] + dx.abs()];
-            let lowest = (0..=16)
-                .map(|k| {
-                    let t = k as f32 / 16.0;
-                    let p = [
-                        (a[0] as f32 + (b[0] - a[0]) as f32 * t) * cell,
-                        (a[1] as f32 + (b[1] - a[1]) as f32 * t) * cell,
-                    ];
-                    ground.cover(p)
-                })
-                .fold(f32::INFINITY, f32::min);
+            let cover_at = |k: i32| -> f32 {
+                let t = k as f32 / 16.0;
+                let p = [
+                    (a[0] as f32 + (b[0] - a[0]) as f32 * t) * cell,
+                    (a[1] as f32 + (b[1] - a[1]) as f32 * t) * cell,
+                ];
+                ground.cover(p)
+            };
+            let lowest = (0..=16).map(cover_at).fold(f32::INFINITY, f32::min);
             for corner in [a, b] {
                 let entry = corners.entry(corner).or_insert(f32::INFINITY);
                 *entry = entry.min(lowest);
@@ -2901,17 +2897,18 @@ fn sheet_current(segments: &[RiverSegment], grid: &SegmentGrid, lake: &Lake) -> 
         .chain(&lake.shore)
         .flat_map(|&[x, z]| [[x, z], [x + 1, z], [x, z + 1], [x + 1, z + 1]])
         .collect();
+    let river_current = |corner: [i32; 2]| -> Option<([i32; 2], [f32; 2])> {
+        let p = [corner[0] as f32 * cell, corner[1] as f32 * cell];
+        if grid.candidates(p).is_empty() {
+            return None;
+        }
+        let envelope = super::carve::envelope_at(segments, grid, p);
+        let speed = envelope.velocity[0].hypot(envelope.velocity[1]);
+        (envelope.bank_distance < 0.0 && speed > 0.02).then_some((corner, envelope.velocity))
+    };
     corners
         .into_iter()
-        .filter_map(|corner| {
-            let p = [corner[0] as f32 * cell, corner[1] as f32 * cell];
-            if grid.candidates(p).is_empty() {
-                return None;
-            }
-            let envelope = super::carve::envelope_at(segments, grid, p);
-            let speed = envelope.velocity[0].hypot(envelope.velocity[1]);
-            (envelope.bank_distance < 0.0 && speed > 0.02).then_some((corner, envelope.velocity))
-        })
+        .filter_map(river_current)
         .collect()
 }
 
@@ -3032,7 +3029,7 @@ fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
             let clear = BANK_REACH + 2.0 * a.half_width.max(b.half_width);
             let near_lake = smoothstep(clear, clear + 15.0, to_lake[i].min(to_lake[i + 1]));
             let shore = if a.lake || b.lake { 0.0 } else { near_sea * near_lake };
-            segments.push(RiverSegment {
+            let reach_segment = RiverSegment {
                 a: a.position,
                 b: b.position,
                 water: [a.water, b.water],
@@ -3043,7 +3040,8 @@ fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
                 skew: 0.5 * (a.skew + b.skew),
                 turbulence: a.turbulence.max(b.turbulence),
                 levee: smoothstep(SEA_LEVEL + 0.05, SEA_LEVEL + 0.6, a.water.min(b.water)) * shore,
-            });
+            };
+            segments.push(reach_segment);
         }
         // Where a river leaves a lake its channel opens out of the lake's
         // bed a little before its first node: a segment's start is flat, and
@@ -3058,7 +3056,7 @@ fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
             let d = [b.position[0] - a.position[0], b.position[1] - a.position[1]];
             let l = d[0].hypot(d[1]).max(1e-3);
             let reach = 3.0 * a.half_width;
-            segments.push(RiverSegment {
+            let outlet_lead_in = RiverSegment {
                 a: [a.position[0] - d[0] / l * reach, a.position[1] - d[1] / l * reach],
                 b: a.position,
                 water: [a.water, a.water],
@@ -3069,7 +3067,8 @@ fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
                 skew: 0.0,
                 turbulence: 0.0,
                 levee: 0.0,
-            });
+            };
+            segments.push(outlet_lead_in);
         }
         // A stream rising at a spring has no wall at its head: its first
         // segment begins as a square cut across the flow, so a lead-in runs
@@ -3085,7 +3084,7 @@ fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
             let reach = (6.0 * a.half_width).max(3.0);
             let top = [a.position[0] - d[0] / l * reach, a.position[1] - d[1] / l * reach];
             let rise = (a.slope.max(0.05) * reach).max(base_height(noise, top[0], top[1]) + CARVE_ROUNDING - a.water);
-            segments.push(RiverSegment {
+            let spring_lead_in = RiverSegment {
                 a: top,
                 b: a.position,
                 water: [a.water + rise, a.water],
@@ -3096,7 +3095,8 @@ fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
                 skew: 0.0,
                 turbulence: 0.0,
                 levee: 0.0,
-            });
+            };
+            segments.push(spring_lead_in);
         }
         // A river's channel opens into the sea a little past its last node.
         if river.end == RiverEnd::Sea && river.nodes.len() >= 2 {
@@ -3105,7 +3105,7 @@ fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
             let d = [b.position[0] - a.position[0], b.position[1] - a.position[1]];
             let l = d[0].hypot(d[1]).max(1e-3);
             let reach = 3.0 * b.half_width;
-            segments.push(RiverSegment {
+            let mouth_extension = RiverSegment {
                 a: b.position,
                 b: [b.position[0] + d[0] / l * reach, b.position[1] + d[1] / l * reach],
                 water: [b.water, b.water],
@@ -3118,7 +3118,8 @@ fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
                 skew: 0.0,
                 turbulence: 0.0,
                 levee: 0.0,
-            });
+            };
+            segments.push(mouth_extension);
         }
     }
     segments
@@ -3166,10 +3167,8 @@ mod tests {
     }
 
     fn reach(flags: &[bool], water: &[f32]) -> Vec<RiverNode> {
-        flags
-            .iter()
-            .zip(water)
-            .enumerate()
+        let node_inputs = flags.iter().zip(water).enumerate();
+        node_inputs
             .map(|(i, (&lake, &water))| RiverNode {
                 position: [i as f32 * 2.5, 0.0],
                 water,
@@ -3189,10 +3188,8 @@ mod tests {
         let water = [6.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.0, 4.9];
         let mut nodes = reach(&flags, &water);
         settle_lake_runs(&mut nodes, |_| 5.1);
-        assert_eq!(
-            nodes.iter().map(|n| n.lake).collect::<Vec<_>>(),
-            [false, true, true, true, true, true, true, true, true, false]
-        );
+        let lake_flags: Vec<bool> = nodes.iter().map(|n| n.lake).collect();
+        assert_eq!(lake_flags, [false, true, true, true, true, true, true, true, true, false]);
         // A hollow deeper than the lake's sheet would show is not taken in.
         let mut nodes = reach(&flags, &water);
         settle_lake_runs(&mut nodes, |p| if p[0] == 10.0 { 4.0 } else { 5.1 });

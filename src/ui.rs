@@ -320,12 +320,11 @@ fn draw_player_tools(
     {
         player.vertical_velocity = 0.0;
     }
-    ui.add(
-        egui::Slider::new(&mut player.movement_speed_multiplier, 0.1..=20.0)
-            .text("Movement speed")
-            .suffix("x")
-            .logarithmic(true),
-    );
+    let mut movement_speed_slider = egui::Slider::new(&mut player.movement_speed_multiplier, 0.1..=20.0);
+    movement_speed_slider = movement_speed_slider.text("Movement speed");
+    movement_speed_slider = movement_speed_slider.suffix("x");
+    movement_speed_slider = movement_speed_slider.logarithmic(true);
+    ui.add(movement_speed_slider);
     ui.horizontal(|ui| {
         if ui.button("Use current position").clicked() {
             trainer.use_position(player.position);
@@ -337,19 +336,19 @@ fn draw_player_tools(
             ));
         }
     });
-    egui::Grid::new("teleport_coordinates")
-        .num_columns(2)
-        .show(ui, |ui| {
-            for (index, axis) in ["X", "Y", "Z"].into_iter().enumerate() {
-                ui.label(axis);
-                ui.add_enabled(
-                    !(index == 1 && trainer.snap_to_ground),
-                    egui::TextEdit::singleline(&mut trainer.coordinates[index])
-                        .desired_width(200.0),
-                );
-                ui.end_row();
-            }
-        });
+    let mut coordinate_grid = egui::Grid::new("teleport_coordinates");
+    coordinate_grid = coordinate_grid.num_columns(2);
+    coordinate_grid.show(ui, |ui| {
+        for (index, axis) in ["X", "Y", "Z"].into_iter().enumerate() {
+            ui.label(axis);
+            ui.add_enabled(
+                !(index == 1 && trainer.snap_to_ground),
+                egui::TextEdit::singleline(&mut trainer.coordinates[index])
+                    .desired_width(200.0),
+            );
+            ui.end_row();
+        }
+    });
     ui.checkbox(
         &mut trainer.snap_to_ground,
         "Place on ground at X/Z (ignore Y)",
@@ -432,118 +431,118 @@ fn draw_trainer_window(
     } else {
         ctx.content_rect().top() + 12.0
     };
-    egui::Window::new("Developer menu [2]")
-        .id(egui::Id::new("developer_menu"))
-        .anchor(
-            egui::Align2::LEFT_TOP,
-            egui::vec2(12.0, top - ctx.content_rect().top()),
-        )
-        .default_width(360.0)
-        .max_height((ctx.content_rect().bottom() - top - 12.0).max(120.0))
-        .resizable(false)
-        .vscroll(true)
-        .open(&mut open)
-        .show(ctx, |ui| {
-            draw_player_tools(ui, player, trainer, cache, noise, snow);
-            separator_text(ui, "Weather here");
-            let selected = weather
-                .trainer_preset
-                .map(WeatherPreset::label)
-                .unwrap_or("Natural weather");
-            let mut requested = weather.trainer_preset;
-            egui::ComboBox::from_id_salt("trainer_weather")
-                .selected_text(selected)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut requested, None, "Natural weather");
-                    for preset in WeatherPreset::ALL {
-                        ui.selectable_value(&mut requested, Some(preset), preset.label());
-                    }
-                });
-            if requested != weather.trainer_preset {
-                weather.set_trainer_preset(requested);
-                weather.refresh_local(player.position.to_array(), weather_offset, settings);
+    let trainer_panels = |ui: &mut egui::Ui| {
+        draw_player_tools(ui, player, trainer, cache, noise, snow);
+        separator_text(ui, "Weather here");
+        let selected = weather
+            .trainer_preset
+            .map(WeatherPreset::label)
+            .unwrap_or("Natural weather");
+        let mut requested = weather.trainer_preset;
+        let mut trainer_weather = egui::ComboBox::from_id_salt("trainer_weather");
+        trainer_weather = trainer_weather.selected_text(selected);
+        trainer_weather.show_ui(ui, |ui| {
+            ui.selectable_value(&mut requested, None, "Natural weather");
+            for preset in WeatherPreset::ALL {
+                ui.selectable_value(&mut requested, Some(preset), preset.label());
             }
-            ui.small(format!(
-                "Current conditions: {}",
-                weather.local_condition().label()
-            ));
-            if matches!(
-                weather.trainer_preset,
-                Some(WeatherPreset::Rain | WeatherPreset::Snow | WeatherPreset::Thunderstorm)
-            ) && weather.local_precipitation.intensity() < 0.05
-            {
-                ui.small("Rain and snow fade above the clouds.");
-            }
-            ui.checkbox(&mut weather.automatic, "Move weather fronts");
-            if weather.local_precipitation.thunderstorm > 0.12
-                && ui.button("Strike lightning").clicked()
-            {
-                weather.request_strike();
-            }
-            ui.add(
-                egui::Slider::new(&mut settings.thunder_volume, 0.0..=1.0)
-                    .text("Thunder volume")
-                    .fixed_decimals(2),
-            );
-
-            separator_text(ui, "Time of day");
-            if ui
-                .add(
-                    egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99).custom_formatter(
-                        |hours, _| {
-                            let minutes = (hours * 60.0).round() as u32 % (24 * 60);
-                            format!("{:02}:{:02}", minutes / 60, minutes % 60)
-                        },
-                    ),
-                )
-                .changed()
-            {
-                day_night.paused = true;
-            }
-            ui.horizontal(|ui| {
-                for (label, hour) in [
-                    ("Dawn", 6.25),
-                    ("Noon", 12.0),
-                    ("Dusk", 17.75),
-                    ("Night", 0.0),
-                ] {
-                    if ui.button(label).clicked() {
-                        day_night.time_hours = hour;
-                        day_night.paused = true;
-                    }
-                }
-            });
-            ui.checkbox(&mut day_night.paused, "Hold selected time");
-            ui.collapsing("World and rendering shortcuts", |ui| {
-                ui.checkbox(
-                    &mut settings.vegetation_enabled,
-                    "Trees, shrubs and flowers",
-                );
-                ui.checkbox(&mut settings.clouds_enabled, "Clouds");
-                ui.checkbox(&mut settings.ssao_enabled, "SSAO");
-                ui.checkbox(&mut settings.flow_debug, "Flow visualization");
-                ui.checkbox(&mut settings.erosion_debug, "Erosion lattice / delta");
-                if ui.button("Regenerate erosion cache").clicked() {
-                    rerun.0 = true;
-                }
-            });
-            ui.separator();
-            ui.checkbox(&mut settings.show_ui, "Advanced controls");
-            if settings.show_ui {
-                draw_advanced_controls(
-                    ui,
-                    settings,
-                    erosion_settings,
-                    water_settings,
-                    day_night,
-                    weather,
-                    player,
-                    rerun,
-                    rivers,
-                );
-            }
-            ui.small("2 close menu  |  3 debug text  |  F12 screenshot");
         });
+        if requested != weather.trainer_preset {
+            weather.set_trainer_preset(requested);
+            weather.refresh_local(player.position.to_array(), weather_offset, settings);
+        }
+        ui.small(format!(
+            "Current conditions: {}",
+            weather.local_condition().label()
+        ));
+        if matches!(
+            weather.trainer_preset,
+            Some(WeatherPreset::Rain | WeatherPreset::Snow | WeatherPreset::Thunderstorm)
+        ) && weather.local_precipitation.intensity() < 0.05
+        {
+            ui.small("Rain and snow fade above the clouds.");
+        }
+        ui.checkbox(&mut weather.automatic, "Move weather fronts");
+        if weather.local_precipitation.thunderstorm > 0.12
+            && ui.button("Strike lightning").clicked()
+        {
+            weather.request_strike();
+        }
+        let mut thunder_volume_slider = egui::Slider::new(&mut settings.thunder_volume, 0.0..=1.0);
+        thunder_volume_slider = thunder_volume_slider.text("Thunder volume");
+        thunder_volume_slider = thunder_volume_slider.fixed_decimals(2);
+        ui.add(thunder_volume_slider);
+
+        separator_text(ui, "Time of day");
+        if ui
+            .add(
+                egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99).custom_formatter(
+                    |hours, _| {
+                        let minutes = (hours * 60.0).round() as u32 % (24 * 60);
+                        format!("{:02}:{:02}", minutes / 60, minutes % 60)
+                    },
+                ),
+            )
+            .changed()
+        {
+            day_night.paused = true;
+        }
+        ui.horizontal(|ui| {
+            for (label, hour) in [
+                ("Dawn", 6.25),
+                ("Noon", 12.0),
+                ("Dusk", 17.75),
+                ("Night", 0.0),
+            ] {
+                if ui.button(label).clicked() {
+                    day_night.time_hours = hour;
+                    day_night.paused = true;
+                }
+            }
+        });
+        ui.checkbox(&mut day_night.paused, "Hold selected time");
+        ui.collapsing("World and rendering shortcuts", |ui| {
+            ui.checkbox(
+                &mut settings.vegetation_enabled,
+                "Trees, shrubs and flowers",
+            );
+            ui.checkbox(&mut settings.clouds_enabled, "Clouds");
+            ui.checkbox(&mut settings.ssao_enabled, "SSAO");
+            ui.checkbox(&mut settings.flow_debug, "Flow visualization");
+            ui.checkbox(&mut settings.erosion_debug, "Erosion lattice / delta");
+            if ui.button("Regenerate erosion cache").clicked() {
+                rerun.0 = true;
+            }
+        });
+        ui.separator();
+        ui.checkbox(&mut settings.show_ui, "Advanced controls");
+        if settings.show_ui {
+            draw_advanced_controls(
+                ui,
+                settings,
+                erosion_settings,
+                water_settings,
+                day_night,
+                weather,
+                player,
+                rerun,
+                rivers,
+            );
+        }
+        ui.small("2 close menu  |  3 debug text  |  F12 screenshot");
+    };
+    let mut window = egui::Window::new("Developer menu [2]");
+    window = window.id(egui::Id::new("developer_menu"));
+    window = window.anchor(
+        egui::Align2::LEFT_TOP,
+        egui::vec2(12.0, top - ctx.content_rect().top()),
+    );
+    window = window.default_width(360.0);
+    window = window.max_height((ctx.content_rect().bottom() - top - 12.0).max(120.0));
+    window = window.resizable(false);
+    window = window.vscroll(true);
+    window = window.open(&mut open);
+    window.show(ctx, trainer_panels);
     settings.show_trainer = open;
     if player.position != previous_position {
         snow.recenter(Vec2::new(player.position.x, player.position.z));
@@ -566,18 +565,18 @@ fn draw_advanced_controls(
 ) {
     separator_text(ui, "Weather");
     ui.checkbox(&mut weather.automatic, "Moving weather fronts");
-    egui::ComboBox::from_label("Weather trend")
-        .selected_text(weather.target.label())
-        .show_ui(ui, |ui| {
-            for preset in WeatherPreset::ALL {
-                if ui
-                    .selectable_label(weather.target == preset, preset.label())
-                    .clicked()
-                {
-                    weather.set_target(preset);
-                }
+    let mut weather_trend = egui::ComboBox::from_label("Weather trend");
+    weather_trend = weather_trend.selected_text(weather.target.label());
+    weather_trend.show_ui(ui, |ui| {
+        for preset in WeatherPreset::ALL {
+            if ui
+                .selectable_label(weather.target == preset, preset.label())
+                .clicked()
+            {
+                weather.set_target(preset);
             }
-        });
+        }
+    });
     if weather.is_transitioning() {
         ui.label(format!("Changing to {}", weather.target.label()));
     }
@@ -605,34 +604,30 @@ fn draw_advanced_controls(
             local_precipitation.gust_strength * 100.0,
         ));
     }
-    ui.add(
-        egui::Slider::new(&mut weather.transition_seconds, 10.0..=180.0)
-            .text("Trend transition")
-            .suffix(" s")
-            .fixed_decimals(0),
-    );
-    ui.add(
-        egui::Slider::new(&mut settings.thunder_volume, 0.0..=1.0)
-            .text("Thunder volume")
-            .fixed_decimals(2),
-    );
+    let mut transition_slider = egui::Slider::new(&mut weather.transition_seconds, 10.0..=180.0);
+    transition_slider = transition_slider.text("Trend transition");
+    transition_slider = transition_slider.suffix(" s");
+    transition_slider = transition_slider.fixed_decimals(0);
+    ui.add(transition_slider);
+    let mut thunder_volume_slider = egui::Slider::new(&mut settings.thunder_volume, 0.0..=1.0);
+    thunder_volume_slider = thunder_volume_slider.text("Thunder volume");
+    thunder_volume_slider = thunder_volume_slider.fixed_decimals(2);
+    ui.add(thunder_volume_slider);
 
     separator_text(ui, "Sun and time");
-    ui.add(
-        egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99)
-            .text("Time of day")
-            .custom_formatter(|hours, _| {
-                let minutes = (hours * 60.0).round() as u32 % (24 * 60);
-                format!("{:02}:{:02}", minutes / 60, minutes % 60)
-            }),
-    );
+    let mut time_of_day_slider = egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99);
+    time_of_day_slider = time_of_day_slider.text("Time of day");
+    time_of_day_slider = time_of_day_slider.custom_formatter(|hours, _| {
+        let minutes = (hours * 60.0).round() as u32 % (24 * 60);
+        format!("{:02}:{:02}", minutes / 60, minutes % 60)
+    });
+    ui.add(time_of_day_slider);
     ui.checkbox(&mut day_night.paused, "Pause day/night cycle");
-    ui.add(
-        egui::Slider::new(&mut day_night.day_length_minutes, 1.0..=120.0)
-            .text("Day duration")
-            .suffix(" min")
-            .logarithmic(true),
-    );
+    let mut day_duration_slider = egui::Slider::new(&mut day_night.day_length_minutes, 1.0..=120.0);
+    day_duration_slider = day_duration_slider.text("Day duration");
+    day_duration_slider = day_duration_slider.suffix(" min");
+    day_duration_slider = day_duration_slider.logarithmic(true);
+    ui.add(day_duration_slider);
     ui.horizontal(|ui| {
         for (label, hour) in [
             ("Dawn", 6.25),
@@ -655,19 +650,17 @@ fn draw_advanced_controls(
         2 => "High",
         _ => "Balanced",
     };
-    egui::ComboBox::from_label("Raymarch quality")
-        .selected_text(quality_name)
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut settings.raymarch_quality, 0, "Low");
-            ui.selectable_value(&mut settings.raymarch_quality, 1, "Balanced");
-            ui.selectable_value(&mut settings.raymarch_quality, 2, "High");
-        });
-    ui.add_enabled(
-        settings.volumetric_lighting,
-        egui::Slider::new(&mut settings.volumetric_strength, 0.0..=2.0)
-            .text("Light shaft strength")
-            .fixed_decimals(2),
-    );
+    let mut quality_combo = egui::ComboBox::from_label("Raymarch quality");
+    quality_combo = quality_combo.selected_text(quality_name);
+    quality_combo.show_ui(ui, |ui| {
+        ui.selectable_value(&mut settings.raymarch_quality, 0, "Low");
+        ui.selectable_value(&mut settings.raymarch_quality, 1, "Balanced");
+        ui.selectable_value(&mut settings.raymarch_quality, 2, "High");
+    });
+    let mut light_shaft_slider = egui::Slider::new(&mut settings.volumetric_strength, 0.0..=2.0);
+    light_shaft_slider = light_shaft_slider.text("Light shaft strength");
+    light_shaft_slider = light_shaft_slider.fixed_decimals(2);
+    ui.add_enabled(settings.volumetric_lighting, light_shaft_slider);
 
     separator_text(ui, "Volumetric clouds");
     ui.small(
@@ -675,57 +668,55 @@ fn draw_advanced_controls(
     );
     ui.checkbox(&mut settings.clouds_enabled, "Clouds");
     ui.add_enabled_ui(settings.clouds_enabled, |ui| {
-        ui.add(
-            egui::Slider::new(&mut settings.cloud_coverage, 0.0..=1.0)
-                .text("Coverage")
-                .fixed_decimals(2),
-        );
-        ui.add(
-            egui::Slider::new(&mut settings.cloud_density, 0.0..=4.0)
-                .text("Density")
-                .fixed_decimals(2),
-        );
-        ui.add(
-            egui::Slider::new(&mut settings.cloud_base_height, 100.0..=6000.0)
-                .text("Cloud base")
-                .suffix(" m")
-                .fixed_decimals(0),
-        );
-        ui.add(
-            egui::Slider::new(&mut settings.cloud_thickness, 100.0..=4000.0)
-                .text("Layer thickness")
-                .suffix(" m")
-                .fixed_decimals(0),
-        );
-        ui.add(
-            egui::Slider::new(&mut settings.cloud_wind_speed, 0.0..=80.0)
-                .text("Cloud wind speed")
-                .suffix(" m/s")
-                .fixed_decimals(1),
-        );
-        ui.add(
-            egui::Slider::new(&mut settings.cloud_wind_direction_degrees, 0.0..=360.0)
-                .text("Cloud wind direction")
-                .suffix("°")
-                .fixed_decimals(0),
-        );
-        ui.add(
-            egui::Slider::new(&mut settings.cloud_shadow_strength, 0.0..=1.0)
-                .text("Cloud shadows")
-                .fixed_decimals(2),
-        );
+        let mut cloud_coverage_slider = egui::Slider::new(&mut settings.cloud_coverage, 0.0..=1.0);
+        cloud_coverage_slider = cloud_coverage_slider.text("Coverage");
+        cloud_coverage_slider = cloud_coverage_slider.fixed_decimals(2);
+        ui.add(cloud_coverage_slider);
+        let mut cloud_density_slider = egui::Slider::new(&mut settings.cloud_density, 0.0..=4.0);
+        cloud_density_slider = cloud_density_slider.text("Density");
+        cloud_density_slider = cloud_density_slider.fixed_decimals(2);
+        ui.add(cloud_density_slider);
+        let mut cloud_base_slider =
+            egui::Slider::new(&mut settings.cloud_base_height, 100.0..=6000.0);
+        cloud_base_slider = cloud_base_slider.text("Cloud base");
+        cloud_base_slider = cloud_base_slider.suffix(" m");
+        cloud_base_slider = cloud_base_slider.fixed_decimals(0);
+        ui.add(cloud_base_slider);
+        let mut layer_thickness_slider =
+            egui::Slider::new(&mut settings.cloud_thickness, 100.0..=4000.0);
+        layer_thickness_slider = layer_thickness_slider.text("Layer thickness");
+        layer_thickness_slider = layer_thickness_slider.suffix(" m");
+        layer_thickness_slider = layer_thickness_slider.fixed_decimals(0);
+        ui.add(layer_thickness_slider);
+        let mut cloud_wind_speed_slider =
+            egui::Slider::new(&mut settings.cloud_wind_speed, 0.0..=80.0);
+        cloud_wind_speed_slider = cloud_wind_speed_slider.text("Cloud wind speed");
+        cloud_wind_speed_slider = cloud_wind_speed_slider.suffix(" m/s");
+        cloud_wind_speed_slider = cloud_wind_speed_slider.fixed_decimals(1);
+        ui.add(cloud_wind_speed_slider);
+        let mut cloud_wind_direction_slider =
+            egui::Slider::new(&mut settings.cloud_wind_direction_degrees, 0.0..=360.0);
+        cloud_wind_direction_slider = cloud_wind_direction_slider.text("Cloud wind direction");
+        cloud_wind_direction_slider = cloud_wind_direction_slider.suffix("°");
+        cloud_wind_direction_slider = cloud_wind_direction_slider.fixed_decimals(0);
+        ui.add(cloud_wind_direction_slider);
+        let mut cloud_shadow_slider =
+            egui::Slider::new(&mut settings.cloud_shadow_strength, 0.0..=1.0);
+        cloud_shadow_slider = cloud_shadow_slider.text("Cloud shadows");
+        cloud_shadow_slider = cloud_shadow_slider.fixed_decimals(2);
+        ui.add(cloud_shadow_slider);
         ui.collapsing("Cloud shape", |ui| {
-            ui.add(
-                egui::Slider::new(&mut settings.cloud_scale, 300.0..=6000.0)
-                    .text("Formation scale")
-                    .suffix(" m")
-                    .fixed_decimals(0),
-            );
-            ui.add(
-                egui::Slider::new(&mut settings.cloud_detail_strength, 0.0..=1.0)
-                    .text("Edge detail")
-                    .fixed_decimals(2),
-            );
+            let mut formation_scale_slider =
+                egui::Slider::new(&mut settings.cloud_scale, 300.0..=6000.0);
+            formation_scale_slider = formation_scale_slider.text("Formation scale");
+            formation_scale_slider = formation_scale_slider.suffix(" m");
+            formation_scale_slider = formation_scale_slider.fixed_decimals(0);
+            ui.add(formation_scale_slider);
+            let mut edge_detail_slider =
+                egui::Slider::new(&mut settings.cloud_detail_strength, 0.0..=1.0);
+            edge_detail_slider = edge_detail_slider.text("Edge detail");
+            edge_detail_slider = edge_detail_slider.fixed_decimals(2);
+            ui.add(edge_detail_slider);
         });
     });
 
@@ -738,26 +729,22 @@ fn draw_advanced_controls(
     ui.add(egui::Slider::new(&mut settings.ao_power, 0.4..=3.0).text("AO power"));
     ui.add(egui::Slider::new(&mut settings.ao_strength, 0.0..=1.0).text("AO strength"));
     ui.add(egui::Slider::new(&mut settings.ao_tex_strength, 0.0..=1.0).text("Texture AO"));
-    ui.add(
-        egui::Slider::new(&mut settings.fog_density, 0.0..=0.001)
-            .text("Fog")
-            .fixed_decimals(5),
-    );
-    ui.add(
-        egui::Slider::new(&mut settings.sun_intensity, 0.0..=8.0)
-            .text("Sun intensity")
-            .fixed_decimals(2),
-    );
-    ui.add(
-        egui::Slider::new(&mut settings.exposure, 0.25..=4.0)
-            .text("Exposure")
-            .fixed_decimals(2),
-    );
-    ui.add(
-        egui::Slider::new(&mut settings.sparkle_strength, 0.0..=2.0)
-            .text("Snow sparkle")
-            .fixed_decimals(2),
-    );
+    let mut fog_slider = egui::Slider::new(&mut settings.fog_density, 0.0..=0.001);
+    fog_slider = fog_slider.text("Fog");
+    fog_slider = fog_slider.fixed_decimals(5);
+    ui.add(fog_slider);
+    let mut sun_intensity_slider = egui::Slider::new(&mut settings.sun_intensity, 0.0..=8.0);
+    sun_intensity_slider = sun_intensity_slider.text("Sun intensity");
+    sun_intensity_slider = sun_intensity_slider.fixed_decimals(2);
+    ui.add(sun_intensity_slider);
+    let mut exposure_slider = egui::Slider::new(&mut settings.exposure, 0.25..=4.0);
+    exposure_slider = exposure_slider.text("Exposure");
+    exposure_slider = exposure_slider.fixed_decimals(2);
+    ui.add(exposure_slider);
+    let mut snow_sparkle_slider = egui::Slider::new(&mut settings.sparkle_strength, 0.0..=2.0);
+    snow_sparkle_slider = snow_sparkle_slider.text("Snow sparkle");
+    snow_sparkle_slider = snow_sparkle_slider.fixed_decimals(2);
+    ui.add(snow_sparkle_slider);
 
     separator_text(ui, "Vegetation");
     ui.checkbox(
@@ -765,11 +752,10 @@ fn draw_advanced_controls(
         "Trees, shrubs and flowers",
     );
     ui.checkbox(&mut settings.vegetation_shadows, "Plant shadows");
-    ui.add(
-        egui::Slider::new(&mut settings.vegetation_detail, 0.4..=2.5)
-            .text("Plant detail distance")
-            .fixed_decimals(2),
-    );
+    let mut plant_detail_slider = egui::Slider::new(&mut settings.vegetation_detail, 0.4..=2.5);
+    plant_detail_slider = plant_detail_slider.text("Plant detail distance");
+    plant_detail_slider = plant_detail_slider.fixed_decimals(2);
+    ui.add(plant_detail_slider);
 
     separator_text(ui, "Rivers");
     ui.checkbox(&mut settings.rivers_visible, "River and lake surfaces");
@@ -808,21 +794,18 @@ fn draw_advanced_controls(
     }
 
     separator_text(ui, "Terrain textures");
-    ui.add(
-        egui::Slider::new(&mut settings.texture_scale, 0.005..=0.6)
-            .text("Texture scale")
-            .fixed_decimals(3),
-    );
-    ui.add(
-        egui::Slider::new(&mut settings.normal_strength, 0.0..=2.0)
-            .text("Normal strength")
-            .fixed_decimals(2),
-    );
-    ui.add(
-        egui::Slider::new(&mut settings.variant_scale, 0.001..=0.05)
-            .text("Dirt/gravel variant scale")
-            .fixed_decimals(3),
-    );
+    let mut texture_scale_slider = egui::Slider::new(&mut settings.texture_scale, 0.005..=0.6);
+    texture_scale_slider = texture_scale_slider.text("Texture scale");
+    texture_scale_slider = texture_scale_slider.fixed_decimals(3);
+    ui.add(texture_scale_slider);
+    let mut normal_strength_slider = egui::Slider::new(&mut settings.normal_strength, 0.0..=2.0);
+    normal_strength_slider = normal_strength_slider.text("Normal strength");
+    normal_strength_slider = normal_strength_slider.fixed_decimals(2);
+    ui.add(normal_strength_slider);
+    let mut variant_scale_slider = egui::Slider::new(&mut settings.variant_scale, 0.001..=0.05);
+    variant_scale_slider = variant_scale_slider.text("Dirt/gravel variant scale");
+    variant_scale_slider = variant_scale_slider.fixed_decimals(3);
+    ui.add(variant_scale_slider);
 
     separator_text(ui, "Water");
     ui.checkbox(&mut water_settings.enabled, "Water surface");
@@ -830,17 +813,17 @@ fn draw_advanced_controls(
     // changes, so graying them out while the surface is off keeps the
     // spectrum from being regenerated for a pass that will not run.
     ui.add_enabled_ui(water_settings.enabled, |ui| {
-        ui.add(
-            egui::Slider::new(&mut water_settings.sea_state_amplitude, 0.0..=1.5)
-                .text("Sea state")
-                .fixed_decimals(2),
-        );
-        ui.add(
-            egui::Slider::new(&mut water_settings.wind_direction_degrees, 0.0..=360.0)
-                .text("Wind direction")
-                .fixed_decimals(0)
-                .suffix("°"),
-        );
+        let mut sea_state_slider =
+            egui::Slider::new(&mut water_settings.sea_state_amplitude, 0.0..=1.5);
+        sea_state_slider = sea_state_slider.text("Sea state");
+        sea_state_slider = sea_state_slider.fixed_decimals(2);
+        ui.add(sea_state_slider);
+        let mut wind_direction_slider =
+            egui::Slider::new(&mut water_settings.wind_direction_degrees, 0.0..=360.0);
+        wind_direction_slider = wind_direction_slider.text("Wind direction");
+        wind_direction_slider = wind_direction_slider.fixed_decimals(0);
+        wind_direction_slider = wind_direction_slider.suffix("°");
+        ui.add(wind_direction_slider);
         // A combo box rather than aqua's cycle-on-click button: the
         // presets are compared by value, so the selection survives
         // edits to the fields they do not carry.
@@ -849,13 +832,13 @@ fn draw_advanced_controls(
             .position(|(_, preset)| *preset == water_settings.optics)
             .unwrap_or(0);
         let mut index = selected;
-        egui::ComboBox::from_label("Optics")
-            .selected_text(WaterOptics::PRESETS[selected].0)
-            .show_ui(ui, |ui| {
-                for (slot, (name, _)) in WaterOptics::PRESETS.iter().enumerate() {
-                    ui.selectable_value(&mut index, slot, *name);
-                }
-            });
+        let mut optics_combo = egui::ComboBox::from_label("Optics");
+        optics_combo = optics_combo.selected_text(WaterOptics::PRESETS[selected].0);
+        optics_combo.show_ui(ui, |ui| {
+            for (slot, (name, _)) in WaterOptics::PRESETS.iter().enumerate() {
+                ui.selectable_value(&mut index, slot, *name);
+            }
+        });
         if index != selected {
             water_settings.optics = WaterOptics::PRESETS[index].1;
         }
@@ -871,12 +854,12 @@ fn draw_advanced_controls(
     ui.add(egui::Slider::new(&mut erosion_settings.deposition_rate, 0.01..=1.2).text("Deposition"));
     ui.add(egui::Slider::new(&mut erosion_settings.sediment_capacity, 0.5..=20.0).text("Capacity"));
     ui.add(egui::Slider::new(&mut erosion_settings.transport_rate, 0.05..=2.0).text("Transport"));
-    ui.add(
-        egui::Slider::new(&mut erosion_settings.maximum_erosion, 1.0..=40.0)
-            .text("Max excavation")
-            .fixed_decimals(1)
-            .suffix(" m"),
-    );
+    let mut max_excavation_slider =
+        egui::Slider::new(&mut erosion_settings.maximum_erosion, 1.0..=40.0);
+    max_excavation_slider = max_excavation_slider.text("Max excavation");
+    max_excavation_slider = max_excavation_slider.fixed_decimals(1);
+    max_excavation_slider = max_excavation_slider.suffix(" m");
+    ui.add(max_excavation_slider);
     ui.add(
         egui::Slider::new(&mut erosion_settings.fluvial_capacity, 0.0..=0.2).text("Stream power"),
     );
@@ -888,12 +871,12 @@ fn draw_advanced_controls(
         egui::Slider::new(&mut erosion_settings.fluvial_deposition, 0.0..=1.0)
             .text("Alluvial deposition"),
     );
-    ui.add(
-        egui::Slider::new(&mut erosion_settings.maximum_incision, 0.0..=30.0)
-            .text("Max incision")
-            .fixed_decimals(1)
-            .suffix(" m"),
-    );
+    let mut max_incision_slider =
+        egui::Slider::new(&mut erosion_settings.maximum_incision, 0.0..=30.0);
+    max_incision_slider = max_incision_slider.text("Max incision");
+    max_incision_slider = max_incision_slider.fixed_decimals(1);
+    max_incision_slider = max_incision_slider.suffix(" m");
+    ui.add(max_incision_slider);
     ui.add(egui::Slider::new(&mut erosion_settings.talus_rate, 0.0..=0.0625).text("Talus slide"));
     ui.add(egui::Slider::new(&mut erosion_settings.rockfall_rate, 0.0..=0.0625).text("Rockfall"));
     ui.horizontal(|ui| {
@@ -1163,16 +1146,15 @@ fn build_flow_preview_pipeline(
 ) -> Option<(RenderPipeline, BindGroup)> {
     let device = world.resource::<RenderDevice>();
     let textures = world.resource::<GpuWorldTexturesOption>().0.as_ref()?;
-    let shader = device
-        .wgpu_device()
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("flow_preview_shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
-                "../assets/shaders/flow-preview.wgsl"
-            ))),
-        });
+    let shader_descriptor = wgpu::ShaderModuleDescriptor {
+        label: Some("flow_preview_shader"),
+        source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+            "../assets/shaders/flow-preview.wgsl"
+        ))),
+    };
+    let shader = device.wgpu_device().create_shader_module(shader_descriptor);
     let target = key.target_format;
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    let pipeline_descriptor = wgpu::RenderPipelineDescriptor {
         label: Some("flow_preview_pipeline"),
         layout: None,
         vertex: wgpu::VertexState {
@@ -1210,32 +1192,33 @@ fn build_flow_preview_pipeline(
         multisample: wgpu::MultisampleState::default(),
         multiview_mask: None,
         cache: None,
-    });
+    };
+    let pipeline = device.create_render_pipeline(&pipeline_descriptor);
     let layout = BindGroupLayout::from(pipeline.get_bind_group_layout(0));
-    let sampler = device
-        .wgpu_device()
-        .create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("flow_preview_sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..default()
-        });
+    let sampler_descriptor = wgpu::SamplerDescriptor {
+        label: Some("flow_preview_sampler"),
+        address_mode_u: wgpu::AddressMode::Repeat,
+        address_mode_v: wgpu::AddressMode::Repeat,
+        address_mode_w: wgpu::AddressMode::Repeat,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..default()
+    };
+    let sampler = device.wgpu_device().create_sampler(&sampler_descriptor);
+    let bind_group_entries = [
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&textures.flow_atlas_view),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: wgpu::BindingResource::Sampler(&sampler),
+        },
+    ];
     let bind_group = device.create_bind_group(
         Some("flow_preview_bind_group"),
         &layout,
-        &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&textures.flow_atlas_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
+        &bind_group_entries,
     );
     Some((pipeline, bind_group))
 }

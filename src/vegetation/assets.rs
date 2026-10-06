@@ -412,30 +412,32 @@ impl Loader {
                 if tangents.len() != positions.len() {
                     return Err("tangent count does not match vertex count".into());
                 }
+                let build_vertex = |i: usize| -> PlantVertex {
+                    let n = normals[i];
+                    let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+                    let normal = if length > 1e-6 {
+                        [n[0] / length, n[1] / length, n[2] / length]
+                    } else {
+                        [0.0, 1.0, 0.0]
+                    };
+                    PlantVertex {
+                        position: positions[i],
+                        normal,
+                        uv: uvs[i],
+                        tangent: tangents[i],
+                    }
+                };
                 let vertices: Vec<PlantVertex> = (0..positions.len())
-                    .map(|i| {
-                        let n = normals[i];
-                        let length = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-                        let normal = if length > 1e-6 {
-                            [n[0] / length, n[1] / length, n[2] / length]
-                        } else {
-                            [0.0, 1.0, 0.0]
-                        };
-                        PlantVertex {
-                            position: positions[i],
-                            normal,
-                            uv: uvs[i],
-                            tangent: tangents[i],
-                        }
-                    })
+                    .map(build_vertex)
                     .collect();
                 if vertices.iter().any(|v| {
-                    v.position
+                    let mut components = v
+                        .position
                         .iter()
                         .chain(&v.normal)
                         .chain(&v.uv)
-                        .chain(&v.tangent)
-                        .any(|value| !value.is_finite())
+                        .chain(&v.tangent);
+                    components.any(|value| !value.is_finite())
                 }) {
                     return Err("non-finite vertex data".into());
                 }
@@ -512,7 +514,7 @@ impl Loader {
             occlusion: occlusion.clone(),
             cap: detail_cap,
         });
-        Ok(self.material(PlantMaterial {
+        let plant_material = PlantMaterial {
             surface,
             base_color,
             detail,
@@ -530,7 +532,8 @@ impl Loader {
                 0.0
             },
             double_sided,
-        }))
+        };
+        Ok(self.material(plant_material))
     }
 }
 
@@ -566,15 +569,16 @@ impl VegetationAssets {
     }
 
     fn load_inner(directory: &Path, with_textures: bool) -> Result<Self, String> {
-        let mut entries: Vec<(ModelName, PathBuf)> = std::fs::read_dir(directory)
-            .map_err(|e| format!("reading {}: {e}", directory.display()))?
+        let dir_entries = std::fs::read_dir(directory)
+            .map_err(|e| format!("reading {}: {e}", directory.display()))?;
+        let glb_paths = dir_entries
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.extension().is_some_and(|extension| extension == "glb"))
-            .filter_map(|path| {
-                let stem = path.file_stem()?.to_str()?.to_string();
-                parse_model_name(&stem).map(|name| (name, path))
-            })
-            .collect();
+            .filter(|path| path.extension().is_some_and(|extension| extension == "glb"));
+        let parse_glb_entry = |path: PathBuf| -> Option<(ModelName, PathBuf)> {
+            let stem = path.file_stem()?.to_str()?.to_string();
+            parse_model_name(&stem).map(|name| (name, path))
+        };
+        let mut entries: Vec<(ModelName, PathBuf)> = glb_paths.filter_map(parse_glb_entry).collect();
         entries.sort_by(|a, b| {
             (a.0.species, &a.0.form, a.0.variant, a.0.lod).cmp(&(b.0.species, &b.0.form, b.0.variant, b.0.lod))
         });
@@ -654,7 +658,7 @@ impl VegetationAssets {
                 });
             }
             let (crown_radius, crown_base) = crown_metrics(&foliage_points, top);
-            models.push(PlantModel {
+            let model = PlantModel {
                 name: model_name,
                 species: name.species,
                 form: name.form.clone(),
@@ -663,7 +667,8 @@ impl VegetationAssets {
                 crown_radius,
                 crown_base,
                 bounding_radius: all_points_radius.max(0.05),
-            });
+            };
+            models.push(model);
             index = group_end;
         }
 
@@ -729,26 +734,27 @@ fn prepare_textures(keys: &[TextureKey]) -> Result<Vec<PreparedTexture>, String>
     let workers = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
         .clamp(1, 8);
+    let worker = || {
+        loop {
+            let index = next.fetch_add(1, Ordering::Relaxed);
+            if index >= keys.len() {
+                break;
+            }
+            let prepared = prepare_texture(&keys[index]);
+            results.lock().unwrap_or_else(|e| e.into_inner())[index] = Some(prepared);
+        }
+    };
     std::thread::scope(|scope| {
         for _ in 0..workers {
-            scope.spawn(|| {
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    if index >= keys.len() {
-                        break;
-                    }
-                    let prepared = prepare_texture(&keys[index]);
-                    results.lock().unwrap_or_else(|e| e.into_inner())[index] = Some(prepared);
-                }
-            });
+            scope.spawn(worker);
         }
     });
-    results
-        .into_inner()
-        .unwrap_or_else(|e| e.into_inner())
+    let texture_results = results.into_inner().unwrap_or_else(|e| e.into_inner());
+    let textures = texture_results
         .into_iter()
         .map(|result| result.expect("every texture prepared"))
-        .collect()
+        .collect();
+    textures
 }
 
 fn prepare_texture(key: &TextureKey) -> Result<PreparedTexture, String> {
@@ -756,13 +762,14 @@ fn prepare_texture(key: &TextureKey) -> Result<PreparedTexture, String> {
         TextureKey::BaseColor { path, cap, cutout } => {
             let image = decode(path)?;
             let levels = base_color_chain(&image, *cap, cutout.then_some(ALPHA_CUTOFF));
-            Ok(PreparedTexture {
+            let texture = PreparedTexture {
                 label: path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
                 width: levels[0].width,
                 height: levels[0].height,
                 srgb: true,
                 levels: levels.into_iter().map(|level| level.rgba).collect(),
-            })
+            };
+            Ok(texture)
         }
         TextureKey::Detail {
             normal,
@@ -790,13 +797,14 @@ fn prepare_texture(key: &TextureKey) -> Result<PreparedTexture, String> {
                 .as_ref()
                 .and(key_label(key))
                 .unwrap_or_else(|| "flat-detail".to_string());
-            Ok(PreparedTexture {
+            let texture = PreparedTexture {
                 label,
                 width: levels[0].width,
                 height: levels[0].height,
                 srgb: false,
                 levels: levels.into_iter().map(|level| level.rgba).collect(),
-            })
+            };
+            Ok(texture)
         }
     }
 }
@@ -815,10 +823,12 @@ fn key_label(key: &TextureKey) -> Option<String> {
 /// Missing maps contribute a flat normal, full roughness and no occlusion,
 /// the glTF defaults, and the material factors are applied in the shader.
 fn pack_detail(normal: Option<&Image>, roughness: Option<&Image>, occlusion: Option<&Image>) -> Image {
-    let (width, height) = normal
-        .map(|n| (n.width, n.height))
-        .or_else(|| roughness.map(|r| (r.width, r.height)))
-        .or_else(|| occlusion.map(|o| (o.width, o.height)))
+    let normal_size = normal.map(|n| (n.width, n.height));
+    let roughness_size = roughness.map(|r| (r.width, r.height));
+    let occlusion_size = occlusion.map(|o| (o.width, o.height));
+    let (width, height) = normal_size
+        .or(roughness_size)
+        .or(occlusion_size)
         .unwrap_or((1, 1));
     let sample = |image: &Image, x: u32, y: u32, channel: usize| -> u8 {
         // Nearest texel of a map that may differ in resolution.
@@ -847,35 +857,31 @@ struct Level {
 
 fn srgb_decode_table() -> &'static [f32; 256] {
     static TABLE: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| {
-        std::array::from_fn(|i| {
-            let value = i as f32 / 255.0;
-            if value <= 0.04045 {
-                value / 12.92
-            } else {
-                ((value + 0.055) / 1.055).powf(2.4)
-            }
-        })
-    })
+    let decode_byte = |i: usize| -> f32 {
+        let value = i as f32 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    TABLE.get_or_init(|| std::array::from_fn(decode_byte))
 }
 
 const ENCODE_STEPS: usize = 16384;
 
 fn srgb_encode_table() -> &'static [u8] {
     static TABLE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| {
-        (0..=ENCODE_STEPS)
-            .map(|i| {
-                let value = i as f32 / ENCODE_STEPS as f32;
-                let encoded = if value <= 0.0031308 {
-                    value * 12.92
-                } else {
-                    1.055 * value.powf(1.0 / 2.4) - 0.055
-                };
-                (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
-            })
-            .collect()
-    })
+    let encode_byte = |i: usize| -> u8 {
+        let value = i as f32 / ENCODE_STEPS as f32;
+        let encoded = if value <= 0.0031308 {
+            value * 12.92
+        } else {
+            1.055 * value.powf(1.0 / 2.4) - 0.055
+        };
+        (encoded.clamp(0.0, 1.0) * 255.0).round() as u8
+    };
+    TABLE.get_or_init(|| (0..=ENCODE_STEPS).map(encode_byte).collect())
 }
 
 fn srgb_encode(linear: f32) -> u8 {
@@ -963,12 +969,11 @@ fn alpha_histogram(rgba: &[u8]) -> [u32; 256] {
 /// Fraction of texels that pass the alpha test after scaling alpha by `scale`.
 fn coverage(histogram: &[u32; 256], cutoff: f32, scale: f32) -> f32 {
     let total: u32 = histogram.iter().sum();
-    let passing: u32 = histogram
+    let passing_alphas = histogram
         .iter()
         .enumerate()
-        .filter(|(alpha, _)| ((*alpha as f32 * scale).round().min(255.0) / 255.0) >= cutoff)
-        .map(|(_, count)| *count)
-        .sum();
+        .filter(|(alpha, _)| ((*alpha as f32 * scale).round().min(255.0) / 255.0) >= cutoff);
+    let passing: u32 = passing_alphas.map(|(_, count)| *count).sum();
     passing as f32 / total.max(1) as f32
 }
 
@@ -1218,17 +1223,18 @@ mod tests {
             let expected = if model.species == Species::Lavender { 1 } else { 4 };
             assert_eq!(model.lods.len(), expected, "{}", model.name);
             assert!(model.height > 0.2 && model.crown_radius > 0.05, "{}", model.name);
+            let lod_triangle_counts: Vec<u32> = model
+                .lods
+                .iter()
+                .map(|lod| lod.primitives.iter().map(|p| p.index_count / 3).sum::<u32>())
+                .collect();
             println!(
                 "{:28} h={:5.2} crown r={:5.2} base={:5.2} tris={:?}",
                 model.name,
                 model.height,
                 model.crown_radius,
                 model.crown_base,
-                model
-                    .lods
-                    .iter()
-                    .map(|lod| lod.primitives.iter().map(|p| p.index_count / 3).sum::<u32>())
-                    .collect::<Vec<_>>()
+                lod_triangle_counts
             );
         }
     }

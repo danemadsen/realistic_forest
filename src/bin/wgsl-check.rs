@@ -39,14 +39,13 @@ fn validate_file(path: &std::path::Path, entry_points: &[EntryPoint]) -> Result<
 fn main() {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let paths: Vec<std::path::PathBuf> = if arguments.is_empty() {
-        let mut glob: Vec<std::path::PathBuf> = std::fs::read_dir("assets/shaders")
+        let wgsl_entries = std::fs::read_dir("assets/shaders")
             .expect("assets/shaders exists")
             .filter_map(|entry| entry.ok())
             .filter(|entry| {
                 entry.path().extension().is_some_and(|extension| extension == "wgsl")
-            })
-            .map(|entry| entry.path())
-            .collect();
+            });
+        let mut glob: Vec<std::path::PathBuf> = wgsl_entries.map(|entry| entry.path()).collect();
         glob.sort();
         glob
     } else {
