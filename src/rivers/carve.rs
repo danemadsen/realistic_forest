@@ -15,7 +15,9 @@
 //! The terrain height is `min(max(h, lower), upper)`, with the upper bound
 //! the minimum and the lower bound the maximum over every nearby segment, so
 //! confluences open into each other and a channel always wins over a
-//! neighbour's levee.
+//! neighbour's levee. Crossing banks and their shallow shoreline strip round
+//! together once, opening a bounded shelf at the junction. Deep channel beds
+//! retain their original profile.
 //!
 //! Segments have a flat start and a round end: a point behind a segment's
 //! start belongs to the segment before it, so a segment never reaches back
@@ -39,6 +41,13 @@ pub const LEVEE_OUTER_SLOPE: f32 = 0.15;
 /// Height over which the carve's creases are rounded where it meets the
 /// natural ground: the top of a bank, the foot of a levee.
 pub const CARVE_ROUNDING: f32 = 0.8;
+/// Round intersecting bank cones over this height difference. Parallel
+/// reaches retain their own bank profile, including subdivided reaches.
+pub const BANK_UNION_ROUNDING: f32 = 2.8;
+/// Shoreline rounding fades out within this distance inside a channel.
+pub const BANK_UNION_SHORE_BLEND: f32 = 0.75;
+/// Largest new wetted shelf outside either channel's original waterline.
+pub const BANK_UNION_INTRUSION: f32 = 0.6;
 
 /// Polynomial smooth minimum: `min(a, b)` with the corner rounded over a
 /// difference of `k`, pulled down by at most `k / 4` where `a == b`.
@@ -248,7 +257,10 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
         // Otherwise a high terrace (or deep hollow under a levee) jumps
         // straight back to its uncarved height at the reach boundary.
         let edge = smoothstep(0.5 * bank_reach, bank_reach, past_bank);
-        let release = bank_reach * edge * edge / (1.0 - edge).max(1e-5);
+        // Ten kilometres already releases the bound past the entire terrain
+        // height range. Saturate it before tiny edge-distance differences
+        // amplify into large CPU/GPU discrepancies in an inactive bound.
+        let release = (bank_reach * edge * edge / (1.0 - edge).max(1e-5)).min(1.0e4);
         envelope.upper = water + bank * past_bank + BANK_CURVE * shoulder * shoulder + release;
         let freeboard = 0.1 + 0.25 * depth;
         let levee_width = 0.8 + 0.3 * half_width;
@@ -293,6 +305,90 @@ pub fn combine(total: &mut Envelope, next: &Envelope) {
         total.half_width = next.half_width;
         total.turbulence = next.turbulence;
         total.bend = next.bend;
+    }
+}
+
+fn bank_surface_slope(segment: &RiverSegment) -> f32 {
+    // Conservative slope at the waterline, including either side of a bend.
+    // Keep this fixed across the union's bisector: using the nearest bank's
+    // changing secant slope would put another cusp in the waterline itself.
+    (segment.bank * (1.0 - 0.75 * segment.skew.abs()).max(0.3)).max(0.001)
+}
+
+/// Round one pair of intersecting banks against the unchanged raw upper
+/// minimum. Taking the lowest pair result once, rather than smoothing the
+/// running union repeatedly, prevents extra segments from excavating deeper.
+/// Mirrored by `riverBankUnionUpper` in river-functions.wgslinc.
+fn bank_union_upper(
+    primary: &RiverSegment,
+    first: &Envelope,
+    next: &RiverSegment,
+    second: &Envelope,
+) -> f32 {
+    let nearest_bank = first.bank_distance.min(second.bank_distance);
+    if nearest_bank <= -BANK_UNION_SHORE_BLEND || second.is_none() {
+        return first.upper;
+    }
+    let primary_direction = [primary.b[0] - primary.a[0], primary.b[1] - primary.a[1]];
+    let other_direction = [next.b[0] - next.a[0], next.b[1] - next.a[1]];
+    let cross = primary_direction[0] * other_direction[1] - primary_direction[1] * other_direction[0];
+    let primary_length_squared = primary_direction[0].powi(2) + primary_direction[1].powi(2);
+    let other_length_squared = other_direction[0].powi(2) + other_direction[1].powi(2);
+    let length_product = (primary_length_squared * other_length_squared).max(1e-12);
+    // The squared sine is independent of tangent orientation: straight
+    // overlapping reaches cannot deepen one another, and a joining branch
+    // eases its bank progressively as its angle opens.
+    let turn = (cross * cross / length_product).clamp(0.0, 1.0);
+    let bank_slope = bank_surface_slope(primary).min(bank_surface_slope(next));
+    // A smooth minimum lowers equal heights by one quarter of its radius.
+    // Bound that lowering by the bank's rise over the allowed shelf width.
+    let shelf_rounding = 4.0 * BANK_UNION_INTRUSION * bank_slope;
+    // Keep the same bound when the two water levels differ: beyond the
+    // allowed shelf the union cannot newly cut below either water surface.
+    let shelf_clearance = first.upper - first.water.max(second.water)
+        + bank_slope * (BANK_UNION_INTRUSION - nearest_bank);
+    let bed_fade = smoothstep(-BANK_UNION_SHORE_BLEND, 0.0, nearest_bank);
+    let rounding = BANK_UNION_ROUNDING.min(shelf_rounding).min(4.0 * shelf_clearance.max(0.0)) * turn * bed_fade;
+    if rounding <= 0.0 {
+        return first.upper;
+    }
+    smooth_min(first.upper, second.upper, rounding)
+}
+
+fn round_bank_union(
+    total: &mut Envelope,
+    segments: &[RiverSegment],
+    candidates: &[u32],
+    p: [f32; 2],
+    primary: Option<usize>,
+) {
+    // Deep water keeps its exact bed. At the shoreline the same rounding
+    // continues into a shallow strip, so its contour does not keep a cusp.
+    if total.bank_distance <= -BANK_UNION_SHORE_BLEND {
+        return;
+    }
+    let Some(primary) = primary else { return; };
+    let raw_bank_distance = total.bank_distance;
+    let first = segment_envelope(&segments[primary], p);
+    if first.bank_distance <= -BANK_UNION_SHORE_BLEND {
+        return;
+    }
+    for &index in candidates.iter().take(MAX_CANDIDATES) {
+        let next = &segments[index as usize];
+        let second = segment_envelope(next, p);
+        let rounded_upper = bank_union_upper(&segments[primary], &first, next, &second);
+        if rounded_upper < total.upper {
+            total.upper = rounded_upper;
+            let bank_slope = bank_surface_slope(&segments[primary]).min(bank_surface_slope(next));
+            let shelf_water = first.water.max(second.water);
+            // A newly cut shelf connects to the participating water above
+            // it. Existing flowing beds retain their original water owner.
+            if raw_bank_distance >= 0.0 && first.bank_distance >= 0.0 && second.bank_distance >= 0.0 && rounded_upper < shelf_water {
+                total.water = total.water.max(shelf_water);
+            }
+            let shelf_distance = ((rounded_upper - total.water) / bank_slope).max(-BANK_UNION_INTRUSION);
+            total.bank_distance = total.bank_distance.min(shelf_distance);
+        }
     }
 }
 
@@ -536,10 +632,16 @@ impl SegmentGrid {
 /// The envelope of every segment near `p`.
 pub fn envelope_at(segments: &[RiverSegment], grid: &SegmentGrid, p: [f32; 2]) -> Envelope {
     let mut total = Envelope::NONE;
-    for &index in grid.candidates(p).iter().take(MAX_CANDIDATES) {
+    let candidates = grid.candidates(p);
+    let mut primary = None;
+    for &index in candidates.iter().take(MAX_CANDIDATES) {
         let envelope = segment_envelope(&segments[index as usize], p);
+        if envelope.upper < total.upper {
+            primary = Some(index as usize);
+        }
         combine(&mut total, &envelope);
     }
+    round_bank_union(&mut total, segments, candidates, p, primary);
     let lake = grid.lake(p);
     if lake > NO_LAKE {
         total.lake = lake;
@@ -564,6 +666,157 @@ mod tests {
             turbulence: 0.0,
             levee: 1.0,
         }
+    }
+
+    fn crossing_banks() -> [RiverSegment; 2] {
+        let mut along_x = straight([10.0, 10.0]);
+        along_x.b = [40.0, 0.0];
+        let mut along_z = along_x;
+        along_z.b = [0.0, 40.0];
+        [along_x, along_z]
+    }
+
+    fn raw_envelope(segments: &[RiverSegment], p: [f32; 2]) -> Envelope {
+        let mut total = Envelope::NONE;
+        for segment in segments {
+            let envelope = segment_envelope(segment, p);
+            combine(&mut total, &envelope);
+        }
+        total
+    }
+
+    #[test]
+    fn intersecting_banks_round_the_ridge_between_channels() {
+        let segments = crossing_banks();
+        let grid = SegmentGrid::build([-32.0, -32.0], 4, &segments);
+        let epsilon = 0.01;
+        let at = |t| envelope_at(&segments, &grid, [6.0 + t, 6.0 - t]).upper;
+        let centre = at(0.0);
+        let raw = raw_envelope(&segments, [6.0, 6.0]).upper;
+        assert!(centre < raw - 0.4, "{centre} {raw}");
+        let left_slope = (centre - at(-epsilon)) / epsilon;
+        let right_slope = (at(epsilon) - centre) / epsilon;
+        assert!((left_slope - right_slope).abs() < 0.08, "bank cusp: {left_slope} -> {right_slope}");
+        let raw_left = raw_envelope(&segments, [6.0 - epsilon, 6.0 + epsilon]).upper;
+        assert!((raw - raw_left) / epsilon > 2.0, "unrounded bank should have a ridge");
+    }
+
+    #[test]
+    fn bank_union_does_not_deepen_when_reaches_are_duplicated_or_subdivided() {
+        let original = crossing_banks();
+        let duplicate: Vec<_> = original.into_iter().cycle().take(32).collect();
+        let divided: Vec<_> = original.iter().flat_map(|segment| {
+            (0..8).map(move |i| {
+                let mut part = *segment;
+                let point = |t| [mix(segment.a[0], segment.b[0], t), mix(segment.a[1], segment.b[1], t)];
+                part.a = point(i as f32 / 8.0);
+                part.b = point((i + 1) as f32 / 8.0);
+                part
+            })
+        }).collect();
+        let grids = [
+            SegmentGrid::build([-32.0, -32.0], 4, &original),
+            SegmentGrid::build([-32.0, -32.0], 4, &duplicate),
+            SegmentGrid::build([-32.0, -32.0], 4, &divided),
+        ];
+        for x in 18..70 {
+            for z in 18..70 {
+                let p = [x as f32 * 0.1 + 0.037, z as f32 * 0.1 + 0.019];
+                let expected = envelope_at(&original, &grids[0], p).upper;
+                let repeated = envelope_at(&duplicate, &grids[1], p).upper;
+                let split = envelope_at(&divided, &grids[2], p).upper;
+                assert!((expected - repeated).abs() < 1e-5, "duplicate at {p:?}: {expected} {repeated}");
+                assert!((expected - split).abs() < 1e-5, "subdivision at {p:?}: {expected} {split}");
+                let original_bank = envelope_at(&original, &grids[0], p).bank_distance;
+                let divided_bank = envelope_at(&divided, &grids[2], p).bank_distance;
+                assert!((original_bank - divided_bank).abs() < 1e-5, "shelf subdivision at {p:?}: {original_bank} {divided_bank}");
+            }
+        }
+        // A straight reach's bank is unchanged even when its segments overlap.
+        let parallel = vec![original[0]; 32];
+        let grid = SegmentGrid::build([-32.0, -32.0], 4, &parallel);
+        let p = [6.0, 6.0];
+        assert_eq!(envelope_at(&parallel, &grid, p).upper, segment_envelope(&original[0], p).upper);
+    }
+
+    #[test]
+    fn bank_rounding_preserves_deep_beds_and_bounds_the_new_wetted_shelf() {
+        for second_water in [10.0, 10.25] {
+            let mut segments = crossing_banks();
+            segments[1].water = [second_water; 2];
+            let grid = SegmentGrid::build([-32.0, -32.0], 4, &segments);
+            for x in 0..100 {
+                for z in 0..100 {
+                    let p = [x as f32 * 0.1, z as f32 * 0.1];
+                    let raw = raw_envelope(&segments, p);
+                    let rounded = envelope_at(&segments, &grid, p);
+                    if raw.bank_distance < 0.0 {
+                        assert_eq!(rounded.water, raw.water, "flow water ownership at {p:?}");
+                    }
+                    if raw.bank_distance <= -BANK_UNION_SHORE_BLEND {
+                        assert_eq!(rounded.upper, raw.upper, "bed at {p:?}");
+                        assert_eq!(rounded.bank_distance, raw.bank_distance, "bed distance at {p:?}");
+                    } else {
+                        let first = segment_envelope(&segments[0], p);
+                        let second = segment_envelope(&segments[1], p);
+                        let water_level = first.water.max(second.water);
+                        let nearest_bank = first.bank_distance.min(second.bank_distance);
+                        if raw.upper >= water_level && rounded.upper < water_level {
+                            assert!(nearest_bank <= BANK_UNION_INTRUSION + 1e-5, "shelf too wide at {p:?}: {rounded:?}");
+                            assert!(rounded.bank_distance < 0.0, "wetted shelf unmarked at {p:?}: {rounded:?}");
+                            assert!(rounded.water_over(rounded.upper).is_some(), "shelf missing water at {p:?}");
+                        }
+                        assert!(rounded.upper >= raw.upper - BANK_UNION_ROUNDING * 0.25 - 1e-5);
+                    }
+                    assert_eq!(rounded.lower, raw.lower);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn intersecting_waterlines_open_a_rounded_shore_contour() {
+        let segments = crossing_banks();
+        let grid = SegmentGrid::build([-32.0, -32.0], 4, &segments);
+        // The old corner was exactly (2, 2). A shallow shelf now covers it,
+        // while its shoreline bows out within the supported water ribbon.
+        let corner = envelope_at(&segments, &grid, [2.0, 2.0]);
+        assert!(corner.upper < 9.8 && corner.bank_distance < 0.0, "{corner:?}");
+        let shoreline_height = |x, z| envelope_at(&segments, &grid, [x, z]).upper - 10.0;
+        let shoreline_z = |x| {
+            let mut lower = 2.0;
+            let mut upper = 5.0;
+            for _ in 0..24 {
+                let middle = 0.5 * (lower + upper);
+                if shoreline_height(x, middle) < 0.0 {
+                    lower = middle;
+                } else {
+                    upper = middle;
+                }
+            }
+            0.5 * (lower + upper)
+        };
+        let mut lower = 2.0;
+        let mut upper = 2.0 + BANK_UNION_INTRUSION;
+        for _ in 0..24 {
+            let middle = 0.5 * (lower + upper);
+            if shoreline_height(middle, middle) < 0.0 {
+                lower = middle;
+            } else {
+                upper = middle;
+            }
+        }
+        let centre_x = 0.5 * (lower + upper);
+        let centre_z = shoreline_z(centre_x);
+        assert!((centre_z - centre_x).abs() < 0.002, "shoreline {centre_x} {centre_z}");
+        assert!(centre_x > 2.45 && centre_x < 2.6);
+        let epsilon = 0.01;
+        let left_slope = (centre_z - shoreline_z(centre_x - epsilon)) / epsilon;
+        let right_slope = (shoreline_z(centre_x + epsilon) - centre_z) / epsilon;
+        assert!((left_slope - right_slope).abs() < 0.10, "shoreline cusp: {left_slope} -> {right_slope}");
+        assert!(left_slope < -0.8 && right_slope < -0.8, "shoreline has no rounded arc: {left_slope} {right_slope}");
+        assert!(shoreline_height(2.7, 2.7) > 0.0);
+        assert!(shoreline_height(2.3, 2.3) < 0.0);
     }
 
     #[test]
@@ -684,13 +937,20 @@ mod tests {
         };
         let segments: Vec<RiverSegment> = (0..20).map(offset_segment).collect();
         let grid = SegmentGrid::build([-100.0, -100.0], 16, &segments);
+        let all: Vec<u32> = (0..segments.len() as u32).collect();
         for z in -60..120 {
             for x in -60..260 {
                 let p = [x as f32 * 1.3, z as f32 * 1.1];
                 let mut brute = Envelope::NONE;
-                for segment in &segments {
-                    combine(&mut brute, &segment_envelope(segment, p));
+                let mut primary = None;
+                for (index, segment) in segments.iter().enumerate() {
+                    let next = segment_envelope(segment, p);
+                    if next.upper < brute.upper {
+                        primary = Some(index);
+                    }
+                    combine(&mut brute, &next);
                 }
+                round_bank_union(&mut brute, &segments, &all, p, primary);
                 let fast = envelope_at(&segments, &grid, p);
                 assert_eq!(brute.upper, fast.upper);
                 assert_eq!(brute.lower, fast.lower);

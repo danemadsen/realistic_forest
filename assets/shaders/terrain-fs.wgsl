@@ -634,6 +634,8 @@ fn rockWeathering(p: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec3<f32>
 // keeps the water in its channel). The upper bounds combine by minimum and
 // the lower ones by maximum, so confluences open into each other; a segment
 // has a flat start and a round end, so it never reaches back up the channel.
+// Crossing banks and their shallow shoreline strip round together once;
+// a bounded shelf opens at junctions and deep beds keep their exact profile.
 struct RiverSegment {
     a: vec2<f32>,
     b: vec2<f32>,
@@ -679,6 +681,10 @@ const RIVER_BANK_CURVE: f32 = 0.16;
 const RIVER_LEVEE_OUTER_SLOPE: f32 = 0.15;
 // Height over which the carve's creases are rounded (CARVE_ROUNDING).
 const RIVER_CARVE_ROUNDING: f32 = 0.8;
+// Height difference over which intersecting bank cones are rounded.
+const RIVER_BANK_UNION_ROUNDING: f32 = 2.8;
+const RIVER_BANK_UNION_SHORE_BLEND: f32 = 0.75;
+const RIVER_BANK_UNION_INTRUSION: f32 = 0.6;
 const RIVER_MAX_CANDIDATES: u32 = 64u;
 
 fn riverNone() -> RiverEnvelope
@@ -738,7 +744,9 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
         // Fade both constraints before their finite support ends: a high
         // terrace or low hollow must not jump back to its uncarved height.
         let edge = smoothstep(0.5*bankReach, bankReach, pastBank);
-        let release = bankReach*edge*edge/max(1.0 - edge, 1e-5);
+        // Saturate the released constraint beyond the terrain's height range
+        // before edge-distance precision differences become greatly amplified.
+        let release = min(bankReach*edge*edge/max(1.0 - edge, 1e-5), 1.0e4);
         envelope.upper = water + bank*pastBank + RIVER_BANK_CURVE*shoulder*shoulder + release;
         let freeboard = 0.1 + 0.25*depth;
         let leveeWidth = 0.8 + 0.3*halfWidth;
@@ -785,6 +793,38 @@ fn riverCombine(total: ptr<function, RiverEnvelope>, next: RiverEnvelope)
     }
 }
 
+// Round a pair against the unchanged raw upper minimum. The caller takes
+// the lowest pair once, so segment count cannot accumulate excavation.
+fn riverBankSurfaceSlope(segment: RiverSegment) -> f32
+{
+    // Fixed conservative waterline slope avoids introducing another cusp
+    // as the nearer bank changes at the junction's bisector.
+    return max(segment.bank*max(1.0 - 0.75*abs(segment.skew), 0.3), 0.001);
+}
+
+fn riverBankUnionUpper(primary: RiverSegment, first: RiverEnvelope,
+                      next: RiverSegment, second: RiverEnvelope) -> f32
+{
+    let nearest_bank = min(first.bank_distance, second.bank_distance);
+    if (nearest_bank <= -RIVER_BANK_UNION_SHORE_BLEND ||
+        second.bank_distance >= RIVER_NONE) { return first.upper; }
+    let primary_direction = primary.b - primary.a;
+    let other_direction = next.b - next.a;
+    let cross_value = primary_direction.x*other_direction.y - primary_direction.y*other_direction.x;
+    let length_product = max(dot(primary_direction, primary_direction)*dot(other_direction, other_direction), 1e-12);
+    // Squared sine: independent of tangent orientation, zero for straight
+    // overlapping reaches and progressively stronger at a joining branch.
+    let turn = clamp(cross_value*cross_value/length_product, 0.0, 1.0);
+    let bank_slope = min(riverBankSurfaceSlope(primary), riverBankSurfaceSlope(next));
+    let shelf_rounding = 4.0*RIVER_BANK_UNION_INTRUSION*bank_slope;
+    let shelf_clearance = first.upper - max(first.water, second.water)
+                        + bank_slope*(RIVER_BANK_UNION_INTRUSION - nearest_bank);
+    let bed_fade = smoothstep(-RIVER_BANK_UNION_SHORE_BLEND, 0.0, nearest_bank);
+    let rounding = min(min(RIVER_BANK_UNION_ROUNDING, shelf_rounding), 4.0*max(shelf_clearance, 0.0))*turn*bed_fade;
+    if (rounding <= 0.0) { return first.upper; }
+    return riverSmoothMin(first.upper, second.upper, rounding);
+}
+
 fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
 {
     var total = riverNone();
@@ -796,9 +836,42 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
     let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*RIVER_GRID_CELL_WORDS;
     let offset = river_grid[entry];
     let count = min(river_grid[entry + 1u], RIVER_MAX_CANDIDATES);
+    var primary = 0xffffffffu;
     for (var i = 0u; i < count; i += 1u)
     {
-        riverCombine(&total, riverSegmentEnvelope(river_segments[river_grid[offset + i]], p));
+        let index = river_grid[offset + i];
+        let envelope = riverSegmentEnvelope(river_segments[index], p);
+        if (envelope.upper < total.upper) { primary = index; }
+        riverCombine(&total, envelope);
+    }
+    // Continue the bank rounding through its shallow shoreline strip, then
+    // fade it out smoothly before the undisturbed channel bed.
+    if (primary != 0xffffffffu && total.bank_distance > -RIVER_BANK_UNION_SHORE_BLEND)
+    {
+        let raw_bank_distance = total.bank_distance;
+        let first_segment = river_segments[primary];
+        let first = riverSegmentEnvelope(first_segment, p);
+        if (first.bank_distance > -RIVER_BANK_UNION_SHORE_BLEND)
+        {
+            for (var i = 0u; i < count; i += 1u)
+            {
+                let next = river_segments[river_grid[offset + i]];
+                let second = riverSegmentEnvelope(next, p);
+                let rounded_upper = riverBankUnionUpper(first_segment, first, next, second);
+                if (rounded_upper < total.upper)
+                {
+                    total.upper = rounded_upper;
+                    let bank_slope = min(riverBankSurfaceSlope(first_segment), riverBankSurfaceSlope(next));
+                    let shelf_water = max(first.water, second.water);
+                    if (raw_bank_distance >= 0.0 && first.bank_distance >= 0.0 && second.bank_distance >= 0.0 && rounded_upper < shelf_water)
+                    {
+                        total.water = max(total.water, shelf_water);
+                    }
+                    let shelf_distance = max((rounded_upper - total.water)/bank_slope, -RIVER_BANK_UNION_INTRUSION);
+                    total.bank_distance = min(total.bank_distance, shelf_distance);
+                }
+            }
+        }
     }
     let record = river_grid[entry + 2u];
     if (record != RIVER_NO_LAKE_RECORD)
@@ -915,6 +988,30 @@ fn riverShoreRun(envelope: RiverEnvelope, height: f32, groundNormal: vec3<f32>) 
     // Bound both distances first so absent water fields stay numerically safe.
     return clamp(riverSmoothMin(clamp(riverRun, -40.0, 40.0),
                                 clamp(lakeRun, -40.0, 40.0), 1.5), -40.0, 40.0);
+}
+
+// Flow belongs to one channel at a confluence, but the shore belongs to all
+// of them. Measure each bank before combining: choosing the flow owner's
+// width and level first left triangular material wedges where ownership
+// changed between a narrow tributary and a wide receiving river.
+fn riverShoreRunAt(envelope: RiverEnvelope, p: vec2<f32>, height: f32,
+                   groundNormal: vec3<f32>) -> f32
+{
+    var run = riverShoreRun(envelope, height, groundNormal);
+    let resolution = river_grid[3];
+    if (resolution == 0u) { return run; }
+    let origin = vec2<f32>(bitcast<f32>(river_grid[0]), bitcast<f32>(river_grid[1]));
+    let cell = floor((p - origin)/bitcast<f32>(river_grid[2]));
+    if (any(cell < vec2<f32>(0.0)) || any(cell >= vec2<f32>(f32(resolution)))) { return run; }
+    let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*RIVER_GRID_CELL_WORDS;
+    let offset = river_grid[entry];
+    let count = min(river_grid[entry + 1u], RIVER_MAX_CANDIDATES);
+    for (var i = 0u; i < count; i += 1u)
+    {
+        let bank = riverSegmentEnvelope(river_segments[river_grid[offset + i]], p);
+        run = min(run, riverShoreRun(bank, height, groundNormal));
+    }
+    return run;
 }
 // END SHORE RUN
 
@@ -1192,7 +1289,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         // is a chord across the carved groove; the carve's bounds put it back
         // on the bank (a no-op at the already-clamped vertices).
         let shoreGround = riverClamp(exact, height);
-        shoreRun = mix(riverShoreRun(exact, shoreGround, materialNormal), shoreRun, handover);
+        shoreRun = mix(riverShoreRunAt(exact, worldXZ, shoreGround, materialNormal), shoreRun, handover);
         river = mix(looked, river, handover);
     }
     // Evaluate derivatives before any material gates. Explicit gradients keep
@@ -1439,7 +1536,10 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let riverBend = river.y;
     let riverTurbulence = river.z;
     let riverPower = river.w*(1.0 + 1.5*riverTurbulence);
-    let inRiver = 1.0 - smoothHermite(-0.30, 0.05, riverBank);
+    // The carve's horizontal footprint can continue under receiving water.
+    // Its footprint alone must not paint exposed ground as a river bed.
+    let submerged = smoothHermite(-0.08, 0.12, waterLevel - height);
+    let inRiver = (1.0 - smoothHermite(-0.30, 0.05, riverBank))*submerged;
     let riverRock = smoothHermite(0.45, 0.85, riverTurbulence);
     // The speeds follow Manning's equation (flow_speed, src/rivers/network.rs):
     // ~0.5 m/s through a lowland reach, ~1.2 through a moderate one and ~1.7
@@ -1459,7 +1559,6 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // ending well inside the 12 m a river's bank field reaches and mostly
     // inside the 8-16 m a lake's shore record does.
     let shoreZone = 1.0 - smoothHermite(5.0, 9.0, shoreRun + (soilSmall - 0.5)*2.0);
-    let calmShore = shoreZone*(1.0 - riverRock);
     // The local bank: how steeply this very ground rises from the water.
     let bankSteep = smoothHermite(0.10, 0.35, 1.0 - normalWorld.y);
     let cutBank = bankSteep*(0.45 + 0.55*smoothHermite(0.0, 0.35, riverBend))
@@ -1476,14 +1575,18 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // Where a river crosses the beach to the sea, its water down at the sea's
     // level, its bed is the beach's sand as the sea's is, so the two waters
     // meet over one bed; a low river or pond inland keeps its own bed.
-    let estuary = 1.0 - smoothHermite(stage.sea_level + 0.1, stage.sea_level + 1.8, waterLevel);
+    let estuary = 1.0 - smoothHermite(stage.sea_level + 0.1, stage.sea_level + 4.0, waterLevel);
     // Carry the same sediment mixture across the waterline and up the shore.
     // Inland silt fades through the bank's soil before it meets coastal sand;
     // it must not replace that sand only inside the narrow wetted channel.
-    let freshwaterSediment = (1.0 - estuary)*max(inRiver, shoreZone*0.85);
+    // The broad damp fringe keeps its existing coastal sand and turf. Only
+    // the bed and the actual bare margin receive fresh river sediment.
+    let freshwaterSediment = (1.0 - estuary)*max(inRiver, shoreBare*0.35);
     let fSandRiver = (1.0 - fGrass)*(1.0 - freshwaterSediment);
-    let coastalSediment = (1.0 - fGrass)*estuary*shoreZone;
+    let coastalSediment = (1.0 - fGrass)*estuary*max(inRiver, shoreBare);
     let riverBed = inRiver*(1.0 - fSandRiver);
+    let shoreSoil = max(max(shoreBare, cutBank), pointBar*(1.0 - barGravel));
+    let calmShore = shoreSoil*(1.0 - riverRock);
     // Along calm water the erosion's gravel and rock give way to the band (a
     // steep face still stands as rock); whitewater keeps its stony banks.
     let fGravelRiver = max(fGravel*(1.0 - 0.9*calmShore)*(1.0 - inRiver*riverSilt),
@@ -1495,8 +1598,9 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // Under the water whatever is not gravel or rock is silt (never turf); on
     // the shore the band's bare earth, a cut bank's face and a slow stream's
     // bar displace the turf, and the background soil patches thin near it.
-    let shoreSoil = max(max(shoreBare, cutBank), pointBar*(1.0 - barGravel));
-    let grassSoilRiver = max(max(grassSoilBlend*(1.0 - 0.5*shoreZone), shoreSoil), inRiver);
+    // Add alluvium to the local ground mixture. Suppressing background soil
+    // throughout shoreZone made a green halo around a separate brown strip.
+    let grassSoilRiver = 1.0 - (1.0 - grassSoilBlend)*(1.0 - shoreSoil)*(1.0 - inRiver);
 
     let groundCover = (1.0 - fSandRiver) * (1.0 - fGravelRiver) * (1.0 - fRockRiver) * (1.0 - fSnowRiver);
     let wSand = fSandRiver * (1.0 - fGravelRiver) * (1.0 - fRockRiver) * (1.0 - fSnowRiver);
@@ -1697,7 +1801,12 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         let width = 0.34 + edgeWidths[g]
                   + select(0.0, 0.60, groundPair)
                   + select(0.0, 0.50*shoreZone, sedimentPair);
-        let contact = smoothHermite(highestScore - width, highestScore, scores[g]);
+        let sharpened_contact = smoothHermite(highestScore - width, highestScore, scores[g]);
+        // Littoral sand and river alluvium share a continuous mixture at the
+        // mouth. Picking a dominant scan here made sand/soil/turf boundaries
+        // snap even when their placement weights already changed gradually.
+        let shoreline_mix = select(0.0, shoreZone*(1.0 - fSnow), g > 0);
+        let contact = mix(sharpened_contact, 1.0, shoreline_mix);
         // Keep a small mineral contribution below the contact threshold;
         // thin silt and sparse grains should not vanish from distant turf.
         let weight = select(0.0, groupWeights[g] * mix(0.08, 1.0, contact), scores[g] > -0.5);
@@ -1773,7 +1882,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         // which farther out stand wider apart than a creek is wide.
         let water = riverEnvelope(worldXZ);
         let dryBank = smoothHermite(0.25, 0.75, riverBankAt(water, height))
-                    * smoothHermite(0.7, 1.6, riverShoreRun(water, riverClamp(water, height), materialNormal));
+                    * smoothHermite(0.7, 1.6, riverShoreRunAt(water, worldXZ, riverClamp(water, height), materialNormal));
         let suitability = clamp(turf * dryShore * intactRoots * stableSlope * dryBank, 0.0, 1.0);
         (*habitat_data) = vec4<f32>(height, suitability, normalWorld.x, normalWorld.z);
     }
@@ -2442,6 +2551,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         let waterline = 1.0 - smoothHermite(stage.sea_level + 0.05,
                                             stage.sea_level + 1.15 + (soilLarge - 0.5) * 0.45,
                                             height);
+        let under_sea = 1.0 - smoothHermite(stage.sea_level - 0.12, stage.sea_level + 0.04, height);
         let shoreWet = waterline * (gSand + gGravel + gRock);
         // A river or lake saturates the margin its water laps, splashed
         // higher beside whitewater, and keeps the earth for a metre or two
@@ -2454,17 +2564,21 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         let lapped = max(1.0 - smoothHermite(0.0, 0.45 + 0.3*soilEdge, shoreRun), splash);
         let dampShore = (1.0 - smoothHermite(0.8, 2.8 + 1.2*soilSmall, shoreRun))
                       * (1.0 - 0.7*gGrass);
-        let moisture = clamp(waterAmount * 0.52 + channel * 0.25 + shoreWet * 0.65
-                             + lapped * 0.72 + dampShore * 0.32
-                             + pointBar * 0.5 + stoneBank * 0.5, 0.0, 0.72)
+        // Saturated coastal sediment has the same finish on both sides of a
+        // mouth. Otherwise the river lookup alone darkens an offshore strip.
+        let marine_saturation = under_sea*(gSand + gGravel + gRock)*0.72;
+        let moisture = clamp(max(waterAmount * 0.52 + channel * 0.25 + shoreWet * 0.65
+                                 + lapped * 0.72 + dampShore * 0.32
+                                 + pointBar * 0.5 + stoneBank * 0.5, marine_saturation), 0.0, 0.72)
                      * (1.0 - gSnow);
         let damp = albedo * vec3<f32>(0.55, 0.57, 0.56);
         albedo = mix(albedo, damp, moisture);
         // Under the water the bed is filmed with algae and settled silt; the
         // beach's sand under a river's mouth is scoured clean, as the sea's
         // is, though just as matte under its water.
-        let submergedBed = (1.0 - smoothHermite(-0.35, 0.0, river.x)) * (1.0 - gSnow);
-        let algae = submergedBed * (1.0 - 0.85*gSand);
+        let submerged_river = (1.0 - smoothHermite(-0.35, 0.0, river.x))*submerged;
+        let submergedBed = max(submerged_river, under_sea)*(1.0 - gSnow);
+        let algae = submerged_river*(1.0 - estuary)*(1.0 - 0.85*gSand)*(1.0 - gSnow);
         // Saturated mud at the waterline is darker again than damp earth, and
         // greyer: water fills its pores and its iron is reduced.
         let lappedAbove = lapped * (1.0 - submergedBed) * (1.0 - gSnow);

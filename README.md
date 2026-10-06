@@ -831,6 +831,12 @@ shoulders, with submerged bed transitions into the pond or seabed. The
 current slows as its cross-section expands, and accelerates again below
 an outlet's sill. The thalweg hugs the outside of every bend.
 
+Submerged transitions follow the routed course and taper to zero within
+10 m, or less than half a pond crossing. Their footprint is checked against
+the receiving water and nearby dry banks. Sea carving stops at the natural
+shore rather than continuing to the offshore routing target, and no straight
+extension is projected across a curved shore.
+
 Every choice is keyed by world position or by a river's head cell, so two
 regions that both see a whole catchment agree on it; when the player moves
 on, the next region is built on the async compute pool (about a second) and
@@ -877,6 +883,12 @@ Gentle junction banks spread their shoulders over up to twice the ordinary
 bank run. Both carve bounds relax smoothly before the lookup's support ends,
 so a cut into high ground cannot stop in a vertical wall at that boundary.
 Levees also retreat continuously as the channel approaches still water.
+Intersecting banks at river confluences are rounded once against their
+original shapes. The rounding continues through the waterline, opening a
+shallow shelf no more than 0.6 m outside either channel. It fades into the
+bed over 0.75 m; straight reaches and deeper beds keep their profiles, and
+extra centreline segments cannot deepen the junction. The water ribbons
+cover the rounded shelf and return to their ordinary width away from it.
 
 The same arithmetic runs on the CPU (`src/rivers/carve.rs`) and in the shared
 `assets/shaders/river-functions.wgslinc`, over the same uploaded segments and
@@ -918,6 +930,12 @@ blends gradually into outlet gravel, and coastal sand blends across both
 the channel and its banks. Sand, soil and gravel retain broad texture
 crossfades at these junctions, with the same shore measurements in both
 terrain shader stages so the transitions stay consistent across terrain LODs.
+At a confluence the material fringe measures every adjoining bank before
+combining them, rather than switching to the width and level of whichever
+channel owns the flow. Only the actual bare margin replaces local ground
+with fresh sediment. Coastal sediment keeps the same saturated finish in a
+river mouth and the surrounding seabed, and sand, soil and turf retain their
+proportional mixture through the shore.
 
 Out of the water every river and lake is edged with bare earth, as the sea is
 with its beach. The band is measured up the shore (`river-shore.wgslinc`,

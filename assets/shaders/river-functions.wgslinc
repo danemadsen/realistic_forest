@@ -29,6 +29,8 @@
 // keeps the water in its channel). The upper bounds combine by minimum and
 // the lower ones by maximum, so confluences open into each other; a segment
 // has a flat start and a round end, so it never reaches back up the channel.
+// Crossing banks and their shallow shoreline strip round together once;
+// a bounded shelf opens at junctions and deep beds keep their exact profile.
 struct RiverSegment {
     a: vec2<f32>,
     b: vec2<f32>,
@@ -74,6 +76,10 @@ const RIVER_BANK_CURVE: f32 = 0.16;
 const RIVER_LEVEE_OUTER_SLOPE: f32 = 0.15;
 // Height over which the carve's creases are rounded (CARVE_ROUNDING).
 const RIVER_CARVE_ROUNDING: f32 = 0.8;
+// Height difference over which intersecting bank cones are rounded.
+const RIVER_BANK_UNION_ROUNDING: f32 = 2.8;
+const RIVER_BANK_UNION_SHORE_BLEND: f32 = 0.75;
+const RIVER_BANK_UNION_INTRUSION: f32 = 0.6;
 const RIVER_MAX_CANDIDATES: u32 = 64u;
 
 fn riverNone() -> RiverEnvelope
@@ -133,7 +139,9 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
         // Fade both constraints before their finite support ends: a high
         // terrace or low hollow must not jump back to its uncarved height.
         let edge = smoothstep(0.5*bankReach, bankReach, pastBank);
-        let release = bankReach*edge*edge/max(1.0 - edge, 1e-5);
+        // Saturate the released constraint beyond the terrain's height range
+        // before edge-distance precision differences become greatly amplified.
+        let release = min(bankReach*edge*edge/max(1.0 - edge, 1e-5), 1.0e4);
         envelope.upper = water + bank*pastBank + RIVER_BANK_CURVE*shoulder*shoulder + release;
         let freeboard = 0.1 + 0.25*depth;
         let leveeWidth = 0.8 + 0.3*halfWidth;
@@ -180,6 +188,38 @@ fn riverCombine(total: ptr<function, RiverEnvelope>, next: RiverEnvelope)
     }
 }
 
+// Round a pair against the unchanged raw upper minimum. The caller takes
+// the lowest pair once, so segment count cannot accumulate excavation.
+fn riverBankSurfaceSlope(segment: RiverSegment) -> f32
+{
+    // Fixed conservative waterline slope avoids introducing another cusp
+    // as the nearer bank changes at the junction's bisector.
+    return max(segment.bank*max(1.0 - 0.75*abs(segment.skew), 0.3), 0.001);
+}
+
+fn riverBankUnionUpper(primary: RiverSegment, first: RiverEnvelope,
+                      next: RiverSegment, second: RiverEnvelope) -> f32
+{
+    let nearest_bank = min(first.bank_distance, second.bank_distance);
+    if (nearest_bank <= -RIVER_BANK_UNION_SHORE_BLEND ||
+        second.bank_distance >= RIVER_NONE) { return first.upper; }
+    let primary_direction = primary.b - primary.a;
+    let other_direction = next.b - next.a;
+    let cross_value = primary_direction.x*other_direction.y - primary_direction.y*other_direction.x;
+    let length_product = max(dot(primary_direction, primary_direction)*dot(other_direction, other_direction), 1e-12);
+    // Squared sine: independent of tangent orientation, zero for straight
+    // overlapping reaches and progressively stronger at a joining branch.
+    let turn = clamp(cross_value*cross_value/length_product, 0.0, 1.0);
+    let bank_slope = min(riverBankSurfaceSlope(primary), riverBankSurfaceSlope(next));
+    let shelf_rounding = 4.0*RIVER_BANK_UNION_INTRUSION*bank_slope;
+    let shelf_clearance = first.upper - max(first.water, second.water)
+                        + bank_slope*(RIVER_BANK_UNION_INTRUSION - nearest_bank);
+    let bed_fade = smoothstep(-RIVER_BANK_UNION_SHORE_BLEND, 0.0, nearest_bank);
+    let rounding = min(min(RIVER_BANK_UNION_ROUNDING, shelf_rounding), 4.0*max(shelf_clearance, 0.0))*turn*bed_fade;
+    if (rounding <= 0.0) { return first.upper; }
+    return riverSmoothMin(first.upper, second.upper, rounding);
+}
+
 fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
 {
     var total = riverNone();
@@ -191,9 +231,42 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
     let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*RIVER_GRID_CELL_WORDS;
     let offset = river_grid[entry];
     let count = min(river_grid[entry + 1u], RIVER_MAX_CANDIDATES);
+    var primary = 0xffffffffu;
     for (var i = 0u; i < count; i += 1u)
     {
-        riverCombine(&total, riverSegmentEnvelope(river_segments[river_grid[offset + i]], p));
+        let index = river_grid[offset + i];
+        let envelope = riverSegmentEnvelope(river_segments[index], p);
+        if (envelope.upper < total.upper) { primary = index; }
+        riverCombine(&total, envelope);
+    }
+    // Continue the bank rounding through its shallow shoreline strip, then
+    // fade it out smoothly before the undisturbed channel bed.
+    if (primary != 0xffffffffu && total.bank_distance > -RIVER_BANK_UNION_SHORE_BLEND)
+    {
+        let raw_bank_distance = total.bank_distance;
+        let first_segment = river_segments[primary];
+        let first = riverSegmentEnvelope(first_segment, p);
+        if (first.bank_distance > -RIVER_BANK_UNION_SHORE_BLEND)
+        {
+            for (var i = 0u; i < count; i += 1u)
+            {
+                let next = river_segments[river_grid[offset + i]];
+                let second = riverSegmentEnvelope(next, p);
+                let rounded_upper = riverBankUnionUpper(first_segment, first, next, second);
+                if (rounded_upper < total.upper)
+                {
+                    total.upper = rounded_upper;
+                    let bank_slope = min(riverBankSurfaceSlope(first_segment), riverBankSurfaceSlope(next));
+                    let shelf_water = max(first.water, second.water);
+                    if (raw_bank_distance >= 0.0 && first.bank_distance >= 0.0 && second.bank_distance >= 0.0 && rounded_upper < shelf_water)
+                    {
+                        total.water = max(total.water, shelf_water);
+                    }
+                    let shelf_distance = max((rounded_upper - total.water)/bank_slope, -RIVER_BANK_UNION_INTRUSION);
+                    total.bank_distance = min(total.bank_distance, shelf_distance);
+                }
+            }
+        }
     }
     let record = river_grid[entry + 2u];
     if (record != RIVER_NO_LAKE_RECORD)
