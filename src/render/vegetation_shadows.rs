@@ -24,7 +24,7 @@ pub const SHADOW_RESOLUTIONS: [u32; SHADOW_CASCADES] = [2048, 2048, 1536];
 /// Horizontal-distance bounds of the cascades, metres. Keep detailed shadows
 /// across the nearby forest before switching to the 2 km map; its larger
 /// texels are only suitable for distant canopy silhouettes.
-pub const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.0, 40.0, 250.0, 2000.0];
+pub const SHADOW_SPLITS: [f32; SHADOW_CASCADES + 1] = [0.0, 50.0, 400.0, 2000.0];
 /// How far up-light of a cascade's receivers a plant can stand and still be
 /// drawn into it: a 35 m pine's shadow under a sun 3 degrees up.
 pub const CASTER_REACH: f32 = 680.0;
@@ -328,7 +328,7 @@ mod tests {
         let uniform = ShadowUniform::new(&cascades, &light, false);
 
         // Wider crossfades must not bring the terminal fade closer as well.
-        assert_eq!(uniform.splits, [40.0, 250.0, 2000.0, 2000.0]);
+        assert_eq!(uniform.splits, [50.0, 400.0, 2000.0, 2000.0]);
         assert_eq!(uniform.params[0], 0.25);
         assert_eq!(uniform.params[2], 206.4);
         assert_eq!(uniform.splits[3] - uniform.params[2], 1793.6);
@@ -466,7 +466,7 @@ mod tests {
         // Only the fine grid samples this narrow hill. Its crowns must
         // remain covered when transitioning into a coarser cascade.
         let heights = receiver_height_bounds(eye, |x, z| {
-            if (x - 10.0).abs() < 0.5 && (z - 10.0).abs() < 0.5 { 900.0 } else { 24.0 }
+            if (x - 12.5).abs() < 0.5 && (z - 12.5).abs() < 0.5 { 900.0 } else { 24.0 }
         });
         assert!(heights[0][1] >= 900.0 + CANOPY_HEIGHT);
         for [low, high] in heights {
