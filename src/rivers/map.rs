@@ -536,6 +536,34 @@ impl<'a> SurfaceIndex<'a> {
     /// (ribbon, sheet, the sheet's lake): the highest of each over `p`.
     pub fn owned(&self, p: [f32; 2]) -> (f32, f32, usize) {
         let (mut ribbon, mut sheet, mut owner) = (f32::NEG_INFINITY, f32::NEG_INFINITY, usize::MAX);
+        self.each_surface(p, |h, first_vertex| {
+            if first_vertex >= self.first_lake {
+                if h > sheet {
+                    sheet = h;
+                    owner = self.lake_starts.partition_point(|&start| start <= first_vertex);
+                }
+            } else {
+                ribbon = ribbon.max(h);
+            }
+        });
+        (ribbon, sheet, owner)
+    }
+
+    /// The lowest and highest river ribbon over `p`, or (+inf, -inf): two
+    /// apart where one river's water shows under another's.
+    pub fn ribbons(&self, p: [f32; 2]) -> (f32, f32) {
+        let (mut lowest, mut highest) = (f32::INFINITY, f32::NEG_INFINITY);
+        self.each_surface(p, |h, first_vertex| {
+            if first_vertex < self.first_lake {
+                lowest = lowest.min(h);
+                highest = highest.max(h);
+            }
+        });
+        (lowest, highest)
+    }
+
+    /// Every drawn triangle over `p`: its height there and its first vertex.
+    fn each_surface(&self, p: [f32; 2], mut visit: impl FnMut(f32, usize)) {
         let key = [(p[0] / SURFACE_BUCKET).floor() as i32, (p[1] / SURFACE_BUCKET).floor() as i32];
         for &t in self.buckets.get(&key).map_or(&[][..], |list| &list[..]) {
             let triangle = &self.mesh.indices[t as usize * 3..t as usize * 3 + 3];
@@ -550,17 +578,8 @@ impl<'a> SurfaceIndex<'a> {
             if l1 < -1e-5 || l2 < -1e-5 || l3 < -1e-5 {
                 continue;
             }
-            let h = l1 * a[1] + l2 * b[1] + l3 * c[1];
-            if triangle[0] as usize >= self.first_lake {
-                if h > sheet {
-                    sheet = h;
-                    owner = self.lake_starts.partition_point(|&start| start <= triangle[0] as usize);
-                }
-            } else {
-                ribbon = ribbon.max(h);
-            }
+            visit(l1 * a[1] + l2 * b[1] + l3 * c[1], triangle[0] as usize);
         }
-        (ribbon, sheet, owner)
     }
 }
 
@@ -691,6 +710,84 @@ pub fn hole_fit(noise: &NoiseField, network: &RiverNetwork) -> Vec<String> {
     lines
 }
 
+/// How the rivers' ribbons sit on the ground and on each other, sampled
+/// across every drawn reach every half metre:
+/// - perched: a ribbon standing more than 10 cm over dry ground past its
+///   channel's waterline (not a lake's bed), so the water runs in the air
+///   beside its bank;
+/// - under: two ribbons over a point more than 20 cm apart with the lower
+///   one above the ground, where one river's water shows under another's.
+pub struct RibbonFit {
+    pub samples: usize,
+    pub perched: usize,
+    pub under: usize,
+    /// (how far, where): the worst of each.
+    pub worst_perched: (f32, [f32; 2]),
+    pub worst_under: (f32, [f32; 2]),
+}
+
+pub fn ribbon_checks(noise: &NoiseField, network: &RiverNetwork) -> RibbonFit {
+    let index = SurfaceIndex::new(network);
+    let mut fit = RibbonFit { samples: 0, perched: 0, under: 0, worst_perched: (0.0, [0.0; 2]), worst_under: (0.0, [0.0; 2]) };
+    for river in &network.rivers {
+        let nodes = &river.nodes;
+        let end = (river.surface_end + 1).min(nodes.len().saturating_sub(1));
+        for i in 0..end {
+            let (a, b) = (&nodes[i], &nodes[i + 1]);
+            let d = [b.position[0] - a.position[0], b.position[1] - a.position[1]];
+            let length = d[0].hypot(d[1]).max(1e-3);
+            let normal = [-d[1] / length, d[0] / length];
+            let reach = 1.2 * a.half_width.max(b.half_width) + 1.5;
+            for t in [0.0f32, 0.25, 0.5, 0.75] {
+                let centre = [a.position[0] + d[0] * t, a.position[1] + d[1] * t];
+                let mut offset = -reach;
+                while offset <= reach {
+                    let p = [centre[0] + normal[0] * offset, centre[1] + normal[1] * offset];
+                    offset += 0.5;
+                    let (lowest, highest) = index.ribbons(p);
+                    if highest <= SEA_LEVEL + 0.05 {
+                        continue;
+                    }
+                    let (_, sheet, _) = index.owned(p);
+                    if sheet >= highest - 0.05 {
+                        continue;
+                    }
+                    fit.samples += 1;
+                    let (ground, envelope) = carved_height(noise, network, p[0], p[1]);
+                    // Ground under a lake's or the sea's water is its bed,
+                    // not a bank.
+                    let perched = highest - ground.max(SEA_LEVEL);
+                    let dry = envelope.lake < ground && sheet < ground;
+                    if envelope.bank_distance > 0.0 && dry && perched > 0.1 {
+                        fit.perched += 1;
+                        if perched > fit.worst_perched.0 {
+                            fit.worst_perched = (perched, p);
+                        }
+                    }
+                    let gap = highest - lowest;
+                    if gap > 0.2 && lowest > ground + 0.02 {
+                        fit.under += 1;
+                        if gap > fit.worst_under.0 {
+                            fit.worst_under = (gap, p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    fit
+}
+
+pub fn ribbon_fit(noise: &NoiseField, network: &RiverNetwork) -> String {
+    let fit = ribbon_checks(noise, network);
+    let (perched, p) = fit.worst_perched;
+    let (under, u) = fit.worst_under;
+    format!(
+        "ribbons: of {} samples, {} perched over the ground beside their banks (worst {perched:.2} m at {:.1},{:.1}), {} showing one river under another (worst {under:.2} m at {:.1},{:.1})",
+        fit.samples, fit.perched, p[0], p[1], fit.under, u[0], u[1]
+    )
+}
+
 pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
     let region = network::region_of(centre[0], centre[1]);
     let network = network::generate(noise, region);
@@ -707,6 +804,7 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
     for line in hole_fit(noise, &network) {
         println!("{line}");
     }
+    println!("{}", ribbon_fit(noise, &network));
     // The nodes nearest the map's centre, for framing a camera on them: the
     // heading is the `--camera` yaw that looks downstream.
     let mut nearest: Vec<(f32, &network::RiverNode, f32)> = network
@@ -797,22 +895,37 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
 /// envelope on a fine grid around a point, plus the rivers and carve
 /// segments there, for inspecting a reported spot without a window.
 /// Writes `<prefix>.f32` (rows of base, carved, upper, lower, water,
-/// bank_distance, lake per sample) and prints the header and nodes.
+/// bank_distance, lake, and the highest and lowest drawn ribbon and the
+/// sheet over the point, per sample) and prints the header and nodes.
 pub fn run_probe(noise: &NoiseField, centre: [f64; 2], extent: f64, step: f64, prefix: &str) {
     let region = network::region_of(centre[0], centre[1]);
     let network = network::generate(noise, region);
+    let index = SurfaceIndex::new(&network);
     let n = (extent / step).round() as usize + 1;
     let origin = [centre[0] - extent * 0.5, centre[1] - extent * 0.5];
     println!("PROBE region {:?} origin {:.3},{:.3} step {} n {}", region, origin[0], origin[1], step, n);
-    let mut data: Vec<f32> = Vec::with_capacity(n * n * 7);
+    let mut data: Vec<f32> = Vec::with_capacity(n * n * 10);
     for row in 0..n {
         let z = (origin[1] + row as f64 * step) as f32;
         for column in 0..n {
             let x = (origin[0] + column as f64 * step) as f32;
             let base = base_height(noise, x, z);
             let (carved, e) = carved_height(noise, &network, x, z);
+            let (_, sheet, _) = index.owned([x, z]);
+            let (lowest, highest) = index.ribbons([x, z]);
             let clean = |v: f32| if v.is_finite() { v.clamp(-1.0e6, 1.0e6) } else if v > 0.0 { 1.0e6 } else { -1.0e6 };
-            data.extend_from_slice(&[base, carved, clean(e.upper), clean(e.lower), clean(e.water), clean(e.bank_distance), clean(e.lake)]);
+            data.extend_from_slice(&[
+                base,
+                carved,
+                clean(e.upper),
+                clean(e.lower),
+                clean(e.water),
+                clean(e.bank_distance),
+                clean(e.lake),
+                clean(highest),
+                clean(lowest.min(highest)),
+                clean(sheet),
+            ]);
         }
     }
     let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -920,6 +1033,75 @@ mod tests {
         assert!(j.mouths > 50);
         assert!(j.cut_off_mouths.len() * 20 <= j.mouths, "{:?}", j.cut_off_mouths);
         assert_eq!(j.flicker, 0);
+    }
+
+    /// The rivers' water sits in their channels: a ribbon stands over dry
+    /// ground beyond its banks only here and there, and only a little, and
+    /// a tributary's water rarely shows under its parent's where they meet.
+    #[test]
+    fn spawn_region_ribbons_sit_in_their_channels() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, [0, 0]);
+        let fit = ribbon_checks(&noise, &network);
+        assert!(fit.samples > 500_000, "{}", fit.samples);
+        assert!(fit.perched * 1000 <= fit.samples, "{} of {} perched", fit.perched, fit.samples);
+        assert!(fit.worst_perched.0 < 1.5, "perched {:?}", fit.worst_perched);
+        assert!(fit.under * 5000 <= fit.samples, "{} of {} under another", fit.under, fit.samples);
+    }
+
+    /// The highest gap between two ribbons over a point, with the lower over
+    /// the ground, and the highest a ribbon stands over dry ground past its
+    /// banks, over a square of side `extent` around `centre`.
+    fn ribbons_around(noise: &NoiseField, network: &RiverNetwork, centre: [f32; 2], extent: f32) -> (usize, f32, f32) {
+        let index = SurfaceIndex::new(network);
+        let (mut samples, mut under, mut perched) = (0usize, 0.0f32, 0.0f32);
+        let steps = (extent / 0.5) as i32;
+        for zi in 0..=steps {
+            for xi in 0..=steps {
+                let p = [centre[0] - 0.5 * extent + xi as f32 * 0.5, centre[1] - 0.5 * extent + zi as f32 * 0.5];
+                let (lowest, highest) = index.ribbons(p);
+                if highest == f32::NEG_INFINITY {
+                    continue;
+                }
+                samples += 1;
+                let (_, sheet, _) = index.owned(p);
+                let (ground, envelope) = carved_height(noise, network, p[0], p[1]);
+                if lowest > ground {
+                    under = under.max(highest - lowest);
+                }
+                if envelope.bank_distance > 0.0 && envelope.lake < ground && sheet < ground {
+                    perched = perched.max(highest - ground.max(SEA_LEVEL));
+                }
+            }
+        }
+        (samples, under, perched)
+    }
+
+    /// Reported: down a steep reach a creek met its river at a narrow angle.
+    /// Graded to the river's level where its course ended, on the river's
+    /// thalweg, it ran in under the river's water, which stood most of a
+    /// metre higher where the two channels first opened into each other.
+    #[test]
+    fn reported_steep_confluence_meets_its_parents_water() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, network::region_of(496.1, 1516.9));
+        let (samples, under, _) = ribbons_around(&noise, &network, [496.0, 1507.0], 16.0);
+        assert!(samples > 200, "{samples}");
+        assert!(under < 0.25, "the creek's water shows {under} m under the river's");
+    }
+
+    /// Reported: a creek cascading down a hillside into a lake ran in the
+    /// air over the ground beside it. The levee that holds a channel's banks
+    /// gives way near still water, its mouth flared wide and low-banked over
+    /// the cascade, and its water stood a hand under the ground at its
+    /// centre, over the hillside falling away across it.
+    #[test]
+    fn reported_cascade_into_a_lake_stays_in_its_channel() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, network::region_of(2222.3, 5721.5));
+        let (samples, _, perched) = ribbons_around(&noise, &network, [2232.0, 5721.0], 24.0);
+        assert!(samples > 200, "{samples}");
+        assert!(perched < 0.7, "the cascade's water stands {perched} m over the ground beside it");
     }
 
     /// The lakes' surface the terrain, the plants and the player measure

@@ -22,7 +22,7 @@
 //! The mesh is cut into 256 m chunks with their bounds, so the renderer only
 //! draws what the camera can see.
 
-use super::network::{FLOW_CELL, Lake, River, RiverEnd};
+use super::network::{FLOW_CELL, Lake, River, RiverEnd, beside_river, first_contact};
 use crate::constants::SEA_LEVEL;
 use std::collections::HashMap;
 
@@ -96,6 +96,10 @@ const SPRING_SINK: f32 = 0.3;
 /// Extra hidden coverage for rounded confluences and tight bends. Terrain
 /// still determines the waterline; this prevents the ribbon ending at it.
 const JUNCTION_RIBBON_MARGIN: f32 = 0.8;
+/// How far a tributary's ribbon lies under its parent's where the parent's
+/// reaches over it: just under, so the parent's water is the one drawn and
+/// the tributary's never shows through it as a second surface.
+const UNDER_PARENT: f32 = 0.03;
 
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
@@ -337,6 +341,29 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
                 .collect()
         };
         let rows: Vec<Vec<[f32; 2]>> = (0..=end).map(row_positions).collect();
+        // A tributary runs into its parent's water, which slopes under its
+        // ribbon's flat rows down a steep parent. Wherever the parent's
+        // ribbon reaches over its own, its ribbon lies just under the
+        // parent's surface there: from where it first reaches the parent's
+        // channel (`network::first_contact`, from which its water is the
+        // parent's) on, and never over it before.
+        let parent = match river.end {
+            RiverEnd::Confluence(parent, _) => rivers.get(parent),
+            _ => None,
+        };
+        let beside = |p: [f32; 2]| parent.map(|parent| beside_river(parent, [p[0] as f64, p[1] as f64]));
+        let node_past: Vec<f32> = match parent {
+            Some(_) => nodes[..=end].iter().map(|node| beside(node.position).map_or(f32::INFINITY, |b| b.0)).collect(),
+            None => vec![f32::INFINITY; end + 1],
+        };
+        let contact = match parent {
+            Some(_) => {
+                let areas: Vec<f32> = nodes[..=end].iter().map(|node| node.area).collect();
+                let lakes: Vec<bool> = nodes[..=end].iter().map(|node| node.lake).collect();
+                first_contact(&node_past, &areas, &lakes)
+            }
+            None => usize::MAX,
+        };
         // How far along the river each row lies from still water: a lake's
         // sheet, or the sea past the river's mouth. Neither is lifted in the
         // distance, so the ribbon must not be lifted where it meets them.
@@ -404,6 +431,21 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
             let row = vertices.len() as u32;
             let mut hidden = true;
             for &p in &rows[i] {
+                let mut own = water;
+                // Within reach of the parent's ribbon, which runs a little
+                // past its banks.
+                let near_parent = node_past[i] < 2.0 * ribbon_half_width + 4.0 * JUNCTION_RIBBON_MARGIN;
+                if near_parent
+                    && let Some((past, parent_water, parent_half_width)) = beside(p)
+                    && past < 0.12 * parent_half_width + JUNCTION_RIBBON_MARGIN
+                {
+                    let under = parent_water - UNDER_PARENT;
+                    own = if i >= contact { under } else { own.min(under) };
+                    // Still tucked under the sea's waves past a coast.
+                    if coast.is_some_and(|coast| i > coast) {
+                        own = own.min(SEA_LEVEL - UNDER_SEA);
+                    }
+                }
                 // Under the sheet of a lake whose level it stands at (running
                 // into it, out of it or through it), the ribbon runs on just
                 // beneath the sheet as drawn, its edge sunk and all, and
@@ -414,9 +456,9 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
                 let (level, deep) = match sheets.under(p) {
                     Some((lake, depth)) if water <= lake + LEVEL_TIE && water >= lake - SHEET_BAND => {
                         let sheet = sheets.height(p).unwrap_or(lake).min(lake);
-                        (water.min(sheet) - under_sheet(depth), depth >= HIDDEN_DEPTH)
+                        (own.min(sheet) - under_sheet(depth), depth >= HIDDEN_DEPTH)
                     }
-                    _ => (water, false),
+                    _ => (own, false),
                 };
                 hidden &= deep;
                 let offset = (p[0] - node.position[0]) * normal[0] + (p[1] - node.position[1]) * normal[1];

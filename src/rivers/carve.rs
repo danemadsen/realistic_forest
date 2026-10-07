@@ -102,9 +102,10 @@ pub struct RiverSegment {
     /// 0..1: none where the river meets the sea, whose bed must not rise.
     pub levee: [f32; 2],
     /// How the water runs on round the segment's ends, as the fall per metre
-    /// of the reaches beside them: up the reach before its start, and down
-    /// the reach after its end (`segment_envelope`). A start below zero has
-    /// no reach before it, and the segment starts flat.
+    /// of the reaches beside them: up the river behind its start (as fast as
+    /// the steepest of the reaches its start cap reaches back beside), and
+    /// down the reach after its end (`segment_envelope`). A start below zero
+    /// has no reach before it, and the segment starts flat.
     pub cap_slope: [f32; 2],
     /// Whitewater, 0 calm to 1 a cascade down rapids: rough beds, bare rock
     /// and foam.
