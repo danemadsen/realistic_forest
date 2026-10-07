@@ -9,6 +9,7 @@
 //! and draws them on the GPU (src/render/vegetation_node.rs).
 
 pub mod assets;
+pub mod collision;
 pub mod ecology;
 pub mod map;
 pub mod scatter;
@@ -107,6 +108,15 @@ pub fn render_profile(species: Species, form: &str) -> RenderProfile {
     }
 }
 
+/// A plant root is refused below this height above the sea, steeper than
+/// this rise over run (about 42 degrees, where the terrain's faces turn to
+/// bare rock), or this far below the ground around it (an incised channel).
+/// The GPU cull enforces them to decide what is drawn, and the player's
+/// collision to decide what is solid, so a trunk is never felt unseen.
+pub const LOWEST_ROOT: f32 = 1.0;
+pub const STEEPEST_ROOT: f32 = 0.9;
+pub const DEEPEST_FURROW: f32 = 0.6;
+
 /// Chunk detail levels are generated out to these distances from the
 /// player (to the nearest point of the chunk) and dropped this much further
 /// out, so walking back and forth across a boundary does not regenerate.
@@ -204,6 +214,64 @@ impl VegetationField {
         self.settled
             && !self.dirty
             && self.uploaded.load(Ordering::Acquire) == self.snapshot.generation
+    }
+
+    /// Every solid plant (a tree or a lilac, see [`collision::is_solid`])
+    /// streamed in with its stem within `reach` metres of `centre`, appended
+    /// to `out`. Plants belong to the chunk their root stands in, so only the
+    /// chunks the circle touches are read, and only their tree and shrub
+    /// levels: the ground layers hold nothing solid.
+    pub fn solids_near(&self, centre: Vec2, reach: f32, out: &mut Vec<collision::Solid>) {
+        let Some(catalog) = self.catalog.as_deref() else {
+            return;
+        };
+        let (low, high) = (centre - Vec2::splat(reach), centre + Vec2::splat(reach));
+        let first = scatter::chunk_of(low.x as f64, low.y as f64);
+        let last = scatter::chunk_of(high.x as f64, high.y as f64);
+        for cz in first[1]..=last[1] {
+            for cx in first[0]..=last[0] {
+                let Some(levels) = self.chunks.get(&[cx, cz]) else {
+                    continue;
+                };
+                for level in [LEVEL_TREES, LEVEL_SHRUBS] {
+                    let Some(plants) = &levels[level as usize] else {
+                        continue;
+                    };
+                    // A chunk holds thousands of plants and this runs every
+                    // frame, so reject by position before the catalogue.
+                    let near = reach + collision::MAX_TRUNK_RADIUS;
+                    let candidates = plants.iter().filter(|plant| {
+                        (plant.position[0] - centre.x).abs() <= near && (plant.position[2] - centre.y).abs() <= near
+                    });
+                    out.extend(
+                        candidates
+                            .filter_map(|plant| collision::Solid::of(catalog, plant))
+                            .filter(|solid| solid.position.distance(centre) <= reach + solid.radius),
+                    );
+                }
+            }
+        }
+    }
+
+    /// A field holding exactly these plants, as if streamed into their chunks
+    /// at the level their layer belongs to.
+    #[cfg(test)]
+    pub fn with_plants(catalog: Catalog, plants: Vec<PlantInstance>) -> Self {
+        let mut field = Self::new(Arc::new(NoiseField { samples: Vec::new() }), false);
+        field.catalog = Some(Arc::new(catalog));
+        for plant in plants {
+            let chunk = scatter::chunk_of(plant.position[0] as f64, plant.position[2] as f64);
+            let level = match plant.layer {
+                layer if layer <= scatter::Layer::Regeneration as u32 => LEVEL_TREES,
+                layer if layer == scatter::Layer::Shrub as u32 => LEVEL_SHRUBS,
+                _ => LEVEL_GROUND,
+            };
+            let levels = field.chunks.entry(chunk).or_default();
+            let mut held = levels[level as usize].take().map_or_else(Vec::new, |held| (*held).clone());
+            held.push(plant);
+            levels[level as usize] = Some(Arc::new(held));
+        }
+        field
     }
 
     pub fn plant_count(&self) -> usize {
@@ -349,5 +417,125 @@ pub fn stream_vegetation(
 
     if field.dirty && (field.since_publish >= PUBLISH_INTERVAL || field.tasks.is_empty()) {
         field.publish();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use scatter::{CatalogModel, Layer};
+
+    /// Model 0 is an oak, 1 a bush and 2 a lilac.
+    pub(crate) fn catalog() -> Catalog {
+        let model = |species, trunk_radius| CatalogModel {
+            species,
+            form: String::new(),
+            height: 8.0,
+            crown_radius: 2.0,
+            trunk_radius,
+        };
+        Catalog {
+            models: vec![model(Species::Oak, 0.4), model(Species::Bush, 0.1), model(Species::Lilac, 0.2)],
+        }
+    }
+
+    pub(crate) fn plant(x: f32, z: f32, model: u32, layer: Layer) -> PlantInstance {
+        PlantInstance {
+            position: [x, 0.0, z],
+            scale: 1.0,
+            model,
+            layer: layer as u32,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn solids_near_reads_only_trunks_in_reach_across_chunks() {
+        let field = VegetationField::with_plants(
+            catalog(),
+            vec![
+                plant(10.0, 0.0, 0, Layer::Canopy),
+                plant(-1.5, 0.5, 0, Layer::Canopy),   // the chunk to the west
+                plant(40.0, 0.0, 0, Layer::Canopy),   // out of reach
+                plant(1.0, 1.0, 1, Layer::Shrub),     // a bush: walked through
+                plant(0.0, -2.0, 2, Layer::Shrub),    // a lilac is solid
+                plant(2.0, 2.0, 2, Layer::Herb),      // the ground layers hold nothing solid
+            ],
+        );
+        let mut found = Vec::new();
+        field.solids_near(Vec2::new(0.5, 0.0), 3.0, &mut found);
+        let mut at: Vec<[f32; 2]> = found.iter().map(|solid| solid.position.to_array()).collect();
+        at.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        assert_eq!(at, vec![[-1.5, 0.5], [0.0, -2.0]]);
+        assert!(found.iter().any(|solid| solid.radius == 0.4));
+
+        // Reach is to the stem's surface: a 0.4 m trunk 3.3 m away is touched.
+        found.clear();
+        field.solids_near(Vec2::new(10.0, 3.3), 3.0, &mut found);
+        assert_eq!(found.len(), 1);
+        found.clear();
+        field.solids_near(Vec2::new(10.0, 3.5), 3.0, &mut found);
+        assert!(found.is_empty());
+    }
+
+    /// The real library and scatter: every tree and lilac stands as a stem
+    /// narrower than the gaps the scatter leaves between canopy trees, the
+    /// chunk query finds exactly what a brute-force scan does, and the player
+    /// can pass between any two neighbouring canopy trunks.
+    #[test]
+    fn the_scattered_forest_is_solid_and_walkable() {
+        let assets = assets::VegetationAssets::load_geometry(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/models"),
+        )
+        .expect("plant geometry loads");
+        let catalog = Catalog::from_assets(&assets);
+        let noise = NoiseField::new();
+        let mut plants = Vec::new();
+        for chunk in [[-1, -1], [0, -1], [-1, 0], [0, 0]] {
+            for level in [LEVEL_TREES, LEVEL_SHRUBS] {
+                plants.extend(scatter::generate_level(&noise, &catalog, None, chunk, level));
+            }
+        }
+        let solids: Vec<(collision::Solid, u32)> = plants
+            .iter()
+            .filter_map(|plant| collision::Solid::of(&catalog, plant).map(|solid| (solid, plant.layer)))
+            .collect();
+        assert!(solids.len() > 1000, "{}", solids.len());
+        let widest = solids.iter().map(|(solid, _)| solid.radius).fold(0.0, f32::max);
+        assert!(widest > 0.5 && widest < collision::MAX_TRUNK_RADIUS, "{widest}");
+        assert!(solids.iter().any(|&(_, layer)| layer == Layer::Shrub as u32), "no lilacs among the solids");
+
+        // Neighbouring canopy trees leave room between their bark.
+        let canopy: Vec<&collision::Solid> = solids
+            .iter()
+            .filter(|&&(_, layer)| layer == Layer::Canopy as u32)
+            .map(|(solid, _)| solid)
+            .collect();
+        for (i, a) in canopy.iter().enumerate() {
+            for b in &canopy[i + 1..] {
+                let gap = a.position.distance(b.position) - a.radius - b.radius;
+                assert!(gap > 2.0 * collision::PLAYER_RADIUS, "trunks {gap:.2} m apart: {a:?} {b:?}");
+            }
+        }
+
+        // The query agrees with a scan of everything, across chunk borders.
+        let field = VegetationField::with_plants(catalog.clone(), plants);
+        for centre in [Vec2::new(0.0, 0.0), Vec2::new(-3.0, 100.0), Vec2::new(-250.0, -255.0), Vec2::new(120.0, -40.0)] {
+            let mut found = Vec::new();
+            field.solids_near(centre, 12.0, &mut found);
+            let expected = solids
+                .iter()
+                .filter(|(solid, _)| solid.position.distance(centre) <= 12.0 + solid.radius)
+                .count();
+            assert_eq!(found.len(), expected, "around {centre}");
+        }
+    }
+
+    #[test]
+    fn a_field_with_no_library_has_nothing_solid() {
+        let field = VegetationField::new(Arc::new(NoiseField { samples: Vec::new() }), false);
+        let mut found = Vec::new();
+        field.solids_near(Vec2::ZERO, 100.0, &mut found);
+        assert!(found.is_empty());
     }
 }

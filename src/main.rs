@@ -1193,12 +1193,12 @@ mod global_key_tests {
             .get_mut::<Player>(player)
             .unwrap()
             .teleport(Vec3::new(100.5, 20.0, -50.25));
-        let pose_player = app.world_mut().get_mut::<Player>(player).unwrap();
+        let mut pose_player = app.world_mut().get_mut::<Player>(player).unwrap();
         pose_player.yaw = std::f32::consts::FRAC_PI_2;
         pose_player.pitch = 0.0;
         press(&mut app, KeyCode::KeyP);
         let expected = "Position: 100.50, 20.00, -50.25\nView: 1.000, 0.000, 0.000";
-        let read = app.world_mut().resource_mut::<Clipboard>().fetch_text();
+        let mut read = app.world_mut().resource_mut::<Clipboard>().fetch_text();
         let text = read
             .poll_result()
             .expect("desktop clipboard reads are immediate")

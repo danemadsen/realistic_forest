@@ -46,7 +46,9 @@ by naga at runtime either way.
 | Escape | Release the cursor |
 | Left click | Capture the cursor again |
 
-Movement is unbounded in both walking and flight modes.
+Movement is unbounded in both walking and flight modes. Walking is stopped by
+trees and lilacs (see [Colliding with trees](#colliding-with-trees)); flight
+passes through them, as it does the ground.
 
 The developer menu opens at the top left with 2 and leaves no launcher or
 overlay when closed. Its movement tools teleport to exact XYZ coordinates
@@ -506,6 +508,38 @@ crowns, out to the far cascade. The cull pass gathers shadow casters even
 behind the camera, at a cheaper LOD per cascade. The tree crowns are also
 laid over the grass's 512-metre capture from above, so the grass thins out and
 stays short in the shade under a closed canopy and grows back in its gaps.
+
+### Colliding with trees
+
+Every fir, pine, oak, maple and lilac is solid to a walking player, and
+nothing else is: shrubs, shore plants and lavender are walked through, and so
+are the crowns and foliage above the trunk. A trunk is a vertical cylinder
+from the ground to the top of the tree. Its radius is measured from the
+model's own bark when the library loads, as the lower quartile of the bark's
+distance from the pivot between 0.3 and 1.5 metres up (or the same fractions
+of a plant too small to have them), then scaled with the plant. Many models
+carry branch bark right down to the ground, so a maximum or a median would
+measure the lowest limbs instead of the trunk. A lilac, whose stems fan out
+from the base, takes the median, which covers the cluster they stand in. No
+stem is thinner than 6 centimetres.
+
+The player's body is a circle 0.6 metres across. Each frame, the step the
+walk would take is cut into stretches of at most 25 centimetres, too short to
+jump a trunk even at a boosted sprint on a slow frame. After each, the body
+is pushed out of whatever trunk it entered along the line from the trunk's
+axis, so a walk into a trunk turns into a slide around it, and what of the
+player's velocity pressed into it is removed. A body wedged between stems too
+close together for it stays where it was. A trunk blocks the player's feet
+while they are lower than its top, less a 30-centimetre step: a stump is
+stepped over, and a jump, which lifts the feet about 1.2 metres, clears
+anything under about a metre and a half.
+
+Collision reads the same streamed chunks the renderer draws from, so it holds
+exactly the trees you see, and no more: it applies the cull pass's rooting
+rules on the CPU, with the same eroded terrain height the player walks on
+(`vegetation/collision.rs`; a test keeps its literals matching
+`vegetation-cull.wgsl`), and a tree the cull refuses on a steep face, in an
+incised channel or at the waterline is not there to walk into.
 
 The diagnostics panel's **Vegetation** section turns the plants and their
 shadows on and off, scales every LOD distance with **Plant detail distance**,

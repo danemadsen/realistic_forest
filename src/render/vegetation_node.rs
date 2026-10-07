@@ -18,7 +18,9 @@ use super::{ExtractedForestView, ForestGlobals, ForestShaderHandles, TerrainStag
 use crate::constants::SEA_LEVEL;
 use crate::vegetation::assets::{PreparedTexture, Species, Surface, VegetationAssets};
 use crate::vegetation::scatter::PlantInstance;
-use crate::vegetation::{VegetationField, VegetationSnapshot, render_profile};
+use crate::vegetation::{
+    DEEPEST_FURROW, LOWEST_ROOT, STEEPEST_ROOT, VegetationField, VegetationSnapshot, render_profile,
+};
 use bevy::mesh::VertexBufferLayout;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -136,14 +138,9 @@ const ARGS_WORDS: usize = 5;
 const WORKGROUP_SIZE: u32 = 64;
 const INSTANCE_STRIDE: u64 = std::mem::size_of::<DrawInstance>() as u64;
 
-/// A plant root is refused below this height above the sea, steeper than
-/// this rise over run (about 42 degrees, where the terrain's faces turn to
-/// bare rock), or this far below the ground around it (an incised channel).
 /// The slack pads the culling sphere for the scatter's height estimate,
-/// which ignores erosion.
-const LOWEST_ROOT: f32 = 1.0;
-const STEEPEST_ROOT: f32 = 0.9;
-const DEEPEST_FURROW: f32 = 0.6;
+/// which ignores erosion. The rooting limits it enforces are
+/// `vegetation::{LOWEST_ROOT, STEEPEST_ROOT, DEEPEST_FURROW}`.
 const CULLING_SLACK: f32 = 12.0;
 
 // ---------------------------------------------------------------------------

@@ -74,6 +74,7 @@ pub struct CatalogModel {
     pub form: String,
     pub height: f32,
     pub crown_radius: f32,
+    pub trunk_radius: f32,
 }
 
 /// The model metrics the scatter needs, in model-table order.
@@ -132,6 +133,7 @@ impl Catalog {
                     form: model.form.clone(),
                     height: model.height,
                     crown_radius: model.crown_radius,
+                    trunk_radius: model.trunk_radius,
                 })
                 .collect(),
         }
