@@ -394,8 +394,14 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
 // Each segment bounds the ground from above (the channel bed, then a bank
 // cone that steepens away from the water) and from below (a low levee that
 // keeps the water in its channel). The upper bounds combine by minimum and
-// the lower ones by maximum, so confluences open into each other; a segment
-// has a flat start and a round end, so it never reaches back up the channel.
+// the lower ones by maximum, so confluences open into each other. Everything
+// that shapes the channel is given at both ends and interpolated along the
+// segment, so neighbours carve the same ground where they meet, and a segment
+// between two others has a round cap at either end whose water is the reach
+// beside's (cap_slope: how fast the water falls up the reach before its start
+// and down the reach after its end), so nothing switches on along a line and
+// a cap never cuts below the bed or holds a levee over the bank beside it. A
+// segment no reach comes before (cap_slope.x below zero) starts flat.
 // Crossing banks and their shallow shoreline strip round together once;
 // a bounded shelf opens at junctions and deep beds keep their exact profile.
 struct RiverSegment {
@@ -405,10 +411,12 @@ struct RiverSegment {
     half_width: vec2<f32>,
     depth: vec2<f32>,
     speed: vec2<f32>,
-    bank: f32,
-    skew: f32,
+    bank: vec2<f32>,
+    skew: vec2<f32>,
+    levee: vec2<f32>,
+    cap_slope: vec2<f32>,
     turbulence: f32,
-    levee: f32,
+    padding: f32,
 };
 
 struct RiverEnvelope {
@@ -460,48 +468,52 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
     let ab = segment.b - segment.a;
     let ap = p - segment.a;
     let lengthSquared = max(dot(ab, ab), 1e-6);
+    let segmentLength = sqrt(lengthSquared);
     let along = dot(ap, ab)/lengthSquared;
-    // Flat start: what lies behind the start belongs to the segment before.
-    if (along < 0.0) { return riverNone(); }
-    let t = min(along, 1.0);
+    // Round caps carry the channel on round each node, their water the
+    // reach beside's; a segment no reach comes before starts flat.
+    let behind = max(-along, 0.0)*segmentLength;
+    if (behind > 0.0 && segment.cap_slope.x < 0.0) { return riverNone(); }
+    let t = clamp(along, 0.0, 1.0);
+    let beyond = max(along - 1.0, 0.0)*segmentLength;
     let offset = ap - ab*t;
     let centreDistance = length(offset);
     let halfWidth = max(mix(segment.half_width.x, segment.half_width.y, t), 0.05);
     let pastBank = centreDistance - halfWidth;
     // Low junction banks spread their shoulders over a broader run.
-    let bankRun = 2.0 - smoothstep(0.2, 0.55, segment.bank);
+    let bankSlope = mix(segment.bank.x, segment.bank.y, t);
+    let bankRun = 2.0 - smoothstep(0.2, 0.55, bankSlope);
     let bankReach = RIVER_BANK_REACH*bankRun;
     if (pastBank >= bankReach) { return riverNone(); }
-    let water = mix(segment.water.x, segment.water.y, t);
+    let water = mix(segment.water.x, segment.water.y, t) + max(segment.cap_slope.x, 0.0)*behind;
     let depth = mix(segment.depth.x, segment.depth.y, t);
-    let segmentLength = sqrt(lengthSquared);
-    // Signed distance to the centreline, + on the left of the flow. The skew
-    // fades out over the round end cap, where "left" stops meaning anything.
-    let crossValue = ab.x*ap.y - ab.y*ap.x;
-    let side = select(-1.0, 1.0, crossValue >= 0.0);
-    let beyond = max(along - 1.0, 0.0)*segmentLength;
-    let skew = segment.skew*(1.0 - smoothstep(0.0, halfWidth, beyond));
-    let speed = mix(segment.speed.x, segment.speed.y, t);
     let direction = ab/segmentLength;
+    // Signed distance from the centreline's line, + on the left of the flow,
+    // and which way across the flow the point lies: a side beside the
+    // segment, turning smoothly from one to the other round a cap.
+    let lateral = direction.x*ap.y - direction.y*ap.x;
+    let across = lateral/max(centreDistance, 1e-6);
+    let skew = mix(segment.skew.x, segment.skew.y, t);
+    let speed = mix(segment.speed.x, segment.speed.y, t);
     var envelope = RiverEnvelope(RIVER_NONE, -RIVER_NONE, pastBank, water,
-                                 direction*speed, halfWidth, segment.turbulence, skew*side,
+                                 direction*speed, halfWidth, segment.turbulence, skew*across,
                                  RIVER_NO_LAKE);
     if (pastBank < 0.0)
     {
         // A flat-bottomed bowl, skewed: zero at both banks, deep right up to
         // them, and deepest toward the outer one.
-        let u = side*centreDistance/halfWidth;
-        let profile = (1.0 - u*u*u*u)*(1.0 + skew*u);
+        let u = centreDistance/halfWidth;
+        let profile = (1.0 - u*u*u*u)*(1.0 + skew*lateral/halfWidth);
         envelope.upper = water - depth*profile;
         // The current runs fastest over the thalweg and stalls at the banks.
-        let lateral = pow(max(1.0 - u*u, 0.0), 0.35);
-        envelope.velocity = envelope.velocity*(lateral*1.25);
+        let lateralSpeed = pow(max(1.0 - u*u, 0.0), 0.35);
+        envelope.velocity = envelope.velocity*(lateralSpeed*1.25);
     }
     else
     {
         // Cut banks stand steep on the outside of a bend; point bars slope
         // gently into the water on the inside.
-        let bank = segment.bank*max(1.0 + 0.75*skew*side, 0.3);
+        let bank = bankSlope*max(1.0 + 0.75*skew*across, 0.3);
         let shoulder = pastBank/bankRun;
         // Fade both constraints before their finite support ends: a high
         // terrace or low hollow must not jump back to its uncarved height.
@@ -512,16 +524,16 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
         envelope.upper = water + bank*pastBank + RIVER_BANK_CURVE*shoulder*shoulder + release;
         let freeboard = 0.1 + 0.25*depth;
         let leveeWidth = 0.8 + 0.3*halfWidth;
-        // Past the segment's end (beyond a half width, the outside of a
-        // bend's waterline) its levee falls on as its water does, or down a
-        // rapid each end would hold a ledge up beside the next.
-        let fall = max(segment.water.x - segment.water.y, 0.0)/segmentLength*max(beyond - halfWidth, 0.0);
+        // Past the segment's end its levee falls on as the water after it
+        // does, or down a rapid each end would hold a ledge up beside the next.
+        let fall = segment.cap_slope.y*beyond;
         // A fading levee retreats gradually instead of switching off as
         // soon as its strength is a little below one.
-        if (segment.levee > 0.0)
+        let levee = mix(segment.levee.x, segment.levee.y, t);
+        if (levee > 0.0)
         {
-            let retreat = 1.0 - segment.levee;
-            let leveeRelease = (depth + 0.25)*retreat*retreat/max(segment.levee, 1e-5);
+            let retreat = 1.0 - levee;
+            let leveeRelease = (depth + 0.25)*retreat*retreat/max(levee, 1e-5);
             envelope.lower = water - fall + min(bank*pastBank, freeboard)
                            - max(pastBank - leveeWidth, 0.0)*RIVER_LEVEE_OUTER_SLOPE
                            - leveeRelease - release;
@@ -561,7 +573,9 @@ fn riverBankSurfaceSlope(segment: RiverSegment) -> f32
 {
     // Fixed conservative waterline slope avoids introducing another cusp
     // as the nearer bank changes at the junction's bisector.
-    return max(segment.bank*max(1.0 - 0.75*abs(segment.skew), 0.3), 0.001);
+    let start = max(segment.bank.x*max(1.0 - 0.75*abs(segment.skew.x), 0.3), 0.001);
+    let end = max(segment.bank.y*max(1.0 - 0.75*abs(segment.skew.y), 0.3), 0.001);
+    return min(start, end);
 }
 
 fn riverBankUnionUpper(primary: RiverSegment, first: RiverEnvelope,

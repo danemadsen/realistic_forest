@@ -19,10 +19,16 @@
 //! together once, opening a bounded shelf at the junction. Deep channel beds
 //! retain their original profile.
 //!
-//! Segments have a flat start and a round end: a point behind a segment's
-//! start belongs to the segment before it, so a segment never reaches back
-//! up the channel over ground the segments above it shape, while bends stay
-//! covered by the previous segment's round end.
+//! Everything that shapes the channel (water, width, depth, bank slope,
+//! skew, levee) is given at both ends of a segment and interpolated along
+//! it, so two segments meeting at a node carve the same ground there. A
+//! segment between two others has a round cap at either end, so nothing
+//! switches on along a line across the bank; the water in a cap is the reach
+//! beside's, rising up the cap before the start as the reach before falls,
+//! so the cap never cuts below that reach's bed, and falling down the cap
+//! past the end for the levee, so it never holds a ledge over the bank
+//! beside the next reach. A segment no reach comes before (a river's first,
+//! or its first out of a lake) starts flat: nothing behind it is its.
 //!
 //! The same arithmetic runs in `river-functions.wgslinc` on the GPU, from the
 //! same uploaded segments, so the drawn ground, the player's footing, the
@@ -65,8 +71,13 @@ pub fn smooth_max(a: f32, b: f32, k: f32) -> f32 {
 /// Side of a cell of the segment lookup grid, metres.
 pub const GRID_CELL: f32 = 32.0;
 
-/// One carve segment, as the GPU reads it: 64 bytes, mirrored by
+/// One carve segment, as the GPU reads it: 88 bytes, mirrored by
 /// `RiverSegment` in river-functions.wgslinc.
+///
+/// Everything that shapes the channel is given at both ends and
+/// interpolated along the segment, so two segments meeting at a node carve
+/// the same ground there: a bank slope, skew or levee held constant along
+/// each segment would change at every node, and down a bank that is a step.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct RiverSegment {
@@ -81,33 +92,58 @@ pub struct RiverSegment {
     pub depth: [f32; 2],
     /// Mean flow speed at the start and end, m/s.
     pub speed: [f32; 2],
-    /// Bank slope (rise over run) just past the waterline.
-    pub bank: f32,
+    /// Bank slope (rise over run) just past the waterline, at the start and
+    /// end.
+    pub bank: [f32; 2],
     /// Thalweg skew toward the left (+) or right (-) bank, -1..1: the outer
     /// bank of a bend, where the pool is deep and the bank is cut steep.
-    pub skew: f32,
+    pub skew: [f32; 2],
+    /// How firmly the ground beside the channel is held above the water,
+    /// 0..1: none where the river meets the sea, whose bed must not rise.
+    pub levee: [f32; 2],
+    /// How the water runs on round the segment's ends, as the fall per metre
+    /// of the reaches beside them: up the reach before its start, and down
+    /// the reach after its end (`segment_envelope`). A start below zero has
+    /// no reach before it, and the segment starts flat.
+    pub cap_slope: [f32; 2],
     /// Whitewater, 0 calm to 1 a cascade down rapids: rough beds, bare rock
     /// and foam.
     pub turbulence: f32,
-    /// How firmly the ground beside the channel is held above the water,
-    /// 0..1: none where the river meets the sea, whose bed must not rise.
-    pub levee: f32,
+    pub padding: f32,
 }
 
-const _: () = assert!(std::mem::size_of::<RiverSegment>() == 64);
+const _: () = assert!(std::mem::size_of::<RiverSegment>() == 88);
+
+/// `cap_slope[0]` of a segment no reach comes before.
+pub const FLAT_START: f32 = -1.0;
+
+/// Bank run for a bank slope: low, shelving banks need a broad shoulder as
+/// well as a gentle slope at the waterline. Stretching the same bank cone
+/// keeps its quadratic term from turning the mouth's softened banks straight
+/// back into walls.
+pub fn bank_run(bank: f32) -> f32 {
+    2.0 - smoothstep(0.2, 0.55, bank)
+}
 
 impl RiverSegment {
-    /// Low, shelving banks need a broad shoulder as well as a gentle slope
-    /// at the waterline. Stretching the same bank cone keeps its quadratic
-    /// term from turning the mouth's softened banks straight back into walls.
-    pub fn bank_run(&self) -> f32 {
-        2.0 - smoothstep(0.2, 0.55, self.bank)
+    /// The water's fall per metre along the segment.
+    pub fn slope(&self) -> f32 {
+        let length = (self.b[0] - self.a[0]).hypot(self.b[1] - self.a[1]).max(1e-3);
+        (self.water[0] - self.water[1]).max(0.0) / length
+    }
+
+    /// A segment by itself, which starts flat and whose end cap's levee
+    /// falls on at its own slope.
+    #[cfg(test)]
+    pub fn alone(mut self) -> Self {
+        self.cap_slope = [FLAT_START, self.slope()];
+        self
     }
 
     /// Largest distance from the centreline at which the segment shapes the
     /// ground.
     pub fn reach(&self) -> f32 {
-        self.half_width[0].max(self.half_width[1]) + BANK_REACH * self.bank_run()
+        self.half_width[0].max(self.half_width[1]) + BANK_REACH * bank_run(self.bank[0].min(self.bank[1]))
     }
 }
 
@@ -195,36 +231,48 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
 
 /// One segment's envelope at `p`. Mirrored line for line by
 /// `riverSegmentEnvelope` in river-functions.wgslinc.
+///
+/// A segment between two others has a round cap at either end, so nothing
+/// switches on along a line: the cap carries the channel on round its node,
+/// and the reach beside carves the same ground there. The water in a cap is
+/// the reach beside's: up the cap before its start it rises as the reach
+/// before falls, so the cap never cuts below that reach's bed, and down the
+/// cap past its end the levee falls as the reach after does, so it never
+/// holds a ledge up beside it. A segment no reach comes before starts flat:
+/// a river's first segment, or its first out of a lake.
 pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
     let ab = [segment.b[0] - segment.a[0], segment.b[1] - segment.a[1]];
     let ap = [p[0] - segment.a[0], p[1] - segment.a[1]];
     let length_squared = (ab[0] * ab[0] + ab[1] * ab[1]).max(1e-6);
+    let length = length_squared.sqrt();
     let along = (ap[0] * ab[0] + ap[1] * ab[1]) / length_squared;
-    // Flat start: what lies behind the start belongs to the segment before.
-    if along < 0.0 {
+    let behind = (-along).max(0.0) * length;
+    if behind > 0.0 && segment.cap_slope[0] < 0.0 {
         return Envelope::NONE;
     }
-    let t = along.min(1.0);
+    let t = along.clamp(0.0, 1.0);
+    let beyond = (along - 1.0).max(0.0) * length;
     let offset = [ap[0] - ab[0] * t, ap[1] - ab[1] * t];
     let distance = (offset[0] * offset[0] + offset[1] * offset[1]).sqrt();
     let half_width = mix(segment.half_width[0], segment.half_width[1], t).max(0.05);
     let past_bank = distance - half_width;
-    let bank_run = segment.bank_run();
+    let bank_slope = mix(segment.bank[0], segment.bank[1], t);
+    let bank_run = bank_run(bank_slope);
     let bank_reach = BANK_REACH * bank_run;
     if past_bank >= bank_reach {
         return Envelope::NONE;
     }
-    let water = mix(segment.water[0], segment.water[1], t);
+    let water = mix(segment.water[0], segment.water[1], t) + segment.cap_slope[0].max(0.0) * behind;
     let depth = mix(segment.depth[0], segment.depth[1], t);
-    let length = length_squared.sqrt();
-    // Signed distance to the centreline, + on the left of the flow. The skew
-    // fades out over the round end cap, where "left" stops meaning anything.
-    let cross = ab[0] * ap[1] - ab[1] * ap[0];
-    let side = if cross >= 0.0 { 1.0 } else { -1.0 };
-    let beyond = (along - 1.0).max(0.0) * length;
-    let skew = segment.skew * (1.0 - smoothstep(0.0, half_width, beyond));
-    let speed = mix(segment.speed[0], segment.speed[1], t);
     let direction = [ab[0] / length, ab[1] / length];
+    // Signed distance from the centreline's line, + on the left of the flow,
+    // and which way across the flow the point lies, -1..1: beside the
+    // segment it is a side, and round a cap it turns smoothly from one side
+    // to the other, so the skew needs no seam where the sides meet.
+    let lateral = direction[0] * ap[1] - direction[1] * ap[0];
+    let across = lateral / distance.max(1e-6);
+    let skew = mix(segment.skew[0], segment.skew[1], t);
+    let speed = mix(segment.speed[0], segment.speed[1], t);
     let mut envelope = Envelope {
         upper: f32::INFINITY,
         lower: f32::NEG_INFINITY,
@@ -233,7 +281,7 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
         velocity: [direction[0] * speed, direction[1] * speed],
         half_width,
         turbulence: segment.turbulence,
-        bend: skew * side,
+        bend: skew * across,
         lake: f32::NEG_INFINITY,
     };
     if past_bank < 0.0 {
@@ -242,16 +290,16 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
         // steeply under the waterline, so the water is deep right up to the
         // banks rather than shoaling over a broad parabola; its mean depth
         // is four fifths of the thalweg's.
-        let u = side * distance / half_width;
-        let profile = (1.0 - u * u * u * u) * (1.0 + skew * u);
+        let u = distance / half_width;
+        let profile = (1.0 - u * u * u * u) * (1.0 + skew * lateral / half_width);
         envelope.upper = water - depth * profile;
         // The current runs fastest over the thalweg and stalls at the banks.
-        let lateral = (1.0 - u * u).max(0.0).powf(0.35);
-        envelope.velocity = [envelope.velocity[0] * lateral * 1.25, envelope.velocity[1] * lateral * 1.25];
+        let lateral_speed = (1.0 - u * u).max(0.0).powf(0.35);
+        envelope.velocity = [envelope.velocity[0] * lateral_speed * 1.25, envelope.velocity[1] * lateral_speed * 1.25];
     } else {
         // Cut banks stand steep on the outside of a bend; point bars slope
         // gently into the water on the inside.
-        let bank = segment.bank * (1.0 + 0.75 * skew * side).max(0.3);
+        let bank = bank_slope * (1.0 + 0.75 * skew * across).max(0.3);
         let shoulder = past_bank / bank_run;
         // Relax both constraints before their finite lookup support ends.
         // Otherwise a high terrace (or deep hollow under a levee) jumps
@@ -264,19 +312,19 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
         envelope.upper = water + bank * past_bank + BANK_CURVE * shoulder * shoulder + release;
         let freeboard = 0.1 + 0.25 * depth;
         let levee_width = 0.8 + 0.3 * half_width;
-        // Past the segment's end its levee falls on as its water does: down
-        // a rapid steeper than the levee's outer slope, the end held up at
-        // its own water would outrank the next segment's lower levee beside
-        // it, a ledge at every node, a flight of steps down the bank. Within
-        // a half width of the end, the outside of a bend's waterline, it
-        // keeps its freeboard, or the water there would have no bank.
-        let fall = (segment.water[0] - segment.water[1]).max(0.0) / length * (beyond - half_width).max(0.0);
+        // Past the segment's end its levee falls on as the water after it
+        // does: down a rapid steeper than the levee's outer slope, the end
+        // held up at its own water would outrank the next segment's lower
+        // levee beside it, a ledge at every node, a flight of steps down the
+        // bank.
+        let fall = segment.cap_slope[1] * beyond;
         // Lower a fading levee gradually into the ground. A fixed 10 km
         // offset made almost any value below 1 switch it off immediately,
         // leaving a step where a channel approached a lake or the sea.
-        if segment.levee > 0.0 {
-            let retreat = 1.0 - segment.levee;
-            let levee_release = (depth + 0.25) * retreat * retreat / segment.levee.max(1e-5);
+        let levee = mix(segment.levee[0], segment.levee[1], t);
+        if levee > 0.0 {
+            let retreat = 1.0 - levee;
+            let levee_release = (depth + 0.25) * retreat * retreat / levee.max(1e-5);
             envelope.lower = water - fall + (bank * past_bank).min(freeboard)
                 - (past_bank - levee_width).max(0.0) * LEVEE_OUTER_SLOPE
                 - levee_release - release;
@@ -312,7 +360,8 @@ fn bank_surface_slope(segment: &RiverSegment) -> f32 {
     // Conservative slope at the waterline, including either side of a bend.
     // Keep this fixed across the union's bisector: using the nearest bank's
     // changing secant slope would put another cusp in the waterline itself.
-    (segment.bank * (1.0 - 0.75 * segment.skew.abs()).max(0.3)).max(0.001)
+    let at = |end: usize| (segment.bank[end] * (1.0 - 0.75 * segment.skew[end].abs()).max(0.3)).max(0.001);
+    at(0).min(at(1))
 }
 
 /// Round one pair of intersecting banks against the unchanged raw upper
@@ -661,11 +710,12 @@ mod tests {
             half_width: [2.0, 2.0],
             depth: [0.5, 0.5],
             speed: [1.0, 1.0],
-            bank: 0.8,
-            skew: 0.0,
-            turbulence: 0.0,
-            levee: 1.0,
+            bank: [0.8; 2],
+            skew: [0.0; 2],
+            levee: [1.0; 2],
+            ..Default::default()
         }
+        .alone()
     }
 
     fn crossing_banks() -> [RiverSegment; 2] {
@@ -673,7 +723,7 @@ mod tests {
         along_x.b = [40.0, 0.0];
         let mut along_z = along_x;
         along_z.b = [0.0, 40.0];
-        [along_x, along_z]
+        [along_x.alone(), along_z.alone()]
     }
 
     fn raw_envelope(segments: &[RiverSegment], p: [f32; 2]) -> Envelope {
@@ -711,7 +761,7 @@ mod tests {
                 let point = |t| [mix(segment.a[0], segment.b[0], t), mix(segment.a[1], segment.b[1], t)];
                 part.a = point(i as f32 / 8.0);
                 part.b = point((i + 1) as f32 / 8.0);
-                part
+                part.alone()
             })
         }).collect();
         let grids = [
@@ -839,6 +889,57 @@ mod tests {
         assert!(segment_envelope(&segment, [5.0, 2.0 + BANK_REACH + 0.5]).is_none());
     }
 
+    /// Neighbouring segments meet at their node with the same bank, skew
+    /// and levee, and each one's caps carry the water of the reach beside,
+    /// so the carved ground has no step at a joint, however much the banks
+    /// change along the river or however fast its water falls.
+    #[test]
+    fn a_bend_down_a_rapid_carves_one_continuous_bank() {
+        let turn = 20f32.to_radians();
+        let nodes = [[0.0, 0.0], [10.0, 0.0], [10.0 + 10.0 * turn.cos(), 10.0 * turn.sin()]];
+        let water = [10.0, 7.0, 4.0];
+        let (bank, skew, levee) = ([0.9, 0.5, 0.3], [0.3, -0.2, 0.1], [1.0, 0.6, 0.2]);
+        let fall = |k: usize| (water[k] - water[k + 1]) / 10.0;
+        let segment = |k: usize, cap_slope: [f32; 2]| RiverSegment {
+            a: nodes[k],
+            b: nodes[k + 1],
+            water: [water[k], water[k + 1]],
+            half_width: [2.0; 2],
+            depth: [0.5; 2],
+            speed: [1.0; 2],
+            bank: [bank[k], bank[k + 1]],
+            skew: [skew[k], skew[k + 1]],
+            levee: [levee[k], levee[k + 1]],
+            cap_slope,
+            ..Default::default()
+        };
+        let segments = [segment(0, [FLAT_START, fall(1)]), segment(1, [fall(0), fall(1)])];
+        let grid = SegmentGrid::build([-32.0, -32.0], 4, &segments);
+        // High ground the banks are cut into, and ground just under the
+        // water, which the levees hold up beside the channel. With a bank,
+        // skew and levee constant along each segment and a square start,
+        // the banks here stepped by 1.5 m at the node; no slope the carve
+        // makes is steeper than 4.
+        for (ground, banks_only) in [(13.0, false), (9.5, true)] {
+            let envelope = |x: f32, z: f32| envelope_at(&segments, &grid, [x, z]);
+            let height = |x: f32, z: f32| envelope(x, z).clamp(ground - 0.3 * x);
+            let step = 0.05;
+            for i in 0..200 {
+                for j in 0..560 {
+                    let (x, z) = (5.0 + i as f32 * step, -14.0 + j as f32 * step);
+                    for (dx, dz) in [(step, 0.0), (0.0, step)] {
+                        let wet = |x: f32, z: f32| envelope(x, z).bank_distance < if banks_only { 0.25 } else { 0.0 };
+                        if wet(x, z) != wet(x + dx, z + dz) || (banks_only && wet(x, z)) {
+                            continue;
+                        }
+                        let jump = (height(x + dx, z + dz) - height(x, z)).abs();
+                        assert!(jump < 4.0 * step, "step of {jump} m at {x}, {z} over ground {ground}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_segment_never_reaches_back_past_its_start() {
         let segment = straight([10.0, 9.0]);
@@ -851,7 +952,7 @@ mod tests {
     #[test]
     fn the_outer_bank_of_a_bend_is_deep_and_steep() {
         let mut segment = straight([10.0, 10.0]);
-        segment.skew = 0.6;
+        segment.skew = [0.6; 2];
         let left = segment_envelope(&segment, [5.0, 1.0]);
         let right = segment_envelope(&segment, [5.0, -1.0]);
         assert!(left.upper < right.upper, "{left:?} {right:?}");
@@ -864,8 +965,8 @@ mod tests {
     fn shelving_junction_banks_have_broad_gentle_shoulders() {
         let ordinary = straight([10.0, 10.0]);
         let mut junction = ordinary;
-        junction.bank = 0.2;
-        junction.levee = 0.0;
+        junction.bank = [0.2; 2];
+        junction.levee = [0.0; 2];
         // Across a four-metre shore the low junction rises less than half
         // as far as the ordinary bank, without turning into a steep wall.
         let shore = [5.0, 6.0];
@@ -883,7 +984,7 @@ mod tests {
     fn carve_returns_to_high_and_low_ground_before_its_support_ends() {
         for bank in [0.2, 0.8] {
             let mut segment = straight([10.0, 10.0]);
-            segment.bank = bank;
+            segment.bank = [bank; 2];
             let edge = segment.reach();
             for ground in [-30.0, 100.0] {
                 // Both sides of the lookup boundary are exactly the natural
@@ -903,15 +1004,15 @@ mod tests {
         let p = [5.0, 2.8];
         let ground = 9.0;
         let full = segment_envelope(&segment, p).clamp(ground);
-        segment.levee = 0.99;
+        segment.levee = [0.99; 2];
         let almost_full = segment_envelope(&segment, p).clamp(ground);
         assert!((full - almost_full).abs() < 0.002, "{full} {almost_full}");
-        segment.levee = 0.5;
+        segment.levee = [0.5; 2];
         let halfway = segment_envelope(&segment, p).clamp(ground);
         assert!(halfway > ground + 0.2 && halfway < full - 0.2, "{ground} {halfway} {full}");
         let mut previous = full;
         for i in (0..100).rev() {
-            segment.levee = i as f32 / 100.0;
+            segment.levee = [i as f32 / 100.0; 2];
             let height = segment_envelope(&segment, p).clamp(ground);
             assert!(height <= previous && previous - height < 0.08, "{i}: {previous} -> {height}");
             previous = height;
@@ -933,7 +1034,7 @@ mod tests {
             let mut s = straight([10.0, 10.0]);
             s.a = [i as f32 * 10.0, 3.0 * i as f32];
             s.b = [i as f32 * 10.0 + 10.0, 3.0 * i as f32 + 3.0];
-            s
+            s.alone()
         };
         let segments: Vec<RiverSegment> = (0..20).map(offset_segment).collect();
         let grid = SegmentGrid::build([-100.0, -100.0], 16, &segments);
@@ -1026,7 +1127,7 @@ mod gpu_tests {
             let centre = [0.5 * (segment.a[0] + segment.b[0]), 0.5 * (segment.a[1] + segment.b[1])];
             let width = 0.5 * (segment.half_width[0] + segment.half_width[1]);
             for fraction in [0.45, 0.75, 0.98, 1.02] {
-                let offset = width + super::BANK_REACH * segment.bank_run() * fraction;
+                let offset = width + super::BANK_REACH * super::bank_run(segment.bank[0].min(segment.bank[1])) * fraction;
                 points.push([centre[0] - d[1] / length * offset, centre[1] + d[0] / length * offset]);
             }
         }

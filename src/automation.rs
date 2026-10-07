@@ -38,6 +38,9 @@ use bevy::prelude::Resource;
 /// `--measure-overlap [--overlap-tile x,z]` simulates one adjacent tile pair,
 /// prints the per-metre height disagreement across their shared overlap as
 /// CSV, and exits — the seam regression check for the erosion boundaries.
+/// `--river-probe x,z [--map-extent m] [--probe-step m] [--probe-out prefix]`
+/// samples the carved ground and river envelope around a point to a file and
+/// prints the rivers there, for inspecting a reported spot without a window.
 /// `--no-vegetation` skips the plant library and scatter; `--vegetation-map
 /// path [--map-centre x,z] [--map-extent m]` renders the scatter from above,
 /// prints its statistics and exits.
@@ -74,6 +77,10 @@ pub struct AutomationSettings {
     pub river_map: Option<String>,
     /// `--no-rivers`: generate and draw no rivers.
     pub no_rivers: bool,
+    /// `--river-probe x,z`: dump the carved ground around a point and exit.
+    pub river_probe: Option<[f64; 2]>,
+    /// `--probe-out prefix`: where `--river-probe` writes its samples.
+    pub probe_out: String,
     pub width: i32,
     pub height: i32,
     pub probe_extent: f32,
@@ -125,6 +132,8 @@ impl Default for AutomationSettings {
             no_vegetation: false,
             river_map: None,
             no_rivers: false,
+            river_probe: None,
+            probe_out: "river-probe".to_owned(),
             width: 1600,
             height: 900,
             probe_extent: 4096.0,
@@ -253,6 +262,21 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--probe" => automation.probe = true,
             "--no-vegetation" => automation.no_vegetation = true,
             "--no-rivers" => automation.no_rivers = true,
+            "--river-probe" => {
+                if let Some(next) = next {
+                    index += 1;
+                    match parse_floats(next, 2) {
+                        Some(v) => automation.river_probe = Some([v[0] as f64, v[1] as f64]),
+                        None => println!("WARNING: --river-probe expects x,z"),
+                    }
+                }
+            }
+            "--probe-out" => {
+                if let Some(next) = next {
+                    index += 1;
+                    automation.probe_out = next.clone();
+                }
+            }
             "--river-map" => {
                 if let Some(next) = next {
                     index += 1;

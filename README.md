@@ -169,6 +169,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--no-vegetation` | Skip loading and scattering the trees, shrubs and flowers |
 | `--no-rivers` | Generate, carve and draw no rivers |
 | `--river-map path.png` | Render the river network from above, print its statistics and the rivers and lakes nearest `--map-centre`, then exit |
+| `--river-probe x,z` | Sample the carved base ground (no erosion) and the river envelope over `--map-extent` metres (default `128`) around a point every `--probe-step` metres (default `0.5`), write them to `<--probe-out>.f32` (default `river-probe`; seven little-endian `f32` per sample: base, carved, upper, lower, water, bank distance, lake), print the river nodes, carve segments and lakes there, then exit |
 | `--vegetation-map path.png` | Render the plant scatter from above, print its statistics, then exit |
 | `--map-centre x,z`, `--map-extent M` | Area of the vegetation or river map: its centre (default `0,0`) and side in metres (default `1024`, or `8192` for the river map) |
 
@@ -775,9 +776,16 @@ water stands no higher than that gap), every river that reaches it shares it (a 
 holding a smaller lake drowns it), the reaches above it are backed up to its
 level, and the river leaves it at its outlet over a sill: for its first 25 m
 the water draws down gently from the lake's level and always stands a little
-under the ground beside it, so the outlet has banks from the start. A river
-crossing a lake is in it from where its course enters the lake's cells to
-where it leaves them; a short stretch where its course strays over a bar or
+under the ground beside it, so the outlet has banks from the start. Backed up
+to the lake's level, the water stands over any ground below it along the
+reach above, however shallow that hollow seemed: the lake floods it too,
+rather than the river being held over it between dikes. A river
+crossing a lake is in it from where its course reaches the lake's water to
+where it leaves it: the lake takes its 4 m cells whole, so where the course
+runs on through the lake's last cells over ground the water does not cover
+(10 cm deep or less), that reach is the inlet's or outlet's channel, cut down
+to the water, and an outlet never begins as a trench in the dry shore. A
+short stretch where its course strays over a bar or
 a ragged edge of the lake counts as the lake's, and a brush with its shore
 opens no mouth. Water runs down every slope, however steep, as rapids; there
 are no waterfalls.
@@ -793,7 +801,10 @@ from where its water reaches the sea's level, the sea fills its channel out
 to the open water. Nothing holds the ground up beside a river's last stretch
 to the sea, or beside it where it runs into or out of a lake, so no levee
 raises a bar across its own mouth between its water and the still water it
-meets.
+meets. An estuary's bed falls toward the sea and meets the seabed: at its
+mouth it is no deeper than the highest ground its water still crosses to
+reach open water (a bar, or the shelving seabed), and up its flare nowhere
+deeper than downstream, so no pool lies behind the shore.
 
 Hydraulics follow from the catchment and the slope. Bankfull discharge grows
 with the catchment, and the channel follows downstream hydraulic geometry,
@@ -827,7 +838,9 @@ scaled to the channel's width: at least 60 m before the sea, 28 m before a
 lake inlet and 32 m around an outlet. An estuary opens to 2.2 times its
 upstream width and stays open seaward; lake inlets and outlets widen to
 1.85 and 1.7 times their channel width. Their banks soften into broad
-shoulders, with submerged bed transitions into the pond or seabed. The
+shoulders (an estuary's a little firmer, cut through the beach rather than
+scooping a bowl out of it, and shallowing as it widens), with submerged bed
+transitions into the pond or seabed. The
 current slows as its cross-section expands, and accelerates again below
 an outlet's sill. The thalweg hugs the outside of every bend.
 
@@ -852,8 +865,8 @@ their lakes, river mouths cut off from the open sea, how far sheets dip
 under a river where they meet), and the rivers and lakes nearest
 `--map-centre`, with each lake's inlets and outlets; `--map-extent` defaults
 to 8 km here. The spawn region holds some 160 rivers, 86 km of channel and
-170 lakes and ponds covering 280 ha; on gentle reaches the water stands about
-0.8 m under the natural ground on average (half of it under 0.56 m), under
+170 lakes and ponds covering 290 ha; on gentle reaches the water stands about
+0.9 m under the natural ground on average (half of it under 0.61 m), under
 1 % of their length is trenched more than 3 m into it, and one of 127 river
 mouths does not reach open sea (a creek down a sea cliff).
 
@@ -872,12 +885,20 @@ natural ground its creases are rounded (a smooth minimum and maximum over
 0.8 m of height), so a bank's top curves over into the land above it rather
 than breaking at an edge the terrain's triangles would draw as a saw-tooth.
 A bank's slope varies only over many widths along the river, so its top does
-not jog in and out from one segment to the next. A segment has a flat start and a
-round end, so it never reaches back up the channel over ground the segments
-above it shape, and past its end its levee falls on as its water does: down
-a rapid steeper than the levee's outer slope, an end held up at its own water
-would stand over the next segment's lower levee, a ledge at every segment and
-a flight of steps down the bank.
+not jog in and out from one segment to the next, and everything that shapes
+the channel (water, width, depth, bank slope, skew and levee) is given at
+both ends of a segment and interpolated along it, so two segments meeting at
+a node carve the same ground there; held constant along each segment, a bank
+or levee changed at every node, a step down the bank. A segment between two
+others has a round cap at either end, so nothing switches on along a line
+across the bank, and the water in a cap is the reach beside's: up the cap
+before its start it rises as the reach before falls, so the cap never cuts
+below that reach's bed, and down the cap past its end the levee falls as the
+reach after does: down a rapid steeper than the levee's outer slope, an end
+held up at its own water would stand over the next segment's lower levee, a
+ledge at every segment and a flight of steps down the bank. Round a cap the
+skew turns smoothly from one side of the channel to the other. A river's
+first segment, and its first out of a lake, starts flat.
 
 Gentle junction banks spread their shoulders over up to twice the ordinary
 bank run. Both carve bounds relax smoothly before the lookup's support ends,

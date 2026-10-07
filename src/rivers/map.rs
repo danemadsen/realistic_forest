@@ -793,6 +793,75 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
     }
 }
 
+/// `--river-probe x,z`: dump the carved base (no erosion) and the river
+/// envelope on a fine grid around a point, plus the rivers and carve
+/// segments there, for inspecting a reported spot without a window.
+/// Writes `<prefix>.f32` (rows of base, carved, upper, lower, water,
+/// bank_distance, lake per sample) and prints the header and nodes.
+pub fn run_probe(noise: &NoiseField, centre: [f64; 2], extent: f64, step: f64, prefix: &str) {
+    let region = network::region_of(centre[0], centre[1]);
+    let network = network::generate(noise, region);
+    let n = (extent / step).round() as usize + 1;
+    let origin = [centre[0] - extent * 0.5, centre[1] - extent * 0.5];
+    println!("PROBE region {:?} origin {:.3},{:.3} step {} n {}", region, origin[0], origin[1], step, n);
+    let mut data: Vec<f32> = Vec::with_capacity(n * n * 7);
+    for row in 0..n {
+        let z = (origin[1] + row as f64 * step) as f32;
+        for column in 0..n {
+            let x = (origin[0] + column as f64 * step) as f32;
+            let base = base_height(noise, x, z);
+            let (carved, e) = carved_height(noise, &network, x, z);
+            let clean = |v: f32| if v.is_finite() { v.clamp(-1.0e6, 1.0e6) } else if v > 0.0 { 1.0e6 } else { -1.0e6 };
+            data.extend_from_slice(&[base, carved, clean(e.upper), clean(e.lower), clean(e.water), clean(e.bank_distance), clean(e.lake)]);
+        }
+    }
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    std::fs::write(format!("{prefix}.f32"), bytes).expect("write probe");
+    let inside = |p: [f32; 2], margin: f64| {
+        (p[0] as f64 - centre[0]).abs() <= extent * 0.5 + margin && (p[1] as f64 - centre[1]).abs() <= extent * 0.5 + margin
+    };
+    for (index, river) in network.rivers.iter().enumerate() {
+        let near: Vec<usize> = (0..river.nodes.len()).filter(|&i| inside(river.nodes[i].position, 40.0)).collect();
+        if near.is_empty() {
+            continue;
+        }
+        println!(
+            "RIVER {index} end {:?} surface_end {} nodes {} (near {}..={})",
+            river.end,
+            river.surface_end,
+            river.nodes.len(),
+            near[0],
+            near[near.len() - 1]
+        );
+        for &i in &near {
+            let node = &river.nodes[i];
+            let ground = base_height(noise, node.position[0], node.position[1]);
+            println!(
+                "  node {i} pos {:.2},{:.2} along {:.1} water {:.3} ground {:.3} hw {:.2} depth {:.2} bank {:.3} slope {:.4} turb {:.2} skew {:.2} lake {} speed {:.2}",
+                node.position[0], node.position[1], node.along, node.water, ground, node.half_width, node.depth, node.bank, node.slope,
+                node.turbulence, node.skew, node.lake, node.speed
+            );
+        }
+    }
+    for (index, segment) in network.segments.iter().enumerate() {
+        if inside(segment.a, 20.0) || inside(segment.b, 20.0) {
+            println!(
+                "SEG {index} a {:.2},{:.2} b {:.2},{:.2} water {:.3},{:.3} hw {:.2},{:.2} depth {:.2},{:.2} bank {:.3},{:.3} skew {:.2},{:.2} turb {:.2} levee {:.3},{:.3} caps {:.4},{:.4}",
+                segment.a[0], segment.a[1], segment.b[0], segment.b[1], segment.water[0], segment.water[1],
+                segment.half_width[0], segment.half_width[1], segment.depth[0], segment.depth[1], segment.bank[0], segment.bank[1],
+                segment.skew[0], segment.skew[1], segment.turbulence, segment.levee[0], segment.levee[1],
+                segment.cap_slope[0], segment.cap_slope[1]
+            );
+        }
+    }
+    for (index, lake) in network.lakes.iter().enumerate() {
+        let cell = network::FLOW_CELL as f32;
+        if lake.cells.iter().any(|c| inside([(c[0] as f32 + 0.5) * cell, (c[1] as f32 + 0.5) * cell], 40.0)) {
+            println!("LAKE {index} level {:.3} cells {} shore {} edge {}", lake.level, lake.cells.len(), lake.shore.len(), lake.edge.len());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
