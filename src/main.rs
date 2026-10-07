@@ -175,6 +175,15 @@ fn main() {
 
     let noise_field = NoiseField::new();
 
+    // --river-probe samples the carved ground around a point and exits with
+    // no window. `--probe-step` defaults to the landform probe's 128 m, far
+    // too coarse for a channel, so anything that coarse means its own 0.5 m.
+    if let Some(centre) = automation.river_probe {
+        let extent = if automation.map_extent_set { automation.map_extent } else { 128.0 };
+        let step = if automation.probe_step < 64.0 { automation.probe_step as f64 } else { 0.5 };
+        rivers::map::run_probe(&noise_field, centre, extent, step, &automation.probe_out);
+        return;
+    }
     // --river-map charts the river network and exits with no window.
     if let Some(path) = &automation.river_map {
         let extent = if automation.map_extent_set { automation.map_extent } else { 8192.0 };

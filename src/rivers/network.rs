@@ -34,7 +34,7 @@
 //! every random choice is keyed by world coordinates or by a river's head
 //! cell, so two regions that both contain a whole catchment agree on it.
 
-use super::carve::{BANK_REACH, CARVE_ROUNDING, GRID_CELL, RiverSegment, SegmentGrid};
+use super::carve::{BANK_REACH, CARVE_ROUNDING, GRID_CELL, RiverSegment, SegmentGrid, bank_run};
 use crate::constants::SEA_LEVEL;
 use crate::noise::{NoiseField, base_height};
 use crate::vegetation::ecology::{cell_key, noise2 as field_noise};
@@ -1359,6 +1359,95 @@ fn raise_lakes(noise: &NoiseField, corridor: &Corridor, flow: &Flow, lakes: &mut
     None
 }
 
+/// How far under a lake's level the ground along the river above it must lie
+/// for the lake's backwater to flood it (`flood_backwater`).
+const BACKWATER_DEPTH: f32 = 0.3;
+
+impl Lakes {
+    /// Flood the hollow around `start` to the level of lake `lake`, as part
+    /// of it: every cell joined to `start` (edge to edge) under that level.
+    /// Nothing changes if the water there would not stay (it reaches the sea,
+    /// runs out between the cells' centres, or would cover more than any lake
+    /// does), or the hollow belongs to another lake.
+    fn extend(&mut self, noise: &NoiseField, corridor: &Corridor, start: [i64; 2], lake: u32) {
+        let level = self.lakes[lake as usize].level;
+        let ground = |cell: [i64; 2]| -> f32 {
+            corridor.inside(cell).map_or_else(
+                || {
+                    let c = Corridor::centre(cell);
+                    base_height(noise, c[0] as f32, c[1] as f32)
+                },
+                |index| corridor.ground[index],
+            )
+        };
+        if self.cells.contains_key(&start) || ground(start) >= level {
+            return;
+        }
+        let mut inside = std::collections::HashSet::from([start]);
+        let mut queue = std::collections::VecDeque::from([start]);
+        let mut cells = Vec::new();
+        while let Some(cell) = queue.pop_front() {
+            cells.push(cell);
+            if cells.len() >= MAX_LAKE_CELLS {
+                return;
+            }
+            for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let next = [cell[0] + dx, cell[1] + dz];
+                if inside.contains(&next) {
+                    continue;
+                }
+                match self.cells.get(&next) {
+                    Some(&other) if other == lake => continue,
+                    Some(_) => return,
+                    None => {}
+                }
+                let height = ground(next);
+                if height < SEA_LEVEL - OPEN_SEA_DEPTH {
+                    return;
+                }
+                if height < level {
+                    inside.insert(next);
+                    queue.push_back(next);
+                }
+            }
+        }
+        // Checked metre by metre with the lake it joins, whose water it is.
+        let mut basin = cells.clone();
+        basin.extend(self.lakes[lake as usize].cells.iter().map(|c| [c[0] as i64, c[1] as i64]));
+        if spill(noise, &basin, level).is_some() {
+            return;
+        }
+        for &cell in &cells {
+            self.cells.insert(cell, lake);
+        }
+        self.lakes[lake as usize].cells.extend(cells.iter().map(|c| [c[0] as i32, c[1] as i32]));
+    }
+}
+
+/// A lake backs the river above it up to its level: no reach upstream falls
+/// below it (`water_profile`). Where the course runs through ground under that
+/// level, the water stands over it at the lake's level whether or not the
+/// hollow seemed shallow enough to cut through, and would only be held there
+/// as a river by a dike either side; a hollow the backwater floods is the
+/// lake's, every cell of it under the level.
+fn flood_backwater(noise: &NoiseField, corridor: &Corridor, flow: &Flow, lakes: &mut Lakes) {
+    let mut below: Option<u32> = None;
+    for &p in flow.path.iter().rev() {
+        let cell = Corridor::cell_of(p);
+        if let Some(&lake) = lakes.cells.get(&cell) {
+            below = Some(lake);
+            continue;
+        }
+        let Some(lake) = below else {
+            continue;
+        };
+        let ground = corridor.inside(cell).map_or_else(|| base_height(noise, p[0] as f32, p[1] as f32), |index| corridor.ground[index]);
+        if ground < lakes.lakes[lake as usize].level - BACKWATER_DEPTH {
+            lakes.extend(noise, corridor, cell, lake);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Plan form
 // ---------------------------------------------------------------------------
@@ -1471,6 +1560,15 @@ const OUTLET_REACH: f32 = 25.0;
 const OUTLET_SLOPE: f32 = 0.025;
 const OUTLET_FREEBOARD: f32 = 0.15;
 
+/// Drawdown begins tangent to the pond's level surface, reaching the normal
+/// sill slope over its first twelve metres. The ground still limits how
+/// high the water can stand where the outlet descends a steep hillside.
+fn outlet_drawdown(run: f32) -> f32 {
+    const EASING: f32 = 12.0;
+    let eased = run.min(EASING);
+    OUTLET_SLOPE * (0.5 * eased * eased / EASING + (run - EASING).max(0.0))
+}
+
 /// How far above its shore a river's lowest reach is graded to the sea.
 const MOUTH_GRADE_REACH: f64 = 120.0;
 /// A bar across a river's mouth lower than this above the sea is cut
@@ -1479,13 +1577,14 @@ const MOUTH_BAR: f32 = 1.5;
 /// Deepest a mouth's grade cuts under the river's own profile.
 const MOUTH_CUT: f32 = 3.0;
 
-/// Bring a river down to the sea along the chord from its surface
+/// Bring a river down to the sea along a smooth grade from its surface
 /// `MOUTH_GRADE_REACH` above its shore to the sea's level at the shore, and
 /// hold it at the sea's level from there on: where the land drops to the
 /// sea down a beach's face, the river cuts down through the beach and the
 /// rise behind it, as a real mouth does, rather than tumbling down the face.
+/// The grade levels out at the coast, where the sea takes over its surface.
 /// A river already falling to the sea over that reach (its profile under
-/// the chord, as a valley's is) is left as it is. Never below a lake's
+/// the grade, as a valley's is) is left as it is. Never below a lake's
 /// level above it.
 fn grade_to_sea(water: &mut [f32], s: &[f64], floor: &[f32], shore: usize) {
     let sea = SEA_LEVEL + 0.02;
@@ -1504,8 +1603,9 @@ fn grade_to_sea(water: &mut [f32], s: &[f64], floor: &[f32], shore: usize) {
     for i in anchor..shore {
         // A beach and the dune behind it are cut through, but a sea cliff
         // keeps its rapids rather than becoming a gorge.
-        let chord = sea + (top - sea) * ((s[shore] - s[i]) / run) as f32;
-        water[i] = water[i].min(chord.max(water[i] - MOUTH_CUT)).max(floor[i]);
+        let upstream = ((s[shore] - s[i]) / run) as f32;
+        let grade = sea + (top - sea) * smoothstep(0.0, 1.0, upstream);
+        water[i] = water[i].min(grade.max(water[i] - MOUTH_CUT)).max(floor[i]);
     }
 }
 
@@ -1712,7 +1812,7 @@ fn water_profile(noise: &NoiseField, points: Vec<PathPoint>, end_level: Option<f
             } else {
                 let held = outlet[i].map_or(f32::NEG_INFINITY, |(level, run)| {
                     let freeboard = OUTLET_FREEBOARD + (bank - OUTLET_FREEBOARD).max(0.0) * (run / OUTLET_REACH);
-                    (level - OUTLET_SLOPE * run).min(ground[i] - freeboard)
+                    (level - outlet_drawdown(run)).min(ground[i] - freeboard)
                 });
                 water[i].max(floor[i]).max(held)
             };
@@ -1820,6 +1920,56 @@ fn node_spacing(half_width: f32) -> f64 {
     (half_width as f64 * 1.5).clamp(2.6, 7.0)
 }
 
+/// How deep a lake's water must stand over the ground at a node of the river
+/// crossing it for the node to be in the lake at an end of its crossing.
+const LAKE_EDGE_DEPTH: f64 = 0.1;
+
+/// A lake takes its 4 m cells whole, by the ground at their centres, so
+/// along a shallow margin a river's course can run on through the lake's
+/// cells over ground the water does not cover, the ground rising a little
+/// over the lake's level between centres. Such a reach at the end of a
+/// crossing is not in the lake: below the lake it is the outlet's channel,
+/// cut down through the sill to the water, and above it the inlet's, cut down
+/// to meet it. Left in the lake, an outlet would begin as a trench in dry
+/// ground, cut off from the water by a strip of shore. A crossing now ends
+/// where two nodes in a row stand in the water, so the outlet's submerged
+/// connector has water to follow back into the lake; one whose water never
+/// does is left as it is: a brush with the shore.
+fn trim_dry_lake_ends(noise: &NoiseField, points: &mut [PathPoint]) {
+    let n = points.len();
+    let deep: Vec<bool> = points
+        .iter()
+        .map(|point| (base_height(noise, point.p[0] as f32, point.p[1] as f32) as f64) < point.lake - LAKE_EDGE_DEPTH)
+        .collect();
+    let mut i = 0;
+    while i < n {
+        if !points[i].lake.is_finite() {
+            i += 1;
+            continue;
+        }
+        let first = i;
+        while i + 1 < n && points[i + 1].lake.is_finite() {
+            i += 1;
+        }
+        let last = i;
+        i += 1;
+        let Some(inner) = (first..last).find(|&k| deep[k] && deep[k + 1]) else {
+            continue;
+        };
+        let outer = (first..last).rev().find(|&k| deep[k] && deep[k + 1]).unwrap_or(inner);
+        if last + 1 < n {
+            for point in &mut points[outer + 2..=last] {
+                point.lake = f64::NEG_INFINITY;
+            }
+        }
+        if first > 0 {
+            for point in &mut points[first..inner] {
+                point.lake = f64::NEG_INFINITY;
+            }
+        }
+    }
+}
+
 fn build_nodes(
     noise: &NoiseField,
     centreline: Vec<PathPoint>,
@@ -1835,6 +1985,7 @@ fn build_nodes(
     for point in centreline.iter_mut() {
         point.lake = lake_at(point.p);
     }
+    trim_dry_lake_ends(noise, &mut centreline);
     // Area never shrinks downstream.
     for i in 1..centreline.len() {
         centreline[i].area = centreline[i].area.max(centreline[i - 1].area);
@@ -2058,8 +2209,158 @@ const LAKE_GAP_DIP: f32 = 0.5;
 const MIN_CROSSING: f32 = 8.0;
 /// How much wider a river opens where it runs into a lake, and where it
 /// leaves one over its outlet's sill.
-const INLET_SPREAD: f32 = 0.4;
-const OUTLET_SPREAD: f32 = 0.15;
+const INLET_SPREAD: f32 = 0.85;
+const OUTLET_SPREAD: f32 = 0.7;
+const SEA_SPREAD: f32 = 1.2;
+
+#[derive(Clone, Copy)]
+enum MouthKind {
+    Inlet,
+    Outlet,
+    Sea,
+}
+
+/// One transition between a channel and a larger water body. The reach is
+/// measured from the channel's width at the junction, before any widening:
+/// changing widths up the river cannot move the start of the transition.
+struct Mouth {
+    along: f32,
+    reach: f32,
+    spread: f32,
+    kind: MouthKind,
+}
+
+impl Mouth {
+    fn new(along: f32, half_width: f32, kind: MouthKind) -> Self {
+        let (widths, least, spread) = match kind {
+            MouthKind::Inlet => (12.0, 28.0, INLET_SPREAD),
+            MouthKind::Outlet => (14.0, 32.0, OUTLET_SPREAD),
+            MouthKind::Sea => (18.0, 60.0, SEA_SPREAD),
+        };
+        Self { along, reach: (widths * half_width).max(least), spread, kind }
+    }
+
+    fn influence(&self, along: f32) -> f32 {
+        // An estuary stays open on the seaward side. Folding the distance
+        // around the shore would pinch it back into a narrow trench offshore.
+        let distance = match self.kind {
+            MouthKind::Sea => (self.along - along).max(0.0),
+            _ => (self.along - along).abs(),
+        };
+        let t = (1.0 - distance / self.reach).clamp(0.0, 1.0);
+        // Zero slope and curvature at both ends: the bank flares gradually
+        // out of the ordinary channel and rounds into the shore.
+        t * t * t * (t * (6.0 * t - 15.0) + 10.0)
+    }
+}
+
+/// Open mouths on both sides of a lake edge, so terrain carving and the
+/// water ribbon share the same widening. A brief brush with a lake's shore
+/// is not a junction. The depth and flow keep the outlet's sill while its
+/// banks become broad shoulders instead of a slot cut through the rim.
+fn open_mouths(nodes: &mut [RiverNode], end: RiverEnd, surface_end: usize) {
+    let mut mouths = Vec::new();
+    for (first, last) in lake_crossings(nodes) {
+        if first > 0 {
+            let (a, b) = (&nodes[first - 1], &nodes[first]);
+            mouths.push(Mouth::new(0.5 * (a.along + b.along), 0.5 * (a.half_width + b.half_width), MouthKind::Inlet));
+        }
+        if last + 1 < nodes.len() {
+            let (a, b) = (&nodes[last], &nodes[last + 1]);
+            mouths.push(Mouth::new(0.5 * (a.along + b.along), 0.5 * (a.half_width + b.half_width), MouthKind::Outlet));
+        }
+    }
+    if end == RiverEnd::Sea {
+        let at = &nodes[surface_end];
+        mouths.push(Mouth::new(at.along, at.half_width, MouthKind::Sea));
+    }
+    for node in nodes {
+        let (mut spread, mut weight, mut depth, mut bank, mut calm, mut openness) = (0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0);
+        for mouth in &mouths {
+            let t = mouth.influence(node.along);
+            let strength = mouth.spread * t;
+            let w = strength * strength;
+            let (depth_change, bank_slope, calming) = match mouth.kind {
+                MouthKind::Inlet => (-0.24, 0.24, 1.0),
+                MouthKind::Outlet => (-0.12, 0.28, 0.35),
+                MouthKind::Sea => (-0.2, 0.35, 1.0),
+            };
+            spread = spread.max(strength);
+            weight += w;
+            depth += w * depth_change * t;
+            bank += w * (node.bank.min(bank_slope) - node.bank) * t;
+            calm += w * calming * t;
+            openness += w * t;
+        }
+        if weight <= 0.0 {
+            continue;
+        }
+        // Adjacent mouths can overlap around a small pond. Blend their
+        // hydraulic changes so switching the dominant flare leaves no step
+        // in depth, speed or the bank slope.
+        let widen = 1.0 + spread;
+        let deepen = 1.0 + depth / weight;
+        node.half_width *= widen;
+        node.depth *= deepen;
+        // A wider cross-section carries the same discharge more slowly;
+        // below a pond's sill the narrowing channel accelerates it again.
+        node.speed /= widen * deepen;
+        node.turbulence *= 1.0 - calm / weight;
+        node.bank += bank / weight;
+        node.skew *= 1.0 - 0.8 * openness / weight;
+    }
+}
+
+/// How far past its mouth an estuary's sill is looked for along the course,
+/// metres, and the least depth its channel keeps over it.
+const ESTUARY_SILL_REACH: f32 = 40.0;
+const ESTUARY_LEAST_DEPTH: f32 = 0.25;
+
+/// An estuary's bed falls toward the sea and meets the seabed. At its mouth
+/// it is no deeper than the highest ground its water must still cross to
+/// reach open water (the bar a beach throws across it, or the shelving
+/// seabed), and up its flare it is nowhere deeper than downstream: deepened
+/// toward the coast, it was a closed bowl behind the shore, a pool the sea's
+/// own floor rose out of beyond the widened channel's round end.
+fn grade_estuary(nodes: &mut [RiverNode], surface_end: usize, ground: impl Fn([f32; 2]) -> f32) {
+    let mouth = surface_end.min(nodes.len() - 1);
+    // From where the course reaches the sea, across whatever it shelves over
+    // before open water.
+    let Some(shore) = (mouth..nodes.len()).find(|&i| ground(nodes[i].position) < SEA_LEVEL) else {
+        return;
+    };
+    let mut sill = f32::NEG_INFINITY;
+    for node in &nodes[shore..] {
+        let height = ground(node.position);
+        if height < SEA_LEVEL - OPEN_SEA_DEPTH || node.along - nodes[shore].along > ESTUARY_SILL_REACH {
+            break;
+        }
+        sill = sill.max(height);
+    }
+    if !sill.is_finite() {
+        return;
+    }
+    // Over the flare's reach, which `Mouth` measures from the channel's
+    // width before it widened.
+    let reach = Mouth::new(nodes[mouth].along, nodes[mouth].half_width / (1.0 + SEA_SPREAD), MouthKind::Sea).reach;
+    let bed_at = |node: &RiverNode, floor: f32| -> f32 {
+        let bed = (node.water - node.depth).max(floor);
+        node.water - (node.water - bed).max(ESTUARY_LEAST_DEPTH)
+    };
+    for node in nodes[mouth..].iter_mut() {
+        node.depth = node.water - bed_at(node, sill);
+    }
+    let start = nodes[mouth].along - reach;
+    let mut floor = sill;
+    for node in nodes[..mouth].iter_mut().rev() {
+        if node.along < start {
+            break;
+        }
+        let bed = bed_at(node, floor);
+        node.depth = node.water - bed;
+        floor = bed;
+    }
+}
 
 /// Join a river's reaches through one lake across the short stretches where
 /// its centreline leaves the lake's cells: over a low bar, across a corner of
@@ -2285,6 +2586,7 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
         let Some(flow) = flow else {
             continue;
         };
+        flood_backwater(noise, wider.as_ref().unwrap_or(&corridors[index]), &flow, &mut lakes);
         // Each point of the flow path takes its catchment from the coarse
         // path beside it.
         let mut points: Vec<PathPoint> = Vec::with_capacity(flow.path.len() + 1);
@@ -2373,28 +2675,6 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
             }
             RiverEnd::Edge => {}
         }
-        // Where a river meets still water it spreads and slows into it rather
-        // than ending as a channel: into a lake it runs into, a little where
-        // it leaves one over its outlet's sill, and into the sea at its mouth.
-        // Only a real crossing of a lake opens mouths, never a brush with its
-        // shore. Nodes on both sides of a mouth widen alike, so the channel
-        // and its ribbon open out smoothly instead of stepping wider at the
-        // lake's edge. A delta or an outlet's sill shoals where a river meets
-        // a lake; the tide scours an estuary deeper toward the sea.
-        // (where along the river, how much it spreads, reach in half widths,
-        // least reach in metres, whether it is the sea)
-        let mut mouths: Vec<(f32, f32, f32, f32, bool)> = Vec::new();
-        for (first, last) in lake_crossings(&nodes) {
-            if first > 0 {
-                mouths.push((0.5 * (nodes[first - 1].along + nodes[first].along), INLET_SPREAD, 4.0, 10.0, false));
-            }
-            if last + 1 < nodes.len() {
-                mouths.push((0.5 * (nodes[last].along + nodes[last + 1].along), OUTLET_SPREAD, 3.0, 8.0, false));
-            }
-        }
-        if end == RiverEnd::Sea {
-            mouths.push((nodes[surface_end].along, 0.5, 8.0, 15.0, true));
-        }
         // A tributary backed up to its parent's level runs calm into it: its
         // mouth is drowned in the parent's water, with no rapids at the join.
         if matches!(end, RiverEnd::Confluence(..)) {
@@ -2404,19 +2684,9 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
                 node.turbulence *= 1.0 - 0.8 * backed;
             }
         }
-        for node in nodes.iter_mut() {
-            let (t, spread, sea) = mouths.iter().fold((0.0f32, 0.0f32, false), |best, &(at, spread, reach, least, sea)| {
-                let reach = (reach * node.half_width).max(least);
-                let t = 1.0 - smoothstep(0.0, reach, (node.along - at).abs());
-                if t * spread > best.0 * best.1 { (t, spread, sea) } else { best }
-            });
-            node.half_width *= 1.0 + spread * t;
-            // Water slows into a lake or the sea, but speeds over a sill as
-            // it leaves a lake: an outlet keeps most of its pace and foam.
-            let calm = (spread / INLET_SPREAD).min(1.0) * t;
-            node.speed *= 1.0 - 0.6 * calm;
-            node.turbulence *= 1.0 - calm;
-            node.depth *= if sea { 1.0 + 0.25 * t } else { 1.0 - 0.6 * spread * t };
+        open_mouths(&mut nodes, end, surface_end);
+        if end == RiverEnd::Sea {
+            grade_estuary(&mut nodes, surface_end, |p| base_height(noise, p[0], p[1]));
         }
         for (k, node) in nodes.iter().enumerate() {
             let cell = [
@@ -2451,7 +2721,7 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
         }
     }
 
-    let segments = build_segments(&finished, noise);
+    let segments = build_segments(&finished, noise, &lakes);
     let origin = routing_origin(region);
     let resolution = ((REGION_SIZE + 2.0 * ROUTING_MARGIN) / GRID_CELL as f64).ceil() as usize;
     let grid_origin = [origin[0] as f32, origin[1] as f32];
@@ -2985,21 +3255,328 @@ fn nearest_on_river(river: &River, p: [f64; 2]) -> (usize, [f64; 2]) {
     (best.0, best.1)
 }
 
-fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
+/// The submerged channel disappears into the existing bed within a few
+/// metres of the shore. Follow the river's routed course, including bends,
+/// and stop before any dry ground or another shore. Widening belongs above
+/// the shore; extending a broad, zero-depth channel offshore still flattens
+/// all ground inside its waterline into an artificial lagoon.
+fn submerged_transition(
+    segments: &mut Vec<RiverSegment>,
+    path: &[RiverNode],
+    outlet: bool,
+    ground: &impl Fn([f32; 2]) -> f32,
+    wet: &impl Fn([f32; 2], f32) -> bool,
+) {
+    let Some(node) = path.first() else { return };
+    if path.len() < 2 {
+        return;
+    }
+    let room: f32 = path
+        .windows(2)
+        .map(|pair| {
+            let dx = pair[1].position[0] - pair[0].position[0];
+            let dz = pair[1].position[1] - pair[0].position[1];
+            dx.hypot(dz)
+        })
+        .sum();
+    let reach = (2.0 * node.half_width).clamp(3.0, 10.0).min(0.4 * room);
+    if reach < 0.5 {
+        return;
+    }
+    let mut entered_water = wet(node.position, node.water);
+    let shore_cut_reach = if node.lake {
+        node.half_width.min(reach)
+    } else {
+        0.0
+    };
+    if !entered_water && shore_cut_reach <= 0.0 {
+        return;
+    }
+    let mut points = vec![(node.position, 0.0, true)];
+    let mut run = 0.0;
+    'course: for pair in path.windows(2) {
+        let (a, b) = (pair[0].position, pair[1].position);
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let length = d[0].hypot(d[1]);
+        if length < 1e-4 {
+            continue;
+        }
+        let step_run = length.min(reach - run);
+        let steps = (step_run / 0.75).ceil().max(1.0) as usize;
+        for step in 1..=steps {
+            let advance = step_run * step as f32 / steps as f32;
+            let p = [a[0] + d[0] * advance / length, a[1] + d[1] * advance / length];
+            let in_water = wet(p, node.water);
+            let sampled_run = run + advance;
+            if in_water {
+                entered_water = true;
+            } else if entered_water || sampled_run > shore_cut_reach {
+                break 'course;
+            }
+            // Probe the shore finely, but only routed corners become
+            // geometry. Dense carve sections overflow the shared CPU/GPU
+            // candidate budget where several outlets are close together.
+            points.push((p, sampled_run, step == steps));
+        }
+        run += step_run;
+        if run >= reach - 1e-4 {
+            break;
+        }
+    }
+    let actual_reach = points.last().map_or(0.0, |p| p.1);
+    if actual_reach < 0.5 || !entered_water {
+        return;
+    }
+    // At a pond's rim the existing outlet has already opened a channel
+    // through ground that was dry before carving. Its submerged connector
+    // must keep that opening, then hand over to natural pond terrain.
+    let needs_rim_cut = ground(node.position) > node.water - node.depth;
+    let connector_reach = if node.lake && needs_rim_cut && room > 2.0 * node.half_width {
+        node.half_width.min(0.6 * actual_reach)
+    } else {
+        0.0
+    };
+    let mut controls: Vec<_> = points
+        .iter()
+        .filter(|point| point.2)
+        .map(|point| (point.0, point.1))
+        .collect();
+    let tip = points.last().unwrap();
+    controls.push((tip.0, tip.1));
+    // Two extra sections keep the bed's eased ends even when the whole
+    // transition fits inside one original centreline segment.
+    for fraction in [0.15, 0.85] {
+        let run = actual_reach * fraction;
+        let end = points.partition_point(|p| p.1 < run).clamp(1, points.len() - 1);
+        let (a, b) = (points[end - 1], points[end]);
+        let t = (run - a.1) / (b.1 - a.1).max(1e-5);
+        let position = [
+            a.0[0] + (b.0[0] - a.0[0]) * t,
+            a.0[1] + (b.0[1] - a.0[1]) * t,
+        ];
+        controls.push((position, run));
+    }
+    controls.sort_by(|a, b| a.1.total_cmp(&b.1));
+    controls.dedup_by(|a, b| (a.1 - b.1).abs() < 0.01);
+    let section = |(p, run): ([f32; 2], f32)| {
+        let fade = 1.0 - smoothstep(0.0, actual_reach, run);
+        let channel_width = node.half_width * fade;
+        let mut width = channel_width;
+        // A bent route may approach a side bank before its centre reaches
+        // it. Keep the entire wetted footprint in the same water body.
+        for ray in 0..16 {
+            let angle = std::f32::consts::TAU * ray as f32 / 16.0;
+            let direction = [angle.cos(), angle.sin()];
+            let steps = (width / 0.5).ceil().max(1.0) as usize;
+            for step in 1..=steps {
+                let radius = width * step as f32 / steps as f32;
+                let q = [p[0] + direction[0] * radius, p[1] + direction[1] * radius];
+                if !wet(q, node.water) {
+                    // Locate the wet edge within the probe interval, then
+                    // leave another half metre inside it. Subtracting only
+                    // the probe spacing can leave the rounded cap touching
+                    // a dry bank between samples.
+                    let mut inside = (radius - width / steps as f32).max(0.0);
+                    let mut outside = radius;
+                    for _ in 0..6 {
+                        let middle = 0.5 * (inside + outside);
+                        let q = [p[0] + direction[0] * middle, p[1] + direction[1] * middle];
+                        if wet(q, node.water) {
+                            inside = middle;
+                        } else {
+                            outside = middle;
+                        }
+                    }
+                    width = (inside - 0.5).max(0.0);
+                    break;
+                }
+            }
+        }
+        if node.lake {
+            if run <= 1e-5 {
+                width = node.half_width;
+            } else if connector_reach > 0.0 {
+                let protection = smoothstep(0.0, connector_reach, run);
+                width = channel_width + (width - channel_width) * protection;
+            }
+        }
+        (p, width, node.depth * fade, node.speed * fade, run)
+    };
+    let mut sections: Vec<_> = controls.into_iter().map(section).collect();
+    // Terrain on one side of the rim can briefly leave and re-enter the
+    // pond. Its guard must not pinch the connector and swell it again.
+    if node.lake {
+        for i in 1..sections.len() {
+            sections[i].1 = sections[i].1.min(sections[i - 1].1);
+        }
+    }
+    let first_segment = segments.len();
+    for pair in sections.windows(2) {
+        let (a, b) = if outlet { (pair[1], pair[0]) } else { (pair[0], pair[1]) };
+        let mut segment = RiverSegment {
+            a: a.0,
+            b: b.0,
+            water: [node.water; 2],
+            half_width: [a.1, b.1],
+            depth: [a.2, b.2],
+            speed: [a.3, b.3],
+            bank: [node.bank.max(0.7); 2],
+            ..Default::default()
+        };
+        // These are submerged bed transitions, not a second set of banks.
+        // Lift their bank cone over nearby dry land, including their round
+        // caps, so a fan beside an oblique shore cannot excavate that shore.
+        for t in [0.0, 0.5, 1.0] {
+            let centre = [a.0[0] + (b.0[0] - a.0[0]) * t, a.0[1] + (b.0[1] - a.0[1]) * t];
+            let width = a.1 + (b.1 - a.1) * t;
+            for ray in 0..16 {
+                let angle = std::f32::consts::TAU * ray as f32 / 16.0;
+                let direction = [angle.cos(), angle.sin()];
+                let mut previous_past = 0.0;
+                let mut previous_wet = true;
+                for step in 0..=16 {
+                    let past = 0.25 + BANK_REACH * step as f32 / 16.0;
+                    let p = [centre[0] + direction[0] * (width + past), centre[1] + direction[1] * (width + past)];
+                    let natural = ground(p);
+                    if natural > node.water {
+                        let mut safe_past = past;
+                        if previous_wet {
+                            let mut inside = previous_past;
+                            let mut outside = past;
+                            for _ in 0..6 {
+                                let middle = 0.5 * (inside + outside);
+                                let q = [
+                                    centre[0] + direction[0] * (width + middle),
+                                    centre[1] + direction[1] * (width + middle),
+                                ];
+                                if ground(q) > node.water {
+                                    outside = middle;
+                                } else {
+                                    inside = middle;
+                                }
+                            }
+                            safe_past = inside.max(0.01);
+                        }
+                        let safe_bank = (natural - node.water + CARVE_ROUNDING) / safe_past;
+                        segment.bank[0] = segment.bank[0].max(safe_bank);
+                    }
+                    previous_past = past;
+                    previous_wet = natural <= node.water;
+                }
+            }
+        }
+        if connector_reach > 0.0 {
+            let near_shore = a.4.min(b.4);
+            let protection = smoothstep(0.25 * connector_reach, connector_reach, near_shore);
+            segment.bank[0] = node.bank + (segment.bank[0] - node.bank) * protection;
+        }
+        segment.bank[1] = segment.bank[0];
+        segments.push(segment);
+    }
+    if outlet {
+        segments[first_segment..].reverse();
+    }
+    // A chain like any reach, its still water level throughout: each joint
+    // at the steeper of the two banks lifted beside it.
+    let chain = segments[first_segment..].to_vec();
+    for (k, segment) in segments[first_segment..].iter_mut().enumerate() {
+        let before = k.checked_sub(1).map(|j| &chain[j]);
+        let after = chain.get(k + 1);
+        segment.bank = [
+            before.map_or(segment.bank[0], |s| s.bank[0].max(segment.bank[0])),
+            after.map_or(segment.bank[1], |s| s.bank[0].max(segment.bank[1])),
+        ];
+        segment.cap_slope = [if before.is_some() { 0.0 } else { super::carve::FLAT_START }, 0.0];
+    }
+}
+
+fn build_segments(rivers: &[River], noise: &NoiseField, lakes: &Lakes) -> Vec<RiverSegment> {
+    let ground = |p: [f32; 2]| base_height(noise, p[0], p[1]);
+    let wet = |p: [f32; 2], level: f32| {
+        ground(p) < level
+            && (level <= SEA_LEVEL + 0.03 || (lakes.level_at([p[0] as f64, p[1] as f64]) - level as f64).abs() < 0.03)
+    };
+    build_segments_on_ground(rivers, &ground, &wet)
+}
+
+/// The first part of the course naturally joined to deep sea water. A
+/// coastal hollow before a beach bar is still part of the channel: retain
+/// its route across the bar, and stop only on the connected seaward side.
+fn sea_shore_index(nodes: &[RiverNode], surface_end: usize, ground: &impl Fn([f32; 2]) -> f32) -> usize {
+    let first = surface_end.min(nodes.len() - 1);
+    let mut shore = nodes.len() - 1;
+    let mut joined_to_deep_water = false;
+    for i in (first..nodes.len()).rev() {
+        let a = nodes[i].position;
+        let b = nodes.get(i + 1).map_or(a, |node| node.position);
+        let dx = b[0] - a[0];
+        let dz = b[1] - a[1];
+        let steps = (dx.hypot(dz) / 0.75).ceil().max(1.0) as usize;
+        for step in (0..steps).rev() {
+            let t = step as f32 / steps as f32;
+            let natural = ground([a[0] + dx * t, a[1] + dz * t]);
+            if natural >= SEA_LEVEL {
+                joined_to_deep_water = false;
+            } else if natural < SEA_LEVEL - OPEN_SEA_DEPTH {
+                joined_to_deep_water = true;
+            }
+        }
+        if !joined_to_deep_water && ground(a) < SEA_LEVEL {
+            // The routed path may end in shallow connected sea before it
+            // reaches a deep node. Look outward through natural wet ground
+            // as well; every intervening dry bar blocks that direction.
+            let search_reach = (3.0 * nodes[i].half_width + BANK_REACH).clamp(16.0, 64.0);
+            let search_steps = (search_reach / 0.75).ceil() as usize;
+            'sea: for ray in 0..16 {
+                let angle = std::f32::consts::TAU * ray as f32 / 16.0;
+                for step in 1..=search_steps {
+                    let radius = search_reach * step as f32 / search_steps as f32;
+                    let p = [a[0] + angle.cos() * radius, a[1] + angle.sin() * radius];
+                    let natural = ground(p);
+                    if natural >= SEA_LEVEL {
+                        break;
+                    }
+                    if natural < SEA_LEVEL - OPEN_SEA_DEPTH {
+                        joined_to_deep_water = true;
+                        break 'sea;
+                    }
+                }
+            }
+        }
+        if joined_to_deep_water && nodes[i].water <= SEA_LEVEL + 0.03 {
+            shore = i;
+        }
+    }
+    shore
+}
+
+fn build_segments_on_ground(
+    rivers: &[River],
+    ground: &impl Fn([f32; 2]) -> f32,
+    wet: &impl Fn([f32; 2], f32) -> bool,
+) -> Vec<RiverSegment> {
     let mut segments = Vec::new();
     for river in rivers {
+        let nodes = &river.nodes;
+        if nodes.len() < 2 {
+            continue;
+        }
+        // Routing continues to a deep sea cell and may turn back along a
+        // neighbouring beach. The channel ends at its first natural shore,
+        // not at that remote routing target.
+        let sea_shore = (river.end == RiverEnd::Sea)
+            .then(|| sea_shore_index(nodes, river.surface_end, ground));
         // Over its last stretch to the sea a river's banks are the shore:
         // nothing holds the ground up beside it, or the levee of a creek
         // that comes down a sea cliff would dam its own mouth.
         let mouth = (river.end == RiverEnd::Sea).then(|| {
             let end = &river.nodes[river.surface_end.min(river.nodes.len() - 1)];
-            end.along - (BANK_REACH + 3.0 * end.half_width)
+            end.along - (2.0 * BANK_REACH + 3.0 * end.half_width)
         });
         // So too where it runs into or out of a lake: a levee's outer slope
         // reaches a bank's width round the ends of the segments beside the
         // lake and would raise a bar across the mouth, between the river's
         // water and the lake's. Metres along the river to the nearest lake.
-        let nodes = &river.nodes;
         let mut to_lake = vec![f32::INFINITY; nodes.len()];
         let mut last: Option<f32> = None;
         for (node, near) in nodes.iter().zip(to_lake.iter_mut()) {
@@ -3019,16 +3596,41 @@ fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
                 *near = near.min(at - node.along);
             }
         }
+        // How firmly each node's banks are held up: not at all in a lake, and
+        // fading out toward still water.
+        let levee_at = |k: usize| -> f32 {
+            let node = &nodes[k];
+            if node.lake {
+                return 0.0;
+            }
+            let near_sea = mouth.map_or(1.0, |mouth| 1.0 - smoothstep(mouth - 15.0, mouth, node.along));
+            // Clear of the lake by the reach of either segment meeting here.
+            let around = &nodes[k.saturating_sub(1)..(k + 2).min(nodes.len())];
+            let widest = around.iter().map(|n| n.half_width).fold(0.0f32, f32::max);
+            let gentlest = around.iter().map(|n| n.bank).fold(f32::INFINITY, f32::min);
+            let clear = 2.0 * widest + BANK_REACH * bank_run(gentlest);
+            let near_lake = smoothstep(clear, clear + 20.0, to_lake[k]);
+            smoothstep(SEA_LEVEL + 0.05, SEA_LEVEL + 0.6, node.water) * near_sea * near_lake
+        };
+        // Which reaches have a channel of their own (none under a lake, nor
+        // past the shore), and how fast each one's water falls.
+        let channelled = |k: usize| -> bool {
+            k + 1 < nodes.len() && !(nodes[k].lake && nodes[k + 1].lake) && !sea_shore.is_some_and(|shore| k >= shore)
+        };
+        let fall_of = |k: usize| -> f32 {
+            let (a, b) = (&nodes[k], &nodes[k + 1]);
+            let length = (b.position[0] - a.position[0]).hypot(b.position[1] - a.position[1]).max(1e-3);
+            (a.water - b.water).max(0.0) / length
+        };
         for (i, pair) in river.nodes.windows(2).enumerate() {
             let (a, b) = (&pair[0], &pair[1]);
-            // Under a lake the river has no channel of its own.
-            if a.lake && b.lake {
+            if !channelled(i) {
                 continue;
             }
-            let near_sea = mouth.map_or(1.0, |mouth| 1.0 - smoothstep(mouth - 15.0, mouth, b.along));
-            let clear = BANK_REACH + 2.0 * a.half_width.max(b.half_width);
-            let near_lake = smoothstep(clear, clear + 15.0, to_lake[i].min(to_lake[i + 1]));
-            let shore = if a.lake || b.lake { 0.0 } else { near_sea * near_lake };
+            // The first reach, and the first out of a lake, start flat (a
+            // spring's narrows away up its lead-in, below).
+            let before = if i > 0 && channelled(i - 1) { fall_of(i - 1) } else { super::carve::FLAT_START };
+            let after = if channelled(i + 1) { fall_of(i + 1) } else { fall_of(i) };
             let reach_segment = RiverSegment {
                 a: a.position,
                 b: b.position,
@@ -3036,39 +3638,38 @@ fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
                 half_width: [a.half_width, b.half_width],
                 depth: [a.depth, b.depth],
                 speed: [a.speed, b.speed],
-                bank: 0.5 * (a.bank + b.bank),
-                skew: 0.5 * (a.skew + b.skew),
+                bank: [a.bank, b.bank],
+                skew: [a.skew, b.skew],
+                levee: [levee_at(i), levee_at(i + 1)],
+                cap_slope: [before, after],
                 turbulence: a.turbulence.max(b.turbulence),
-                levee: smoothstep(SEA_LEVEL + 0.05, SEA_LEVEL + 0.6, a.water.min(b.water)) * shore,
+                ..Default::default()
             };
             segments.push(reach_segment);
         }
-        // Where a river leaves a lake its channel opens out of the lake's
-        // bed a little before its first node: a segment's start is flat, and
-        // the outlet's first one would otherwise begin as a square cut across
-        // the flow, a wall at the lake's edge. This lead-in runs up out of
-        // the bed and meets that start with its round end.
-        for pair in river.nodes.windows(2) {
+        // Follow the drowned course at a pond's inlet and outlet. A
+        // straight extension of the final tangent can cross its side bank
+        // even when the extension is shorter than the lake's crossing.
+        for (i, pair) in river.nodes.windows(2).enumerate() {
             let (a, b) = (&pair[0], &pair[1]);
-            if !(a.lake && !b.lake) {
+            if a.lake == b.lake {
                 continue;
             }
-            let d = [b.position[0] - a.position[0], b.position[1] - a.position[1]];
-            let l = d[0].hypot(d[1]).max(1e-3);
-            let reach = 3.0 * a.half_width;
-            let outlet_lead_in = RiverSegment {
-                a: [a.position[0] - d[0] / l * reach, a.position[1] - d[1] / l * reach],
-                b: a.position,
-                water: [a.water, a.water],
-                half_width: [a.half_width * 1.3, a.half_width],
-                depth: [0.05, a.depth],
-                speed: [a.speed * 0.6, a.speed],
-                bank: a.bank * 0.5,
-                skew: 0.0,
-                turbulence: 0.0,
-                levee: 0.0,
+            if sea_shore.is_some_and(|shore| i >= shore) {
+                break;
+            }
+            let path = if a.lake {
+                let first = (0..=i).rev().take_while(|&j| nodes[j].lake).last().unwrap_or(i);
+                nodes[first..=i]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .collect::<Vec<_>>()
+            } else {
+                let last = (i + 1..nodes.len()).take_while(|&j| nodes[j].lake).last().unwrap_or(i + 1);
+                nodes[i + 1..=last].to_vec()
             };
-            segments.push(outlet_lead_in);
+            submerged_transition(&mut segments, &path, a.lake, ground, wet);
         }
         // A stream rising at a spring has no wall at its head: its first
         // segment begins as a square cut across the flow, so a lead-in runs
@@ -3083,7 +3684,7 @@ fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
             let l = d[0].hypot(d[1]).max(1e-3);
             let reach = (6.0 * a.half_width).max(3.0);
             let top = [a.position[0] - d[0] / l * reach, a.position[1] - d[1] / l * reach];
-            let rise = (a.slope.max(0.05) * reach).max(base_height(noise, top[0], top[1]) + CARVE_ROUNDING - a.water);
+            let rise = (a.slope.max(0.05) * reach).max(ground(top) + CARVE_ROUNDING - a.water);
             let spring_lead_in = RiverSegment {
                 a: top,
                 b: a.position,
@@ -3091,35 +3692,14 @@ fn build_segments(rivers: &[River], noise: &NoiseField) -> Vec<RiverSegment> {
                 half_width: [0.0, a.half_width],
                 depth: [0.0, a.depth],
                 speed: [0.0, a.speed],
-                bank: a.bank,
-                skew: 0.0,
-                turbulence: 0.0,
-                levee: 0.0,
+                bank: [a.bank; 2],
+                ..Default::default()
             };
-            segments.push(spring_lead_in);
+            let after = if channelled(0) { fall_of(0) } else { spring_lead_in.slope() };
+            segments.push(RiverSegment { cap_slope: [super::carve::FLAT_START, after], ..spring_lead_in });
         }
-        // A river's channel opens into the sea a little past its last node.
-        if river.end == RiverEnd::Sea && river.nodes.len() >= 2 {
-            let a = river.nodes[river.nodes.len() - 2];
-            let b = river.nodes[river.nodes.len() - 1];
-            let d = [b.position[0] - a.position[0], b.position[1] - a.position[1]];
-            let l = d[0].hypot(d[1]).max(1e-3);
-            let reach = 3.0 * b.half_width;
-            let mouth_extension = RiverSegment {
-                a: b.position,
-                b: [b.position[0] + d[0] / l * reach, b.position[1] + d[1] / l * reach],
-                water: [b.water, b.water],
-                half_width: [b.half_width, b.half_width * 1.3],
-                // Its groove ramps up into the seabed rather than ending in
-                // a bowl under the sea.
-                depth: [b.depth, 0.05],
-                speed: [b.speed, b.speed * 0.6],
-                bank: b.bank * 0.5,
-                skew: 0.0,
-                turbulence: 0.0,
-                levee: 0.0,
-            };
-            segments.push(mouth_extension);
+        if let Some(shore) = sea_shore {
+            submerged_transition(&mut segments, &nodes[shore..], false, ground, wet);
         }
     }
     segments
@@ -3143,6 +3723,173 @@ impl RiverNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reported_pond_outlets_keep_their_full_opening_through_the_rim() {
+        let noise = NoiseField::new();
+        let network = generate(&noise, [0, 0]);
+        for target in [[-765.3, 941.7], [757.7, 1335.2], [710.0, 1256.9]] {
+            let candidates = network.rivers.iter().flat_map(|river| {
+                river.nodes.windows(2).enumerate()
+                    .filter(|(_, pair)| pair[0].lake && !pair[1].lake)
+                    .map(move |(i, pair)| {
+                        let dx = pair[1].position[0] - target[0];
+                        let dz = pair[1].position[1] - target[1];
+                        (river, i, dx.hypot(dz))
+                    })
+            });
+            let (river, index, distance) = candidates
+                .min_by(|a, b| a.2.total_cmp(&b.2))
+                .unwrap();
+            // Each now begins where its lake's water does, a node or two
+            // back from where the reported outlets left their lakes' cells.
+            assert!(distance < 8.0, "the reported outlet should be present: {target:?} nearest {distance}");
+            let shore = river.nodes[index];
+            let connector = network.segments.iter().find(|segment| {
+                segment.b == shore.position && segment.water == [shore.water; 2]
+            }).expect("the outlet should have a submerged connector");
+            assert_eq!(connector.half_width[1], shore.half_width);
+            assert_eq!(connector.depth[1], shore.depth);
+            assert_eq!(connector.bank[1], shore.bank);
+
+            let inside = river.nodes[index - 1].position;
+            let dx = inside[0] - shore.position[0];
+            let dz = inside[1] - shore.position[1];
+            let length = dx.hypot(dz);
+            let direction = [dx / length, dz / length];
+            let normal = [-direction[1], direction[0]];
+            for run in [0.4, 1.0] {
+                for side in [-0.65, 0.0, 0.65] {
+                    let offset = side * shore.half_width;
+                    let p = [
+                        shore.position[0] + direction[0] * run + normal[0] * offset,
+                        shore.position[1] + direction[1] * run + normal[1] * offset,
+                    ];
+                    let natural = base_height(&noise, p[0], p[1]);
+                    let carved = network.envelope(p[0], p[1]).clamp(natural);
+                    assert!(carved < shore.water - 0.1,
+                        "the pond rim must leave the outlet open at {p:?}: {carved}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pond_outlets_with_interior_room_keep_their_shore_connectors_open() {
+        let noise = NoiseField::new();
+        let network = generate(&noise, [0, 0]);
+        let mut checked = 0;
+        let mut above_water = 0;
+        for river in &network.rivers {
+            for (index, pair) in river.nodes.windows(2).enumerate() {
+                let shore = pair[0];
+                if !shore.lake || pair[1].lake || index == 0 {
+                    continue;
+                }
+                let first = (0..=index).rev()
+                    .take_while(|&i| river.nodes[i].lake)
+                    .last().unwrap();
+                let room = shore.along - river.nodes[first].along;
+                let reach = (2.0 * shore.half_width).clamp(3.0, 10.0).min(0.4 * room);
+                if room <= 2.0 * shore.half_width || reach < 2.5 {
+                    continue;
+                }
+                let connector = network.segments.iter().find(|segment| {
+                    segment.b == shore.position && segment.water == [shore.water; 2]
+                }).expect("every roomy pond outlet must connect back into its pond");
+                assert_eq!(connector.half_width[1], shore.half_width);
+                assert_eq!(connector.depth[1], shore.depth);
+                let natural = base_height(&noise, shore.position[0], shore.position[1]);
+                if natural >= shore.water {
+                    above_water += 1;
+                    assert_eq!(connector.bank[1], shore.bank);
+                }
+                let inside = river.nodes[index - 1].position;
+                let dx = inside[0] - shore.position[0];
+                let dz = inside[1] - shore.position[1];
+                let length = dx.hypot(dz);
+                let direction = [dx / length, dz / length];
+                let normal = [-direction[1], direction[0]];
+                for run in [0.0, 0.4, 1.0] {
+                    let centre = [
+                        shore.position[0] + direction[0] * run,
+                        shore.position[1] + direction[1] * run,
+                    ];
+                    let local_section = network.segments.iter().find_map(|segment| {
+                        if segment.water != [shore.water; 2] {
+                            return None;
+                        }
+                        let dx = segment.b[0] - segment.a[0];
+                        let dz = segment.b[1] - segment.a[1];
+                        let t = ((centre[0] - segment.a[0]) * dx
+                            + (centre[1] - segment.a[1]) * dz)
+                            / (dx * dx + dz * dz).max(1e-6);
+                        if !(0.0..=1.0).contains(&t) {
+                            return None;
+                        }
+                        let q = [segment.a[0] + dx * t, segment.a[1] + dz * t];
+                        if (q[0] - centre[0]).hypot(q[1] - centre[1]) > 0.05 {
+                            return None;
+                        }
+                        let width = segment.half_width[0]
+                            + (segment.half_width[1] - segment.half_width[0]) * t;
+                        let depth = segment.depth[0]
+                            + (segment.depth[1] - segment.depth[0]) * t;
+                        Some((width, depth))
+                    });
+                    let Some((width, depth)) = local_section else { continue };
+                    if width < 0.1 || depth < 0.1 {
+                        continue;
+                    }
+                    for side in [-0.65, 0.0, 0.65] {
+                        let offset = side * width;
+                        let p = [
+                            centre[0] + normal[0] * offset,
+                            centre[1] + normal[1] * offset,
+                        ];
+                        let natural = base_height(&noise, p[0], p[1]);
+                        let carved = network.envelope(p[0], p[1]).clamp(natural);
+                        assert!(carved < shore.water - 0.03,
+                            "pond outlet {:?} is blocked at {p:?}: {carved} >= {}",
+                            shore.position, shore.water);
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked > 100);
+        // An outlet leaves its lake where the water is, never from a node on
+        // the dry ground of the lake's last cells.
+        assert_eq!(above_water, 0, "outlets beginning on dry ground: {above_water} of {checked}");
+    }
+
+    /// A lake backs the river above it up to its level. Where the river's
+    /// course runs through ground below that level, the water stands over it
+    /// as the lake's, not as a river held up between dikes.
+    #[test]
+    fn a_lakes_backwater_floods_the_hollows_below_its_level() {
+        let noise = NoiseField::new();
+        let network = generate(&noise, [0, 0]);
+        let mut backed = 0;
+        for river in &network.rivers {
+            let (mut level, mut shore) = (f32::NEG_INFINITY, 0.0);
+            for node in river.nodes.iter().rev() {
+                if node.lake {
+                    (level, shore) = (node.water, node.along);
+                    continue;
+                }
+                // Up the river from the lake's 4 m cells, which end anywhere
+                // across a cell of a steep shore, and backed up to its level.
+                if shore - node.along < 2.0 * FLOW_CELL as f32 || (node.water - level).abs() > 0.01 {
+                    continue;
+                }
+                backed += 1;
+                let natural = base_height(&noise, node.position[0], node.position[1]);
+                assert!(natural > level - 1.0, "held {:.2} m over the ground at {:?}", level - natural, node.position);
+            }
+        }
+        assert!(backed > 100, "{backed}");
+    }
 
     /// Channels are as deep and as fast as real ones of their size.
     #[test]
@@ -3214,6 +3961,305 @@ mod tests {
         assert_eq!(lake_crossings(&nodes), vec![(4, 7)]);
     }
 
+    fn uniform_channel(flags: &[bool]) -> Vec<RiverNode> {
+        let mut nodes = reach(flags, &vec![5.0; flags.len()]);
+        for node in &mut nodes {
+            node.half_width = 2.0;
+            node.depth = 0.8;
+            node.speed = 1.0;
+            node.bank = 0.7;
+            node.turbulence = 0.2;
+        }
+        nodes
+    }
+
+    /// Deepened toward the coast, an estuary held a closed pool behind the
+    /// shore, deeper than the shelving seabed it opened into. Its bed falls
+    /// to the sea and meets the seabed instead.
+    #[test]
+    fn an_estuary_bed_falls_to_the_seabed_without_a_pool_behind_the_shore() {
+        let water: Vec<f32> = (0..=100).map(|i| (1.5 - 0.03 * i as f32).max(SEA_LEVEL + 0.02)).collect();
+        let mut nodes = reach(&[false; 101], &water);
+        for (i, node) in nodes.iter_mut().enumerate() {
+            node.half_width = 2.0;
+            node.speed = 1.0;
+            node.bank = 0.7;
+            // Pools and riffles, as the channel's bed undulates.
+            node.depth = if i % 7 < 3 { 1.2 } else { 0.8 };
+        }
+        // The beach ends 130 m down the river, and the seabed shelves at
+        // 0.4 m under the sea before it drops away past 200 m.
+        let ground = |p: [f32; 2]| if p[0] < 130.0 { 2.0 } else if p[0] < 200.0 { SEA_LEVEL - 0.4 } else { SEA_LEVEL - 3.0 };
+        let surface_end = nodes.iter().position(|n| n.water <= SEA_LEVEL + 0.03).unwrap();
+        let upstream = nodes[10];
+        open_mouths(&mut nodes, RiverEnd::Sea, surface_end);
+        grade_estuary(&mut nodes, surface_end, ground);
+        let bed = |n: &RiverNode| n.water - n.depth;
+        let mouth = nodes[surface_end].along;
+        for pair in nodes.windows(2).filter(|pair| pair[0].along >= mouth - 60.0) {
+            assert!(bed(&pair[1]) <= bed(&pair[0]) + 1e-5, "the bed rises toward the sea at {}", pair[1].along);
+        }
+        for node in &nodes[surface_end..] {
+            assert!(bed(node) >= SEA_LEVEL - 0.4 - 1e-5, "deeper than the seabed it opens into: {node:?}");
+            assert!(node.depth >= ESTUARY_LEAST_DEPTH - 1e-5);
+        }
+        assert_eq!(nodes[10], upstream, "the river above its estuary keeps its own bed");
+    }
+
+    #[test]
+    fn estuary_opens_gradually_before_the_shore_and_stays_open_offshore() {
+        let mut nodes = uniform_channel(&[false; 101]);
+        let original = nodes.clone();
+        let shore = 60;
+        open_mouths(&mut nodes, RiverEnd::Sea, shore);
+        assert_eq!(nodes[30], original[30], "ordinary channel 75 m above the coast is unchanged");
+        assert!(nodes[45].half_width > original[45].half_width + 0.5);
+        assert!((nodes[shore].half_width / original[shore].half_width - 2.2).abs() < 1e-5);
+        assert!(nodes[shore].bank <= 0.36);
+        assert!(nodes.windows(2).all(|p| p[1].half_width >= p[0].half_width));
+        assert!(nodes[shore..].iter().all(|n| (n.half_width - nodes[shore].half_width).abs() < 1e-5));
+        for (node, old) in nodes.iter().zip(&original) {
+            assert_eq!(node.water, old.water);
+            let section_flow = node.half_width * node.depth * node.speed;
+            assert!((section_flow - old.half_width * old.depth * old.speed).abs() < 1e-5);
+        }
+        // No corner at either end of the widening, even on a coarse mesh.
+        assert!(nodes[37].half_width - nodes[36].half_width < 0.01);
+        assert!(nodes[shore].half_width - nodes[shore - 1].half_width < 0.01);
+    }
+
+    #[test]
+    fn pond_outlet_flare_crosses_the_shore_and_narrows_smoothly_downstream() {
+        let flags: Vec<bool> = (0..=80).map(|i| i <= 30).collect();
+        let mut nodes = uniform_channel(&flags);
+        let original = nodes.clone();
+        open_mouths(&mut nodes, RiverEnd::Edge, 80);
+        assert!(nodes[30].half_width > 1.65 * original[30].half_width);
+        assert!((nodes[30].half_width - nodes[31].half_width).abs() < 1e-5);
+        assert!(nodes[35].half_width > 1.4 * original[35].half_width);
+        assert_eq!(nodes[44], original[44]);
+        assert!(nodes[31..].windows(2).all(|p| p[1].half_width <= p[0].half_width));
+        assert!(nodes[30].bank < 0.29);
+        assert!(nodes[31].speed < nodes[40].speed);
+        assert!(nodes.iter().zip(&original).all(|(a, b)| a.water == b.water));
+    }
+
+    #[test]
+    fn submerged_transitions_join_and_taper_to_zero_without_a_depth_step() {
+        let path = uniform_channel(&[true; 12]);
+        let node = path[0];
+        for outlet in [false, true] {
+            let mut fan = Vec::new();
+            submerged_transition(&mut fan, &path, outlet, &|_| 0.0, &|_, _| true);
+            assert!(fan.windows(2).all(|p| p[0].b == p[1].a && p[0].depth[1] == p[1].depth[0]));
+            let (channel, bed) = if outlet {
+                (fan.last().unwrap().depth[1], fan[0].depth[0])
+            } else {
+                (fan[0].depth[0], fan.last().unwrap().depth[1])
+            };
+            assert_eq!(channel, node.depth);
+            assert_eq!(bed, 0.0);
+            let tip = if outlet { &fan[0] } else { fan.last().unwrap() };
+            assert_eq!(tip.half_width[usize::from(!outlet)], 0.0, "a zero-depth tip must also have zero width");
+            assert!(fan.iter().all(|s| s.levee == [0.0; 2] && s.water == [node.water; 2]));
+            let slope = |s: &RiverSegment| (s.depth[1] - s.depth[0]).abs() / (s.b[0] - s.a[0]).hypot(s.b[1] - s.a[1]);
+            let end_slope = slope(&fan[0]).max(slope(fan.last().unwrap()));
+            let steepest = fan.iter().map(slope).fold(0.0f32, f32::max);
+            assert!(end_slope < 0.5 * steepest, "both ends should ease into their neighbours");
+        }
+    }
+
+    #[test]
+    fn a_shallow_pond_rim_keeps_the_outlet_open_then_tapers_without_pinching() {
+        let mut path = uniform_channel(&[true; 7]);
+        for node in &mut path {
+            node.bank = 0.28;
+        }
+        // The natural pond narrows to a shallow sill. The channel has
+        // already opened that sill to its full two-metre half width.
+        let ground = |p: [f32; 2]| {
+            let natural_half_width = 0.5 + 0.6 * p[0].max(0.0);
+            if p[1].abs() > natural_half_width { 7.0 } else { 4.8 }
+        };
+        let wet = |p: [f32; 2], level: f32| ground(p) < level;
+        let mut fan = Vec::new();
+        submerged_transition(&mut fan, &path, true, &ground, &wet);
+        let connection = fan.last().unwrap();
+        assert_eq!(connection.half_width[1], path[0].half_width);
+        assert_eq!(connection.depth[1], path[0].depth);
+        assert_eq!(connection.bank[1], path[0].bank);
+        assert!(connection.half_width[0] > 1.25,
+            "the first submerged reach must remain an open mouth");
+        for segment in &fan {
+            assert!(segment.half_width[0] <= segment.half_width[1]);
+        }
+        for pair in fan.windows(2) {
+            assert_eq!(pair[0].half_width[1], pair[1].half_width[0]);
+            assert_eq!(pair[0].depth[1], pair[1].depth[0]);
+        }
+        assert_eq!(fan[0].half_width[0], 0.0);
+    }
+
+    #[test]
+    fn a_pond_connector_crosses_an_initial_dry_sill_then_requires_wet_interior() {
+        let mut path = uniform_channel(&[true; 7]);
+        for node in &mut path {
+            node.bank = 0.28;
+        }
+        for rise in [0.0, 0.4, 2.0] {
+            let ground = |p: [f32; 2]| {
+                if p[0] < 0.9 { 5.0 + rise } else { 4.8 }
+            };
+            let wet = |p: [f32; 2], level: f32| ground(p) < level;
+            let mut fan = Vec::new();
+            submerged_transition(&mut fan, &path, true, &ground, &wet);
+            let connection = fan.last().expect("the initial sill should join real pond water");
+            assert_eq!(connection.b, path[0].position);
+            assert_eq!(connection.half_width[1], path[0].half_width);
+            assert_eq!(connection.depth[1], path[0].depth);
+            assert_eq!(connection.bank[1], path[0].bank);
+            let p = [0.4, 0.65 * path[0].half_width];
+            let mut envelope = super::super::carve::Envelope::NONE;
+            for segment in &fan {
+                super::super::carve::combine(&mut envelope,
+                    &super::super::carve::segment_envelope(segment, p));
+            }
+            assert!(envelope.clamp(ground(p)) < path[0].water - 0.1);
+        }
+        let mut fan = Vec::new();
+        submerged_transition(&mut fan, &path, true, &|_| 5.4, &|_, _| false);
+        assert!(fan.is_empty(), "a connector must reach actual pond water");
+        let ground = |p: [f32; 2]| {
+            if (0.8..2.4).contains(&p[0]) { 4.8 } else { 5.4 }
+        };
+        let wet = |p: [f32; 2], level: f32| ground(p) < level;
+        submerged_transition(&mut fan, &path, true, &ground, &wet);
+        assert!(!fan.is_empty());
+        assert!(fan.iter().all(|segment| segment.a[0] < 2.4 && segment.b[0] < 2.4),
+            "once inside the pond, a later dry bank must stop the transition");
+    }
+
+    #[test]
+    fn a_submerged_transition_follows_a_bend_instead_of_crossing_a_ponds_side_bank() {
+        let mut path = uniform_channel(&[true; 4]);
+        for (node, position) in path.iter_mut().zip([[0.0, 0.0], [1.5, 0.0], [1.5, 3.0], [1.5, 10.0]]) {
+            node.position = position;
+        }
+        let ground = |p: [f32; 2]| if p[0] < 3.0 { 3.0 } else { 9.0 };
+        let wet = |p: [f32; 2], level: f32| ground(p) < level;
+        for outlet in [false, true] {
+            let mut fan = Vec::new();
+            submerged_transition(&mut fan, &path, outlet, &ground, &wet);
+            assert!(!fan.is_empty());
+            assert!(fan.iter().all(|s| s.a[0] <= 1.5 && s.b[0] <= 1.5));
+            assert!(fan.iter().any(|s| s.a[1] > 1.0 || s.b[1] > 1.0), "transition should follow the drowned bend");
+            let p = [4.0, 0.0];
+            let mut envelope = super::super::carve::Envelope::NONE;
+            for segment in &fan {
+                super::super::carve::combine(&mut envelope, &super::super::carve::segment_envelope(segment, p));
+            }
+            assert!((envelope.clamp(ground(p)) - ground(p)).abs() < 1e-4, "the adjacent dry bank must keep its height");
+        }
+    }
+
+    #[test]
+    fn transitions_in_a_narrow_pond_stop_before_the_opposite_shore() {
+        let mut path = uniform_channel(&[true; 3]);
+        for (node, position) in path.iter_mut().zip([[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]]) {
+            node.position = position;
+            node.half_width = 5.0;
+        }
+        let ground = |p: [f32; 2]| if p[0] <= 4.0 { 3.0 } else { 9.0 };
+        let wet = |p: [f32; 2], level: f32| ground(p) < level;
+        let mut fan = Vec::new();
+        submerged_transition(&mut fan, &path, false, &ground, &wet);
+        assert!(!fan.is_empty());
+        assert!(fan.iter().all(|s| s.a[0] <= 1.6 && s.b[0] <= 1.6));
+        for x in [4.1, 4.5, 5.0, 6.0, 8.0] {
+            let p = [x, 0.0];
+            let mut envelope = super::super::carve::Envelope::NONE;
+            for segment in &fan {
+                super::super::carve::combine(&mut envelope, &super::super::carve::segment_envelope(segment, p));
+            }
+            assert!((envelope.clamp(ground(p)) - ground(p)).abs() < 1e-4, "opposite shore at {x} must not be carved");
+        }
+    }
+
+    #[test]
+    fn a_sea_mouth_stops_before_the_routing_path_turns_onto_an_adjacent_beach() {
+        let mut nodes = uniform_channel(&[false; 5]);
+        for (node, position) in nodes.iter_mut().zip([[-10.0, 0.0], [0.0, 0.0], [4.0, 0.0], [4.0, 20.0], [20.0, 30.0]]) {
+            node.position = position;
+            node.water = SEA_LEVEL + 0.02;
+        }
+        nodes[0].water = SEA_LEVEL + 0.3;
+        let river = River { nodes, end: RiverEnd::Sea, surface_end: 1 };
+        let ground = |p: [f32; 2]| if p[0] <= 0.0 || p[1] >= 14.0 { 3.0 } else { -2.0 };
+        let wet = |p: [f32; 2], level: f32| ground(p) < level;
+        let segments = build_segments_on_ground(&[river], &ground, &wet);
+        assert!(segments.iter().all(|s| s.a[1] <= 4.0 && s.b[1] <= 4.0));
+        for p in [[4.0, 20.0], [20.0, 30.0], [4.0, 14.0]] {
+            let mut envelope = super::super::carve::Envelope::NONE;
+            for segment in &segments {
+                super::super::carve::combine(&mut envelope, &super::super::carve::segment_envelope(segment, p));
+            }
+            assert!((envelope.clamp(ground(p)) - ground(p)).abs() < 1e-4, "routing-only beach at {p:?} must keep its height");
+        }
+    }
+
+    #[test]
+    fn a_coastal_hollow_does_not_end_the_channel_before_it_crosses_a_beach_bar() {
+        let mut nodes = uniform_channel(&[false; 5]);
+        for (i, node) in nodes.iter_mut().enumerate() {
+            node.position = [i as f32 * 4.0, 0.0];
+            node.water = SEA_LEVEL + 0.02;
+        }
+        let ground = |p: [f32; 2]| {
+            if p[0] < 0.0 || (8.5..11.5).contains(&p[0]) {
+                1.0
+            } else if p[0] < 12.0 {
+                -0.2
+            } else {
+                -2.0
+            }
+        };
+        assert_eq!(sea_shore_index(&nodes, 1, &ground), 3);
+        let wet = |p: [f32; 2], level: f32| ground(p) < level;
+        let river = River { nodes, end: RiverEnd::Sea, surface_end: 1 };
+        let segments = build_segments_on_ground(&[river], &ground, &wet);
+        assert!(segments.iter().any(|segment| segment.a[0] == 8.0 && segment.b[0] == 12.0));
+    }
+
+    #[test]
+    fn pond_drawdown_eases_out_of_still_water_without_a_slope_step() {
+        let falls: Vec<f32> = (0..=100).map(|i| outlet_drawdown(i as f32 * 0.25)).collect();
+        assert_eq!(falls[0], 0.0);
+        assert!(falls.windows(2).all(|p| p[1] >= p[0] && p[1] - p[0] <= OUTLET_SLOPE * 0.25 + 1e-6));
+        assert!(falls[1] < OUTLET_SLOPE * 0.25 * 0.02);
+        assert!(((falls[49] - falls[48]) - (falls[48] - falls[47])).abs() < 1e-4);
+    }
+
+    #[test]
+    fn outlet_banks_leave_room_for_their_broad_shoulders_before_raising_a_levee() {
+        let flags: Vec<bool> = (0..=80).map(|i| i <= 20).collect();
+        let mut nodes = uniform_channel(&flags);
+        open_mouths(&mut nodes, RiverEnd::Edge, 80);
+        let lake_end = nodes[20].along;
+        let river = River { nodes, end: RiverEnd::Edge, surface_end: 80 };
+        let segments = build_segments_on_ground(&[river], &|_| 4.0, &|_, _| true);
+        // A node raises a levee only clear of the lake by its banks' reach;
+        // between it and the last node without one, the levee fades in.
+        for segment in &segments {
+            let clearance = segment.reach() + segment.half_width[0].max(segment.half_width[1]);
+            for (end, position) in [segment.a, segment.b].iter().enumerate() {
+                if segment.levee[end] > 0.0 {
+                    assert!(position[0] - lake_end > clearance, "{segment:?}");
+                }
+            }
+        }
+        assert!(segments.iter().any(|s| s.levee == [1.0; 2]));
+    }
+
     /// A river that drops to the sea down a beach's face is graded down to
     /// it through the beach instead; one that comes down its valley to the
     /// sea anyway keeps its own profile.
@@ -3229,6 +4275,7 @@ mod tests {
         assert!(water[shore..].iter().all(|&w| w <= SEA_LEVEL + 0.02 + 1e-5));
         assert!(water.windows(2).all(|w| w[1] <= w[0] + 1e-5));
         assert!((water[shore - 30] - 2.3).abs() < 1e-5, "{}", water[shore - 30]);
+        assert!(water[shore - 1] - water[shore] < 0.02, "mouth should level into the ocean");
         // A valley falling steeply and then gently to the shore lies under
         // the chord already.
         let valley: Vec<f32> = s.iter().map(|&v| (0.02 + 0.0004 * (200.0 - v).max(0.0).powi(2) as f32).max(0.02)).collect();

@@ -93,6 +93,9 @@ const UNDER_SEA: f32 = 0.2;
 const SEA_BLEND: f32 = 90.0;
 /// How far under its spring's ground a stream's surface begins.
 const SPRING_SINK: f32 = 0.3;
+/// Extra hidden coverage for rounded confluences and tight bends. Terrain
+/// still determines the waterline; this prevents the ribbon ending at it.
+const JUNCTION_RIBBON_MARGIN: f32 = 0.8;
 
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
@@ -227,7 +230,34 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
     };
     let sheets = Sheets::new(lakes);
     let seas = sea_blends(rivers);
-    for (river, &(sea_share, sea_along, sea_ramp)) in rivers.iter().zip(&seas) {
+    let mut junctions = vec![Vec::new(); rivers.len()];
+    for (index, river) in rivers.iter().enumerate() {
+        let RiverEnd::Confluence(parent, _) = river.end else {
+            continue;
+        };
+        let Some(parent_river) = rivers.get(parent) else {
+            continue;
+        };
+        let Some(node) = river.nodes.get(river.surface_end) else {
+            continue;
+        };
+        junctions[index].push(node.position);
+        let mut nearest_position = None;
+        let mut nearest_distance = f32::INFINITY;
+        for parent_node in &parent_river.nodes {
+            let dx = parent_node.position[0] - node.position[0];
+            let dz = parent_node.position[1] - node.position[1];
+            let distance_squared = dx * dx + dz * dz;
+            if distance_squared < nearest_distance {
+                nearest_position = Some(parent_node.position);
+                nearest_distance = distance_squared;
+            }
+        }
+        if let Some(position) = nearest_position {
+            junctions[parent].push(position);
+        }
+    }
+    for (river_index, (river, &(sea_share, sea_along, sea_ramp))) in rivers.iter().zip(&seas).enumerate() {
         let nodes = &river.nodes;
         // A river's surface runs on past where its own water ends, sunk
         // under the still water it meets, so it never ends in an edge: one
@@ -273,10 +303,36 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
             let tangent = direction(i);
             let normal = [-tangent[1], tangent[0]];
             let half_width = if spring && i == 0 { 0.1 } else { node.half_width.max(0.25) };
+            let mut junction_influence = 0.0f32;
+            for position in &junctions[river_index] {
+                let distance = (position[0] - node.position[0]).hypot(position[1] - node.position[1]);
+                let influence = 1.0 - smoothstep(half_width + 4.0, half_width + 12.0, distance);
+                junction_influence = junction_influence.max(influence);
+            }
+            if i > 0 && i < end {
+                let before_direction = [
+                    node.position[0] - nodes[i - 1].position[0],
+                    node.position[1] - nodes[i - 1].position[1],
+                ];
+                let after_direction = [
+                    nodes[i + 1].position[0] - node.position[0],
+                    nodes[i + 1].position[1] - node.position[1],
+                ];
+                let before_length = before_direction[0].hypot(before_direction[1]);
+                let after_length = after_direction[0].hypot(after_direction[1]);
+                let length_product = before_length * after_length;
+                let cross = before_direction[0] * after_direction[1] - before_direction[1] * after_direction[0];
+                let turn = cross / length_product.max(1e-5);
+                let bend_influence = smoothstep(0.05, 0.25, turn * turn);
+                junction_influence = junction_influence.max(bend_influence);
+            }
+            let margin = if spring && i == 0 { 0.0 } else { JUNCTION_RIBBON_MARGIN * junction_influence };
             offsets
                 .iter()
                 .map(|&across| {
-                    [node.position[0] + normal[0] * across * half_width, node.position[1] + normal[1] * across * half_width]
+                    let edge_margin = if across.abs() > 1.0 { margin * across.signum() } else { 0.0 };
+                    let offset = across * half_width + edge_margin;
+                    [node.position[0] + normal[0] * offset, node.position[1] + normal[1] * offset]
                 })
                 .collect()
         };
@@ -331,6 +387,8 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
         for i in 0..=end {
             let node = &nodes[i];
             let tangent = direction(i);
+            let normal = [-tangent[1], tangent[0]];
+            let ribbon_half_width = if spring && i == 0 { 0.1 } else { node.half_width.max(0.25) };
             // Past where its own water ends, the river runs on sunk under the
             // still water it meets (the sea, its parent); and water standing
             // at the sea's level is the sea's, drawn by the sea itself.
@@ -345,7 +403,7 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
             let still = 1.0 - smoothstep(0.0, LIFT_FADE, from_still[i]);
             let row = vertices.len() as u32;
             let mut hidden = true;
-            for (&across, &p) in offsets.iter().zip(&rows[i]) {
+            for &p in &rows[i] {
                 // Under the sheet of a lake whose level it stands at (running
                 // into it, out of it or through it), the ribbon runs on just
                 // beneath the sheet as drawn, its edge sunk and all, and
@@ -361,6 +419,8 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
                     _ => (water, false),
                 };
                 hidden &= deep;
+                let offset = (p[0] - node.position[0]) * normal[0] + (p[1] - node.position[1]) * normal[1];
+                let across = offset / ribbon_half_width;
                 let speed = node.speed * lateral(across);
                 let vertex = SurfaceVertex {
                     position: [p[0], level, p[1]],
@@ -535,6 +595,60 @@ fn add_lake(
 mod tests {
     use super::*;
     use crate::rivers::network::RiverNode;
+
+    #[test]
+    fn confluence_ribbons_cover_the_rounded_shore_and_fade_back_to_normal_width() {
+        let positions = [-20.0, 0.0, 20.0, 40.0];
+        let node_at = |position, along| RiverNode {
+            position,
+            water: 5.0,
+            half_width: 2.0,
+            speed: 1.0,
+            along,
+            ..Default::default()
+        };
+        let trunk_nodes = positions.iter().map(|&x| node_at([x, 0.0], x + 20.0)).collect();
+        let tributary_nodes = positions[..3].iter().map(|&z| node_at([0.0, z], z + 20.0)).collect();
+        let trunk = River {
+            nodes: trunk_nodes,
+            end: RiverEnd::Edge,
+            surface_end: 3,
+        };
+        let tributary = River {
+            nodes: tributary_nodes,
+            end: RiverEnd::Confluence(0, 1),
+            surface_end: 1,
+        };
+        let rivers = [trunk, tributary];
+        let mesh = build(&rivers, &[]);
+
+        let junction_row = &mesh.vertices[5..10];
+        assert!(junction_row[0].position[2].abs() > 2.6);
+        assert!(junction_row[4].position[2].abs() > 2.6);
+        let far_row = &mesh.vertices[15..20];
+        assert!((far_row[0].position[2].abs() - 2.24).abs() < 1e-5);
+        for vertex in junction_row {
+            let actual_across = vertex.position[2] / vertex.half_width;
+            assert!((actual_across - vertex.across).abs() < 1e-5);
+        }
+        // This point lies beyond both original ribbons but inside the
+        // rounded confluence. At least one water triangle must cover it.
+        let point = [2.5, 2.5];
+        let cross = |a: [f32; 2], b: [f32; 2]| a[0] * b[1] - a[1] * b[0];
+        let contains_point = |triangle: &[u32]| {
+            let a = mesh.vertices[triangle[0] as usize].position;
+            let b = mesh.vertices[triangle[1] as usize].position;
+            let c = mesh.vertices[triangle[2] as usize].position;
+            let sides = [
+                cross([b[0] - a[0], b[2] - a[2]], [point[0] - a[0], point[1] - a[2]]),
+                cross([c[0] - b[0], c[2] - b[2]], [point[0] - b[0], point[1] - b[2]]),
+                cross([a[0] - c[0], a[2] - c[2]], [point[0] - c[0], point[1] - c[2]]),
+            ];
+            let same_sign = sides.iter().all(|&side| side >= 0.0) || sides.iter().all(|&side| side <= 0.0);
+            same_sign && [a, b, c].iter().all(|vertex| vertex[1] >= 5.0 - 1e-5)
+        };
+        assert!(mesh.indices.chunks_exact(3).any(contains_point));
+    }
 
     /// A river runs into a lake, through it and out of it. Under the lake's
     /// sheet its ribbon lies just beneath the sheet near the edge and deeper
