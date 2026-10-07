@@ -155,6 +155,9 @@ pub struct PlantModel {
     pub crown_base: f32,
     /// Largest horizontal extent of any LOD, for conservative culling.
     pub bounding_radius: f32,
+    /// Radius of the solid stem at the foot of the plant, metres: what the
+    /// player cannot walk through.
+    pub trunk_radius: f32,
 }
 
 pub struct VegetationAssets {
@@ -622,6 +625,7 @@ impl VegetationAssets {
             };
             let mut lods = Vec::new();
             let mut foliage_points: Vec<[f32; 3]> = Vec::new();
+            let mut bark_points: Vec<[f32; 3]> = Vec::new();
             let mut all_points_radius = 0.0f32;
             let mut top = 0.0f32;
             for (lod_index, (entry, path)) in group.iter().enumerate() {
@@ -641,6 +645,8 @@ impl VegetationAssets {
                             top = top.max(p[1]);
                             if loader.materials[primitive.material].surface != Surface::Bark {
                                 foliage_points.push(p);
+                            } else {
+                                bark_points.push(p);
                             }
                         }
                     }
@@ -667,6 +673,7 @@ impl VegetationAssets {
                 crown_radius,
                 crown_base,
                 bounding_radius: all_points_radius.max(0.05),
+                trunk_radius: trunk_radius(&bark_points, top, name.species),
             };
             models.push(model);
             index = group_end;
@@ -700,6 +707,39 @@ fn crown_metrics(points: &[[f32; 3]], top: f32) -> (f32, f32) {
     let radius = radii[(radii.len() * 9 / 10).min(radii.len() - 1)];
     let base = heights[heights.len() / 10].max(0.0);
     (radius.max(0.05), base.min(top))
+}
+
+/// The bark's lowest and highest distance from the trunk's axis that the
+/// stem is measured over: from the knee to the chest of the authored model, or
+/// the same fractions of a plant too small to have them.
+const TRUNK_BAND_BASE: f32 = 0.3;
+const TRUNK_BAND_TOP: f32 = 1.5;
+
+/// Radius of the stem at the foot of a plant from the LOD-0 bark: a quantile
+/// of the bark's distance from the pivot (the trunk's axis) over the lowest
+/// stretch of the model. Above it the branches spread, and many models carry
+/// branch bark right down to the ground, so a maximum or a median would
+/// measure the lowest limbs; the lower quartile sits on the trunk's surface,
+/// which is most of the bark there. A lilac is the exception, a shrub whose
+/// stems fan out from the base: its median takes the cluster they stand in.
+fn trunk_radius(bark: &[[f32; 3]], top: f32, species: Species) -> f32 {
+    let base = TRUNK_BAND_BASE.min(0.2 * top);
+    let ceiling = TRUNK_BAND_TOP.min(0.35 * top).max(base + 0.1);
+    let mut radii: Vec<f32> = bark
+        .iter()
+        .filter(|p| p[1] >= base && p[1] <= ceiling)
+        .map(|p| p[0].hypot(p[2]))
+        .collect();
+    if radii.len() < 4 {
+        // A stem too short or too sparse to measure: take all of its bark.
+        radii = bark.iter().map(|p| p[0].hypot(p[2])).collect();
+    }
+    if radii.is_empty() {
+        return 0.03 * top;
+    }
+    radii.sort_by(f32::total_cmp);
+    let quantile = if species == Species::Lilac { 0.5 } else { 0.25 };
+    radii[((radii.len() as f32 * quantile) as usize).min(radii.len() - 1)]
 }
 
 // ---------------------------------------------------------------------------
@@ -1187,6 +1227,41 @@ mod tests {
             checked[paired as usize] += 1;
         }
         assert_eq!(checked, [47, 38]);
+    }
+
+    #[test]
+    fn trunk_radii_follow_the_bark_not_the_branches() {
+        let assets = VegetationAssets::load_geometry(Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/models"))
+            .expect("plant library geometry loads");
+        let trunk = |name: &str| {
+            assets
+                .models
+                .iter()
+                .find(|model| model.name == name)
+                .unwrap_or_else(|| panic!("no model {name}"))
+                .trunk_radius
+        };
+        // The bare trunk of a fir that carries its limbs high, and a fir whose
+        // limbs reach the ground with bark of their own: both are the trunk.
+        assert!((0.15..0.3).contains(&trunk("fir-large-2")), "{}", trunk("fir-large-2"));
+        assert!((0.15..0.3).contains(&trunk("fir-large-1")), "{}", trunk("fir-large-1"));
+        // Old growth is broader than young stands of the same species.
+        assert!((0.35..0.5).contains(&trunk("pine-large-1")), "{}", trunk("pine-large-1"));
+        assert!(trunk("pine-large-1") > 2.0 * trunk("pine-medium-1"));
+        assert!((0.8..1.2).contains(&trunk("oak-large-3")), "{}", trunk("oak-large-3"));
+        assert!((0.15..0.25).contains(&trunk("maple-medium-1")), "{}", trunk("maple-medium-1"));
+        // A seedling's stem is a twig; a lilac's stems stand in a cluster.
+        assert!(trunk("oak-sapling-1") < 0.05, "{}", trunk("oak-sapling-1"));
+        assert!((0.25..0.6).contains(&trunk("lilac-bush-1")), "{}", trunk("lilac-bush-1"));
+        for model in &assets.models {
+            assert!(
+                model.trunk_radius > 0.0 && model.trunk_radius < model.crown_radius,
+                "{}: trunk {} against crown {}",
+                model.name,
+                model.trunk_radius,
+                model.crown_radius
+            );
+        }
     }
 
     /// Loading every model decodes ~150 PNGs; run explicitly with

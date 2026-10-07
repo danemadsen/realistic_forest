@@ -5,6 +5,8 @@ use crate::constants::*;
 use crate::erosion::ErosionCache;
 use crate::noise::NoiseField;
 use crate::snow::{self, SnowState};
+use crate::vegetation::VegetationField;
+use crate::vegetation::collision::{self, PLAYER_RADIUS};
 use bevy::camera::Projection;
 use bevy::input::{ButtonInput, keyboard::KeyCode, mouse::MouseButton};
 use bevy::math::{Vec2, Vec3};
@@ -121,6 +123,7 @@ pub fn update_player_system(
     erosion: Res<ErosionCache>,
     noise: Res<NoiseField>,
     mut snow: ResMut<SnowState>,
+    vegetation: Res<VegetationField>,
     ui_wants_input: Res<UiWantsInput>,
     automation: Option<Res<crate::automation::AutomationSettings>>,
 ) {
@@ -245,6 +248,9 @@ pub fn update_player_system(
         // the current was carrying dead in mid-air.
         candidate.x = player.position.x + player.velocity.x * dt;
         candidate.z = player.position.z + player.velocity.y * dt;
+        // Trunks and lilac stems are solid. Flight passes through them, as it
+        // does the ground.
+        collide_with_trunks(&mut player, &mut candidate, &vegetation, &erosion, &noise);
         // A swimmer kicks up out of the water as a walker jumps off the ground.
         let floating = depth > EYE_HEIGHT - SWIM_FREEBOARD;
         let jump = keys.just_pressed(KeyCode::Space) && !ui_wants_input;
@@ -268,6 +274,40 @@ pub fn update_player_system(
     }
     player.position = candidate;
     snow.recenter(Vec2::new(candidate.x, candidate.z));
+}
+
+/// Slide the step from the player's position to `candidate` around the
+/// trunks and stems it would run into, and take from the player's velocity
+/// what pressed into them. Only the ground-level circle matters: a trunk
+/// blocks the feet while they are lower than its top (less a step), so a jump
+/// clears a stem under a metre and a half and nothing taller.
+fn collide_with_trunks(
+    player: &mut Player,
+    candidate: &mut Vec3,
+    vegetation: &VegetationField,
+    erosion: &ErosionCache,
+    noise: &NoiseField,
+) {
+    let from = Vec2::new(player.position.x, player.position.z);
+    let to = Vec2::new(candidate.x, candidate.z);
+    let mut solids = Vec::new();
+    vegetation.solids_near(from, PLAYER_RADIUS + from.distance(to), &mut solids);
+    if solids.is_empty() {
+        return;
+    }
+    // A tree the GPU would not draw is not there to walk into.
+    let trunks: Vec<collision::Trunk> = solids
+        .iter()
+        .filter_map(|solid| solid.stand(erosion, noise, from))
+        .collect();
+    let feet = player.position.y - EYE_HEIGHT;
+    let slid = collision::slide(&trunks, from, to, feet);
+    candidate.x = slid.position.x;
+    candidate.z = slid.position.y;
+    let pressing = player.velocity.dot(slid.normal);
+    if pressing < 0.0 {
+        player.velocity -= slid.normal * pressing;
+    }
 }
 
 /// Resolve against the puffed surface first, then compact only the contact
@@ -532,6 +572,74 @@ mod tests {
         let end = Vec2::new(candidate.x, candidate.z);
         assert_eq!(snow.compression(end), 1.0);
         assert_eq!(snow.compression(old_xz.lerp(end, 0.5)), 0.0);
+    }
+
+    /// A flat mountain world with one 8 m oak, its trunk 0.4 m in radius, 3 m
+    /// east of the player.
+    fn forest_of_one(field: f32) -> (NoiseField, ErosionCache, VegetationField, Player) {
+        let noise = NoiseField {
+            samples: vec![field; NOISE_RESOLUTION * NOISE_RESOLUTION],
+        };
+        let erosion = ErosionCache::default();
+        let tree = crate::vegetation::scatter::PlantInstance {
+            position: [1003.0, 0.0, 1000.0],
+            scale: 1.0,
+            model: 0,
+            layer: crate::vegetation::scatter::Layer::Canopy as u32,
+            ..Default::default()
+        };
+        let vegetation = VegetationField::with_plants(crate::vegetation::tests::catalog(), vec![tree]);
+        let mut player = Player::default();
+        let ground = crate::erosion::sample_eroded_height(&erosion, &noise, 1000.0, 1000.0, [1000.0, 1000.0]);
+        player.position = Vec3::new(1000.0, ground + EYE_HEIGHT, 1000.0);
+        (noise, erosion, vegetation, player)
+    }
+
+    #[test]
+    fn the_player_walks_up_to_a_trunk_and_no_further() {
+        let (noise, erosion, vegetation, mut player) = forest_of_one(0.70);
+        for _ in 0..200 {
+            player.velocity = Vec2::new(10.0, 0.0);
+            let mut candidate = player.position + Vec3::X * (10.0 * 0.016);
+            collide_with_trunks(&mut player, &mut candidate, &vegetation, &erosion, &noise);
+            player.position = candidate;
+        }
+        let stopped = 1003.0 - 0.4 - PLAYER_RADIUS;
+        assert!((player.position.x - stopped).abs() < 0.01, "{}", player.position);
+        assert!(player.velocity.x.abs() < 1e-4, "{:?}", player.velocity);
+    }
+
+    #[test]
+    fn the_player_slides_along_a_trunk_it_meets_at_an_angle() {
+        let (noise, erosion, vegetation, mut player) = forest_of_one(0.70);
+        player.position.z += 0.3;
+        for _ in 0..200 {
+            let mut candidate = player.position + Vec3::X * (10.0 * 0.016);
+            collide_with_trunks(&mut player, &mut candidate, &vegetation, &erosion, &noise);
+            player.position = candidate;
+        }
+        // Past the tree, and round the side it was off-axis toward.
+        assert!(player.position.x > 1003.5, "{}", player.position);
+        assert!(player.position.z > 1000.3, "{}", player.position);
+    }
+
+    #[test]
+    fn a_tree_the_gpu_would_not_draw_is_not_solid() {
+        // The same tree on ground under the sea: the cull refuses its root.
+        let (noise, erosion, vegetation, mut player) = forest_of_one(0.0);
+        let mut candidate = player.position + Vec3::X * 6.0;
+        collide_with_trunks(&mut player, &mut candidate, &vegetation, &erosion, &noise);
+        assert_eq!(candidate.x, 1006.0);
+    }
+
+    #[test]
+    fn a_jump_does_not_clear_a_tall_tree() {
+        let (noise, erosion, vegetation, mut player) = forest_of_one(0.70);
+        // The oak is 8 m tall: no jump clears it.
+        player.position.y += 1.2;
+        let mut candidate = player.position + Vec3::X * 6.0;
+        collide_with_trunks(&mut player, &mut candidate, &vegetation, &erosion, &noise);
+        assert!(candidate.x < 1003.0, "{}", candidate);
     }
 
     /// Run the wading model until it settles.
