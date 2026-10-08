@@ -884,12 +884,12 @@ fn ribbon(
         Draft { vertices, side, ..row }
     };
     let mut previous: Option<Draft> = None;
-    for i in 0..=end {
+    for (i, offsets) in base_offsets.iter().enumerate() {
         if i < merging {
-            lay(&draft(i, &base_offsets[i]));
+            lay(&draft(i, offsets));
             continue;
         }
-        let here = dense(draft(i, &base_offsets[i]));
+        let here = dense(draft(i, offsets));
         if let Some(before) = previous.as_ref() {
             let reach = before
                 .vertices

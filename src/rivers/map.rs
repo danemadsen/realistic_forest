@@ -699,12 +699,12 @@ pub fn seams_around(noise: &NoiseField, network: &RiverNetwork, index: &SurfaceI
                 let at = |k: usize| &grid[(zi + k * dz - dz) * n + xi + k * dx - dx];
                 let (a, b, c, d) = (at(0), at(1), at(2), at(3));
                 let middle = [origin[0] + (xi as f32 + 0.5 * dx as f32) * STEP, origin[1] + (zi as f32 + 0.5 * dz as f32) * STEP];
-                for kind in 0..SEAM_KINDS {
+                for (kind, &limit) in SEAM_LIMITS.iter().enumerate() {
                     let Some(step) = change(b, c, kind) else { continue };
                     let before = change(a, b, kind).unwrap_or(0.0);
                     let after = change(c, d, kind).unwrap_or(0.0);
                     let excess = step - before.max(after);
-                    if excess > SEAM_LIMITS[kind] {
+                    if excess > limit {
                         seams.steps[kind] += 1;
                         if excess > seams.worst[kind].0 {
                             seams.worst[kind] = (excess, middle);

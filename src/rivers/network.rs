@@ -3843,7 +3843,6 @@ fn build_segments_on_ground(
                 levee: [levee_at(i), levee_at(i + 1)],
                 cap_slope: [before, after],
                 turbulence: [a.turbulence, b.turbulence],
-                ..Default::default()
             };
             segments.push(reach_segment);
         }

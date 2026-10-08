@@ -801,12 +801,16 @@ mod tests {
         [along_x.alone(), along_z.alone()]
     }
 
+    /// The envelope as `envelope_at` has it before the bank union rounds it.
     fn raw_envelope(segments: &[RiverSegment], p: [f32; 2]) -> Envelope {
         let mut total = Envelope::NONE;
+        let mut blend = OwnerBlend::NONE;
         for segment in segments {
             let envelope = segment_envelope(segment, p);
             combine(&mut total, &envelope);
+            blend.add(&envelope);
         }
+        blend.apply(&mut total);
         total
     }
 
@@ -1148,7 +1152,8 @@ mod gpu_tests {
     use wgpu::util::DeviceExt;
 
     /// The WGSL river block must carve exactly what the CPU carves: the
-    /// player walks on the CPU's ground and sees the GPU's.
+    /// player walks on the CPU's ground and sees the GPU's; and shade it by
+    /// the same water, whitewater, current and width.
     /// Run on a GPU (or lavapipe): cargo test river_block_matches_cpu -- --ignored
     #[test]
     #[ignore = "requires a GPU adapter"]
@@ -1167,10 +1172,11 @@ mod gpu_tests {
              {block}
              @compute @workgroup_size(64)
              fn evaluate(@builtin(global_invocation_id) id: vec3<u32>) {{
-                 if (id.x >= arrayLength(&samples)) {{ return; }}
-                 let p = samples[id.x].xy;
+                 if (2u * id.x >= arrayLength(&samples)) {{ return; }}
+                 let p = samples[2u * id.x].xy;
                  let e = riverEnvelope(p);
-                 samples[id.x] = vec4<f32>(e.upper, e.lower, e.bank_distance, e.lake);
+                 samples[2u * id.x] = vec4<f32>(e.upper, e.lower, e.bank_distance, e.lake);
+                 samples[2u * id.x + 1u] = vec4<f32>(e.water, e.turbulence, length(e.velocity), e.half_width);
              }}"
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1219,7 +1225,8 @@ mod gpu_tests {
                 }
             }
         }
-        let samples: Vec<[f32; 4]> = points.iter().map(|p| [p[0], p[1], 0.0, 0.0]).collect();
+        // Two per point: the bounds, then what the ground is shaded by.
+        let samples: Vec<[f32; 4]> = points.iter().flat_map(|p| [[p[0], p[1], 0.0, 0.0], [0.0; 4]]).collect();
         let grid = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(&payload.grid_words),
@@ -1255,7 +1262,7 @@ mod gpu_tests {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &group, &[]);
-            pass.dispatch_workgroups((samples.len() as u32).div_ceil(64), 1, 1);
+            pass.dispatch_workgroups((points.len() as u32).div_ceil(64), 1, 1);
         }
         encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output.size());
         queue.submit([encoder.finish()]);
@@ -1267,7 +1274,8 @@ mod gpu_tests {
         let results: &[[f32; 4]] = bytemuck::cast_slice(&mapped);
         let mut inside = 0;
         let mut lakes = 0;
-        for (p, gpu) in points.iter().zip(results) {
+        for (p, pair) in points.iter().zip(results.chunks_exact(2)) {
+            let (gpu, shade) = (pair[0], pair[1]);
             let cpu = network.envelope(p[0], p[1]);
             let close = |a: f32, b: f32| (a.min(1e29) - b.min(1e29)).abs() <= 2e-3 * a.abs().clamp(1.0, 1e29);
             assert!(close(gpu[0], cpu.upper.min(1e30)), "upper at {p:?}: GPU {gpu:?} CPU {cpu:?}");
@@ -1278,6 +1286,11 @@ mod gpu_tests {
             assert!(lake_close, "lake at {p:?}: GPU {gpu:?} CPU {cpu:?}");
             if cpu.bank_distance < 0.0 {
                 inside += 1;
+                let speed = cpu.velocity[0].hypot(cpu.velocity[1]);
+                let fields = [(shade[0], cpu.water), (shade[1], cpu.turbulence), (shade[2], speed), (shade[3], cpu.half_width)];
+                for (gpu_field, cpu_field) in fields {
+                    assert!(close(gpu_field, cpu_field), "shading at {p:?}: GPU {shade:?} CPU {cpu:?}");
+                }
             }
             if cpu.lake > NO_LAKE {
                 lakes += 1;
