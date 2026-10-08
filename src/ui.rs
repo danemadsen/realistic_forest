@@ -787,6 +787,18 @@ fn draw_advanced_controls(
                     if player.swept { ", swept off your feet" } else { "" }
                 ));
             }
+            if let Some(water) = player.water.filter(|water| player.position.y < water.surface) {
+                let kind = match water.kind {
+                    crate::player::WaterKind::River => "a river's",
+                    crate::player::WaterKind::Lake => "a lake's",
+                    crate::player::WaterKind::Sea => "the sea's",
+                };
+                ui.label(format!(
+                    "Eye {:.1} m under {kind} water, {:.1} m deep",
+                    water.surface - player.position.y,
+                    water.depth()
+                ));
+            }
         }
         None => {
             ui.label("Rivers disabled (--no-rivers)");

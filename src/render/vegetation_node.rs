@@ -1485,7 +1485,7 @@ mod tests {
         let cull = include_str!("../../assets/shaders/vegetation-cull.wgsl");
         let draw = include_str!("../../assets/shaders/vegetation.wgsl");
         let composite = include_str!("../../assets/shaders/composite.wgsl");
-        let water = include_str!("../../assets/shaders/water-surface.wgsl");
+        let water = include_str!("../../assets/shaders/water.wgsl");
         let model = layout!(
             ModelParams, height, crown_radius, crown_base, bound_radius, lod_end, max_distance, lod_count,
             habitat, region, draw_word, draw_count, shadow_word, shadow_count

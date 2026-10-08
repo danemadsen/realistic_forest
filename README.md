@@ -36,8 +36,8 @@ by naga at runtime either way.
 | --- | --- |
 | Mouse | Look |
 | W/A/S/D | Move |
-| Space | Jump, or rise while flying |
-| Left Shift | Descend while flying |
+| Space | Jump, or rise while flying; swim up, or kick out of the water at its surface |
+| Left Shift | Descend while flying; dive while swimming |
 | Left Control | Movement boost |
 | V | Toggle flight |
 | 2 | Open or close the developer menu; release the cursor while open, capture it on close |
@@ -48,7 +48,8 @@ by naga at runtime either way.
 
 Movement is unbounded in both walking and flight modes. Walking is stopped by
 trees and lilacs (see [Colliding with trees](#colliding-with-trees)); flight
-passes through them, as it does the ground.
+passes through them, as it does the ground. Water too deep to stand in, the
+sea's, a lake's or a river's, is swum in (see [Wading and swimming](#wading-and-swimming)).
 
 The developer menu opens at the top left with 2 and leaves no launcher or
 overlay when closed. Its movement tools teleport to exact XYZ coordinates
@@ -317,6 +318,10 @@ beyond the mesh's displacement fade and across the flat horizon skirt.
 Each wave filters against its projected pixel footprint; unresolved ripples
 broaden the sun reflection instead of shimmering. Crest compression drives
 whitecaps and subsurface light, with foam detail also filtered at distance.
+The sea is drawn by the same water shader as the rivers and lakes (see
+[The water](#the-water)): its swell is its own, and its shorter waves are the
+wind sea every water body shares, which on the open sea takes the whole of
+the wind.
 
 ## Imported grass
 
@@ -1077,42 +1082,77 @@ at an angle cannot be blended into one without squeezing the ripples
 between them. Wherever one surface shows beside the other they carry the
 same water, so no line crosses the junction.
 
-The river shader (`vs_river`/`fs_river` in `water-surface.wgsl`) shades the
-water with the sea's own optics, sky and screen-space reflections, sun
-glitter, refraction, rain rings and fog, and the plants' shadow cascades. Sun
-and moon glints are a normalised GGX lobe weighted by the water's own Fresnel
-at each facet (the sea's glints use the same), so water mirrors the sun only
-where its facets line up, as sparkles and a soft path, never as a white
-sheet. On top of that:
+All the water, the sea, rivers and creeks, ponds and lakes, is one shader
+(`assets/shaders/water.wgsl`). The sea's tiles (`vs_sea`) and the rivers'
+ribbons and lakes' sheets (`vs_inland`) feed the same `fs_water`, which is
+told what the water is rather than which kind it is: how much of it is the
+open sea's, how still it is, its level, its current, its whitewater and the
+foam drifting on it. Everything else follows from those, so a river's last
+reach turns to the sea's water as it meets it, and a stream leaving a tarn
+carries the tarn's colour down. Every surface has the same optics, sky and
+screen-space reflections, sun glitter, refraction, rain rings and fog, the
+plants' shadow cascades and the same underside. Sun and moon glints are a
+normalised GGX lobe weighted by the water's own Fresnel at each facet, so
+water mirrors the sun only where its facets line up, as sparkles and a soft
+path, never as a white sheet. What differs from one water to the next:
 
-- **Brown, tannin-stained water.** The forest's dissolved organic matter
-  absorbs blue most, so a riffle shows a golden bed, a pool an amber one and
-  deep water goes dark brown; lakes are darker still, and rapids are milky
-  with bubbles. The eye's path is bent down into the water and the light
-  scattered back out of it is dimmed with depth, so depth reads.
+- **Its colour.** The sea's is its optics preset. Forest water is stained
+  like tea by the tannins the rain leaches from the forest floor: dissolved
+  organic matter absorbs blue most, so a riffle shows a golden bed, a pool an
+  amber one and deep water goes dark brown; ponds are darker still, and
+  rapids are milky with bubbles. Above the forest nothing stains it: a
+  mountain lake or stream is clear snowmelt over rock with a little rock
+  flour in it, glass over the stones of its shallows, turquoise a few metres
+  down and a deep blue-cyan over its depths. The stain fades out between 60
+  m and 110 m, the altitudes over which the forest gives way to rock, so a
+  pond in the woods stays brown and a tarn above them is cyan. The eye's path
+  is bent down into the water and the light scattered back out of it is
+  dimmed with depth, so depth reads.
+- **How rough it is.** Every water body feels the same wind (10 m up, about a
+  third of the wind the clouds ride on) and raises the same kind of waves
+  from it: a spectrum of short waves whose slope follows Cox and Munk's
+  measurements of the sea surface, peaked where JONSWAP puts the peak of a
+  sea the wind has blown over that far, moving with the capillary-gravity
+  dispersion. What differs is how much wind the water feels and over what
+  fetch. The open sea takes all of it over unlimited fetch, with whitecaps
+  from a fresh breeze, and adds its swell and its surf. A lake's waves grow
+  from its upwind shore across it, calm in the lee of the trees there and
+  rougher toward its far shore. A pond ringed by forest, or a creek in its
+  cut under the crowns, lies sheltered and nearly glassy but for the cat's
+  paws gusts send across it. A river adds what its current does to it.
 - **What the water mirrors.** Where the screen cannot show a reflection, the
   shader walks out along the reflected ray's bearing over the ground and the
   canopy (the shore map near the camera, the lighting map beyond, and the
   share of open sky the tree crowns leave) and finds the horizon the banks
   and crowns raise: below it the water mirrors dark banks and foliage, above
   it the sky. A creek in its cut under the trees is dark but for a strip of
-  sky down its corridor; a pond in a clearing keeps its sky.
-- **The stream's own frame.** Ripples live in metres down and across the
-  channel, so they follow every bend, and cross-fade into a parent's
-  where a tributary joins it. Two advected phases stream at the
-  water's own speed, drawn out along fast water; standing waves stand still
-  over riffles, fixed to the bed, while ripples and foam stream through
-  them; boils swell glassy on runs and pools; gusts dull open water in cat's
-  paws. What a pixel cannot resolve becomes roughness by its true slope
-  variance, per axis of the flow, so distant water does not turn white.
-- **Foam that follows the flow.** Rapids churn white over the steps and
-  boulders of their bed, with dark glassy tongues of water between; foam they make drifts
-  downstream for some fifteen seconds as lace gathered on the seams by the
-  banks, on a tongue down the current and as scum in slack water, and an
-  inlet carries it out into the pond. It is cream, stained like the water,
-  and in the shade of the crowns it is lit only by the sky they leave.
+  sky down its corridor; a pond in a clearing keeps its sky; the sea mirrors
+  its wooded headlands near the shore.
+- **The current.** A river's ripples live in metres down and across its
+  channel, so they follow every bend, and cross-fade into a parent's where a
+  tributary joins it. The current carries them downstream at the water's own
+  speed, drawn out along fast water, each scale on its own cycle, its two
+  layers handed over with their contrast held so the water never pulses.
+  Standing waves stand still over riffles, fixed to the bed, while ripples
+  and foam stream through them; they swell and ebb in place rather than in a
+  travelling pulse, which used to read as the water running upstream. Boils
+  swell glassy on runs and pools, and the wind's waves ride the current. A
+  texture the current carries further in one frame than a third of its own
+  size would strobe and seem to run backwards; it becomes roughness instead,
+  as what a pixel cannot resolve does, by its true slope variance.
+- **Foam.** On the sea, breaking crests and the shore's wash; on any water, a
+  strong wind's whitecaps. Rapids churn white over the steps and boulders of
+  their bed, with dark glassy tongues of water between; foam they make
+  drifts downstream for some fifteen seconds as lace gathered on the seams by
+  the banks, on a tongue down the current and as scum in slack water, and an
+  inlet carries it out into the pond. Stream foam is cream, stained like the
+  water, and in the shade of the crowns it is lit only by the sky they leave.
+- **Seen from below.** Any surface over the eye is Snell's window: the sky
+  and banks refracted through it inside the critical angle, and outside it a
+  mirror of the water's own glow. The medium the eye is in is that water's:
+  the sea's preset, a pond's dark tea or a tarn's clear cyan.
 
-### Wading
+### Wading and swimming
 
 Flowing water pushes the player. The current's drag on the submerged body,
 ½ρC_dAu² over the legs and then the torso as the water deepens, is set
@@ -1120,15 +1160,19 @@ against the friction the feet can hold with, which buoyancy and a whitewater
 bed reduce. Knee-deep water slows a wade, more so walking upstream; a gentle
 current is stood against; a strong one carries the body along more and more,
 and once its drag outweighs the footing it sweeps the player off their feet
-and away downstream, down any rapids coming. Water too deep to stand in
-floats the player with the current; a lake's still water only floats them.
-Space kicks a swimmer up out of the water as it jumps a walker off the
+and away downstream, down any rapids coming. Water too deep to stand in, the
+sea's, a lake's or a river's, is swum in: the body floats head out, carried
+by any current, until the player dives. Left Shift dives and Space swims
+back up; swimming forward while looking well down or up follows the eye; a
+swimmer left alone drifts back up and floats. The bed is solid, and from the
+surface Space kicks a swimmer up out of the water as it jumps a walker off the
 ground, onto a bank or over a ledge; a body in the air over the water keeps
 the motion it left the water with, so a hop neither shakes off the current
-nor stops a body it was carrying dead.
-The F1 panel's **Rivers** section
+nor stops a body it was carrying dead. Once the eye is under, the view is
+that water's medium, whichever water it is.
+The developer menu's **Rivers** section
 reports the network, the nearest channel and the current the player stands
-in, and can hide the water surfaces.
+in, and can hide the river and lake surfaces.
 
 ## Day/night lighting and atmosphere
 
@@ -1241,7 +1285,7 @@ outside the current view, and the cloud shadow map supplies sunlight
 occlusion for fog in the atmosphere and water passes.
 The water surface then samples the opaque scene for refraction and raymarched
 reflections, followed by underwater effects where applicable. The sea and the
-rivers depth-test against the G-buffer's own depth buffer in hardware, ahead
+rivers and lakes depth-test against the G-buffer's own depth buffer in hardware, ahead
 of their shaders, so water hidden behind terrain or plants is never shaded;
 they write that depth too, so a river never paints over a nearer wave. FXAA smooths the
 completed scene, and the diagnostics panel draws on top. The G-buffer, AO and

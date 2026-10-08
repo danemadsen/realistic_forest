@@ -26,8 +26,8 @@ use super::network::{FLOW_CELL, Lake, River, RiverEnd};
 use crate::constants::SEA_LEVEL;
 use std::collections::HashMap;
 
-/// One water-surface vertex: 64 bytes, mirrored by the river vertex inputs
-/// in water-surface.wgsl.
+/// One water-surface vertex: 64 bytes, mirrored by `vs_inland`'s inputs in
+/// water.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SurfaceVertex {
@@ -1325,6 +1325,65 @@ mod tests {
         assert_eq!(row(7).half_width, 2.0);
         let sheet = mesh.vertices.last().unwrap();
         assert_eq!((sheet.along, sheet.half_width, sheet.foam), (0.0, 0.0, 0.0));
+    }
+
+    /// Over a real region, the frame each ribbon lays its ripples in runs
+    /// downstream wherever the water is drawn: the shader carries the
+    /// ripples along the frame's downstream axis, so a ribbon whose frame ran
+    /// against its current would draw its water running backwards. Where it
+    /// becomes its parent's water the frame cross-fades into the parent's, so
+    /// a tributary's mouth is left out, as is the hidden ribbon under the
+    /// banks past either waterline. And the water itself never rises
+    /// downstream.
+    #[test]
+    fn ribbons_carry_their_current_downstream() {
+        let noise = crate::noise::NoiseField::new();
+        let network = crate::rivers::network::generate(&noise, [0, 0]);
+        let mesh = &network.surface;
+        let (mut total, mut reversed, mut askew) = (0.0f64, 0.0f64, 0.0f64);
+        for triangle in mesh.indices.chunks_exact(3) {
+            let [a, b, c] = [0, 1, 2].map(|k| mesh.vertices[triangle[k] as usize]);
+            let ribbon = [a, b, c].iter().all(|v| v.half_width > 0.0 && v.joined[2] == 0.0);
+            let open = [a, b, c].iter().any(|v| v.across.abs() < 1.0);
+            if !ribbon || !open {
+                continue;
+            }
+            let flat = |v: &SurfaceVertex| [v.position[0], v.position[2]];
+            let (pa, pb, pc) = (flat(&a), flat(&b), flat(&c));
+            let e1 = [pb[0] - pa[0], pb[1] - pa[1]];
+            let e2 = [pc[0] - pa[0], pc[1] - pa[1]];
+            let det = e1[0] * e2[1] - e1[1] * e2[0];
+            if det.abs() < 1e-6 {
+                continue;
+            }
+            // The gradient of `along` over the triangle: the frame's
+            // downstream axis in the world.
+            let (d1, d2) = (b.along - a.along, c.along - a.along);
+            let downstream = [(d1 * e2[1] - d2 * e1[1]) / det, (e1[0] * d2 - e2[0] * d1) / det];
+            let v = [a.velocity[0] + b.velocity[0] + c.velocity[0], a.velocity[1] + b.velocity[1] + c.velocity[1]];
+            let (speed, length) = (v[0].hypot(v[1]), downstream[0].hypot(downstream[1]));
+            if speed < 0.15 || length < 1e-6 {
+                continue;
+            }
+            let cos = (downstream[0] * v[0] + downstream[1] * v[1]) / (speed * length);
+            let area = f64::from(det.abs()) * 0.5;
+            total += area;
+            if cos < 0.0 {
+                reversed += area;
+            }
+            if cos < std::f32::consts::FRAC_1_SQRT_2 {
+                askew += area;
+            }
+        }
+        assert!(total > 1.0e5, "the region has rivers: {total} m²");
+        assert!(reversed / total < 1e-4, "{reversed:.1} m² of {total:.0} m² runs against its current");
+        assert!(askew / total < 2e-3, "{askew:.1} m² of {total:.0} m² runs over 45 degrees off its current");
+        for river in &network.rivers {
+            let drawn = &river.nodes[..=river.surface_end.min(river.nodes.len() - 1)];
+            for pair in drawn.windows(2) {
+                assert!(pair[1].water <= pair[0].water + 0.005, "water rising downstream: {pair:?}");
+            }
+        }
     }
 
     /// A river reaching the sea ends one row past the coast, tucked just

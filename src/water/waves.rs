@@ -22,12 +22,18 @@
 //! Crest power table rather than written into it, and each doc comment carries
 //! its own calibration.
 //!
-//! Together they are what makes the water a *lake*. Crest's table is a fully
-//! developed 150 kph wind sea: 82% of its wave height sits in the 16-64 m
-//! octaves and the largest single component is a 60 m, 6.2 s swell. The taper
-//! takes the swell out, the ripple gain takes the fine chop down, and the
-//! concentration organises what is left into a travelling train instead of an
-//! isotropic fan. See the constants below for the measured rungs.
+//! Together they scale Crest's ocean to a coastal sea under a moderate
+//! breeze. Crest's table is a fully developed 150 kph wind sea: 82% of its
+//! wave height sits in the 16-64 m octaves and the largest single component is
+//! a 60 m, 6.2 s swell. The taper turns that swell down without taking it out,
+//! the ripple gain takes the fine chop down, and the concentration organises
+//! what is left into a travelling train instead of an isotropic fan. See the
+//! constants below for the measured rungs. Waves shorter than the 2 m this
+//! spectrum starts at are not Crest's: they are the wind sea every water body
+//! shares (`windSea` in assets/shaders/water.wgsl), which on the open sea takes
+//! the whole of the wind over unlimited fetch. Lakes and ponds have only that
+//! wind sea, limited by their fetch and their shelter, and no swell at all,
+//! which is what keeps them calmer than the sea.
 
 use bevy::math::Vec2;
 
@@ -68,8 +74,8 @@ const DIRECTION_VARIANCE_DEGREES: f32 = 90.0;
 ///
 /// Calibration, the directional concentration `lambda_max/trace` of the slope
 /// covariance `sum 0.5(ak)^2 dir dir^T` (0.5 is fully isotropic, 1.0 a perfect
-/// train; shipped tuning otherwise at [`SWELL_GAIN`] 0.20, [`RIPPLE_GAIN`]
-/// 0.5, `sea_state_amplitude` 0.28):
+/// train; measured with [`SWELL_GAIN`] at 0.20, [`RIPPLE_GAIN`] 0.5 and
+/// `sea_state_amplitude` 0.28):
 ///   1.0 -> 0.552, along-wind tilt 0.037 deg, cross-wind 0.034 (shipped)
 ///   1.5 -> 0.690, along 0.042, cross 0.028
 ///   2.0 -> 0.770, along 0.044, cross 0.024 (shipped value)
@@ -95,11 +101,12 @@ const ANALYTIC_CHOP: f32 = 1.6;
 /// below pins that.
 ///
 /// The two octaves under it are where the surface's slope lives. At
-/// `sea_state_amplitude` 0.28 and the shipped tuning the 40 uploaded components
-/// give an RMS surface tilt of 2.037 degrees; the 2-8 m octaves carry 56.1% of
-/// that slope variance on 17.6% of the wave height, and the 16-64 m octaves
-/// only 6.2% of the slope on 51.6% of the height. The 2-8 m band is therefore
-/// both the near-field look and the band a strength change moves.
+/// `sea_state_amplitude` 0.28 with [`SWELL_GAIN`] at 0.20 the 40 uploaded
+/// components give an RMS surface tilt of 2.037 degrees; the 2-8 m octaves
+/// carry 56.1% of that slope variance on 17.6% of the wave height, and the
+/// 16-64 m octaves only 6.2% of the slope on 51.6% of the height. The 2-8 m
+/// band is therefore both the near-field look and the band a strength change
+/// moves.
 const RIPPLE_BAND_METRES: f32 = 8.0;
 
 /// Amplitude gain for everything shorter than [`RIPPLE_BAND_METRES`].
@@ -111,7 +118,7 @@ const RIPPLE_BAND_METRES: f32 = 8.0;
 /// octave instead of scaling a band.
 ///
 /// Calibration, measured against the exact float32 generator at
-/// `sea_state_amplitude` 0.28 with [`SWELL_GAIN`] at its shipped 0.20 and
+/// `sea_state_amplitude` 0.28 with [`SWELL_GAIN`] at 0.20 and
 /// [`DIRECTION_CONCENTRATION`] at 2.0 (baseline, gain 1.0: RMS tilt 3.335
 /// degrees, H_s 0.3090 m, sum|a| 0.5835 m, far-field GGX alpha 0.06667, fold
 /// 0.6240, breaking area 14.27%):
@@ -145,9 +152,9 @@ const SWELL_BAND_METRES: f32 = 16.0;
 /// inert across the uploaded spectrum (its amplitude factor is 0.998 at 64 m)
 /// and `POWER_LOG10` alone shapes the sea into 16-64 m swell: 79.6% of the wave
 /// height, with a single 60 m, 6.2 s component as the largest wave in the
-/// water. No lake with a kilometre of fetch can grow that, so the gain tapers
-/// it. Moving `WIND_SPEED_KPH` instead would drag the window's peak into the
-/// resolved band and invalidate every gain rung documented above; editing
+/// water. That is a storm sea's swell, so the gain tapers it. Moving
+/// `WIND_SPEED_KPH` instead would drag the window's peak into the resolved
+/// band and invalidate every gain rung documented above; editing
 /// `POWER_LOG10` would break the "Crest defaults ported verbatim" contract and
 /// smear across an octave through the interpolation in `spectrum_amplitude`.
 ///
@@ -155,8 +162,11 @@ const SWELL_BAND_METRES: f32 = 16.0;
 /// below about 0.25 the largest single component stops being the 60 m swell and
 /// becomes a 13.1 m, 2.90 s wave, which is the lake regime the shoreline
 /// surveys report (H_s 0.10-0.40 m, T_p 1.4-2.5 s summary / 1.7-3.6 s
-/// measured). At 0.35 the swell is still the largest wave and the sea still
-/// reads as an ocean with the amplitude turned down.
+/// measured). The sea was held there (0.20) while it was the only water with
+/// waves at all. Now that lakes raise their own fetch-limited waves, the sea
+/// is an ocean again: at 0.35 the swell is still the largest wave and the sea
+/// reads as an ocean with the amplitude turned down, H_s 0.41 m under the
+/// default breeze, rougher than any lake and calm enough for a shoreline.
 ///
 /// Calibration at `sea_state_amplitude` 0.28 with [`RIPPLE_GAIN`] at its
 /// shipped 0.5 and [`DIRECTION_CONCENTRATION`] at 2.0, columns sum|a| m / H_s m
@@ -167,19 +177,20 @@ const SWELL_BAND_METRES: f32 = 16.0;
 ///   0.50 -> 0.8802 / 0.5555 / 2.344 / 1.526 / 1.267 / 0.05221 / 0.5168 /
 ///            6.20% / 60 m, 6.19 s
 ///   0.35 -> 0.6882 / 0.4123 / 2.163 / 1.526 / 0.887 / 0.04977 / 0.4629 /
-///            4.70% / 60 m, 6.19 s
+///            4.70% / 60 m, 6.19 s (shipped value)
 ///   0.25 -> 0.5601 / 0.3237 / 2.072 / 1.526 / 0.633 / 0.04857 / 0.4270 /
 ///            4.01% / 13 m, 2.90 s
 ///   0.20 -> 0.4961 / 0.2834 / 2.037 / 1.526 / 0.507 / 0.04812 / 0.4090 /
-///            3.73% / 13 m, 2.90 s (shipped value)
+///            3.73% / 13 m, 2.90 s (the lake regime)
 ///   0.14 -> 0.4193 / 0.2412 / 2.005 / 1.526 / 0.355 / 0.04770 / 0.3874 /
 ///            3.48% / 13 m, 2.90 s
 /// The 2-8 m tilt is 1.526 deg at every rung: the band edge is above it, so
-/// this lever and [`RIPPLE_GAIN`] are orthogonal by construction. H_s 0.2834 m
-/// is the middle of the surveyed lake band. The taper also *raises* the folding
-/// margin, from 1/sum(ak) 2.297 at 1.00 to 3.912 at 0.20, rather than spending
-/// it.
-const SWELL_GAIN: f32 = 0.20;
+/// this lever and [`RIPPLE_GAIN`] are orthogonal by construction. The taper
+/// also *raises* the folding margin, from 1/sum(ak) 2.297 at 1.00 to 3.912 at
+/// 0.20, rather than spending it; 0.35 still keeps it above 2. The far-field
+/// alpha column is the swell's alone: the wind sea under 2 m adds its own
+/// Cox-Munk roughness on top in the shader.
+const SWELL_GAIN: f32 = 0.35;
 
 const MIN_AMPLITUDE: f32 = 0.001;
 const TAU: f32 = std::f32::consts::TAU;

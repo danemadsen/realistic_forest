@@ -1,7 +1,7 @@
 # Attribution
 
-The code in `src/water/` and the water shaders in `assets/shaders/water-*.wgsl`
-are derived from **bevy-aqua** (<https://github.com/sayhisam1/bevy-aqua>),
+The code in `src/water/` and the water shader `assets/shaders/water.wgsl` are
+derived from **bevy-aqua** (<https://github.com/sayhisam1/bevy-aqua>),
 licensed **MIT OR Apache-2.0**. Aqua is itself a port of **Crest Ocean System**
 for Unity (MIT) and of the Godot ocean shader, and its underwater medium,
 fullscreen medium pass and water-surface underside design came from
@@ -18,8 +18,8 @@ are copied out of this repository.
 | `src/water/waves.rs` | `bevy-aqua-waves/src/lib.rs` (spectrum, band partition); Crest `Scripts/Shapes/ShapeGerstnerBatched.cs`, `Shaders/OceanInputs/GerstnerShared.hlsl`, `OceanWaveSpectrum.cs` |
 | `src/water/rings.rs` | `bevy-aqua-geom/src/rings.rs`; Crest `Scripts/OceanBuilder.cs` (`BuildOceanPatch`, `CreateLOD`) |
 | `src/water/optics.rs` | `bevy-aqua-core/src/lib.rs` (`WaterOptics`, `WaterOptics::PRESETS`) |
-| `assets/shaders/water-surface.wgsl` | `bevy-aqua-waves/src/anim_waves.wgsl` (shoaling, Gerstner sum), `bevy-aqua-core/src/cascade/material.wgsl` (foam, SSS, Fresnel composition), `bevy-aqua-optics/src/optics.wgsl` (`godot_fresnel`, deep-water weight), `bevy-aqua-medium/src/medium.wgsl` (Beer-Lambert) |
-| `assets/shaders/water-underwater.wgsl` | `bevy-aqua-volume/src/volume.wgsl` and `bevy-aqua-medium/src/medium.wgsl` |
+| `assets/shaders/water.wgsl` (`vs_sea`, `fs_water`) | `bevy-aqua-waves/src/anim_waves.wgsl` (shoaling, Gerstner sum), `bevy-aqua-core/src/cascade/material.wgsl` (foam, SSS, Fresnel composition), `bevy-aqua-optics/src/optics.wgsl` (`godot_fresnel`, deep-water weight), `bevy-aqua-medium/src/medium.wgsl` (Beer-Lambert) |
+| `assets/shaders/water.wgsl` (`fs_underwater`) | `bevy-aqua-volume/src/volume.wgsl` and `bevy-aqua-medium/src/medium.wgsl` |
 
 ## What was changed
 
@@ -33,5 +33,10 @@ texture, the atmosphere LUT) has been replaced by this renderer's own single
 sun, deferred G-buffer and composited frame.
 
 Not ported: the FFT spectral wave model, planar reflections, screen-space
-reflections, caustics, spray, motion vectors, bounded water bodies and rivers,
-and the GPU wave-query readback. See the module comment in `src/water/mod.rs`.
+reflections, caustics, spray, motion vectors, bounded water bodies, and the
+GPU wave-query readback. See the module comment in `src/water/mod.rs`.
+
+Not from aqua: the rivers and lakes the same surface shader draws, their
+current, their inland optics and the wind sea every water body shares
+(`vs_inland`, `windSea`, `flowSurface` and `inlandMedium` in
+`assets/shaders/water.wgsl`) are this project's own.

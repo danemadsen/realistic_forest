@@ -317,7 +317,7 @@ mod tests {
     }
 
     /// One tile's world-space x and z bounds: `build_instances`' placement plus
-    /// the rotation `water-surface.wgsl`'s `vs_main` applies.
+    /// the rotation `water.wgsl`'s `vs_sea` applies.
     fn tile_world_bounds(tile: &Tile, lod: usize) -> [[f32; 2]; 2] {
         let scale = lod_scale(lod);
         let mesh = build_patch(tile.patch);
