@@ -3,6 +3,7 @@
 
 use super::carve::Envelope;
 use super::network::{self, RiverEnd, RiverNetwork};
+use super::surface::SurfaceVertex;
 use crate::constants::SEA_LEVEL;
 use crate::noise::{NoiseField, base_height};
 
@@ -562,12 +563,50 @@ impl<'a> SurfaceIndex<'a> {
         (lowest, highest)
     }
 
+    /// The river ribbon drawn on top over `p` (the highest), its vertex
+    /// attributes interpolated there as the GPU interpolates them.
+    pub fn top_ribbon(&self, p: [f32; 2]) -> Option<SurfaceVertex> {
+        let mut top: Option<SurfaceVertex> = None;
+        self.each_triangle(p, |triangle, weights| {
+            if triangle[0] as usize >= self.first_lake {
+                return;
+            }
+            let v = triangle.map(|k| self.mesh.vertices[k as usize]);
+            let mix = |f: &dyn Fn(&SurfaceVertex) -> f32| weights[0] * f(&v[0]) + weights[1] * f(&v[1]) + weights[2] * f(&v[2]);
+            let height = mix(&|v| v.position[1]);
+            if top.is_some_and(|t| t.position[1] >= height) {
+                return;
+            }
+            top = Some(SurfaceVertex {
+                position: [p[0], height, p[1]],
+                velocity: [mix(&|v| v.velocity[0]), mix(&|v| v.velocity[1])],
+                across: mix(&|v| v.across),
+                turbulence: mix(&|v| v.turbulence),
+                still: mix(&|v| v.still),
+                along: mix(&|v| v.along),
+                half_width: mix(&|v| v.half_width),
+                foam: mix(&|v| v.foam),
+                sea: mix(&|v| v.sea),
+                side: mix(&|v| v.side),
+            });
+        });
+        top
+    }
+
     /// Every drawn triangle over `p`: its height there and its first vertex.
     fn each_surface(&self, p: [f32; 2], mut visit: impl FnMut(f32, usize)) {
+        self.each_triangle(p, |triangle, weights| {
+            let height = (0..3).map(|k| weights[k] * self.mesh.vertices[triangle[k] as usize].position[1]).sum();
+            visit(height, triangle[0] as usize);
+        });
+    }
+
+    /// Every drawn triangle over `p`, with `p`'s barycentric weights in it.
+    fn each_triangle(&self, p: [f32; 2], mut visit: impl FnMut([u32; 3], [f32; 3])) {
         let key = [(p[0] / SURFACE_BUCKET).floor() as i32, (p[1] / SURFACE_BUCKET).floor() as i32];
         for &t in self.buckets.get(&key).map_or(&[][..], |list| &list[..]) {
-            let triangle = &self.mesh.indices[t as usize * 3..t as usize * 3 + 3];
-            let [a, b, c] = [0, 1, 2].map(|k| self.mesh.vertices[triangle[k] as usize].position);
+            let triangle = [0, 1, 2].map(|k| self.mesh.indices[t as usize * 3 + k]);
+            let [a, b, c] = triangle.map(|k| self.mesh.vertices[k as usize].position);
             let d = (b[2] - c[2]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[2] - c[2]);
             if d.abs() < 1e-9 {
                 continue;
@@ -578,9 +617,134 @@ impl<'a> SurfaceIndex<'a> {
             if l1 < -1e-5 || l2 < -1e-5 || l3 < -1e-5 {
                 continue;
             }
-            visit(l1 * a[1] + l2 * b[1] + l3 * c[1], triangle[0] as usize);
+            visit(triangle, [l1, l2, l3]);
         }
     }
+}
+
+/// How smoothly the water changes where two rivers meet, sampled every
+/// quarter metre over a square around each confluence. A seam is a step
+/// between two neighbouring samples beyond the change on either side of
+/// them, so a ramp or a kink is none, however steep:
+/// - in the water drawn on top: its height, its current, its whitewater
+///   (turbulence and drifting foam) and its ripple frame (`along` and
+///   `side`, in metres), which the shader lays its
+///   ripples, standing waves and foam in;
+/// - in the bed the terrain paints under the water: the whitewater, speed
+///   and water level of the channel the envelope hands the point to.
+#[derive(Default)]
+pub struct JunctionSeams {
+    pub junctions: usize,
+    pub samples: usize,
+    /// Steps by kind, and the worst of each and where: height, current,
+    /// whitewater, frame, bed whitewater, bed speed, bed water level.
+    pub steps: [usize; SEAM_KINDS],
+    pub worst: [(f32, [f32; 2]); SEAM_KINDS],
+}
+
+pub const SEAM_KINDS: usize = 7;
+pub const SEAM_NAMES: [&str; SEAM_KINDS] = ["height", "current", "whitewater", "frame", "bed whitewater", "bed speed", "bed level"];
+/// A step this far beyond the change either side of it is a seam.
+pub const SEAM_LIMITS: [f32; SEAM_KINDS] = [0.03, 0.3, 0.1, 0.5, 0.1, 0.3, 0.03];
+
+/// Seams within the square of side `extent` around `centre`.
+pub fn seams_around(noise: &NoiseField, network: &RiverNetwork, index: &SurfaceIndex, centre: [f32; 2], extent: f32, seams: &mut JunctionSeams) {
+    const STEP: f32 = 0.25;
+    let n = (extent / STEP) as usize + 1;
+    let origin = [centre[0] - 0.5 * extent, centre[1] - 0.5 * extent];
+    // Per sample, its measures (several numbers for the current and the
+    // frame), or None where no water shows.
+    let mut grid: Vec<Option<[Vec<f32>; SEAM_KINDS]>> = vec![None; n * n];
+    for zi in 0..n {
+        for xi in 0..n {
+            let p = [origin[0] + xi as f32 * STEP, origin[1] + zi as f32 * STEP];
+            let (ground, envelope) = carved_height(noise, network, p[0], p[1]);
+            let (_, sheet, _) = index.owned(p);
+            let Some(top) = index.top_ribbon(p) else { continue };
+            let visible = top.position[1] > ground + 0.01 && top.position[1] > sheet + 0.05 && top.position[1] > SEA_LEVEL + 0.05;
+            if !visible {
+                continue;
+            }
+            seams.samples += 1;
+            // Clear of the banks, where a channel's current falls steeply
+            // to nothing at its waterline.
+            let bed = |v: f32| if envelope.bank_distance < -0.4 { vec![v] } else { vec![] };
+            grid[zi * n + xi] = Some([
+                vec![top.position[1]],
+                vec![top.velocity[0], top.velocity[1]],
+                vec![top.turbulence.max(top.foam)],
+                vec![top.along, top.side],
+                bed(envelope.turbulence),
+                bed(envelope.velocity[0].hypot(envelope.velocity[1])),
+                bed(envelope.water),
+            ]);
+        }
+    }
+    // The change between two samples of one kind: the length of the
+    // difference of their measures, if both have them.
+    let change = |a: &Option<[Vec<f32>; SEAM_KINDS]>, b: &Option<[Vec<f32>; SEAM_KINDS]>, kind: usize| -> Option<f32> {
+        let (a, b) = (a.as_ref()?, b.as_ref()?);
+        if a[kind].is_empty() || b[kind].is_empty() {
+            return None;
+        }
+        Some(a[kind].iter().zip(&b[kind]).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt())
+    };
+    for zi in 0..n {
+        for xi in 0..n {
+            for (dx, dz) in [(1usize, 0usize), (0, 1)] {
+                // Four samples in a row: a, b, c, d; the step is b to c.
+                if xi < dx || zi < dz || xi + 2 * dx >= n || zi + 2 * dz >= n {
+                    continue;
+                }
+                let at = |k: usize| &grid[(zi + k * dz - dz) * n + xi + k * dx - dx];
+                let (a, b, c, d) = (at(0), at(1), at(2), at(3));
+                let middle = [origin[0] + (xi as f32 + 0.5 * dx as f32) * STEP, origin[1] + (zi as f32 + 0.5 * dz as f32) * STEP];
+                for kind in 0..SEAM_KINDS {
+                    let Some(step) = change(b, c, kind) else { continue };
+                    let before = change(a, b, kind).unwrap_or(0.0);
+                    let after = change(c, d, kind).unwrap_or(0.0);
+                    let excess = step - before.max(after);
+                    if excess > SEAM_LIMITS[kind] {
+                        seams.steps[kind] += 1;
+                        if excess > seams.worst[kind].0 {
+                            seams.worst[kind] = (excess, middle);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn junction_seams(noise: &NoiseField, network: &RiverNetwork) -> JunctionSeams {
+    let index = SurfaceIndex::new(network);
+    let mut seams = JunctionSeams::default();
+    for river in &network.rivers {
+        let RiverEnd::Confluence(parent, _) = river.end else {
+            continue;
+        };
+        let Some(parent) = network.rivers.get(parent) else {
+            continue;
+        };
+        let Some(node) = river.nodes.get(river.surface_end) else {
+            continue;
+        };
+        let widest = parent.nodes.iter().map(|n| n.half_width).fold(0.0f32, f32::max).min(8.0);
+        seams.junctions += 1;
+        seams_around(noise, network, &index, node.position, 2.0 * (widest + 10.0), &mut seams);
+    }
+    seams
+}
+
+pub fn seam_fit(noise: &NoiseField, network: &RiverNetwork) -> String {
+    let seams = junction_seams(noise, network);
+    let parts: Vec<String> = (0..SEAM_KINDS)
+        .map(|k| {
+            let (worst, at) = seams.worst[k];
+            format!("{} {} (worst {worst:.2} at {:.1},{:.1})", seams.steps[k], SEAM_NAMES[k], at[0], at[1])
+        })
+        .collect();
+    format!("confluences: {} junctions, {} water samples; seams: {}", seams.junctions, seams.samples, parts.join(", "))
 }
 
 /// How the water looks around the lakes, sampled every metre over and
@@ -805,6 +969,7 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
         println!("{line}");
     }
     println!("{}", ribbon_fit(noise, &network));
+    println!("{}", seam_fit(noise, &network));
     // The nodes nearest the map's centre, for framing a camera on them: the
     // heading is the `--camera` yaw that looks downstream.
     let mut nearest: Vec<(f32, &network::RiverNode, f32)> = network
@@ -962,7 +1127,7 @@ pub fn run_probe(noise: &NoiseField, centre: [f64; 2], extent: f64, step: f64, p
                 "SEG {index} a {:.2},{:.2} b {:.2},{:.2} water {:.3},{:.3} hw {:.2},{:.2} depth {:.2},{:.2} bank {:.3},{:.3} skew {:.2},{:.2} turb {:.2} levee {:.3},{:.3} caps {:.4},{:.4}",
                 segment.a[0], segment.a[1], segment.b[0], segment.b[1], segment.water[0], segment.water[1],
                 segment.half_width[0], segment.half_width[1], segment.depth[0], segment.depth[1], segment.bank[0], segment.bank[1],
-                segment.skew[0], segment.skew[1], segment.turbulence, segment.levee[0], segment.levee[1],
+                segment.skew[0], segment.skew[1], segment.turbulence[0].max(segment.turbulence[1]), segment.levee[0], segment.levee[1],
                 segment.cap_slope[0], segment.cap_slope[1]
             );
         }
@@ -1088,6 +1253,55 @@ mod tests {
         let (samples, under, _) = ribbons_around(&noise, &network, [496.0, 1507.0], 16.0);
         assert!(samples > 200, "{samples}");
         assert!(under < 0.25, "the creek's water shows {under} m under the river's");
+    }
+
+    /// Where two rivers meet, the water drawn over the junction is one
+    /// water: its height, its current, its whitewater and its ripple frame
+    /// run on from the tributary's surface into the parent's without a step,
+    /// and so do the whitewater, speed and level of the bed the terrain
+    /// paints under it.
+    #[test]
+    fn spawn_region_confluences_join_without_a_seam() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, [0, 0]);
+        let seams = junction_seams(&noise, &network);
+        assert!(seams.junctions >= 20 && seams.samples > 20_000, "{} junctions, {} samples", seams.junctions, seams.samples);
+        // Seams per 10,000 samples of water: what is left lies mostly where
+        // a tributary stands under its parent out of a lake, and keeps its
+        // own water.
+        let limits = [8, 8, 5, 6, 2, 18, 8];
+        for kind in 0..SEAM_KINDS {
+            let (worst, at) = seams.worst[kind];
+            assert!(
+                seams.steps[kind] * 10_000 <= limits[kind] * seams.samples,
+                "{} {} seams in {} samples (worst {worst} at {at:?})",
+                seams.steps[kind],
+                SEAM_NAMES[kind],
+                seams.samples
+            );
+        }
+    }
+
+    /// Reported: down a steep reach, where a creek ran into its river, the
+    /// creek's water met the river's along a hard line across the creek's
+    /// mouth: the river's ribbon reached past its waterline over the open
+    /// water there, and every attribute of the water stepped at its edge;
+    /// the bed under the merged water changed from the river's rock to the
+    /// creek's gravel along another.
+    #[test]
+    fn reported_steep_confluence_joins_without_a_seam() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, network::region_of(501.5, 1504.5));
+        let index = SurfaceIndex::new(&network);
+        let mut seams = JunctionSeams::default();
+        seams_around(&noise, &network, &index, [497.0, 1506.0], 24.0, &mut seams);
+        assert!(seams.samples > 1000, "{}", seams.samples);
+        // A few steep changes are left right at the waterline, where the
+        // creek's current falls to nothing against its bank.
+        let limits = [0, 4, 0, 6, 0, 3, 3];
+        for kind in 0..SEAM_KINDS {
+            assert!(seams.steps[kind] <= limits[kind], "{} {} seams (worst {:?})", seams.steps[kind], SEAM_NAMES[kind], seams.worst[kind]);
+        }
     }
 
     /// Reported: a creek cascading down a hillside into a lake ran in the

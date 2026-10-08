@@ -636,8 +636,8 @@ fn rockWeathering(p: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>) -> vec3<f32>
 // that shapes the channel is given at both ends and interpolated along the
 // segment, so neighbours carve the same ground where they meet, and a segment
 // between two others has a round cap at either end whose water is the reach
-// beside's (cap_slope: how fast the water falls up the reach before its start
-// and down the reach after its end), so nothing switches on along a line and
+// beside's (cap_slope: how fast the water rises up the river behind its start
+// and falls down the reach after its end), so nothing switches on along a line and
 // a cap never cuts below the bed or holds a levee over the bank beside it. A
 // segment no reach comes before (cap_slope.x below zero) starts flat.
 // Crossing banks and their shallow shoreline strip round together once;
@@ -653,8 +653,8 @@ struct RiverSegment {
     skew: vec2<f32>,
     levee: vec2<f32>,
     cap_slope: vec2<f32>,
-    turbulence: f32,
-    padding: f32,
+    // Whitewater at the start and end, interpolated like the rest.
+    turbulence: vec2<f32>,
 };
 
 struct RiverEnvelope {
@@ -694,6 +694,9 @@ const RIVER_BANK_UNION_ROUNDING: f32 = 2.8;
 const RIVER_BANK_UNION_SHORE_BLEND: f32 = 0.75;
 const RIVER_BANK_UNION_INTRUSION: f32 = 0.6;
 const RIVER_MAX_CANDIDATES: u32 = 64u;
+// How far behind the nearest channel, in riverScore, another channel's water
+// still counts: each weighs exp(-behind/RIVER_OWNER_BLEND) (OWNER_BLEND).
+const RIVER_OWNER_BLEND: f32 = 0.25;
 
 fn riverNone() -> RiverEnvelope
 {
@@ -734,7 +737,7 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
     let skew = mix(segment.skew.x, segment.skew.y, t);
     let speed = mix(segment.speed.x, segment.speed.y, t);
     var envelope = RiverEnvelope(RIVER_NONE, -RIVER_NONE, pastBank, water,
-                                 direction*speed, halfWidth, segment.turbulence, skew*across,
+                                 direction*speed, halfWidth, mix(segment.turbulence.x, segment.turbulence.y, t), skew*across,
                                  RIVER_NO_LAKE);
     if (pastBank < 0.0)
     {
@@ -805,6 +808,64 @@ fn riverCombine(total: ptr<function, RiverEnvelope>, next: RiverEnvelope)
     }
 }
 
+// The water a point belongs to, blended over every channel near it by how far
+// behind the nearest each lies (carve.rs OwnerBlend): where two channels'
+// waters meet, the water level, current, width, whitewater and bend hand over
+// smoothly instead of switching along a line. An online softmax: one pass.
+struct RiverOwnerBlend {
+    best: f32,
+    weight: f32,
+    water: f32,
+    velocity: vec2<f32>,
+    half_width: f32,
+    turbulence: f32,
+    bend: f32,
+};
+
+fn riverOwnerBlendAdd(blend: ptr<function, RiverOwnerBlend>, next: RiverEnvelope)
+{
+    if (next.bank_distance >= RIVER_NONE) { return; }
+    let score = riverScore(next);
+    var k = 1.0;
+    if ((*blend).weight == 0.0)
+    {
+        (*blend).best = score;
+    }
+    else if (score < (*blend).best)
+    {
+        // A nearer channel: what was gathered so far falls behind it.
+        let fade = exp(-((*blend).best - score)/RIVER_OWNER_BLEND);
+        (*blend).weight *= fade;
+        (*blend).water *= fade;
+        (*blend).velocity *= fade;
+        (*blend).half_width *= fade;
+        (*blend).turbulence *= fade;
+        (*blend).bend *= fade;
+        (*blend).best = score;
+    }
+    else
+    {
+        k = exp(-(score - (*blend).best)/RIVER_OWNER_BLEND);
+    }
+    (*blend).weight += k;
+    (*blend).water += k*next.water;
+    (*blend).velocity += k*next.velocity;
+    (*blend).half_width += k*next.half_width;
+    (*blend).turbulence += k*next.turbulence;
+    (*blend).bend += k*next.bend;
+}
+
+fn riverOwnerBlendApply(blend: RiverOwnerBlend, total: ptr<function, RiverEnvelope>)
+{
+    if (blend.weight <= 0.0) { return; }
+    let inverse = 1.0/blend.weight;
+    (*total).water = blend.water*inverse;
+    (*total).velocity = blend.velocity*inverse;
+    (*total).half_width = blend.half_width*inverse;
+    (*total).turbulence = blend.turbulence*inverse;
+    (*total).bend = blend.bend*inverse;
+}
+
 // Round a pair against the unchanged raw upper minimum. The caller takes
 // the lowest pair once, so segment count cannot accumulate excavation.
 fn riverBankSurfaceSlope(segment: RiverSegment) -> f32
@@ -851,13 +912,16 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
     let offset = river_grid[entry];
     let count = min(river_grid[entry + 1u], RIVER_MAX_CANDIDATES);
     var primary = 0xffffffffu;
+    var blend = RiverOwnerBlend(0.0, 0.0, 0.0, vec2<f32>(0.0), 0.0, 0.0, 0.0);
     for (var i = 0u; i < count; i += 1u)
     {
         let index = river_grid[offset + i];
         let envelope = riverSegmentEnvelope(river_segments[index], p);
         if (envelope.upper < total.upper) { primary = index; }
         riverCombine(&total, envelope);
+        riverOwnerBlendAdd(&blend, envelope);
     }
+    riverOwnerBlendApply(blend, &total);
     // Continue the bank rounding through its shallow shoreline strip, then
     // fade it out smoothly before the undisturbed channel bed.
     if (primary != 0xffffffffu && total.bank_distance > -RIVER_BANK_UNION_SHORE_BLEND)

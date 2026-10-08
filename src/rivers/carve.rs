@@ -107,10 +107,10 @@ pub struct RiverSegment {
     /// down the reach after its end (`segment_envelope`). A start below zero
     /// has no reach before it, and the segment starts flat.
     pub cap_slope: [f32; 2],
-    /// Whitewater, 0 calm to 1 a cascade down rapids: rough beds, bare rock
-    /// and foam.
-    pub turbulence: f32,
-    pub padding: f32,
+    /// Whitewater, 0 calm to 1 a cascade down rapids (rough beds, bare rock
+    /// and foam), at the start and end: given at both ends like the rest, so
+    /// the bed does not change from gravel to rock along a line at a node.
+    pub turbulence: [f32; 2],
 }
 
 const _: () = assert!(std::mem::size_of::<RiverSegment>() == 88);
@@ -281,7 +281,7 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
         water,
         velocity: [direction[0] * speed, direction[1] * speed],
         half_width,
-        turbulence: segment.turbulence,
+        turbulence: mix(segment.turbulence[0], segment.turbulence[1], t),
         bend: skew * across,
         lake: f32::NEG_INFINITY,
     };
@@ -679,9 +679,81 @@ impl SegmentGrid {
     }
 }
 
+/// How far behind the nearest channel, in the `combine` score (metres past
+/// a waterline in that channel's widths), another channel's water still
+/// counts: each weighs `exp(-behind / OWNER_BLEND)`.
+pub const OWNER_BLEND: f32 = 0.25;
+
+/// The water a point belongs to, blended over every channel near it by how
+/// far behind the nearest each lies: where two channels' waters meet (a creek
+/// running into its river), the water level, current, width, whitewater and
+/// bend under them hand over smoothly instead of switching along a line,
+/// where the bed would change from the creek's gravel to the river's rock.
+/// Within one channel its neighbouring segments agree, so blending them
+/// changes nothing. An online softmax, so one pass serves; mirrored by
+/// `RiverOwnerBlend` in river-functions.wgslinc.
+#[derive(Clone, Copy, Debug)]
+pub struct OwnerBlend {
+    best: f32,
+    weight: f32,
+    water: f32,
+    velocity: [f32; 2],
+    half_width: f32,
+    turbulence: f32,
+    bend: f32,
+}
+
+impl OwnerBlend {
+    pub const NONE: OwnerBlend = OwnerBlend { best: 0.0, weight: 0.0, water: 0.0, velocity: [0.0; 2], half_width: 0.0, turbulence: 0.0, bend: 0.0 };
+
+    pub fn add(&mut self, next: &Envelope) {
+        if next.is_none() {
+            return;
+        }
+        let score = next.bank_distance / next.half_width.clamp(0.5, 4.0);
+        let k = if self.weight == 0.0 {
+            self.best = score;
+            1.0
+        } else if score < self.best {
+            // A nearer channel: what was gathered so far falls behind it.
+            let fade = (-(self.best - score) / OWNER_BLEND).exp();
+            self.weight *= fade;
+            self.water *= fade;
+            self.velocity = [self.velocity[0] * fade, self.velocity[1] * fade];
+            self.half_width *= fade;
+            self.turbulence *= fade;
+            self.bend *= fade;
+            self.best = score;
+            1.0
+        } else {
+            (-(score - self.best) / OWNER_BLEND).exp()
+        };
+        self.weight += k;
+        self.water += k * next.water;
+        self.velocity = [self.velocity[0] + k * next.velocity[0], self.velocity[1] + k * next.velocity[1]];
+        self.half_width += k * next.half_width;
+        self.turbulence += k * next.turbulence;
+        self.bend += k * next.bend;
+    }
+
+    /// The blend in place of the nearest channel's own values.
+    pub fn apply(&self, total: &mut Envelope) {
+        if self.weight <= 0.0 {
+            return;
+        }
+        let inverse = 1.0 / self.weight;
+        total.water = self.water * inverse;
+        total.velocity = [self.velocity[0] * inverse, self.velocity[1] * inverse];
+        total.half_width = self.half_width * inverse;
+        total.turbulence = self.turbulence * inverse;
+        total.bend = self.bend * inverse;
+    }
+}
+
 /// The envelope of every segment near `p`.
 pub fn envelope_at(segments: &[RiverSegment], grid: &SegmentGrid, p: [f32; 2]) -> Envelope {
     let mut total = Envelope::NONE;
+    let mut blend = OwnerBlend::NONE;
     let candidates = grid.candidates(p);
     let mut primary = None;
     for &index in candidates.iter().take(MAX_CANDIDATES) {
@@ -690,7 +762,9 @@ pub fn envelope_at(segments: &[RiverSegment], grid: &SegmentGrid, p: [f32; 2]) -
             primary = Some(index as usize);
         }
         combine(&mut total, &envelope);
+        blend.add(&envelope);
     }
+    blend.apply(&mut total);
     round_bank_union(&mut total, segments, candidates, p, primary);
     let lake = grid.lake(p);
     if lake > NO_LAKE {

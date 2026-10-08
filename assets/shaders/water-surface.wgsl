@@ -1963,6 +1963,9 @@ struct RiverVertexOutput
     // lake's sheet), z foam drifting down from whitewater upstream, w how far
     // the water has turned to the sea's (1 where a river meets the sea).
     @location(3) stream: vec4<f32>,
+    // Metres across the channel in its own frame, which runs on from a
+    // tributary into its parent's.
+    @location(4) side: f32,
 };
 
 @vertex
@@ -1976,6 +1979,7 @@ fn vs_river(
     @location(6) half_width: f32,
     @location(7) foam: f32,
     @location(8) sea: f32,
+    @location(9) side: f32,
 ) -> RiverVertexOutput
 {
     // A distant channel is narrower than the clipmap's triangles there,
@@ -1995,6 +1999,7 @@ fn vs_river(
     out.velocity = velocity;
     out.channel = vec4<f32>(across, turbulence, position.y, still);
     out.stream = vec4<f32>(along, half_width, foam, sea);
+    out.side = side;
     return out;
 }
 
@@ -2301,7 +2306,7 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     let speed = length(velocity);
     let downstream = select(vec2<f32>(1.0, 0.0), velocity/max(speed, 1e-4), river && speed > 1e-4);
     let cross_stream = vec2<f32>(-downstream.y, downstream.x);
-    let st = select(in.world_position.xz, vec2<f32>(along, across*half_width), river);
+    let st = select(in.world_position.xz, vec2<f32>(along, in.side), river);
     let flow = select(velocity, vec2<f32>(speed, 0.0), river);
     // The pixel's footprint along each axis of that frame: a grazing view
     // stretches it along the view, not across the flow.

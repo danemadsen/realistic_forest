@@ -1713,23 +1713,50 @@ fn grade_to_parent(water: &mut [f32], s: &[f64], floor: &[f32], lake: Option<(us
     }
 }
 
-/// How far `p` lies past a river's waterline (negative inside its channel),
-/// and the river's water and half width beside it, interpolated along its
-/// centreline.
-pub(super) fn beside_river(river: &River, p: [f64; 2]) -> (f32, f32, f32) {
-    let mut best = (f64::INFINITY, 0.0f32, 0.0f32);
-    for pair in river.nodes.windows(2) {
+/// The point of a river's centreline nearest `p`: how far `p` lies from it,
+/// and the river there, its nodes interpolated along the centreline.
+pub(super) fn nearest_node(river: &River, p: [f64; 2]) -> (f32, RiverNode) {
+    let mut best = (f64::INFINITY, 0usize, 0.0f64);
+    for (k, pair) in river.nodes.windows(2).enumerate() {
         let (a, b) = (&pair[0], &pair[1]);
         let pa = [a.position[0] as f64, a.position[1] as f64];
         let ab = [b.position[0] as f64 - pa[0], b.position[1] as f64 - pa[1]];
         let t = (((p[0] - pa[0]) * ab[0] + (p[1] - pa[1]) * ab[1]) / (ab[0] * ab[0] + ab[1] * ab[1]).max(1e-9)).clamp(0.0, 1.0);
         let d = distance(p, [pa[0] + ab[0] * t, pa[1] + ab[1] * t]);
         if d < best.0 {
-            let t = t as f32;
-            best = (d, a.half_width + (b.half_width - a.half_width) * t, a.water + (b.water - a.water) * t);
+            best = (d, k, t);
         }
     }
-    (best.0 as f32 - best.1, best.2, best.1)
+    let Some(a) = river.nodes.get(best.1) else {
+        return (f32::INFINITY, RiverNode::default());
+    };
+    let b = river.nodes.get(best.1 + 1).unwrap_or(a);
+    let t = best.2 as f32;
+    let mix = |x: f32, y: f32| x + (y - x) * t;
+    let node = RiverNode {
+        position: [mix(a.position[0], b.position[0]), mix(a.position[1], b.position[1])],
+        water: mix(a.water, b.water),
+        half_width: mix(a.half_width, b.half_width),
+        depth: mix(a.depth, b.depth),
+        speed: mix(a.speed, b.speed),
+        discharge: mix(a.discharge, b.discharge),
+        area: mix(a.area, b.area),
+        bank: mix(a.bank, b.bank),
+        skew: mix(a.skew, b.skew),
+        turbulence: mix(a.turbulence, b.turbulence),
+        slope: mix(a.slope, b.slope),
+        along: mix(a.along, b.along),
+        lake: a.lake && b.lake,
+    };
+    (best.0 as f32, node)
+}
+
+/// How far `p` lies past a river's waterline (negative inside its channel),
+/// and the river's water and half width beside it, interpolated along its
+/// centreline.
+pub(super) fn beside_river(river: &River, p: [f64; 2]) -> (f32, f32, f32) {
+    let (distance, node) = nearest_node(river, p);
+    (distance - node.half_width, node.water, node.half_width)
 }
 
 /// Where a tributary's water joins its parent's: the first point of the
@@ -1758,6 +1785,48 @@ pub(super) fn first_contact(past: &[f32], areas: &[f32], lakes: &[bool]) -> usiz
         contact -= 1;
     }
     contact
+}
+
+/// Metres up a tributary from where it reaches its parent over which its
+/// water takes on the parent's (at least six of its own widths).
+const MERGE_REACH: f32 = 12.0;
+
+/// Where a tributary reaches its parent (`first_contact`), and how far its
+/// water has become the parent's at each node, 0 to 1: none above
+/// `MERGE_REACH` before there, all of it from there on, never in a lake.
+pub(super) fn merge_weights(nodes: &[RiverNode], parent: &River) -> (usize, Vec<f32>) {
+    if nodes.is_empty() {
+        return (0, Vec::new());
+    }
+    let past: Vec<f32> = nodes.iter().map(|n| beside_river(parent, [n.position[0] as f64, n.position[1] as f64]).0).collect();
+    let areas: Vec<f32> = nodes.iter().map(|n| n.area).collect();
+    let lakes: Vec<bool> = nodes.iter().map(|n| n.lake).collect();
+    let contact = first_contact(&past, &areas, &lakes);
+    let at = nodes[contact].along;
+    let reach = MERGE_REACH.max(6.0 * nodes[contact].half_width);
+    (contact, nodes.iter().map(|n| if n.lake { 0.0 } else { smoothstep(at - reach, at, n.along) }).collect())
+}
+
+/// Where a tributary runs into its parent, its water becomes the parent's:
+/// over its last metres its whitewater and its speed take on the parent's
+/// beside it, so the bed under the merged water, whichever channel the
+/// ground answers to, sorts the same rock and gravel and the drawn water
+/// the same foam; and its bed deepens to meet the parent's rather than
+/// hanging over it, a step down the parent's channel wall.
+fn merge_with_parent(nodes: &mut [RiverNode], parent: &River) {
+    let (_, weights) = merge_weights(nodes, parent);
+    for (node, merge) in nodes.iter_mut().zip(weights) {
+        if merge <= 0.0 {
+            continue;
+        }
+        let (distance, there) = nearest_node(parent, [node.position[0] as f64, node.position[1] as f64]);
+        node.turbulence += (there.turbulence - node.turbulence) * merge;
+        node.speed += (there.speed - node.speed) * merge;
+        // The parent's bed under the node, a flat-bottomed bowl as carved.
+        let u = (distance / there.half_width.max(0.05)).min(1.0);
+        let bed = there.depth * (1.0 - u * u * u * u);
+        node.depth += (node.depth.max(bed) - node.depth) * merge;
+    }
 }
 
 /// From where a tributary reaches its parent on, its surface is the
@@ -2791,6 +2860,11 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
         if end == RiverEnd::Sea {
             grade_estuary(&mut nodes, surface_end, |p| base_height(noise, p[0], p[1]));
         }
+        if let RiverEnd::Confluence(parent, _) = end
+            && let Some(parent_river) = rivers[parent].as_ref()
+        {
+            merge_with_parent(&mut nodes, parent_river);
+        }
         for (k, node) in nodes.iter().enumerate() {
             let cell = [
                 (node.position[0] as f64 / JOIN_CELL).floor() as i64,
@@ -3768,7 +3842,7 @@ fn build_segments_on_ground(
                 skew: [a.skew, b.skew],
                 levee: [levee_at(i), levee_at(i + 1)],
                 cap_slope: [before, after],
-                turbulence: a.turbulence.max(b.turbulence),
+                turbulence: [a.turbulence, b.turbulence],
                 ..Default::default()
             };
             segments.push(reach_segment);
@@ -4015,6 +4089,45 @@ mod tests {
             }
         }
         assert!(backed > 100, "{backed}");
+    }
+
+    /// Over its last metres a creek's water becomes its river's: its
+    /// whitewater and speed come to the river's beside it and its bed
+    /// deepens to the river's instead of hanging over it. Far above, it is
+    /// its own.
+    #[test]
+    fn a_tributary_takes_on_its_parents_water_where_it_runs_in() {
+        let parent_node = |k: i32| RiverNode {
+            position: [-40.0 + 4.0 * k as f32, 0.0],
+            water: 5.0,
+            half_width: 2.0,
+            depth: 0.8,
+            speed: 2.0,
+            turbulence: 0.8,
+            along: 4.0 * k as f32,
+            ..Default::default()
+        };
+        let parent = River { nodes: (0..=20).map(parent_node).collect(), end: RiverEnd::Edge, surface_end: 20 };
+        // Straight in from the side, ending on the river's centreline.
+        let creek_node = |k: i32| RiverNode {
+            position: [0.0, -30.0 + 2.0 * k as f32],
+            water: 5.0,
+            half_width: 1.0,
+            depth: 0.3,
+            speed: 0.6,
+            turbulence: 0.1,
+            along: 2.0 * k as f32,
+            ..Default::default()
+        };
+        let mut nodes: Vec<RiverNode> = (0..=15).map(creek_node).collect();
+        merge_with_parent(&mut nodes, &parent);
+        let (first, last) = (&nodes[0], &nodes[15]);
+        assert_eq!((first.turbulence, first.speed, first.depth), (0.1, 0.6, 0.3), "{first:?}");
+        assert!((last.turbulence - 0.8).abs() < 1e-5 && (last.speed - 2.0).abs() < 1e-5, "{last:?}");
+        assert!(last.depth >= 0.8 - 1e-5, "{last:?}");
+        for pair in nodes.windows(2) {
+            assert!(pair[1].turbulence >= pair[0].turbulence && pair[1].depth >= pair[0].depth, "{pair:?}");
+        }
     }
 
     /// Channels are as deep and as fast as real ones of their size.
