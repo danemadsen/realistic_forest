@@ -1808,11 +1808,13 @@ pub(super) fn merge_weights(nodes: &[RiverNode], parent: &River) -> (usize, Vec<
 }
 
 /// Where a tributary runs into its parent, its water becomes the parent's:
-/// over its last metres its whitewater and its speed take on the parent's
-/// beside it, so the bed under the merged water, whichever channel the
-/// ground answers to, sorts the same rock and gravel and the drawn water
-/// the same foam; and its bed deepens to meet the parent's rather than
-/// hanging over it, a step down the parent's channel wall.
+/// over its last metres its current comes to the parent's speed beside it,
+/// and its bed deepens to meet the parent's rather than hanging over it, a
+/// step down the parent's channel wall. Its whitewater stays its own to the
+/// parent's waterline (a calm creek stays calm across its own mouth) and
+/// becomes the parent's halfway in to its centre, as the drawn surface does
+/// (`surface::merge_into`), so the bed its course carves through the
+/// parent's channel is the parent's rock.
 fn merge_with_parent(nodes: &mut [RiverNode], parent: &River) {
     let (_, weights) = merge_weights(nodes, parent);
     for (node, merge) in nodes.iter_mut().zip(weights) {
@@ -1820,8 +1822,9 @@ fn merge_with_parent(nodes: &mut [RiverNode], parent: &River) {
             continue;
         }
         let (distance, there) = nearest_node(parent, [node.position[0] as f64, node.position[1] as f64]);
-        node.turbulence += (there.turbulence - node.turbulence) * merge;
         node.speed += (there.speed - node.speed) * merge;
+        let inside = smoothstep(0.0, 0.5, 1.0 - distance / there.half_width.max(0.05));
+        node.turbulence += (there.turbulence - node.turbulence) * inside * merge;
         // The parent's bed under the node, a flat-bottomed bowl as carved.
         let u = (distance / there.half_width.max(0.05)).min(1.0);
         let bed = there.depth * (1.0 - u * u * u * u);
@@ -4090,10 +4093,11 @@ mod tests {
         assert!(backed > 100, "{backed}");
     }
 
-    /// Over its last metres a creek's water becomes its river's: its
-    /// whitewater and speed come to the river's beside it and its bed
-    /// deepens to the river's instead of hanging over it. Far above, it is
-    /// its own.
+    /// Over its last metres a creek's water becomes its river's: its speed
+    /// comes to the river's beside it and its bed deepens to the river's
+    /// instead of hanging over it; it keeps its own whitewater to the
+    /// river's waterline and takes on the river's inside it. Far above, it
+    /// is all its own.
     #[test]
     fn a_tributary_takes_on_its_parents_water_where_it_runs_in() {
         let parent_node = |k: i32| RiverNode {
@@ -4124,8 +4128,12 @@ mod tests {
         assert_eq!((first.turbulence, first.speed, first.depth), (0.1, 0.6, 0.3), "{first:?}");
         assert!((last.turbulence - 0.8).abs() < 1e-5 && (last.speed - 2.0).abs() < 1e-5, "{last:?}");
         assert!(last.depth >= 0.8 - 1e-5, "{last:?}");
+        // Its own mouth, outside the river's waterline (2 m), stays calm.
+        let mouth = &nodes[14];
+        assert!(mouth.position[1] == -2.0 && mouth.turbulence == 0.1, "{mouth:?}");
         for pair in nodes.windows(2) {
-            assert!(pair[1].turbulence >= pair[0].turbulence && pair[1].depth >= pair[0].depth, "{pair:?}");
+            let [a, b] = [&pair[0], &pair[1]];
+            assert!(b.speed >= a.speed && b.depth >= a.depth && b.turbulence >= a.turbulence, "{pair:?}");
         }
     }
 

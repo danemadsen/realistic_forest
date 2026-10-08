@@ -1307,8 +1307,10 @@ mod tests {
         seams_around(&noise, &network, &index, [497.0, 1506.0], 24.0, &mut seams);
         assert!(seams.samples > 1000, "{}", seams.samples);
         // A few steep changes are left right at the waterline, where the
-        // creek's current falls to nothing against its bank.
-        let limits = [0, 4, 0, 6, 0, 3, 3];
+        // creek's current falls to nothing against its bank, and where the
+        // calm creek's gravel bed turns to the white river's rock over half a
+        // metre at the river's waterline.
+        let limits = [0, 4, 0, 6, 1, 3, 3];
         for kind in 0..SEAM_KINDS {
             assert!(seams.steps[kind] <= limits[kind], "{} {} seams (worst {:?})", seams.steps[kind], SEAM_NAMES[kind], seams.worst[kind]);
         }

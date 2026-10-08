@@ -750,9 +750,10 @@ some metres before it reaches the thalweg, past water standing higher than
 where it ends, and graded to the level at its end it would run in under the
 river's water where the two channels already lie open to each other. Over
 its last 12 m (six of its widths on a larger one) before it reaches the
-parent its water becomes the parent's: its speed and whitewater come to the
-parent's beside it, and its bed deepens to the parent's instead of hanging
-over it. Its surface does the same where they meet (see The water). A
+parent its water becomes the parent's: its current comes to the parent's
+speed beside it, and its bed deepens to the parent's instead of hanging
+over it; its whitewater stays its own to the parent's waterline and becomes
+the parent's halfway in to its centre. Its surface does the same where they meet (see The water). A
 tributary standing under its parent where it reaches it (out of a lake at
 the foot of the parent's fall into it) keeps its own water, and lies just
 under the parent's ribbon wherever that reaches over it. A lake's water keeps its level:
