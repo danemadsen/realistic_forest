@@ -1888,6 +1888,16 @@ const RIVER_NOISE_SLOPE_VARIANCE: f32 = 0.187;
 const RIVER_STEP_SPACING: f32 = 4.0;
 const RIVER_TONGUE_WANDER: f32 = 18.0;
 
+// Where a rapid's bed steps, 0..1 about 0.5, at metres `along` its channel
+// and `across` it in half widths: ledges a few metres apart drawn out
+// downstream, broken by boulders at a third of their scale.
+fn riverSteps(along: f32, across: f32) -> f32
+{
+    let ledges = valueNoise(vec2<f32>(along/(1.6*RIVER_STEP_SPACING), across*1.7 + 3.1));
+    let boulders = valueNoise(vec2<f32>(along/(0.45*RIVER_STEP_SPACING) + 7.3, across*4.1 + 1.7));
+    return 0.5 + (ledges - 0.5)*1.15 + (boulders - 0.5)*0.55;
+}
+
 // One cycle of a flow-mapped layer: a texture carried by the current for
 // `period` seconds and then laid down afresh, two such layers half a cycle
 // apart so one is always at its height while the other is renewed. Their
@@ -2247,8 +2257,11 @@ fn surroundings(world_xz: vec2<f32>, level: f32, reflection: vec3<f32>, alpha: f
         let to_bank = half_width*(1.0 - across*sign(sideways))/max(abs(sideways), 0.05);
         horizon = max(horizon, 1.35/(max(to_bank, 0.0) + 2.0)*(1.0 - fine));
     }
-    // The lobe's spread, in the same tangent measure.
-    let spread = (0.04 + 1.5*alpha)*(1.0 + rise*rise);
+    // The lobe's spread, in the same tangent measure, widened by how little
+    // six taps and a canopy map can say about where the horizon really is:
+    // a crown's silhouette is not a line, and on glassy water a hard edge
+    // would cut the trees' reflection out of the sky as one flat blot.
+    let spread = (0.04 + 1.5*alpha)*(1.0 + rise*rise) + 0.3*horizon;
     var sky = smoothstepf(horizon - spread, horizon + spread, rise);
     // Crowns over the water itself hide even the steep rays.
     sky *= mix(1.0, here.a, smoothstepf(0.3, 1.5, rise));
@@ -2603,9 +2616,11 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
 
     // Whitewater gathers where the bed steps: over the ledges and boulders
     // of a rapid, with dark glassy tongues of water running between them.
-    // The steps stay put as the water runs over them.
-    let step_noise = mix(valueNoise(vec2<f32>(along/RIVER_STEP_SPACING, across*1.7 + 3.1)),
-                         valueNoise(vec2<f32>(joined_st.x/RIVER_STEP_SPACING, across*1.7 + 3.1)), joining);
+    // The steps stay put as the water runs over them. A ledge throws its
+    // white water out in a train downstream of it, and the boulders between
+    // break it up, so the steps are drawn out along the flow and broken by a
+    // finer scale, not laid as round patches.
+    let step_noise = mix(riverSteps(along, across), riverSteps(joined_st.x, across), joining);
     let steps = smoothstepf(0.25, 0.75, 0.5 + (step_noise - 0.5)*restore);
     // Rapids turn milky below each step, where the water plunges and fills
     // with bubbles, and run clear over the smooth tongues between.
