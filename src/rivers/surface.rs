@@ -26,7 +26,7 @@ use super::network::{FLOW_CELL, Lake, River, RiverEnd};
 use crate::constants::SEA_LEVEL;
 use std::collections::HashMap;
 
-/// One water-surface vertex: 52 bytes, mirrored by the river vertex inputs
+/// One water-surface vertex: 64 bytes, mirrored by the river vertex inputs
 /// in water-surface.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -61,12 +61,39 @@ pub struct SurfaceVertex {
     pub sea: f32,
     /// Metres across the channel in the ribbon's own frame: `across` times
     /// `half_width`. A tributary's frame (this and `along`) is shifted to
-    /// run on into its parent's where it reaches it, so its ripples meet the
-    /// parent's. 0 on a lake.
+    /// line up with its parent's where it reaches it. 0 on a lake.
     pub side: f32,
+    /// Where a tributary's water becomes its parent's: the parent's frame
+    /// (`along`, `side`) here and how far the ripples and foam are laid in
+    /// it rather than the tributary's own, 0 to 1. Two frames at an angle
+    /// cannot be blended into one without squeezing the ripples between
+    /// them, so the shader draws them in both and cross-fades. Elsewhere the
+    /// ribbon's own frame and 0.
+    pub joined: [f32; 3],
 }
 
-const _: () = assert!(std::mem::size_of::<SurfaceVertex>() == 52);
+const _: () = assert!(std::mem::size_of::<SurfaceVertex>() == 64);
+
+/// How far the ripples drawn change between two points of the water: the
+/// change of each frame they are laid in, by its share of the cross-fade
+/// (`SurfaceVertex::joined`), and of the cross-fade itself. A point with no
+/// cross-fade shows the same ripples whatever its share, so it takes the
+/// other's: a tributary that has all become its parent's water meets the
+/// parent's own frame.
+pub fn pattern_frame_change(a: &SurfaceVertex, b: &SurfaceVertex) -> f32 {
+    let apart = |p: [f32; 2], q: [f32; 2]| (p[0] - q[0]).hypot(p[1] - q[1]);
+    let own = |v: &SurfaceVertex| [v.along, v.side];
+    let into = |v: &SurfaceVertex| if v.joined[2] > 0.0 { [v.joined[0], v.joined[1]] } else { own(v) };
+    let (mut wa, mut wb) = (a.joined[2].clamp(0.0, 1.0), b.joined[2].clamp(0.0, 1.0));
+    if wa <= 0.0 {
+        wa = wb;
+    } else if wb <= 0.0 {
+        wb = wa;
+    }
+    let share = 0.5 * (wa + wb);
+    let fade = (wa - wb).abs() * 0.5 * (apart(own(a), into(a)) + apart(own(b), into(b)));
+    (1.0 - share) * apart(own(a), own(b)) + share * apart(into(a), into(b)) + fade
+}
 
 /// Side of a culling chunk, metres.
 pub const CHUNK: f32 = 256.0;
@@ -311,9 +338,9 @@ fn join_rows(a: Row, b: Row, out: &mut Vec<u32>) {
 
 /// Vertices weighed together, every attribute alike.
 fn weigh(parts: &[(SurfaceVertex, f32)]) -> SurfaceVertex {
-    let mut sum = [0.0f32; 13];
+    let mut sum = [0.0f32; 16];
     for &(vertex, weight) in parts {
-        let fields: [f32; 13] = bytemuck::cast(vertex);
+        let fields: [f32; 16] = bytemuck::cast(vertex);
         for (total, field) in sum.iter_mut().zip(fields) {
             *total += field * weight;
         }
@@ -459,8 +486,15 @@ fn merge_into(
     };
     let joined = parent.position[1] + OVER_PARENT - (OVER_PARENT + UNDER_PARENT) * dip;
     let level = before + (joined - before) * merge * near;
-    let mut vertex = mix_vertex(own, parent, share * merge * near);
+    let share = share * merge * near;
+    let mut vertex = mix_vertex(own, parent, share);
     vertex.position = [own.position[0], level, own.position[2]];
+    // Its ripples keep its own frame, cross-faded into the parent's as
+    // drawn (as it reaches on out past the parent's edge, off its ribbon).
+    vertex.along = own.along;
+    vertex.side = own.side;
+    let frame = if parent.joined[2] > 0.5 { [parent.joined[0], parent.joined[1]] } else { [parent.along, parent.side] };
+    vertex.joined = if share > 0.0 { [frame[0], frame[1] + gap * frame[1].signum(), share] } else { own.joined };
     vertex
 }
 
@@ -804,6 +838,7 @@ fn ribbon(
                     foam: foam[i],
                     sea,
                     side: offset + side_offset,
+                    joined: [node.along + along_offset, offset + side_offset, 0.0],
                 }
             })
             .collect();
@@ -1003,6 +1038,7 @@ fn add_lake(
                 foam: 0.0,
                 sea: 0.0,
                 side: 0.0,
+                joined: [0.0; 3],
             });
             vertices.len() as u32 - 1
         };
@@ -1179,7 +1215,7 @@ mod tests {
                         (a.position[1] - b.position[1]).abs(),
                         (a.velocity[0] - b.velocity[0]).hypot(a.velocity[1] - b.velocity[1]),
                         (a.turbulence - b.turbulence).abs().max((a.foam - b.foam).abs()),
-                        (a.along - b.along).hypot(a.side - b.side),
+                        pattern_frame_change(&a, &b),
                     ];
                     for (worst, change) in worst.iter_mut().zip(changes) {
                         *worst = worst.max(change);
@@ -1189,8 +1225,11 @@ mod tests {
         }
         // An eighth of a metre apart: the trunk's water falls 1.25 cm, its
         // current turns from its core to its banks and the frame moves on as
-        // far again, a little more where the two waters blend.
-        let limits = [0.04, 0.5, 0.15, 0.5];
+        // far again, a little more where the two waters blend and the creek's
+        // ripples cross-fade into the trunk's over a metre or so. Without the
+        // blend, the trunk's edge across the creek's mouth steps the frame by
+        // tens of metres.
+        let limits = [0.04, 0.5, 0.15, 0.75];
         for (k, name) in ["height", "current", "whitewater", "frame"].iter().enumerate() {
             assert!(worst[k] < limits[k], "{name} steps {} between neighbouring samples", worst[k]);
         }

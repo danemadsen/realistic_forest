@@ -1069,9 +1069,12 @@ past the parent's waterline to a little over halfway to its centre, and only
 once it is all the parent's does it dip under it; out past its own waterline, toward its
 ribbon's side edges, and over its last 1.5 m, it becomes the parent's too.
 Its rows and columns close up to half a metre over the merge, so it follows
-the parent's surface closely, and its ripple frame is shifted to run on from
-the parent's where it reaches it. Wherever one surface shows beside the
-other they carry the same water, so no line crosses the junction.
+the parent's surface closely. Its ripples, whitewater steps and foam are
+drawn in both its own frame and the parent's, cross-faded as its water
+becomes the parent's (with their contrast held), since two frames meeting
+at an angle cannot be blended into one without squeezing the ripples
+between them. Wherever one surface shows beside the other they carry the
+same water, so no line crosses the junction.
 
 The river shader (`vs_river`/`fs_river` in `water-surface.wgsl`) shades the
 water with the sea's own optics, sky and screen-space reflections, sun
@@ -1094,8 +1097,8 @@ sheet. On top of that:
   it the sky. A creek in its cut under the trees is dark but for a strip of
   sky down its corridor; a pond in a clearing keeps its sky.
 - **The stream's own frame.** Ripples live in metres down and across the
-  channel, so they follow every bend; a tributary's frame runs on into its
-  parent's. Two advected phases stream at the
+  channel, so they follow every bend, and cross-fade into a parent's
+  where a tributary joins it. Two advected phases stream at the
   water's own speed, drawn out along fast water; standing waves stand still
   over riffles, fixed to the bed, while ripples and foam stream through
   them; boils swell glassy on runs and pools; gusts dull open water in cat's

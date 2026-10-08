@@ -588,6 +588,7 @@ impl<'a> SurfaceIndex<'a> {
                 foam: mix(&|v| v.foam),
                 sea: mix(&|v| v.sea),
                 side: mix(&|v| v.side),
+                joined: [mix(&|v| v.joined[0]), mix(&|v| v.joined[1]), mix(&|v| v.joined[2])],
             });
         });
         top
@@ -628,8 +629,9 @@ impl<'a> SurfaceIndex<'a> {
 /// them, so a ramp or a kink is none, however steep:
 /// - in the water drawn on top: its height, its current, its whitewater
 ///   (turbulence and drifting foam) and its ripple frame (`along` and
-///   `side`, in metres), which the shader lays its
-///   ripples, standing waves and foam in;
+///   `side`, in metres, cross-faded into the parent's where a tributary
+///   joins it), which the shader lays its ripples, standing waves and foam
+///   in;
 /// - in the bed the terrain paints under the water: the whitewater, speed
 ///   and water level of the channel the envelope hands the point to.
 #[derive(Default)]
@@ -643,6 +645,9 @@ pub struct JunctionSeams {
 }
 
 pub const SEAM_KINDS: usize = 7;
+/// The kind measuring the ripples' frame, which is cross-faded where a
+/// tributary's water becomes its parent's (`surface::pattern_frame_change`).
+const FRAME_SEAM: usize = 3;
 pub const SEAM_NAMES: [&str; SEAM_KINDS] = ["height", "current", "whitewater", "frame", "bed whitewater", "bed speed", "bed level"];
 /// A step this far beyond the change either side of it is a seam.
 pub const SEAM_LIMITS: [f32; SEAM_KINDS] = [0.03, 0.3, 0.1, 0.5, 0.1, 0.3, 0.03];
@@ -673,7 +678,7 @@ pub fn seams_around(noise: &NoiseField, network: &RiverNetwork, index: &SurfaceI
                 vec![top.position[1]],
                 vec![top.velocity[0], top.velocity[1]],
                 vec![top.turbulence.max(top.foam)],
-                vec![top.along, top.side],
+                vec![top.along, top.side, top.joined[0], top.joined[1], top.joined[2]],
                 bed(envelope.turbulence),
                 bed(envelope.velocity[0].hypot(envelope.velocity[1])),
                 bed(envelope.water),
@@ -681,11 +686,16 @@ pub fn seams_around(noise: &NoiseField, network: &RiverNetwork, index: &SurfaceI
         }
     }
     // The change between two samples of one kind: the length of the
-    // difference of their measures, if both have them.
+    // difference of their measures (the frame's as the ripples show it), if
+    // both have them.
     let change = |a: &Option<[Vec<f32>; SEAM_KINDS]>, b: &Option<[Vec<f32>; SEAM_KINDS]>, kind: usize| -> Option<f32> {
         let (a, b) = (a.as_ref()?, b.as_ref()?);
         if a[kind].is_empty() || b[kind].is_empty() {
             return None;
+        }
+        if kind == FRAME_SEAM {
+            let frame = |m: &[f32]| SurfaceVertex { along: m[0], side: m[1], joined: [m[2], m[3], m[4]], ..Default::default() };
+            return Some(super::surface::pattern_frame_change(&frame(&a[kind]), &frame(&b[kind])));
         }
         Some(a[kind].iter().zip(&b[kind]).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt())
     };
