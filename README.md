@@ -169,7 +169,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--no-vegetation` | Skip loading and scattering the trees, shrubs and flowers |
 | `--no-rivers` | Generate, carve and draw no rivers |
 | `--river-map path.png` | Render the river network from above, print its statistics and the rivers and lakes nearest `--map-centre`, then exit |
-| `--river-probe x,z` | Sample the carved base ground (no erosion) and the river envelope over `--map-extent` metres (default `128`) around a point every `--probe-step` metres (default `0.5`), write them to `<--probe-out>.f32` (default `river-probe`; seven little-endian `f32` per sample: base, carved, upper, lower, water, bank distance, lake), print the river nodes, carve segments and lakes there, then exit |
+| `--river-probe x,z` | Sample the carved base ground (no erosion) and the river envelope over `--map-extent` metres (default `128`) around a point every `--probe-step` metres (default `0.5`), write them to `<--probe-out>.f32` (default `river-probe`; ten little-endian `f32` per sample: base, carved, upper, lower, water, bank distance, lake, then the highest and lowest river ribbon and the lake sheet drawn over the point, or -10⁶ where none), print the river nodes, carve segments and lakes there, then exit |
 | `--vegetation-map path.png` | Render the plant scatter from above, print its statistics, then exit |
 | `--map-centre x,z`, `--map-extent M` | Area of the vegetation or river map: its centre (default `0,0`) and side in metres (default `1024`, or `8192` for the river map) |
 
@@ -742,7 +742,16 @@ confluences do, its mouth drowned in the parent's water and calm: over its
 last metres it stands at that level and above them rises at most 3 cm per
 metre, its channel cut down for it (a gorge where it comes down a steep
 valley side, and no more than 2.5 m farther up, fading to nothing 60 m up
-it, where any steeper water stays as rapids). A lake's water keeps its level:
+it, where any steeper water stays as rapids). It meets the parent's water
+where it first comes within reach of the parent's channel, at the level the
+parent stands at there, and from there on its surface is the parent's beside
+it: down a steep river a creek joining at a narrow angle runs beside it for
+some metres before it reaches the thalweg, past water standing higher than
+where it ends, and graded to the level at its end it would run in under the
+river's water where the two channels already lie open to each other. Where
+the parent's ribbon reaches over the tributary's, the tributary's lies just
+under it, so the parent's water is the one drawn and the tributary's never
+shows through it as a second surface. A lake's water keeps its level:
 where a tributary leaves a pond too close above the confluence to fall at
 3 cm per metre, it runs down from the pond's level as one even rapid to where
 it meets its parent, rather than dropping off the pond's edge. Where water seems held
@@ -752,7 +761,10 @@ sends its river out through that gap, and any other is routed again through
 a wider corridor.
 
 The water surface follows the channel's ground a hand or two below its banks
-(0.1 m plus a seventh of its depth) and only ever falls downstream: the
+(0.1 m plus a seventh of its depth), the lower of the ground at its two banks
+and at its centre, so across a hillside a stream cuts into the slope rather
+than standing above its downhill bank on an embankment, and only ever falls
+downstream: the
 surface is the falling profile that best fits the ground along the river (a
 least-squares, never-rising fit), so where the ground rises over a bump and
 falls again the river neither cuts the whole bump away nor floods the hollow
@@ -760,7 +772,7 @@ behind it, but meets them halfway, never standing above the natural ground.
 Down a steep reach that fit falls in steps, flat behind each little rise and
 steep between, which the channel and its banks would terrace into the
 hillside; there the surface is smoothed over a few channel widths (never
-lifted above the lowest ground it has passed in the last few widths, so it
+lifted above the lowest bank it has passed in the last few widths, so it
 cannot trace the rises, though below a cliff the fit drops off it is lifted
 to round the drop into a rapid),
 and across a bench it keeps falling at no less than a third of the reach's
@@ -842,7 +854,13 @@ shoulders (an estuary's a little firmer, cut through the beach rather than
 scooping a bowl out of it, and shallowing as it widens), with submerged bed
 transitions into the pond or seabed. The
 current slows as its cross-section expands, and accelerates again below
-an outlet's sill. The thalweg hugs the outside of every bend.
+an outlet's sill. A mouth is the reach drowned in the still water, though: it
+opens fully only where the river's water stands within 0.3 m of the lake's
+or the sea's level, and not at all where it stands 1.2 m from it, so a
+cascade down into a lake or to the sea, or an outlet's rapid well below its
+sill, keeps its own channel, banks and whitewater until it meets the water,
+rather than spreading into a broad, glassy, low-banked sheet sliding down
+the hillside over its banks. The thalweg hugs the outside of every bend.
 
 Submerged transitions follow the routed course and taper to zero within
 10 m, or less than half a pond crossing. Their footprint is checked against
@@ -862,13 +880,16 @@ or running along a slope above its valley's floor), how much of the lakes'
 sheet edges would stand over lower ground, how cleanly the rivers meet still
 water (rivers darting out of a lake and back, how far outlets fall below
 their lakes, river mouths cut off from the open sea, how far sheets dip
-under a river where they meet), and the rivers and lakes nearest
+under a river where they meet), how the ribbons sit (how often one stands in
+the air over dry ground beside its banks, or one river's water shows under
+another's), and the rivers and lakes nearest
 `--map-centre`, with each lake's inlets and outlets; `--map-extent` defaults
 to 8 km here. The spawn region holds some 160 rivers, 86 km of channel and
 170 lakes and ponds covering 290 ha; on gentle reaches the water stands about
-0.9 m under the natural ground on average (half of it under 0.61 m), under
-1 % of their length is trenched more than 3 m into it, and one of 127 river
-mouths does not reach open sea (a creek down a sea cliff).
+1.0 m under the natural ground on average (half of it under 0.71 m), under
+1 % of their length is trenched more than 3 m into it, one of 127 river
+mouths does not reach open sea (a creek down a sea cliff), and fewer than one
+in a thousand samples across the ribbons stands over dry ground past a bank.
 
 ### How they shape the ground
 
@@ -892,8 +913,12 @@ a node carve the same ground there; held constant along each segment, a bank
 or levee changed at every node, a step down the bank. A segment between two
 others has a round cap at either end, so nothing switches on along a line
 across the bank, and the water in a cap is the reach beside's: up the cap
-before its start it rises as the reach before falls, so the cap never cuts
-below that reach's bed, and down the cap past its end the levee falls as the
+before its start it rises as fast as the river does behind it, as far back
+as the cap reaches (the steepest of the reaches there, not just the one
+before, which at the foot of a cascade may fall gently into a wide,
+low-banked mouth while the cascade above it falls steeply), so the cap never
+cuts below their beds or scoops a bowl out of the hillside beside them, and
+down the cap past its end the levee falls as the
 reach after does: down a rapid steeper than the levee's outer slope, an end
 held up at its own water would stand over the next segment's lower levee, a
 ledge at every segment and a flight of steps down the bank. Round a cap the
