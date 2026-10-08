@@ -748,10 +748,15 @@ parent stands at there, and from there on its surface is the parent's beside
 it: down a steep river a creek joining at a narrow angle runs beside it for
 some metres before it reaches the thalweg, past water standing higher than
 where it ends, and graded to the level at its end it would run in under the
-river's water where the two channels already lie open to each other. Where
-the parent's ribbon reaches over the tributary's, the tributary's lies just
-under it, so the parent's water is the one drawn and the tributary's never
-shows through it as a second surface. A lake's water keeps its level:
+river's water where the two channels already lie open to each other. Over
+its last 12 m (six of its widths on a larger one) before it reaches the
+parent its water becomes the parent's: its current comes to the parent's
+speed beside it, and its bed deepens to the parent's instead of hanging
+over it; its whitewater stays its own to the parent's waterline and becomes
+the parent's halfway in to its centre. Its surface does the same where they meet (see The water). A
+tributary standing under its parent where it reaches it (out of a lake at
+the foot of the parent's fall into it) keeps its own water, and lies just
+under the parent's ribbon wherever that reaches over it. A lake's water keeps its level:
 where a tributary leaves a pond too close above the confluence to fall at
 3 cm per metre, it runs down from the pond's level as one even rapid to where
 it meets its parent, rather than dropping off the pond's edge. Where water seems held
@@ -882,7 +887,10 @@ water (rivers darting out of a lake and back, how far outlets fall below
 their lakes, river mouths cut off from the open sea, how far sheets dip
 under a river where they meet), how the ribbons sit (how often one stands in
 the air over dry ground beside its banks, or one river's water shows under
-another's), and the rivers and lakes nearest
+another's), how smoothly the water meets at each confluence (steps, sampled
+every quarter metre around it, in the height, current, whitewater and ripple
+frame of the water drawn on top and in the whitewater, speed and level of the
+bed the terrain paints under it), and the rivers and lakes nearest
 `--map-centre`, with each lake's inlets and outlets; `--map-extent` defaults
 to 8 km here. The spawn region holds some 160 rivers, 86 km of channel and
 170 lakes and ponds covering 290 ha; on gentle reaches the water stands about
@@ -901,14 +909,18 @@ and ground standing above it is cut back into a bank; just beyond the
 waterline the ground is held a little above the water and falls gently away
 from it, the broad, low natural levee a river builds, so the channel always
 contains its river. Bounds combine across segments (minimum above, maximum
-below), so confluences open into each other, and where the carve meets the
+below), so confluences open into each other. What the ground is shaded by
+(the water, current, width, whitewater and bend of the channel there) blends
+between the channels whose banks lie nearest, measured in their own widths,
+so under merged water the bed turns from one channel's rock to the other's
+gravel over a metre or so, not along a line. Where the carve meets the
 natural ground its creases are rounded (a smooth minimum and maximum over
 0.8 m of height), so a bank's top curves over into the land above it rather
 than breaking at an edge the terrain's triangles would draw as a saw-tooth.
 A bank's slope varies only over many widths along the river, so its top does
 not jog in and out from one segment to the next, and everything that shapes
 the channel (water, width, depth, bank slope, skew and levee) is given at
-both ends of a segment and interpolated along it, so two segments meeting at
+both ends of a segment and interpolated along it, as is its whitewater, so two segments meeting at
 a node carve the same ground there; held constant along each segment, a bank
 or levee changed at every node, a step down the bank. A segment between two
 others has a round cap at either end, so nothing switches on along a line
@@ -1048,6 +1060,23 @@ river's surface is lifted by about the bank those triangles leave so it still
 shows from a ridge (a lake, wide enough for any triangles, never is, and nor
 is a river near the still water it meets, so the two still meet from afar).
 
+Where a tributary runs into its parent, the two surfaces become one water.
+The parent's ribbon reaches past its waterline, under its banks, and so over
+the open water of the tributary's mouth; the tributary's ribbon runs on just
+over it there (2 cm), coming to the level of the parent's edge over the last
+2 m before it. Into the parent's channel it takes on the parent's surface as
+drawn, its height, current, whitewater, foam and ripple frame, from just
+past the parent's waterline to a little over halfway to its centre, and only
+once it is all the parent's does it dip under it; out past its own waterline, toward its
+ribbon's side edges, and over its last 1.5 m, it becomes the parent's too.
+Its rows and columns close up to half a metre over the merge, so it follows
+the parent's surface closely. Its ripples, whitewater steps and foam are
+drawn in both its own frame and the parent's, cross-faded as its water
+becomes the parent's (with their contrast held), since two frames meeting
+at an angle cannot be blended into one without squeezing the ripples
+between them. Wherever one surface shows beside the other they carry the
+same water, so no line crosses the junction.
+
 The river shader (`vs_river`/`fs_river` in `water-surface.wgsl`) shades the
 water with the sea's own optics, sky and screen-space reflections, sun
 glitter, refraction, rain rings and fog, and the plants' shadow cascades. Sun
@@ -1069,7 +1098,8 @@ sheet. On top of that:
   it the sky. A creek in its cut under the trees is dark but for a strip of
   sky down its corridor; a pond in a clearing keeps its sky.
 - **The stream's own frame.** Ripples live in metres down and across the
-  channel, so they follow every bend. Two advected phases stream at the
+  channel, so they follow every bend, and cross-fade into a parent's
+  where a tributary joins it. Two advected phases stream at the
   water's own speed, drawn out along fast water; standing waves stand still
   over riffles, fixed to the bed, while ripples and foam stream through
   them; boils swell glassy on runs and pools; gusts dull open water in cat's

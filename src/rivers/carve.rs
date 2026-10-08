@@ -107,10 +107,10 @@ pub struct RiverSegment {
     /// down the reach after its end (`segment_envelope`). A start below zero
     /// has no reach before it, and the segment starts flat.
     pub cap_slope: [f32; 2],
-    /// Whitewater, 0 calm to 1 a cascade down rapids: rough beds, bare rock
-    /// and foam.
-    pub turbulence: f32,
-    pub padding: f32,
+    /// Whitewater, 0 calm to 1 a cascade down rapids (rough beds, bare rock
+    /// and foam), at the start and end: given at both ends like the rest, so
+    /// the bed does not change from gravel to rock along a line at a node.
+    pub turbulence: [f32; 2],
 }
 
 const _: () = assert!(std::mem::size_of::<RiverSegment>() == 88);
@@ -281,7 +281,7 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
         water,
         velocity: [direction[0] * speed, direction[1] * speed],
         half_width,
-        turbulence: segment.turbulence,
+        turbulence: mix(segment.turbulence[0], segment.turbulence[1], t),
         bend: skew * across,
         lake: f32::NEG_INFINITY,
     };
@@ -679,9 +679,81 @@ impl SegmentGrid {
     }
 }
 
+/// How far behind the nearest channel, in the `combine` score (metres past
+/// a waterline in that channel's widths), another channel's water still
+/// counts: each weighs `exp(-behind / OWNER_BLEND)`.
+pub const OWNER_BLEND: f32 = 0.25;
+
+/// The water a point belongs to, blended over every channel near it by how
+/// far behind the nearest each lies: where two channels' waters meet (a creek
+/// running into its river), the water level, current, width, whitewater and
+/// bend under them hand over smoothly instead of switching along a line,
+/// where the bed would change from the creek's gravel to the river's rock.
+/// Within one channel its neighbouring segments agree, so blending them
+/// changes nothing. An online softmax, so one pass serves; mirrored by
+/// `RiverOwnerBlend` in river-functions.wgslinc.
+#[derive(Clone, Copy, Debug)]
+pub struct OwnerBlend {
+    best: f32,
+    weight: f32,
+    water: f32,
+    velocity: [f32; 2],
+    half_width: f32,
+    turbulence: f32,
+    bend: f32,
+}
+
+impl OwnerBlend {
+    pub const NONE: OwnerBlend = OwnerBlend { best: 0.0, weight: 0.0, water: 0.0, velocity: [0.0; 2], half_width: 0.0, turbulence: 0.0, bend: 0.0 };
+
+    pub fn add(&mut self, next: &Envelope) {
+        if next.is_none() {
+            return;
+        }
+        let score = next.bank_distance / next.half_width.clamp(0.5, 4.0);
+        let k = if self.weight == 0.0 {
+            self.best = score;
+            1.0
+        } else if score < self.best {
+            // A nearer channel: what was gathered so far falls behind it.
+            let fade = (-(self.best - score) / OWNER_BLEND).exp();
+            self.weight *= fade;
+            self.water *= fade;
+            self.velocity = [self.velocity[0] * fade, self.velocity[1] * fade];
+            self.half_width *= fade;
+            self.turbulence *= fade;
+            self.bend *= fade;
+            self.best = score;
+            1.0
+        } else {
+            (-(score - self.best) / OWNER_BLEND).exp()
+        };
+        self.weight += k;
+        self.water += k * next.water;
+        self.velocity = [self.velocity[0] + k * next.velocity[0], self.velocity[1] + k * next.velocity[1]];
+        self.half_width += k * next.half_width;
+        self.turbulence += k * next.turbulence;
+        self.bend += k * next.bend;
+    }
+
+    /// The blend in place of the nearest channel's own values.
+    pub fn apply(&self, total: &mut Envelope) {
+        if self.weight <= 0.0 {
+            return;
+        }
+        let inverse = 1.0 / self.weight;
+        total.water = self.water * inverse;
+        total.velocity = [self.velocity[0] * inverse, self.velocity[1] * inverse];
+        total.half_width = self.half_width * inverse;
+        total.turbulence = self.turbulence * inverse;
+        total.bend = self.bend * inverse;
+    }
+}
+
 /// The envelope of every segment near `p`.
 pub fn envelope_at(segments: &[RiverSegment], grid: &SegmentGrid, p: [f32; 2]) -> Envelope {
     let mut total = Envelope::NONE;
+    let mut blend = OwnerBlend::NONE;
     let candidates = grid.candidates(p);
     let mut primary = None;
     for &index in candidates.iter().take(MAX_CANDIDATES) {
@@ -690,7 +762,9 @@ pub fn envelope_at(segments: &[RiverSegment], grid: &SegmentGrid, p: [f32; 2]) -
             primary = Some(index as usize);
         }
         combine(&mut total, &envelope);
+        blend.add(&envelope);
     }
+    blend.apply(&mut total);
     round_bank_union(&mut total, segments, candidates, p, primary);
     let lake = grid.lake(p);
     if lake > NO_LAKE {
@@ -727,12 +801,16 @@ mod tests {
         [along_x.alone(), along_z.alone()]
     }
 
+    /// The envelope as `envelope_at` has it before the bank union rounds it.
     fn raw_envelope(segments: &[RiverSegment], p: [f32; 2]) -> Envelope {
         let mut total = Envelope::NONE;
+        let mut blend = OwnerBlend::NONE;
         for segment in segments {
             let envelope = segment_envelope(segment, p);
             combine(&mut total, &envelope);
+            blend.add(&envelope);
         }
+        blend.apply(&mut total);
         total
     }
 
@@ -1074,7 +1152,8 @@ mod gpu_tests {
     use wgpu::util::DeviceExt;
 
     /// The WGSL river block must carve exactly what the CPU carves: the
-    /// player walks on the CPU's ground and sees the GPU's.
+    /// player walks on the CPU's ground and sees the GPU's; and shade it by
+    /// the same water, whitewater, current and width.
     /// Run on a GPU (or lavapipe): cargo test river_block_matches_cpu -- --ignored
     #[test]
     #[ignore = "requires a GPU adapter"]
@@ -1093,10 +1172,11 @@ mod gpu_tests {
              {block}
              @compute @workgroup_size(64)
              fn evaluate(@builtin(global_invocation_id) id: vec3<u32>) {{
-                 if (id.x >= arrayLength(&samples)) {{ return; }}
-                 let p = samples[id.x].xy;
+                 if (2u * id.x >= arrayLength(&samples)) {{ return; }}
+                 let p = samples[2u * id.x].xy;
                  let e = riverEnvelope(p);
-                 samples[id.x] = vec4<f32>(e.upper, e.lower, e.bank_distance, e.lake);
+                 samples[2u * id.x] = vec4<f32>(e.upper, e.lower, e.bank_distance, e.lake);
+                 samples[2u * id.x + 1u] = vec4<f32>(e.water, e.turbulence, length(e.velocity), e.half_width);
              }}"
         );
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1145,7 +1225,8 @@ mod gpu_tests {
                 }
             }
         }
-        let samples: Vec<[f32; 4]> = points.iter().map(|p| [p[0], p[1], 0.0, 0.0]).collect();
+        // Two per point: the bounds, then what the ground is shaded by.
+        let samples: Vec<[f32; 4]> = points.iter().flat_map(|p| [[p[0], p[1], 0.0, 0.0], [0.0; 4]]).collect();
         let grid = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytemuck::cast_slice(&payload.grid_words),
@@ -1181,7 +1262,7 @@ mod gpu_tests {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &group, &[]);
-            pass.dispatch_workgroups((samples.len() as u32).div_ceil(64), 1, 1);
+            pass.dispatch_workgroups((points.len() as u32).div_ceil(64), 1, 1);
         }
         encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, output.size());
         queue.submit([encoder.finish()]);
@@ -1193,7 +1274,8 @@ mod gpu_tests {
         let results: &[[f32; 4]] = bytemuck::cast_slice(&mapped);
         let mut inside = 0;
         let mut lakes = 0;
-        for (p, gpu) in points.iter().zip(results) {
+        for (p, pair) in points.iter().zip(results.chunks_exact(2)) {
+            let (gpu, shade) = (pair[0], pair[1]);
             let cpu = network.envelope(p[0], p[1]);
             let close = |a: f32, b: f32| (a.min(1e29) - b.min(1e29)).abs() <= 2e-3 * a.abs().clamp(1.0, 1e29);
             assert!(close(gpu[0], cpu.upper.min(1e30)), "upper at {p:?}: GPU {gpu:?} CPU {cpu:?}");
@@ -1204,6 +1286,11 @@ mod gpu_tests {
             assert!(lake_close, "lake at {p:?}: GPU {gpu:?} CPU {cpu:?}");
             if cpu.bank_distance < 0.0 {
                 inside += 1;
+                let speed = cpu.velocity[0].hypot(cpu.velocity[1]);
+                let fields = [(shade[0], cpu.water), (shade[1], cpu.turbulence), (shade[2], speed), (shade[3], cpu.half_width)];
+                for (gpu_field, cpu_field) in fields {
+                    assert!(close(gpu_field, cpu_field), "shading at {p:?}: GPU {shade:?} CPU {cpu:?}");
+                }
             }
             if cpu.lake > NO_LAKE {
                 lakes += 1;

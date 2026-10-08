@@ -1963,6 +1963,11 @@ struct RiverVertexOutput
     // lake's sheet), z foam drifting down from whitewater upstream, w how far
     // the water has turned to the sea's (1 where a river meets the sea).
     @location(3) stream: vec4<f32>,
+    // Metres across the channel in its own frame.
+    @location(4) side: f32,
+    // Where a tributary's water becomes its parent's: the parent's frame
+    // (xy) and how far its ripples and foam are laid in it (z).
+    @location(5) joined: vec3<f32>,
 };
 
 @vertex
@@ -1976,6 +1981,8 @@ fn vs_river(
     @location(6) half_width: f32,
     @location(7) foam: f32,
     @location(8) sea: f32,
+    @location(9) side: f32,
+    @location(10) joined: vec3<f32>,
 ) -> RiverVertexOutput
 {
     // A distant channel is narrower than the clipmap's triangles there,
@@ -1995,6 +2002,8 @@ fn vs_river(
     out.velocity = velocity;
     out.channel = vec4<f32>(across, turbulence, position.y, still);
     out.stream = vec4<f32>(along, half_width, foam, sea);
+    out.side = side;
+    out.joined = joined;
     return out;
 }
 
@@ -2301,7 +2310,15 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     let speed = length(velocity);
     let downstream = select(vec2<f32>(1.0, 0.0), velocity/max(speed, 1e-4), river && speed > 1e-4);
     let cross_stream = vec2<f32>(-downstream.y, downstream.x);
-    let st = select(in.world_position.xz, vec2<f32>(along, across*half_width), river);
+    let st = select(in.world_position.xz, vec2<f32>(along, in.side), river);
+    // Where a tributary's water becomes its parent's, its ripples, steps and
+    // foam cross-fade into those laid in the parent's own frame: two frames
+    // at an angle cannot be blended into one without squeezing the ripples
+    // between them. Two patterns mixed lose contrast, which `restore` puts
+    // back.
+    let joined_st = in.joined.xy;
+    let joining = select(0.0, clamp(in.joined.z, 0.0, 1.0), river);
+    let restore = inverseSqrt((1.0 - joining)*(1.0 - joining) + joining*joining);
     let flow = select(velocity, vec2<f32>(speed, 0.0), river);
     // The pixel's footprint along each axis of that frame: a grazing view
     // stretches it along the view, not across the flow.
@@ -2309,7 +2326,14 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
                               max(abs(dot(pixel_dx.xz, cross_stream)), abs(dot(pixel_dy.xz, cross_stream))));
     let roughness = clamp(turbulence*0.8 + smoothstepf(0.6, 3.0, speed)*0.25, 0.0, 1.0);
     let riffle = select(0.0, smoothstepf(0.03, 0.2, turbulence)*smoothstepf(0.45, 1.2, speed), river);
-    let water_surface = riverSurface(st, flow, time, roughness, riffle, river, footprint);
+    var water_surface = riverSurface(st, flow, time, roughness, riffle, river, footprint);
+    if (joining > 0.001)
+    {
+        let other = riverSurface(joined_st, flow, time, roughness, riffle, river, footprint);
+        water_surface.slope = mix(water_surface.slope, other.slope, joining)*restore;
+        water_surface.variance = mix(water_surface.variance, other.variance, joining);
+        water_surface.crest = mix(water_surface.crest, other.crest, joining);
+    }
     let impacts = waterImpacts(in.world_position.xz, globals.storm.z, pixel_footprint,
                                view_distance, precipitation.x, precipitation.y, precipitation.w);
     let slope = downstream*water_surface.slope.x + cross_stream*water_surface.slope.y + impacts.slope;
@@ -2375,7 +2399,9 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     // Whitewater gathers where the bed steps: over the ledges and boulders
     // of a rapid, with dark glassy tongues of water running between them.
     // The steps stay put as the water runs over them.
-    let steps = smoothstepf(0.25, 0.75, valueNoise(vec2<f32>(along/RIVER_STEP_SPACING, across*1.7 + 3.1)));
+    let step_noise = mix(valueNoise(vec2<f32>(along/RIVER_STEP_SPACING, across*1.7 + 3.1)),
+                         valueNoise(vec2<f32>(joined_st.x/RIVER_STEP_SPACING, across*1.7 + 3.1)), joining);
+    let steps = smoothstepf(0.25, 0.75, 0.5 + (step_noise - 0.5)*restore);
     // Rapids turn milky below each step, where the water plunges and fills
     // with bubbles, and run clear over the smooth tongues between.
     let aeration = smoothstepf(0.3, 0.9, turbulence)*mix(0.15, 0.7, steps);
@@ -2434,7 +2460,12 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     // Foam on a run is drawn out along the current; churned in a rapid it
     // breaks into short ragged patches.
     let foam_stretch = select(1.0, 1.0 + 2.5*smoothstepf(0.3, 1.5, speed)*(1.0 - 0.75*turbulence), river);
-    let pattern = riverFoamPattern(st, flow, foam_stretch, time, footprint);
+    var pattern = riverFoamPattern(st, flow, foam_stretch, time, footprint);
+    if (joining > 0.001)
+    {
+        let other = riverFoamPattern(joined_st, flow, foam_stretch, time, footprint);
+        pattern = 0.5 + (mix(pattern, other, joining) - 0.5)*restore;
+    }
     // Whitewater where the bed breaks the surface, below the steps.
     let whitewater = smoothstepf(0.35, 0.85, turbulence)*mix(0.15, 0.8, steps);
     // Flecks on the faces of a riffle's standing waves.
@@ -2443,7 +2474,8 @@ fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
     // into lines where the surface currents converge: the seams between the
     // fast core and the slack water by the banks, a tongue down the current
     // that wanders across the channel, and a scum in the slack edges of pools.
-    let wander = (valueNoise(vec2<f32>(along/RIVER_TONGUE_WANDER, 5.3)) - 0.5)*0.8;
+    let wander = (mix(valueNoise(vec2<f32>(along/RIVER_TONGUE_WANDER, 5.3)),
+                      valueNoise(vec2<f32>(joined_st.x/RIVER_TONGUE_WANDER, 5.3)), joining) - 0.5)*0.8;
     let off_tongue = (across - wander)*6.0;
     let tongue = exp(-off_tongue*off_tongue);
     let seam = smoothstepf(0.5, 0.75, abs(across))*(1.0 - smoothstepf(0.82, 0.97, abs(across)));
