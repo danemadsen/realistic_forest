@@ -26,7 +26,7 @@ use super::network::{FLOW_CELL, Lake, River, RiverEnd};
 use crate::constants::SEA_LEVEL;
 use std::collections::HashMap;
 
-/// One water-surface vertex: 64 bytes, mirrored by `vs_inland`'s inputs in
+/// One water-surface vertex: 68 bytes, mirrored by `vs_inland`'s inputs in
 /// water.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -70,9 +70,41 @@ pub struct SurfaceVertex {
     /// them, so the shader draws them in both and cross-fades. Elsewhere the
     /// ribbon's own frame and 0.
     pub joined: [f32; 3],
+    /// How clear the water is: 0 stained like tea by the forest it drains,
+    /// 1 clear mountain water (`lake_clarity`, `stream_clarity`). The shader
+    /// colours the water by it.
+    pub clarity: f32,
 }
 
-const _: () = assert!(std::mem::size_of::<SurfaceVertex>() == 64);
+const _: () = assert!(std::mem::size_of::<SurfaceVertex>() == 68);
+
+/// Altitudes over which the forest gives way to bare rock: the treeline is
+/// 96 m, give or take 15 (src/vegetation/ecology.rs). Above it nothing
+/// stains the water.
+const ABOVE_FOREST: [f32; 2] = [95.0, 115.0];
+/// Altitudes over which the forest thins out toward the treeline: a lake
+/// large and deep enough here is fed by snowmelt and springs and holds them
+/// clear, where a pond the same height in the trees stays humic.
+const MONTANE: [f32; 2] = [55.0, 85.0];
+/// Lake areas, square metres, over which a montane lake turns clear.
+const LARGE_LAKE: [f32; 2] = [10_000.0, 30_000.0];
+/// Metres down a river over which the clearness of the lake it leaves fades
+/// into the stain of the forest it runs through.
+const CLEAR_FADE: f32 = 1500.0;
+
+/// How clear a lake's water is, 0..1: the forest's dissolved organic matter
+/// stains its streams and ponds like tea wherever there is forest to drain,
+/// but above the treeline a tarn is clear snowmelt over rock, whatever its
+/// size, and a large lake among the thinning trees below it is too.
+pub fn lake_clarity(level: f32, area: f32) -> f32 {
+    let montane = smoothstep(MONTANE[0], MONTANE[1], level) * smoothstep(LARGE_LAKE[0], LARGE_LAKE[1], area);
+    stream_clarity(level).max(montane)
+}
+
+/// How clear a stream's own water is: clear above the forest, stained in it.
+pub fn stream_clarity(level: f32) -> f32 {
+    smoothstep(ABOVE_FOREST[0], ABOVE_FOREST[1], level)
+}
 
 /// How far the ripples drawn change between two points of the water: the
 /// change of each frame they are laid in, by its share of the cross-fade
@@ -172,15 +204,23 @@ fn under_sheet(depth: f32) -> f32 {
 struct Sheets {
     cells: HashMap<[i32; 2], f32>,
     corners: HashMap<[i32; 2], f32>,
+    /// The clarity of the highest lake over each cell.
+    clarity: HashMap<[i32; 2], (f32, f32)>,
 }
 
 impl Sheets {
     fn new(lakes: &[Lake]) -> Self {
         let mut cells: HashMap<[i32; 2], f32> = HashMap::new();
         let mut corners: HashMap<[i32; 2], f32> = HashMap::new();
+        let mut clarity: HashMap<[i32; 2], (f32, f32)> = HashMap::new();
         for lake in lakes {
             let sunk: HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
+            let clear = lake_clarity(lake.level, lake.cells.len() as f32 * LAKE_CELL * LAKE_CELL);
             for &cell in lake.cells.iter().chain(&lake.shore) {
+                let entry = clarity.entry(cell).or_insert((lake.level, clear));
+                if lake.level > entry.0 {
+                    *entry = (lake.level, clear);
+                }
                 let level = cells.entry(cell).or_insert(lake.level);
                 *level = level.max(lake.level);
                 for corner in [cell, [cell[0] + 1, cell[1]], [cell[0], cell[1] + 1], [cell[0] + 1, cell[1] + 1]] {
@@ -190,7 +230,12 @@ impl Sheets {
                 }
             }
         }
-        Sheets { cells, corners }
+        Sheets { cells, corners, clarity }
+    }
+
+    /// The clarity of the lake whose sheet lies over `p`, if one does.
+    fn clarity(&self, p: [f32; 2]) -> Option<f32> {
+        self.clarity.get(&Self::cell_of(p)).map(|&(_, clear)| clear)
     }
 
     /// The drawn sheet's height over `p`, over the two triangles each cell
@@ -338,9 +383,9 @@ fn join_rows(a: Row, b: Row, out: &mut Vec<u32>) {
 
 /// Vertices weighed together, every attribute alike.
 fn weigh(parts: &[(SurfaceVertex, f32)]) -> SurfaceVertex {
-    let mut sum = [0.0f32; 16];
+    let mut sum = [0.0f32; 17];
     for &(vertex, weight) in parts {
-        let fields: [f32; 16] = bytemuck::cast(vertex);
+        let fields: [f32; 17] = bytemuck::cast(vertex);
         for (total, field) in sum.iter_mut().zip(fields) {
             *total += field * weight;
         }
@@ -804,6 +849,24 @@ fn ribbon(
         carried = carried.max(nodes[i].turbulence);
         foam[i] = carried;
     }
+    // The water's clarity: its own, clear above the forest, or the clarity
+    // of the last lake it passed through, which fades into the forest's
+    // stain as it runs on down. A stream through a brown pond comes out
+    // brown; one out of a clear mountain lake stays clear for a while.
+    let mut clarity = vec![0.0f32; end + 1];
+    let mut carried = 0.0f32;
+    for i in 0..=end {
+        if i > 0 {
+            let step = (nodes[i].along - nodes[i - 1].along).max(0.0);
+            carried *= (-step / CLEAR_FADE).exp();
+        }
+        if nodes[i].lake
+            && let Some(lake) = sheets.clarity(nodes[i].position)
+        {
+            carried = lake;
+        }
+        clarity[i] = carried.max(stream_clarity(nodes[i].water));
+    }
     // A row as the river alone would have it, its columns `offsets`.
     let draft = |i: usize, offsets: &[f32]| -> Draft {
         let node = &nodes[i];
@@ -839,6 +902,7 @@ fn ribbon(
                     sea,
                     side: offset + side_offset,
                     joined: [node.along + along_offset, offset + side_offset, 0.0],
+                    clarity: clarity[i],
                 }
             })
             .collect();
@@ -1021,6 +1085,7 @@ fn add_lake(
 ) {
     let sunk: HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
     let current: HashMap<[i32; 2], [f32; 2]> = lake.current.iter().copied().collect();
+    let clarity = lake_clarity(lake.level, lake.cells.len() as f32 * LAKE_CELL * LAKE_CELL);
     let mut corner_index = HashMap::new();
     let mut corner = |vertices: &mut Vec<SurfaceVertex>, x: i32, z: i32| -> u32 {
         let push_vertex = || {
@@ -1039,6 +1104,7 @@ fn add_lake(
                 sea: 0.0,
                 side: 0.0,
                 joined: [0.0; 3],
+                clarity,
             });
             vertices.len() as u32 - 1
         };
@@ -1382,6 +1448,61 @@ mod tests {
             let drawn = &river.nodes[..=river.surface_end.min(river.nodes.len() - 1)];
             for pair in drawn.windows(2) {
                 assert!(pair[1].water <= pair[0].water + 0.005, "water rising downstream: {pair:?}");
+            }
+        }
+    }
+
+    /// Forest ponds stay stained however high they lie below the treeline,
+    /// a large lake among the thinning trees runs clear, every tarn above
+    /// the treeline is clear and the lowland lakes keep the forest's tea.
+    #[test]
+    fn mountain_lakes_run_clear_and_forest_ponds_stay_stained() {
+        let area = |cells: f32| cells * LAKE_CELL * LAKE_CELL;
+        // A 60 m pond at 89 m, and a 200 m lake at 99 m, 10 m above it.
+        assert!(lake_clarity(89.1, area(227.0)) < 0.05);
+        assert!(lake_clarity(98.7, area(2256.0)) > 0.95);
+        // A small tarn above the treeline.
+        assert!(lake_clarity(112.0, area(763.0)) > 0.9);
+        // A broad lowland lake.
+        assert!(lake_clarity(18.3, area(5758.0)) < 0.01);
+        assert_eq!(stream_clarity(40.0), 0.0);
+        assert_eq!(stream_clarity(130.0), 1.0);
+    }
+
+    /// A stream out of a clear lake carries the lake's clarity down into the
+    /// forest, fading as it goes; out of a stained pond it is stained.
+    #[test]
+    fn a_stream_carries_its_lakes_clarity_downstream() {
+        let level = 90.0;
+        let cells: Vec<[i32; 2]> = (0..80).flat_map(|x| (-40..40).map(move |z| [x, z])).collect();
+        let clear = Lake { level, cells: cells.clone(), shore: Vec::new(), edge: Vec::new(), current: Vec::new() };
+        let pond = Lake { level, cells: cells[..40].to_vec(), shore: Vec::new(), edge: Vec::new(), current: Vec::new() };
+        let river = |out_of_lake: bool| {
+            let node = |k: i32| {
+                let x = 20.0 * k as f32;
+                RiverNode {
+                    position: [x, 2.0],
+                    water: level - 0.01 * (x - 320.0).max(0.0),
+                    half_width: 2.0,
+                    depth: 0.5,
+                    speed: 1.0,
+                    along: x,
+                    lake: out_of_lake && x < 320.0,
+                    ..Default::default()
+                }
+            };
+            River { nodes: (0..=200).map(node).collect(), end: RiverEnd::Edge, surface_end: 200 }
+        };
+        for (lake, expected) in [(clear, 1.0), (pond, 0.0)] {
+            let lake_clear = lake_clarity(lake.level, lake.cells.len() as f32 * LAKE_CELL * LAKE_CELL);
+            assert!((lake_clear - expected).abs() < 0.05, "{lake_clear}");
+            let mesh = build(&[river(true)], std::slice::from_ref(&lake));
+            let at = |x: f32| mesh.vertices.iter().find(|v| v.half_width > 0.0 && (v.position[0] - x).abs() < 1.0).unwrap().clarity;
+            assert!((at(200.0) - lake_clear).abs() < 1e-5, "in the lake it is the lake's water");
+            assert!(at(1800.0) < at(800.0) || lake_clear == 0.0, "the clarity fades downstream");
+            assert!(at(800.0) <= lake_clear + 1e-5);
+            if expected > 0.5 {
+                assert!(at(800.0) > 0.6 && at(3800.0) < 0.2, "{} {}", at(800.0), at(3800.0));
             }
         }
     }

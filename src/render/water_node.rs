@@ -212,6 +212,20 @@ fn settle_wave_gain(current: f32, target: f32, delta_seconds: f32) -> f32 {
     current + (target - current) * blend
 }
 
+impl ExtractedWater {
+    /// Whether the eye is within `margin` metres of going under the water it
+    /// is over, or below it, and that water is drawn.
+    pub fn eye_submerged(&self, margin: f32) -> bool {
+        self.eye_water.is_some_and(|here| {
+            let drawn = match here.kind {
+                WaterKind::Sea => self.draw,
+                WaterKind::River | WaterKind::Lake => self.rivers_visible,
+            };
+            drawn && self.camera_height <= here.surface + margin
+        })
+    }
+}
+
 /// The water the medium pass puts the eye in: the eye's water, if the eye is
 /// near enough its surface for the medium to have faded in, and if that water
 /// is drawn at all. Returns the uniform block's `eye_water` and `eye_body`.
@@ -230,7 +244,7 @@ fn eye_medium(water: &ExtractedWater) -> ([f32; 4], [f32; 4]) {
     let fade = (-height / UNDERWATER_FADE_METRES + 0.5).clamp(0.0, 1.0);
     let sea = if here.kind == WaterKind::Sea { 1.0 } else { 0.0 };
     let still = if here.kind == WaterKind::River { 0.0 } else { 1.0 };
-    ([here.surface, height, fade, sea], [still, here.turbulence, 0.0, 0.0])
+    ([here.surface, height, fade, sea], [still, here.turbulence, here.clarity, 0.0])
 }
 
 // ---------------------------------------------------------------------------
@@ -960,6 +974,7 @@ fn river_vertex_layout() -> Vec<VertexBufferLayout> {
             attribute(8, 44, VertexFormat::Float32),
             attribute(9, 48, VertexFormat::Float32),
             attribute(10, 52, VertexFormat::Float32x3),
+            attribute(11, 64, VertexFormat::Float32),
         ],
     }]
 }

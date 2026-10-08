@@ -589,6 +589,7 @@ impl<'a> SurfaceIndex<'a> {
                 sea: mix(&|v| v.sea),
                 side: mix(&|v| v.side),
                 joined: [mix(&|v| v.joined[0]), mix(&|v| v.joined[1]), mix(&|v| v.joined[2])],
+                clarity: mix(&|v| v.clarity),
             });
         });
         top

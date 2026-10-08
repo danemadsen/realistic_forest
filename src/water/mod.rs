@@ -159,7 +159,7 @@ pub struct WaterStageUniforms {
     /// faded in, w how far it is the sea's water. All zero out of the water.
     pub eye_water: [f32; 4], // 1520
     /// x how still that water is (1 a lake or the sea, 0 a stream), y its
-    /// whitewater; zw unused.
+    /// whitewater, z its clarity (`rivers::surface::lake_clarity`); w unused.
     pub eye_body: [f32; 4], // 1536
     /// rgb sunlight at the surface for the submerged medium, w moon radiance
     /// scale.

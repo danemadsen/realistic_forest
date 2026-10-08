@@ -129,7 +129,7 @@ struct WaterStageUniforms
     canopy_map: vec4<f32>,    // canopy capture: world centre XZ, span (0 while absent), texel size
     wind: vec4<f32>,          // x surface wind at 10 m, m/s; y gustiness 0..1; zw unused
     eye_water: vec4<f32>,     // x level of the water at the eye, y eye height above it, z submerged fade, w its sea share
-    eye_body: vec4<f32>,      // x its stillness, y its whitewater; zw unused
+    eye_body: vec4<f32>,      // x its stillness, y its whitewater, z its clarity; w unused
     medium_sun: vec4<f32>,    // rgb sunlight at the surface for the medium, w moon radiance scale
 };
 @group(2) @binding(0) var<uniform> stage: WaterStageUniforms;
@@ -1574,18 +1574,19 @@ fn waterImpacts(world_xz: vec2<f32>, time: f32, footprint: f32,
 //   glass over the stones; a few metres down it turns turquoise, and its
 //   depths a deep blue-cyan.
 //
-// The forest thins out from about 60 m and gives way to rock by about 110 m
-// (the treeline is 96 m, src/vegetation/ecology.rs), so the stain fades out
-// over the same altitudes: a pond in the woods stays tea-brown and a tarn
-// above them is cyan.
+// Which a piece of water is, its clarity, is decided on the CPU per water
+// body and handed over with it (`lake_clarity` in src/rivers/surface.rs):
+// above the treeline every tarn is clear; among the thinning trees below it
+// a lake large enough to hold its snowmelt clear is too, where a pond the
+// same height stays humic; a stream is clear above the forest and carries
+// the clarity of the lake it leaves down into the forest, where the stain
+// takes over again.
 const RIVER_EXTINCTION: vec3<f32> = vec3<f32>(0.40, 0.38, 1.05);
 const RIVER_SCATTER: vec3<f32> = vec3<f32>(0.012, 0.012, 0.010);
 const POND_EXTINCTION: vec3<f32> = vec3<f32>(0.55, 0.58, 1.60);
 const POND_SCATTER: vec3<f32> = vec3<f32>(0.010, 0.010, 0.008);
 const ALPINE_EXTINCTION: vec3<f32> = vec3<f32>(0.48, 0.13, 0.12);
 const ALPINE_SCATTER: vec3<f32> = vec3<f32>(0.026, 0.031, 0.031);
-const ALPINE_LOW: f32 = 60.0;
-const ALPINE_HIGH: f32 = 110.0;
 // Bubbles beaten into whitewater scatter every colour alike and absorb none
 // (per metre at full aeration); half of it is counted as leaving the eye ray.
 const BUBBLE_SCATTER: f32 = 2.4;
@@ -1598,16 +1599,12 @@ struct WaterBody
     sea: f32,
     // Still water (a lake, a pond or the sea) rather than a running stream.
     still: f32,
-    // Clear mountain water rather than the forest's stained water.
+    // Clear mountain water rather than the forest's stained water: its
+    // clarity.
     alpine: f32,
     // Bubbles beaten in by whitewater, 0..1.
     aeration: f32,
 };
-
-fn alpineShare(level: f32) -> f32
-{
-    return smoothstepf(ALPINE_LOW, ALPINE_HIGH, level);
-}
 
 // Extinction and scattering, per metre.
 struct WaterMedium
@@ -2294,6 +2291,9 @@ struct WaterVertexOutput
     // Where a tributary's water becomes its parent's: the parent's frame
     // (xy) and how far its ripples and foam are laid in it (z).
     @location(6) joined: vec3<f32>,
+    // How clear the water is: 0 stained by the forest, 1 clear mountain
+    // water. The sea's colour is its own, so 0 there.
+    @location(7) clarity: f32,
 };
 
 // The sea: one of Crest's concentric tiles, displaced by the Gerstner sum.
@@ -2340,6 +2340,7 @@ fn vs_sea(
     out.stream = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     out.side = 0.0;
     out.joined = vec3<f32>(0.0);
+    out.clarity = 0.0;
     return out;
 }
 
@@ -2358,6 +2359,7 @@ fn vs_inland(
     @location(8) sea: f32,
     @location(9) side: f32,
     @location(10) joined: vec3<f32>,
+    @location(11) clarity: f32,
 ) -> WaterVertexOutput
 {
     // A distant channel is narrower than the clipmap's triangles there,
@@ -2380,6 +2382,7 @@ fn vs_inland(
     out.stream = vec4<f32>(along, half_width, foam, sea);
     out.side = side;
     out.joined = joined;
+    out.clarity = clarity;
     return out;
 }
 
@@ -2607,7 +2610,7 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     // Rapids turn milky below each step, where the water plunges and fills
     // with bubbles, and run clear over the smooth tongues between.
     let aeration = select(0.0, smoothstepf(0.3, 0.9, turbulence)*mix(0.15, 0.7, steps), river);
-    let body = WaterBody(sea, stillness, alpineShare(level)*(1.0 - sea), aeration);
+    let body = WaterBody(sea, stillness, clamp(in.clarity, 0.0, 1.0)*(1.0 - sea), aeration);
 
     let cos_refracted = sqrt(1.0 - (1.0 - to_view.y*to_view.y)/(N_WATER*N_WATER));
     var water_body = vec3<f32>(0.0);
@@ -2964,7 +2967,7 @@ fn fs_underwater(in: FullscreenOutput) -> @location(0) vec4<f32>
         optical_path = min(optical_path, surface_path);
     }
     let scene_linear = sceneRadiance(scene.rgb);
-    let body = WaterBody(stage.eye_water.w, stage.eye_body.x, alpineShare(level)*(1.0 - stage.eye_water.w),
+    let body = WaterBody(stage.eye_water.w, stage.eye_body.x, clamp(stage.eye_body.z, 0.0, 1.0)*(1.0 - stage.eye_water.w),
                          smoothstepf(0.3, 0.9, stage.eye_body.y)*0.4);
     let medium = waterMedium(body);
     let transmittance = exp(-medium.sigma_t*optical_path);

@@ -1103,11 +1103,15 @@ path, never as a white sheet. What differs from one water to the next:
   rapids are milky with bubbles. Above the forest nothing stains it: a
   mountain lake or stream is clear snowmelt over rock with a little rock
   flour in it, glass over the stones of its shallows, turquoise a few metres
-  down and a deep blue-cyan over its depths. The stain fades out between 60
-  m and 110 m, the altitudes over which the forest gives way to rock, so a
-  pond in the woods stays brown and a tarn above them is cyan. The eye's path
-  is bent down into the water and the light scattered back out of it is
-  dimmed with depth, so depth reads.
+  down and a deep blue-cyan over its depths. Which a lake is follows from
+  where it lies and how big it is: above the treeline (95-115 m) every tarn
+  is clear; among the thinning trees below it (from about 55 m) a lake large
+  enough to hold its snowmelt clear (over a hectare or so) is too, where a
+  pond the same height stays brown. A stream is clear above the forest, and
+  one leaving a clear lake carries its clarity down into the forest for a
+  kilometre or two before the stain takes over. The eye's path is bent down
+  into the water and the light scattered back out of it is dimmed with
+  depth, so depth reads.
 - **How rough it is.** Every water body feels the same wind (10 m up, about a
   third of the wind the clouds ride on) and raises the same kind of waves
   from it: a spectrum of short waves whose slope follows Cox and Munk's
