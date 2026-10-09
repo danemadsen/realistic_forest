@@ -401,10 +401,10 @@ pub fn update_player_system(
             // A swimmer at the surface kicks up out of the water as a walker
             // jumps off the ground.
             if swimming && jump {
-                player.vertical_velocity = 7.4;
+                player.vertical_velocity = JUMP_SPEED;
             }
             let before = (player.position.y, player.vertical_velocity);
-            let afloat = water.is_some_and(|water| water.float_eye().is_some());
+            let afloat = water.filter(|water| water.float_eye().is_some()).map(|water| water.surface);
             update_walking_ground(
                 &mut player,
                 &mut candidate,
@@ -516,7 +516,7 @@ fn update_walking_ground(
     noise: &NoiseField,
     snow: &mut SnowState,
     jump_requested: bool,
-    afloat: bool,
+    afloat: Option<f32>,
     dt: f32,
 ) {
     let previous_xz = Vec2::new(player.position.x, player.position.z);
@@ -525,15 +525,8 @@ fn update_walking_ground(
     let old_ground = old_surface.height(snow, previous_xz);
     let mut next_xz = Vec2::new(candidate.x, candidate.z);
     let mut next_surface = snow::sample_surface(erosion, noise, next_xz, visibility_center);
-    // A body afloat steps up from its feet, not from the bed far under
-    // them, so a swimmer kicks up out of the water onto a bank.
     let next_ground = next_surface.height(snow, next_xz);
-    let too_high = if afloat {
-        too_high_to_step(next_ground, old_ground, player.position.y)
-    } else {
-        next_ground - old_ground > STEP_HEIGHT
-    };
-    if too_high {
+    if step_blocked(next_ground, old_ground, player.position.y, player.vertical_velocity, afloat) {
         candidate.x = player.position.x;
         candidate.z = player.position.z;
         next_xz = previous_xz;
@@ -543,7 +536,7 @@ fn update_walking_ground(
         player.position.y <= old_ground + EYE_HEIGHT + 0.03 && player.vertical_velocity <= 0.0;
     let jumping = jump_requested && grounded_before;
     if jumping {
-        player.vertical_velocity = 7.4;
+        player.vertical_velocity = JUMP_SPEED;
     }
     player.vertical_velocity -= FALL_ACCELERATION * dt;
     candidate.y += player.vertical_velocity * dt;
@@ -566,6 +559,10 @@ fn update_walking_ground(
 
 /// The highest a body steps up onto, metres.
 const STEP_HEIGHT: f32 = 1.25;
+/// How fast a jump, or a swimmer's kick up out of the water, leaves, m/s.
+const JUMP_SPEED: f32 = 7.4;
+/// How high a jump or a kick lifts the eye, metres.
+const JUMP_HEIGHT: f32 = JUMP_SPEED * JUMP_SPEED / (2.0 * FALL_ACCELERATION);
 /// How fast a body in the air gathers downward speed, m/s². Stronger than
 /// gravity, so jumps and falls feel snappy rather than floaty.
 const FALL_ACCELERATION: f32 = 23.0;
@@ -601,6 +598,22 @@ pub struct SwimStroke {
     /// Forward input times the sine of the eye's pitch: swimming forward
     /// follows the eye down into the water or up out of it.
     pub forward_pitch: f32,
+}
+
+/// Whether ground at `next` is too high for a body to step onto from ground
+/// at `ground`, its eye at `eye` and falling at `-vertical_velocity`, over
+/// deep water at the surface `afloat` if it is. A walker steps up to
+/// `STEP_HEIGHT`. A swimmer kicked up out of the water steps up from its
+/// feet, not from the bed far under them, so it reaches a bank; a body
+/// falling onto the water from higher lands on nothing over its feet.
+fn step_blocked(next: f32, ground: f32, eye: f32, vertical_velocity: f32, afloat: Option<f32>) -> bool {
+    match afloat {
+        Some(surface) if eye <= surface + SWIM_FREEBOARD + JUMP_HEIGHT && vertical_velocity >= -JUMP_SPEED => {
+            too_high_to_step(next, ground, eye)
+        }
+        Some(_) => next > ground.max(eye - EYE_HEIGHT),
+        None => next - ground > STEP_HEIGHT,
+    }
 }
 
 /// Whether ground at `bed` is too high for a swimmer whose eye is at `eye`,
@@ -834,7 +847,7 @@ mod tests {
             &noise,
             &mut snow,
             false,
-            false,
+            None,
             0.02,
         );
         let end = Vec2::new(candidate.x, candidate.z);
@@ -856,7 +869,7 @@ mod tests {
             &noise,
             &mut snow,
             true,
-            false,
+            None,
             0.02,
         );
         assert!(player.vertical_velocity > 0.0);
@@ -870,7 +883,7 @@ mod tests {
             &noise,
             &mut snow,
             false,
-            false,
+            None,
             0.02,
         );
         assert_eq!(snow.revision(), revision);
@@ -890,7 +903,7 @@ mod tests {
             &noise,
             &mut snow,
             false,
-            false,
+            None,
             0.05,
         );
         let end = Vec2::new(candidate.x, candidate.z);
@@ -1169,9 +1182,22 @@ mod tests {
         assert!(!too_high_to_step(9.5, -20.0, floating));
         assert!(too_high_to_step(12.0, -20.0, floating));
         // A bank at the water's edge is out of reach afloat, but a kick up
-        // out of the water lifts the feet onto it.
+        // out of the water lifts the feet onto it, rising or coming back.
         assert!(too_high_to_step(10.0, -20.0, floating));
-        assert!(!too_high_to_step(10.0, -20.0, 11.4));
+        assert!(!step_blocked(10.0, -20.0, 11.4, 2.0, Some(10.0)));
+        assert!(!step_blocked(10.5, -20.0, 11.2, -3.0, Some(10.0)));
+        // A walker steps up only so far from the ground it stands on.
+        assert!(!step_blocked(5.2, 4.0, 5.75, 0.0, None));
+        assert!(step_blocked(5.3, 4.0, 5.75, 0.0, None));
+        // A body falling past a ledge over the pool from a cliff top lands
+        // on nothing over its feet: it falls on into the water, though onto
+        // a shore below its feet it lands.
+        assert!(step_blocked(23.0, 0.0, 24.0, -18.0, Some(10.0)));
+        assert!(!step_blocked(15.0, 0.0, 24.0, -18.0, Some(10.0)));
+        // Near the water, a body coming down faster than a kick's own fall
+        // lands on nothing over its feet either.
+        assert!(!step_blocked(10.0, 0.0, 11.0, -3.0, Some(10.0)));
+        assert!(step_blocked(10.0, 0.0, 11.0, -JUMP_SPEED - 1.0, Some(10.0)));
         // Stretched out along a bed at 4 m: up a slope, but not up a wall
         // without first swimming up it.
         assert!(!too_high_to_step(5.0, 4.0, 4.0 + SWIM_BED_CLEARANCE));
