@@ -1469,7 +1469,16 @@ mod eye_water_tests {
         water.draw = false;
         assert!(!water.eye_submerged(0.2));
         assert_eq!(eye_medium(&water), ([0.0; 4], [0.0; 4]));
+        // With the sea hidden and the rivers drawn, the river's last reach
+        // under its ribbon is drawn, but its mouth past the ribbon is the
+        // sea's to draw (`player::water_at`), and nothing is drawn there.
+        water.rivers_visible = true;
+        assert!(water.eye_submerged(0.2));
+        water.eye_water = Some(WaterHere { kind: WaterKind::Sea, ..estuary() });
+        assert!(!water.eye_submerged(0.2));
+        assert_eq!(eye_medium(&water), ([0.0; 4], [0.0; 4]));
         // A hidden stream over dry ground leaves no sea to fall back to.
+        water.rivers_visible = false;
         water.draw = true;
         water.eye_water = Some(WaterHere { surface: SEA_LEVEL + 4.0, ground: SEA_LEVEL + 3.0, ..estuary() });
         water.camera_height = SEA_LEVEL + 3.5;

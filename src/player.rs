@@ -71,6 +71,8 @@ pub struct WaterHere {
     pub clarity: f32,
     pub sea: f32,
     pub still: f32,
+    /// Which water's surface is drawn over it: a river's mouth past its
+    /// ribbon is the sea's, though its level and current are the river's.
     pub kind: WaterKind,
 }
 
@@ -109,18 +111,13 @@ pub fn water_at(erosion: &ErosionCache, noise: &NoiseField, x: f32, z: f32, visi
         .as_ref()
         .map_or(crate::rivers::carve::Envelope::NONE, |network| network.envelope(x, z));
     let ground = crate::erosion::sample_eroded_height(erosion, noise, x, z, visibility_center);
-    // A river's or a lake's water is the water drawn over this point. With
-    // nothing drawn there, it is the sea's where it lies at the sea's level
-    // (an estuary past the ribbon's end, where the sea's surface is the one
-    // drawn), else a stream's own.
     let drawn = erosion.rivers.as_ref().and_then(|network| network.surface.drawn_at([x, z]));
-    let inland = |surface: f32, current: Vec2, turbulence: f32, kind: WaterKind| {
-        let (clarity, sea, still) = match drawn {
-            Some(drawn) => (drawn.clarity, drawn.sea, drawn.still),
-            None if ground < SEA_LEVEL && surface <= SEA_LEVEL + 0.03 => (0.0, 1.0, 1.0),
-            None => (crate::rivers::surface::stream_clarity(surface), 0.0, f32::from(u8::from(kind == WaterKind::Lake))),
-        };
-        WaterHere { surface, ground, current, turbulence, clarity, sea, still, kind }
+    let inland = |surface: f32, current: Vec2, turbulence: f32, kind: WaterKind| WaterHere {
+        surface,
+        ground,
+        current,
+        turbulence,
+        ..drawn_as(drawn, surface, ground, kind)
     };
     let river = (envelope.bank_distance < 0.5)
         .then(|| inland(envelope.water, Vec2::from(envelope.velocity), envelope.turbulence, WaterKind::River));
@@ -131,6 +128,21 @@ pub fn water_at(erosion: &ErosionCache, noise: &NoiseField, x: f32, z: f32, visi
         .flatten()
         .filter(|water| water.depth() > 0.0)
         .reduce(|a, b| if b.surface > a.surface { b } else { a })
+}
+
+/// A river's or a lake's water at `surface` over `ground` as it is drawn:
+/// the colour shares of the surface drawn over it (`drawn`), its own kind.
+/// With nothing drawn there, it is the sea's where it lies at the sea's level
+/// over the sea floor (a river's mouth past its ribbon, where the sea draws
+/// the water), else a stream's own. Only the colour shares and the kind are
+/// meant; the rest is the caller's.
+fn drawn_as(drawn: Option<crate::rivers::surface::SurfaceVertex>, surface: f32, ground: f32, kind: WaterKind) -> WaterHere {
+    let (clarity, sea, still, kind) = match drawn {
+        Some(drawn) => (drawn.clarity, drawn.sea, drawn.still, kind),
+        None if ground < SEA_LEVEL && surface <= SEA_LEVEL + 0.03 => (0.0, 1.0, 1.0, WaterKind::Sea),
+        None => (crate::rivers::surface::stream_clarity(surface), 0.0, f32::from(u8::from(kind == WaterKind::Lake)), kind),
+    };
+    WaterHere { surface, ground, current: Vec2::ZERO, turbulence: 0.0, clarity, sea, still, kind }
 }
 
 impl Default for Player {
@@ -1295,6 +1307,19 @@ mod tests {
         let level = SwimStroke { forward_pitch: 0.0, ..Default::default() };
         let (eye, _) = swim(floating, 0.0, level, 1.5);
         assert!((eye - floating).abs() < 1e-4, "{eye}");
+    }
+
+    #[test]
+    fn a_rivers_mouth_past_its_ribbon_is_the_seas_to_draw() {
+        let mouth = drawn_as(None, SEA_LEVEL + 0.02, SEA_LEVEL - 2.0, WaterKind::River);
+        assert_eq!((mouth.kind, mouth.sea, mouth.still, mouth.clarity), (WaterKind::Sea, 1.0, 1.0, 0.0));
+        // Under its ribbon it is the river's, in the sea's colours.
+        let ribbon = crate::rivers::surface::SurfaceVertex { sea: 1.0, still: 1.0, clarity: 0.2, ..Default::default() };
+        let reach = drawn_as(Some(ribbon), SEA_LEVEL + 0.02, SEA_LEVEL - 2.0, WaterKind::River);
+        assert_eq!((reach.kind, reach.sea, reach.clarity), (WaterKind::River, 1.0, 0.2));
+        // Upstream, over dry ground, with nothing drawn, a stream's own.
+        let stream = drawn_as(None, SEA_LEVEL + 3.0, SEA_LEVEL + 2.0, WaterKind::River);
+        assert_eq!((stream.kind, stream.sea), (WaterKind::River, 0.0));
     }
 
     #[test]

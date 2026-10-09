@@ -3,7 +3,6 @@
 //! the current stroke's luminance and adds the channel's glow to the scene.
 
 use super::{ExtractedForestView, ForestGlobals, ForestShaderHandles, globals_layout};
-use crate::constants::SEA_LEVEL;
 use crate::lightning::{BoltKind, MAX_BOLT_SEGMENTS};
 use bevy::prelude::*;
 use bevy::render::render_resource::{
@@ -234,10 +233,12 @@ pub fn forest_lightning_pass(
     if !bolt_visible(extracted) {
         return;
     }
-    let ocean_visible = world
+    // Under the drawn water, the sea's or a river's or a lake's, the sky and
+    // its bolts are the medium's to show.
+    if world
         .get_resource::<super::water_node::ExtractedWater>()
-        .is_some_and(|water| water.draw);
-    if ocean_visible && extracted.player_position[1] <= SEA_LEVEL + 0.2 {
+        .is_some_and(|water| water.eye_submerged(0.2))
+    {
         return;
     }
     let (Some(blit), Some(bolt), Some(globals), Some(bolt_group), Some(screen_layout)) = (
