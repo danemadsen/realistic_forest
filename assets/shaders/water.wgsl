@@ -113,6 +113,9 @@ struct GpuWave
 
 const WAVE_SLOTS: u32 = 40u;
 const LOD_COUNT: u32 = 5u;
+const WIND_RUNGS: u32 = 14u;
+const WIND_PER_RUNG: u32 = 4u;
+const WIND_COMPONENTS: u32 = 56u;
 
 struct WaterStageUniforms
 {
@@ -130,6 +133,10 @@ struct WaterStageUniforms
     eye_water: vec4<f32>,     // x level of the water at the eye, y eye height above it, z submerged fade, w its sea share
     eye_body: vec4<f32>,      // x its stillness, y its whitewater, z its clarity; w unused
     medium_sun: vec4<f32>,    // rgb sunlight at the surface for the medium, w moon radiance scale
+    // The wind sea's components for the wind's heading (`windSea`): xy wave
+    // vector in whole cycles over WIND_PERIOD, z phase in cycles, w heading
+    // off the wind in radians.
+    wind_waves: array<vec4<f32>, WIND_COMPONENTS>,
 };
 @group(2) @binding(0) var<uniform> stage: WaterStageUniforms;
 
@@ -1462,6 +1469,27 @@ fn valueNoise(p: vec2<f32>) -> f32
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
+// A random unit gradient at every lattice point.
+fn latticeGradient(cell: vec2<f32>) -> vec2<f32>
+{
+    let angle = 6.2831853*hash21(cell);
+    return vec2<f32>(cos(angle), sin(angle));
+}
+
+// Gradient noise, blended quintically: about 0 on average, within +-0.7,
+// with a deviation of 0.215.
+fn gradientNoise(p: vec2<f32>) -> f32
+{
+    let i = floor(p);
+    let f = p - i;
+    let u = f*f*f*(f*(f*6.0 - 15.0) + 10.0);
+    let a = dot(latticeGradient(i), f);
+    let b = dot(latticeGradient(i + vec2<f32>(1.0, 0.0)), f - vec2<f32>(1.0, 0.0));
+    let c = dot(latticeGradient(i + vec2<f32>(0.0, 1.0)), f - vec2<f32>(0.0, 1.0));
+    let d = dot(latticeGradient(i + vec2<f32>(1.0, 1.0)), f - vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
 /// Two octaves is enough to break a contour line; this is not a detail layer.
 fn foamBreakup(world_xz: vec2<f32>, footprint: f32) -> f32
 {
@@ -1693,12 +1721,21 @@ fn waterMedium(body: WaterBody) -> WaterMedium
 // are its Gerstner spectrum, so on the sea these waves stop at the 2 m that
 // spectrum starts at.
 //
-// The waves are laid in half-octave rungs, two crossing components a rung
-// spread round the wind (shorter waves spread wider), each moving with the
-// capillary-gravity dispersion `w^2 = g k + (sigma/rho) k^3`. On running
-// water they ride the current (`drift`). What a pixel cannot resolve, or a
-// frame cannot follow, becomes roughness at the slope variance it has.
-const WIND_RUNGS: u32 = 14u;
+// The waves are laid in half-octave rungs of four components, each moving
+// with the capillary-gravity dispersion `w^2 = g k + (sigma/rho) k^3`. They
+// head round the wind as a measured wind sea's do: a sech^2 spread, narrowest
+// just past the peak and broader for the shorter waves (Donelan, Hamilton and
+// Hui; Banner), but never broader than Cox and Munk found the short waves,
+// whose slope runs 1.65 times as steep up the wind as across it. Where each
+// component heads, its wavelength and its phase are fixed for the wind's
+// heading (`stage.wind_waves`, drawn on the CPU from that broadest spread by
+// `wind_sea_components` in src/water/waves.rs); the local wind and fetch only
+// weight them, so where the spread is narrower the waves across the wind
+// carry less. A gust or a nearer shore then changes how high the ripples run,
+// never where their crests lie, and nothing re-phases them from one frame to
+// the next. On running water they ride the current (`drift`). What a pixel
+// cannot resolve, or a frame cannot follow, becomes roughness at the slope
+// variance it has.
 const WIND_SHORTEST: f32 = 0.04;
 const CAPILLARY_CUTOFF: f32 = 0.017;
 // Surface tension over density, m^3/s^2.
@@ -1710,6 +1747,11 @@ const RUNG_LOG_SPAN: f32 = 0.34657359;
 // The period, metres, every wind wave repeats over (see `windSea`): far too
 // long to see repeat.
 const WIND_PERIOD: f32 = 512.0;
+// The broadest the wind sea is spread, the spread its components are drawn
+// from (`SPREAD_FLOOR` in src/water/waves.rs).
+const SPREAD_FLOOR: f32 = 0.955;
+// A component's wavelength lies within a quarter octave of its rung's.
+const WIND_RUNG_STRETCH: f32 = 1.1892071;
 
 struct WindSea
 {
@@ -1743,12 +1785,20 @@ fn windPeakWavenumber(wind: f32, fetch: f32) -> f32
     return omega*omega/GRAVITY;
 }
 
-fn hash11(x: f32) -> f32
+// How narrowly the waves at `frequency_ratio` times the peak's angular
+// frequency are spread about the wind, as the `beta` of a sech^2(beta*theta)
+// spread: Donelan, Hamilton and Hui's fit eased into Banner's, floored at
+// SPREAD_FLOOR. Mirrors `spreading_beta` in src/water/waves.rs, which
+// carries the measurements.
+fn spreadingBeta(frequency_ratio: f32) -> f32
 {
-    return fract(sin(x*127.1 + 311.7)*43758.5453);
+    let r = max(frequency_ratio, 1e-3);
+    let donelan = select(2.28*pow(r, -0.65), 2.61*pow(r, 1.3), r < 0.95);
+    let banner = pow(10.0, -0.4 + 0.8393*exp(-0.567*log(r*r)));
+    return max(mix(donelan, banner, smoothstepf(1.6, 2.0, r)), SPREAD_FLOOR);
 }
 
-fn windSea(xz: vec2<f32>, drift: vec2<f32>, wind_direction: vec2<f32>, wind: f32, fetch: f32,
+fn windSea(xz: vec2<f32>, drift: vec2<f32>, wind: f32, fetch: f32,
            longest: f32, time: f32, pixel_dx: vec2<f32>, pixel_dy: vec2<f32>, current: f32,
            frame_seconds: f32) -> WindSea
 {
@@ -1759,19 +1809,24 @@ fn windSea(xz: vec2<f32>, drift: vec2<f32>, wind_direction: vec2<f32>, wind: f32
         return result;
     }
     let k_peak = windPeakWavenumber(wind, fetch);
+    let omega_peak = sqrt(GRAVITY*k_peak);
     // The capillary ripples under the shortest rung are always unresolved.
     result.variance += saturation*log(WIND_SHORTEST/CAPILLARY_CUTOFF);
-    // Every wave vector is snapped to the lattice of waves periodic over
-    // WIND_PERIOD metres, and the position wrapped into one period first, so
-    // the phase stays exact however far out the water lies: k*x itself
-    // passes a million radians a few kilometres from the origin, beyond what
-    // a 32-bit float can resolve.
+    // Every wave vector is a whole number of cycles over WIND_PERIOD metres,
+    // and the position is wrapped into one period first, so the phase stays
+    // exact however far out the water lies: k*x itself passes a million
+    // radians a few kilometres from the origin, beyond what a 32-bit float
+    // can resolve.
     let p = xz - drift;
     let wrapped = p - WIND_PERIOD*floor(p/WIND_PERIOD);
+    // The pixel's narrowest width in any direction: it resolves no wave
+    // shorter than twice that, whichever way the wave runs.
+    let finest = abs(pixel_dx.x*pixel_dy.y - pixel_dx.y*pixel_dy.x)
+               / max(length(pixel_dx) + length(pixel_dy), 1e-6);
     for (var rung = 0u; rung < WIND_RUNGS; rung += 1u)
     {
         let nominal = WIND_SHORTEST*exp2(f32(rung)*0.5);
-        if (nominal > longest)
+        if (nominal/WIND_RUNG_STRETCH > longest)
         {
             break;
         }
@@ -1789,42 +1844,86 @@ fn windSea(xz: vec2<f32>, drift: vec2<f32>, wind_direction: vec2<f32>, wind: f32
             if (below_peak > 1.0) { break; }
             continue;
         }
-        let omega = sqrt(GRAVITY*k + SURFACE_TENSION*k*k*k);
-        // A frame must not carry a crest more than a fraction of its
-        // wavelength, or it seems to run backwards.
-        let per_frame = (omega/k + current)*frame_seconds/nominal;
-        let steady = 1.0 - smoothstepf(0.22, 0.42, per_frame);
-        // Waves well short of the peak are spread widely about the wind; at
-        // the peak they run with it.
-        let spread = mix(0.35, 1.1, smoothstepf(0.5, 2.5, from_peak));
-        for (var side = 0u; side < 2u; side += 1u)
+        // Every wave of the rung is too short for the pixel: all of it is
+        // roughness, and none of it needs evaluating.
+        let rung_longest = nominal*WIND_RUNG_STRETCH*1.01;
+        if (finest >= 0.5*rung_longest && rung_longest <= 0.85*longest)
         {
-            let seed = f32(rung)*2.0 + f32(side);
-            let angle = (select(-1.0, 1.0, side == 1u))*spread*(0.35 + 0.65*hash11(seed));
-            let c = cos(angle);
-            let s = sin(angle);
-            let lattice = round(vec2<f32>(wind_direction.x*c - wind_direction.y*s,
-                                          wind_direction.x*s + wind_direction.y*c)*(WIND_PERIOD/nominal));
-            let cycles = max(length(lattice), 1.0);
-            let direction = lattice/cycles;
+            result.variance += rung_variance;
+            continue;
+        }
+        // The components were drawn from the broadest spread. Each carries
+        // the ratio of the rung's own spread to that one at its heading, and
+        // the rung's slope variance is shared out by those weights; at the
+        // broadest spread itself, which is every rung well short of the
+        // peak, they share it equally.
+        let omega = sqrt(GRAVITY*k + SURFACE_TENSION*k*k*k);
+        let beta = spreadingBeta(omega/omega_peak);
+        var weights: array<f32, WIND_PER_RUNG>;
+        var total = 0.0;
+        for (var j = 0u; j < WIND_PER_RUNG; j += 1u)
+        {
+            weights[j] = 1.0;
+            if (beta > SPREAD_FLOOR)
+            {
+                let heading = stage.wind_waves[rung*WIND_PER_RUNG + j].w;
+                let ratio = cosh(SPREAD_FLOOR*heading)/cosh(beta*heading);
+                weights[j] = ratio*ratio;
+            }
+            total += weights[j];
+        }
+        for (var j = 0u; j < WIND_PER_RUNG; j += 1u)
+        {
+            let wave = stage.wind_waves[rung*WIND_PER_RUNG + j];
+            let cycles = max(length(wave.xy), 1.0);
+            let direction = wave.xy/cycles;
             let wavelength = WIND_PERIOD/cycles;
+            let k_wave = 2.0*PI/wavelength;
+            let omega_wave = sqrt(GRAVITY*k_wave + SURFACE_TENSION*k_wave*k_wave*k_wave);
+            // A frame must not carry a crest more than a fraction of its
+            // wavelength, or it seems to run backwards.
+            let per_frame = (omega_wave/k_wave + current)*frame_seconds/wavelength;
+            let steady = 1.0 - smoothstepf(0.22, 0.42, per_frame);
+            // Up to the longest wave this water raises, they fade out rather
+            // than stop.
+            let kept = 1.0 - smoothstepf(0.85*longest, longest, wavelength);
             let cycles_per_pixel = max(abs(dot(direction, pixel_dx)), abs(dot(direction, pixel_dy)))/wavelength;
             let resolved = (1.0 - smoothstepf(0.125, 0.5, cycles_per_pixel))*steady;
-            let component_variance = 0.5*rung_variance;
+            let component_variance = rung_variance*kept*weights[j]/total;
             result.variance += component_variance*(1.0 - resolved*resolved);
-            if (resolved <= 0.0)
+            if (resolved <= 0.0 || component_variance <= 0.0)
             {
                 continue;
             }
             // Slope variance (a k)^2 / 2 per component.
-            let amplitude = sqrt(2.0*component_variance)/k;
-            let phase = 6.2831853*(fract(dot(lattice, wrapped)/WIND_PERIOD) + hash11(seed + 17.0)) - omega*time;
-            result.slope -= direction*(amplitude*k*sin(phase)*resolved);
+            let amplitude = sqrt(2.0*component_variance)/k_wave;
+            let phase = 6.2831853*(fract(dot(wave.xy, wrapped)/WIND_PERIOD) + wave.z) - omega_wave*time;
+            result.slope -= direction*(amplitude*k_wave*sin(phase)*resolved);
             result.height += amplitude*cos(phase)*resolved;
             result.height_variance += 0.5*amplitude*amplitude*resolved*resolved;
         }
     }
     return result;
+}
+
+// Gusts cross the water as cat's paws: patches of ripples blown along at
+// about the wind's speed and drawn out down it, some three times as long as
+// they are wide, as the streaks a gust leaves on water are. The field lives
+// in the wind's own frame, so no patch lines up with the world's axes, and
+// is gradient noise, whose blobs have no corners. Its cells are as wide
+// across the wind as the value noise's it replaced and three times as long,
+// which keeps the paws as large and the gusts as strong. About 0.5 on
+// average, and within 0..1 over most of the water.
+const GUST_STRETCH: f32 = 3.0;
+
+fn windGust(xz: vec2<f32>, wind_direction: vec2<f32>, wind: f32, time: f32) -> f32
+{
+    let speed = max(wind, 1.0);
+    let frame = vec2<f32>(dot(xz, wind_direction), dot(xz, vec2<f32>(-wind_direction.y, wind_direction.x)));
+    let broad = (10.0 + 2.5*speed)*vec2<f32>(GUST_STRETCH, 1.0);
+    let fine = (4.0 + speed)*vec2<f32>(GUST_STRETCH, 1.0);
+    return 0.5 + 0.65*gradientNoise((frame - vec2<f32>(time*speed*0.8, 0.0))/broad)
+               + 0.35*gradientNoise((frame - vec2<f32>(time*speed, 0.0))/fine + vec2<f32>(7.3, 1.9));
 }
 
 // How much of the wind reaches the water, and over what fetch. Walk upwind
@@ -2585,10 +2684,7 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     let wind_direction = vec2<f32>(cos(stage.flags.z), sin(stage.flags.z));
     let here = riverCanopy(xz);
     let exposure = windExposure(xz, level, -wind_direction, here.a, sea, across, half_width, cross_stream);
-    // Gusts cross the water as cat's paws, at about the wind's speed.
-    let gust_speed = max(stage.wind.x, 1.0);
-    let gust = valueNoise((xz - wind_direction*time*gust_speed*0.8)/(10.0 + 2.5*gust_speed))*0.65
-             + valueNoise((xz - wind_direction*time*gust_speed)/(4.0 + gust_speed) + vec2<f32>(7.3, 1.9))*0.35;
+    let gust = windGust(xz, wind_direction, stage.wind.x, time);
     let gust_factor = 1.0 + stage.wind.y*(gust - 0.5)*1.6;
     let local_wind = stage.wind.x*exposure.shelter*max(gust_factor, 0.0)*(1.0 + 0.31*precipitation.w);
     // On the sea the wind sea stops where the swell's spectrum begins.
@@ -2600,7 +2696,7 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
         for (var layer = 0u; layer < 2u; layer += 1u)
         {
             let cycle = flowLayer(time, 3.0, layer, 0.29, velocity);
-            let waves = windSea(xz, cycle.offset, wind_direction, local_wind, exposure.fetch, longest,
+            let waves = windSea(xz, cycle.offset, local_wind, exposure.fetch, longest,
                                 time, pixel_dx, pixel_dy, speed, frame_seconds);
             wind_sea.slope += waves.slope*cycle.weight;
             wind_sea.height += waves.height*cycle.weight;
@@ -2610,7 +2706,7 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     }
     else
     {
-        wind_sea = windSea(xz, vec2<f32>(0.0), wind_direction, local_wind, exposure.fetch, longest,
+        wind_sea = windSea(xz, vec2<f32>(0.0), local_wind, exposure.fetch, longest,
                            time, pixel_dx, pixel_dy, 0.0, frame_seconds);
     }
     slope += wind_sea.slope;

@@ -164,10 +164,16 @@ pub struct WaterStageUniforms {
     /// rgb sunlight at the surface for the submerged medium, w moon radiance
     /// scale.
     pub medium_sun: [f32; 4], // 1536
+    /// The wind sea's components for the wind's heading
+    /// ([`waves::wind_sea_components`]): xy wave vector in whole cycles over
+    /// the wind sea's period, z phase in cycles, w heading off the wind in
+    /// radians. Written with the wave spectrum, when the sea state or the
+    /// heading changes.
+    pub wind_waves: [[f32; 4]; waves::WIND_COMPONENTS], // 1552 896
 }
 
 const _: () = assert!(std::mem::size_of::<GpuWave>() == 32);
-const _: () = assert!(std::mem::size_of::<WaterStageUniforms>() == 1552);
+const _: () = assert!(std::mem::size_of::<WaterStageUniforms>() == 2448);
 
 impl Default for WaterStageUniforms {
     fn default() -> Self {
@@ -186,6 +192,7 @@ impl Default for WaterStageUniforms {
             eye_water: [0.0; 4],
             eye_body: [0.0; 4],
             medium_sun: [0.0; 4],
+            wind_waves: waves::wind_sea_components(0.0),
         }
     }
 }

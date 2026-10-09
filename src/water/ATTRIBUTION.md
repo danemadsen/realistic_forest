@@ -36,6 +36,17 @@ Not ported: the FFT spectral wave model, planar reflections, screen-space
 reflections, caustics, spray, motion vectors, bounded water bodies, and the
 GPU wave-query readback. See the module comment in `src/water/mod.rs`.
 
+The Gerstner set keeps Crest's wavelengths and amplitudes, drawn from the
+same stream, but not Crest's directions or phases. Crest's generator gives
+each component one index within its octave that sets its wavelength, its
+direction stratum and its phase eighth together, and draws the phases from
+the wavelengths' own seed, so every octave repeats the same fan in step and
+the sea shows rows of dimples. `src/water/waves.rs` draws the directions from
+a measured directional spectrum (Donelan, Hamilton and Hui's spread with
+Banner's extension, floored at Cox and Munk's slope ratio) through strata
+shuffled independently in every octave, and the phases uniformly, each from
+a seed of its own.
+
 Not from aqua: the rivers and lakes the same surface shader draws, their
 current, their inland optics and the wind sea every water body shares
 (`vs_inland`, `windSea`, `flowSurface` and `inlandMedium` in

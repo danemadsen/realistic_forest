@@ -791,6 +791,7 @@ fn build_stage_uniforms(
         settings.wind_direction_degrees.to_radians(),
         rings::horizon_wave_fade_end(),
     ];
+    block.wind_waves = waves::wind_sea_components(settings.wind_direction_degrees.to_radians());
     block
 }
 
@@ -1602,6 +1603,7 @@ mod exposure_tests {
 #[cfg(test)]
 mod shading_tests {
     use super::*;
+    use bevy::math::Vec2;
     use bevy::tasks::block_on;
     use wgpu::util::DeviceExt;
 
@@ -1614,6 +1616,8 @@ mod shading_tests {
         let rest = &WATER[start..];
         let end = if head.starts_with("const") {
             rest.find(";\n").expect("a constant ends") + 2
+        } else if head.starts_with("struct") {
+            rest.find("\n};\n").expect("a structure ends") + 4
         } else {
             rest.find("\n}\n").expect("a function ends") + 3
         };
@@ -1624,6 +1628,12 @@ mod shading_tests {
     /// with the water shader's `heads` in scope, on whatever adapter there
     /// is. `None` without one.
     fn evaluate(heads: &[&str], body: &str, inputs: &[[f32; 4]]) -> Option<Vec<[f32; 4]>> {
+        evaluate_with("", heads, body, inputs)
+    }
+
+    /// [`evaluate`], with `prelude` declared before the shader's items: the
+    /// stand-ins for the bindings they read.
+    fn evaluate_with(prelude: &str, heads: &[&str], body: &str, inputs: &[[f32; 4]]) -> Option<Vec<[f32; 4]>> {
         let instance = wgpu::Instance::default();
         let Ok(adapter) = block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("skipping water shading check: no GPU adapter");
@@ -1632,7 +1642,8 @@ mod shading_tests {
         let (device, queue) = block_on(adapter.request_device(&Default::default())).expect("a device");
         let items = heads.iter().map(|head| item(head)).collect::<Vec<_>>().join("\n");
         let source = format!(
-            "{items}
+            "{prelude}
+             {items}
              @group(0) @binding(0) var<storage, read_write> samples: array<vec4<f32>>;
              @compute @workgroup_size(64)
              fn evaluate(@builtin(global_invocation_id) id: vec3<u32>) {{
@@ -1809,6 +1820,161 @@ mod shading_tests {
         assert!(!WATER.contains("canopy_map"), "the stage block must not carry a canopy window");
     }
 
+    /// The wind sea's constants are mirrored by hand in the shader.
+    #[test]
+    fn the_wind_sea_constants_match_their_mirror() {
+        use crate::water::waves;
+        let constant = |name: &str| item(&format!("const {name}:"));
+        assert!(constant("WIND_RUNGS").contains(&format!("= {}u;", waves::WIND_RUNGS)));
+        assert!(constant("WIND_PER_RUNG").contains(&format!("= {}u;", waves::WIND_PER_RUNG)));
+        assert!(constant("WIND_COMPONENTS").contains(&format!("= {}u;", waves::WIND_COMPONENTS)));
+        assert!(constant("WIND_SHORTEST").contains(&format!("= {:?};", waves::WIND_SHORTEST_METRES)));
+        assert!(constant("WIND_PERIOD").contains(&format!("= {:?};", waves::WIND_PERIOD_METRES)));
+        assert!(constant("SPREAD_FLOOR").contains(&format!("= {:?};", waves::SPREAD_FLOOR)));
+    }
+
+    /// Where the wind sea's crests lie and where they head come only from the
+    /// table built for the wind's heading. Nothing a pixel computes, its local
+    /// wind, its fetch or its maps, may reach a wave vector or a phase, or the
+    /// ripples re-phase from frame to frame as those move; nor may the waves
+    /// be mirrored pairs about the wind, which cross in a lattice.
+    #[test]
+    fn the_wind_sea_takes_its_waves_from_the_heading_alone() {
+        let sea = item("fn windSea(");
+        assert!(sea.contains("stage.wind_waves[rung*WIND_PER_RUNG + j]"));
+        for gone in ["hash11", "round(", "wind_direction", "select(-1.0, 1.0"] {
+            assert!(!sea.contains(gone), "windSea still uses {gone}");
+        }
+        let phase = sea.lines().find(|line| line.contains("let phase =")).expect("a phase");
+        assert!(phase.contains("dot(wave.xy, wrapped)") && phase.contains("wave.z"), "{phase}");
+    }
+
+    /// The shader's spread is the CPU's, which carries the measurements.
+    #[test]
+    fn the_shader_spreads_the_wind_sea_as_the_cpu_does() {
+        use crate::water::waves::spreading_beta;
+        let heads = ["fn smoothstepf(", "const SPREAD_FLOOR:", "fn spreadingBeta("];
+        let body = "samples[id.x] = vec4<f32>(spreadingBeta(input.x), 0.0, 0.0, 0.0);";
+        let inputs: Vec<[f32; 4]> = (0..400).map(|step| [0.05 + step as f32 * 0.02, 0.0, 0.0, 0.0]).collect();
+        let Some(values) = evaluate(&heads, body, &inputs) else {
+            return;
+        };
+        for (input, value) in inputs.iter().zip(&values) {
+            let expected = spreading_beta(input[0]);
+            assert!((value[0] - expected).abs() < 1e-3 * expected, "{}: {} against {expected}", input[0], value[0]);
+        }
+    }
+
+    /// The wind sea as the shader draws it, over the open sea and a lake: its
+    /// slope steeper up the wind than across it, where the crossing pairs
+    /// gave the same both ways, and all of its slope accounted for, resolved
+    /// or as roughness, however coarse the pixel. On the open sea the ratio
+    /// is Cox and Munk's (1.32-1.65 for the whole sea surface); a young sea a
+    /// hundred metres from its shore has most of its slope in waves near its
+    /// peak, which run closest to the wind, and is more anisotropic still.
+    #[test]
+    fn the_wind_sea_runs_with_the_wind_and_keeps_its_slope() {
+        use crate::water::waves;
+        let wind_heading = 0.733f32;
+        let table = waves::wind_sea_components(wind_heading)
+            .iter()
+            .map(|c| format!("vec4<f32>({:?}, {:?}, {:?}, {:?})", c[0], c[1], c[2], c[3]))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let prelude = "struct TestStage { flags: vec4<f32>, wind_waves: array<vec4<f32>, 56> };
+                       var<private> stage: TestStage;";
+        let heads = [
+            "const PI:", "const GRAVITY:", "fn smoothstepf(", "const WIND_RUNGS:", "const WIND_PER_RUNG:",
+            "const WIND_COMPONENTS:", "const WIND_SHORTEST:", "const CAPILLARY_CUTOFF:", "const SURFACE_TENSION:",
+            "const COX_MUNK_SLOPE:", "const RUNG_LOG_SPAN:", "const WIND_PERIOD:", "const SPREAD_FLOOR:",
+            "const WIND_RUNG_STRETCH:", "struct WindSea", "fn windSaturation(", "fn windPeakWavenumber(",
+            "fn spreadingBeta(", "fn windSea(",
+        ];
+        // x, z, the pixel's size, the longest wave the water raises; the
+        // wind and the fetch per case.
+        let mut seed = 0x9e37_79b9_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        let positions: Vec<[f32; 2]> = (0..4096).map(|_| [next() * 3000.0 - 1500.0, next() * 3000.0 - 1500.0]).collect();
+        let wind = Vec2::from_angle(wind_heading);
+        // The open sea under the default breeze, and a lake 100 m down from
+        // its upwind shore.
+        for (speed, fetch, longest, spread) in [(6.3f32, 1.0e5f32, 2.0f32, 1.2f32..1.9f32), (5.0, 100.0, 3.7, 1.5..4.0)] {
+            let body = format!(
+                "stage.flags = vec4<f32>(0.0);
+                 stage.wind_waves = array<vec4<f32>, 56>({table});
+                 let sea = windSea(input.xy, vec2<f32>(0.0), {speed:?}, {fetch:?}, input.w, 0.0,
+                                   vec2<f32>(input.z, 0.0), vec2<f32>(0.0, input.z), 0.0, 1.0/60.0);
+                 samples[id.x] = vec4<f32>(sea.slope, sea.variance, sea.height);"
+            );
+            let mut inputs = Vec::new();
+            for pixel in [0.002f32, 200.0] {
+                inputs.extend(positions.iter().map(|p| [p[0], p[1], pixel, longest]));
+            }
+            let Some(values) = evaluate_with(prelude, &heads, &body, &inputs) else {
+                return;
+            };
+            let (near, far) = values.split_at(positions.len());
+            let n = positions.len() as f32;
+            let up = near.iter().map(|v| Vec2::new(v[0], v[1]).dot(wind).powi(2)).sum::<f32>() / n;
+            let across = near.iter().map(|v| Vec2::new(v[0], v[1]).perp_dot(wind).powi(2)).sum::<f32>() / n;
+            let rough = near.iter().map(|v| v[2]).sum::<f32>() / n;
+            let total = far.iter().map(|v| v[2]).sum::<f32>() / n;
+            let ratio = up / across;
+            assert!(spread.contains(&ratio), "{speed} m/s over {fetch} m: up/cross {ratio}");
+            let kept = (up + across + rough) / total;
+            assert!((kept - 1.0).abs() < 0.08, "{speed} m/s over {fetch} m: {up} + {across} + {rough} of {total}");
+            assert!(far.iter().all(|v| v[0] == 0.0 && v[1] == 0.0), "a coarse pixel resolved a ripple");
+        }
+    }
+
+    /// The cat's paws are drawn out down the wind, not cells on the world's
+    /// axes: the gust field stays alike much further along the wind than
+    /// across it, and is as strong as before on average.
+    #[test]
+    fn gusts_are_drawn_out_down_the_wind() {
+        let heads = ["fn hash21(", "fn latticeGradient(", "fn gradientNoise(", "const GUST_STRETCH:", "fn windGust("];
+        let heading = 0.733f32;
+        let wind = Vec2::from_angle(heading);
+        let body = format!(
+            "samples[id.x] = vec4<f32>(windGust(input.xy, vec2<f32>({:?}, {:?}), 6.3, input.z), 0.0, 0.0, 0.0);",
+            wind.x, wind.y
+        );
+        let mut seed = 0x2545_f491_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        let points: Vec<Vec2> = (0..8192).map(|_| Vec2::new(next() * 4000.0 - 2000.0, next() * 4000.0 - 2000.0)).collect();
+        let lag = 15.0;
+        let mut inputs = Vec::new();
+        for offset in [Vec2::ZERO, wind * lag, wind.perp() * lag] {
+            inputs.extend(points.iter().map(|p| [p.x + offset.x, p.y + offset.y, 40.0, 0.0]));
+        }
+        let Some(values) = evaluate(&heads, &body, &inputs) else {
+            return;
+        };
+        let field: Vec<&[[f32; 4]]> = values.chunks(points.len()).collect();
+        let mean = field[0].iter().map(|v| v[0]).sum::<f32>() / points.len() as f32;
+        let deviation = (field[0].iter().map(|v| (v[0] - mean).powi(2)).sum::<f32>() / points.len() as f32).sqrt();
+        let correlation = |other: &[[f32; 4]]| {
+            field[0].iter().zip(other).map(|(a, b)| (a[0] - mean) * (b[0] - mean)).sum::<f32>()
+                / points.len() as f32
+                / (deviation * deviation)
+        };
+        assert!((mean - 0.5).abs() < 0.02, "mean {mean}");
+        // The value noise it replaced varied by 0.158 about its mean.
+        assert!((deviation - 0.158).abs() < 0.02, "deviation {deviation}");
+        let (along, across) = (correlation(field[1]), correlation(field[2]));
+        assert!(along > across + 0.3, "{lag} m down the wind {along}, across it {across}");
+    }
+
     /// The stage block is mirrored by hand on both sides; a field added to one
     /// alone would shift everything after it.
     #[test]
@@ -1835,7 +2001,7 @@ mod shading_tests {
         }
         let rust = offsets!(
             waves, ranges, params, extinction, scatter, surface, sss_tint, misc, flags, shore_map, wind,
-            eye_water, eye_body, medium_sun
+            eye_water, eye_body, medium_sun, wind_waves
         );
         assert_eq!(wgsl, rust);
         assert_eq!(span, std::mem::size_of::<WaterStageUniforms>());

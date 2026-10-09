@@ -1122,13 +1122,26 @@ to the next:
   from it: a spectrum of short waves whose slope follows Cox and Munk's
   measurements of the sea surface, peaked where JONSWAP puts the peak of a
   sea the wind has blown over that far, moving with the capillary-gravity
-  dispersion. What differs is how much wind the water feels and over what
-  fetch. The open sea takes all of it over unlimited fetch, with whitecaps
-  from a fresh breeze, and adds its swell and its surf. A lake's waves grow
-  from its upwind shore across it, calm in the lee of the trees there and
-  rougher toward its far shore. A pond ringed by forest, or a creek in its
-  cut under the crowns, lies sheltered and nearly glassy but for the cat's
-  paws gusts send across it. A river adds what its current does to it. The
+  dispersion. The waves head round the wind as a measured sea's do, a
+  short-crested field rather than a weave: narrowly just past the peak and
+  more broadly for the shorter waves (Donelan, Hamilton and Hui; Banner),
+  never more broadly than Cox and Munk saw the short waves, whose slope runs
+  1.65 times as steep up the wind as across it. Each half octave of
+  wavelength holds four waves whose headings, lengths and phases are fixed
+  for the wind's heading, drawn so that no two of them cross mirrored about
+  the wind; the local wind only shares the slope out between them, so a gust
+  or a nearer shore changes how high the ripples run and never where their
+  crests lie. The sea's swell spreads the same way about the wind, its long
+  waves long-crested, and its components no longer run as families of
+  octave harmonics in step. What differs is how much wind the water feels
+  and over what fetch. The open sea takes all of it over unlimited fetch,
+  with whitecaps from a fresh breeze, and adds its swell and its surf. A
+  lake's waves grow from its upwind shore across it, calm in the lee of the
+  trees there and rougher toward its far shore. A pond ringed by forest, or
+  a creek in its cut under the crowns, lies sheltered and nearly glassy but
+  for the cat's paws gusts send across it, patches drawn out three times as
+  long down the wind as across it. A river adds what its current does to
+  it. The
   crowns are read from the grass's 512-metre capture, placed by the window
   the capture itself records as it is taken, so in the frame the camera
   crosses into the next window the forest the water sees does not jump.
