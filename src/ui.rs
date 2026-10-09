@@ -299,7 +299,11 @@ fn ground_position(
 ) -> Vec3 {
     let xz = Vec2::new(position.x, position.z);
     let y = snow::sample_surface(cache, noise, xz, xz.to_array()).height(snow, xz) + EYE_HEIGHT;
-    Vec3::new(position.x, y, position.z)
+    // Over water too deep to stand in, the player is set afloat on it, not
+    // on its bed.
+    let afloat = crate::player::water_at(cache, noise, position.x, position.z, xz.to_array())
+        .and_then(|water| water.float_eye());
+    Vec3::new(position.x, afloat.map_or(y, |eye| eye.max(y)), position.z)
 }
 
 fn draw_player_tools(
@@ -314,11 +318,9 @@ fn draw_player_tools(
         trainer.use_position(player.position);
     }
     separator_text(ui, "Player and teleport");
-    if ui
-        .checkbox(&mut player.flying, "Fly / noclip [V]")
-        .changed()
-    {
-        player.vertical_velocity = 0.0;
+    let mut flying = player.flying;
+    if ui.checkbox(&mut flying, "Fly / noclip [V]").changed() {
+        player.set_flying(flying);
     }
     let mut movement_speed_slider = egui::Slider::new(&mut player.movement_speed_multiplier, 0.1..=20.0);
     movement_speed_slider = movement_speed_slider.text("Movement speed");

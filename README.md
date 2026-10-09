@@ -1168,7 +1168,9 @@ and away downstream, down any rapids coming. Water too deep to stand in, the
 sea's, a lake's or a river's, is swum in: the body floats head out, carried
 by any current, until the player dives. Left Shift dives and Space swims
 back up; swimming forward while looking well down or up follows the eye; a
-swimmer left alone drifts back up and floats. The bed is solid, and from the
+swimmer left alone drifts back up and floats, and a diver reaching water too
+shallow to float in stands up out of it. The water takes a fall into it the
+same way whatever the frame rate. The bed is solid, and from the
 surface Space kicks a swimmer up out of the water as it jumps a walker off the
 ground, onto a bank or over a ledge; a body in the air over the water keeps
 the motion it left the water with, so a hop neither shakes off the current

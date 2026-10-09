@@ -74,6 +74,12 @@ impl WaterHere {
     pub fn depth(&self) -> f32 {
         self.surface - self.ground
     }
+
+    /// Where the eye of a body floating head out in this water is, if it is
+    /// too deep to stand in.
+    pub fn float_eye(&self) -> Option<f32> {
+        (self.depth() > EYE_HEIGHT - SWIM_FREEBOARD).then_some(self.surface + SWIM_FREEBOARD)
+    }
 }
 
 /// The water over the ground at `(x, z)`, if any: a river's (a little splash
@@ -158,6 +164,15 @@ impl Player {
         self.vertical_velocity = 0.0;
         self.velocity = Vec2::ZERO;
         true
+    }
+
+    /// Start or stop flying. Flight's speed is not momentum: a body that
+    /// stops flying drops from rest, rather than gliding on at flight speed
+    /// over water it has not yet reached.
+    pub fn set_flying(&mut self, flying: bool) {
+        self.flying = flying;
+        self.vertical_velocity = 0.0;
+        self.velocity = Vec2::ZERO;
     }
 
     /// Keep cursor visibility, grab state and mouse-motion warmup consistent.
@@ -245,8 +260,8 @@ pub fn update_player_system(
         }
     }
     if keys.just_pressed(KeyCode::KeyV) && !ui_wants_input {
-        player.flying = !player.flying;
-        player.vertical_velocity = 0.0;
+        let flying = !player.flying;
+        player.set_flying(flying);
     }
     if player.mouse_captured && !ui_wants_input {
         let delta = mouse_motion
@@ -325,7 +340,7 @@ pub fn update_player_system(
         // Water too deep to stand in is swum in: the body floats, head out,
         // until the player dives.
         let floating = depth > EYE_HEIGHT - SWIM_FREEBOARD;
-        let swimming = floating && player.position.y <= surface + SWIM_FREEBOARD + 0.03;
+        let swimming = swims(water, player.position.y, player.vertical_velocity);
         let jump = keys.just_pressed(KeyCode::Space) && !ui_wants_input;
         let at_surface = player.position.y >= surface + SWIM_FREEBOARD - 0.05;
         if swimming && !(jump && at_surface) {
@@ -362,8 +377,9 @@ pub fn update_player_system(
                 dt,
             );
             // Falling into deep water ends at its surface, not the bed: the
-            // water takes the fall and the swim takes over from there.
-            if floating && candidate.y < surface + SWIM_FREEBOARD && player.vertical_velocity < 0.0 {
+            // water takes the fall on the frame that reaches the swim, and
+            // the swim takes over from there.
+            if floating && candidate.y <= surface + SWIM_ENTRY && player.vertical_velocity < 0.0 {
                 player.vertical_velocity *= 0.25;
             }
         }
@@ -456,7 +472,10 @@ fn update_walking_ground(
 }
 
 /// How far the eye floats above the water when it is too deep to stand in.
-const SWIM_FREEBOARD: f32 = 0.25;
+pub const SWIM_FREEBOARD: f32 = 0.25;
+/// How far over the water the eye may be and swim: a body falling into deep
+/// water is taken by it on the frame its eye comes within this.
+const SWIM_ENTRY: f32 = SWIM_FREEBOARD + 0.03;
 /// How fast a swimmer climbs or dives, m/s.
 const SWIM_VERTICAL_SPEED: f32 = 1.4;
 /// How fast a swimmer who does nothing drifts back up: a body with a breath
@@ -483,20 +502,39 @@ pub struct SwimStroke {
     pub forward_pitch: f32,
 }
 
+/// Whether a body whose eye is at `eye`, rising at `vertical_velocity`,
+/// swims in `water` this step. Water too deep to stand in is swum in once
+/// the eye comes down within `SWIM_ENTRY` of it. A swimmer still under where
+/// it shallows swims on until they have stood up out of it
+/// (`swim_vertical`), rather than being lifted to standing height in one
+/// step. A body rising faster than any stroke, kicked up out of the water, is
+/// in the air until it falls back to it.
+fn swims(water: Option<WaterHere>, eye: f32, vertical_velocity: f32) -> bool {
+    water.is_some_and(|water| {
+        let floating = water.float_eye().is_some();
+        let standing_up = water.depth() > 0.02 && eye < water.ground + EYE_HEIGHT - 0.03;
+        (floating || standing_up) && eye <= water.surface + SWIM_ENTRY && vertical_velocity <= SWIM_VERTICAL_SPEED
+    })
+}
+
 /// The eye height and vertical velocity a swimmer comes to after one step:
 /// the stroke sets a climb or a dive, the water's drag eases the body toward
 /// it, a body left alone drifts up to float head out, and neither the
-/// surface (the swimmer floats there) nor the bed stops being solid.
+/// surface (the swimmer floats there) nor the bed stops being solid. Where
+/// the water is too shallow to float in, a swimmer left alone stands up out
+/// of it instead, at a stroke's pace, to standing height and no higher.
 pub fn swim_vertical(eye: f32, vertical_velocity: f32, stroke: SwimStroke, surface: f32, bed: f32, dt: f32) -> (f32, f32) {
+    let standing = bed + EYE_HEIGHT;
+    let shallow = standing > surface + SWIM_FREEBOARD;
+    let top = if shallow { standing } else { surface + SWIM_FREEBOARD };
     let mut target = SWIM_VERTICAL_SPEED * (stroke.forward_pitch.clamp(-1.0, 1.0)
         + f32::from(u8::from(stroke.rise)) - f32::from(u8::from(stroke.dive)));
     if !stroke.rise && !stroke.dive && stroke.forward_pitch.abs() < 0.05 {
-        target = SWIM_BUOYANT_RISE;
+        target = if shallow { SWIM_VERTICAL_SPEED } else { SWIM_BUOYANT_RISE };
     }
     let target = target.clamp(-SWIM_VERTICAL_SPEED, SWIM_VERTICAL_SPEED);
     let mut velocity = vertical_velocity + (target - vertical_velocity) * (1.0 - (-SWIM_RESPONSE * dt).exp());
     let mut y = eye + velocity * dt;
-    let top = surface + SWIM_FREEBOARD;
     let bottom = (bed + SWIM_BED_CLEARANCE).min(top);
     if y >= top {
         y = top;
@@ -862,6 +900,62 @@ mod tests {
         let (risen, _) = swim(bottom, 0.0, rise, 2.0);
         let (drifted, _) = swim(bottom, 0.0, SwimStroke::default(), 2.0);
         assert!(risen > drifted + 1.0, "{risen} {drifted}");
+    }
+
+    #[test]
+    fn a_diver_in_the_shallows_stands_up_out_of_the_water() {
+        // A metre of water over a bed at 9 m, the eye stretched out along it.
+        let mut eye = 9.0 + SWIM_BED_CLEARANCE;
+        let mut velocity = 0.0;
+        let mut previous = eye;
+        let dt = 1.0 / 120.0;
+        for _ in 0..240 {
+            (eye, velocity) = swim_vertical(eye, velocity, SwimStroke::default(), 10.0, 9.0, dt);
+            assert!(eye - previous <= SWIM_VERTICAL_SPEED * dt + 1e-5, "no faster than a stroke: {previous} {eye}");
+            previous = eye;
+        }
+        // Up to standing height and no higher, within two seconds, where
+        // walking takes over from swimming without a step.
+        assert!((eye - (9.0 + EYE_HEIGHT)).abs() < 1e-4 && velocity == 0.0, "{eye} {velocity}");
+        let wading = WaterHere {
+            surface: 10.0,
+            ground: 9.0,
+            current: Vec2::ZERO,
+            turbulence: 0.0,
+            clarity: 0.0,
+            sea: 0.0,
+            still: 1.0,
+            kind: WaterKind::Lake,
+        };
+        assert!(!swims(Some(wading), eye, velocity));
+        // Still under, the diver swims; a walker in the same water does not.
+        assert!(swims(Some(wading), 9.0 + SWIM_BED_CLEARANCE, 0.0));
+        assert!(!swims(Some(wading), 9.0 + EYE_HEIGHT, 0.0));
+        assert!(!swims(None, 0.0, 0.0));
+    }
+
+    #[test]
+    fn deep_water_takes_a_fall_and_lets_a_kick_out_of_it() {
+        let deep = WaterHere {
+            surface: 10.0,
+            ground: 0.0,
+            current: Vec2::ZERO,
+            turbulence: 0.0,
+            clarity: 0.0,
+            sea: 1.0,
+            still: 1.0,
+            kind: WaterKind::Sea,
+        };
+        assert_eq!(deep.float_eye(), Some(10.0 + SWIM_FREEBOARD));
+        // A falling eye anywhere within the entry band is the water's.
+        for eye in [10.0, 10.0 + SWIM_FREEBOARD, 10.0 + SWIM_ENTRY] {
+            assert!(swims(Some(deep), eye, -9.0), "{eye}");
+        }
+        assert!(!swims(Some(deep), 10.0 + SWIM_ENTRY + 0.01, -9.0));
+        // A swimmer kicked up out of it is in the air while it rises, however
+        // short a frame leaves it inside the band.
+        assert!(!swims(Some(deep), 10.0 + SWIM_FREEBOARD + 0.01, 7.3));
+        assert!(swims(Some(deep), 10.0 + SWIM_FREEBOARD, SWIM_VERTICAL_SPEED));
     }
 
     #[test]

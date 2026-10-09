@@ -80,8 +80,10 @@ const FOAM_SCALE: f32 = 1.0;
 
 /// Eye height, in metres, over which the submerged-camera medium fades in
 /// across the surface. Wide enough that crossing the surface does not pop,
-/// narrow enough that it never reaches the camera while walking a shore.
-const UNDERWATER_FADE_METRES: f32 = 0.6;
+/// narrow enough that it never reaches the camera while walking a shore or
+/// floating head out: the band's top half lies under the swimmer's eye.
+const UNDERWATER_FADE_METRES: f32 = 0.4;
+const _: () = assert!(UNDERWATER_FADE_METRES / 2.0 <= crate::player::SWIM_FREEBOARD);
 
 /// Artistic gain for the medium's low single-scattering albedo (~0.025).
 /// Underwater lighting is reconstructed into HDR before attenuation; this gain
