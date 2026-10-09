@@ -215,31 +215,36 @@ fn settle_wave_gain(current: f32, target: f32, delta_seconds: f32) -> f32 {
 }
 
 impl ExtractedWater {
-    /// Whether the eye is within `margin` metres of going under the water it
-    /// is over, or below it, and that water is drawn.
+    /// The water the eye is over or in as it is drawn: the eye's own, or
+    /// where that is hidden (the rivers and lakes turned off) the sea under
+    /// it, if the sea is drawn and covers the ground there, as it does at a
+    /// river's mouth.
+    pub fn drawn_eye_water(&self) -> Option<WaterHere> {
+        let drawn = |here: &WaterHere| match here.kind {
+            WaterKind::Sea => self.draw,
+            WaterKind::River | WaterKind::Lake => self.rivers_visible,
+        };
+        let here = self.eye_water?;
+        if drawn(&here) { Some(here) } else { WaterHere::sea(here.ground).filter(drawn) }
+    }
+
+    /// Whether the eye is within `margin` metres of going under the drawn
+    /// water it is over, or below it.
     pub fn eye_submerged(&self, margin: f32) -> bool {
-        self.eye_water.is_some_and(|here| {
-            let drawn = match here.kind {
-                WaterKind::Sea => self.draw,
-                WaterKind::River | WaterKind::Lake => self.rivers_visible,
-            };
-            drawn && self.camera_height <= here.surface + margin
-        })
+        self.drawn_eye_water()
+            .is_some_and(|here| self.camera_height <= here.surface + margin)
     }
 }
 
-/// The water the medium pass puts the eye in: the eye's water, if the eye is
-/// near enough its surface for the medium to have faded in, and if that water
-/// is drawn at all. Returns the uniform block's `eye_water` and `eye_body`.
+/// The water the medium pass puts the eye in: the drawn water it is over
+/// (`ExtractedWater::drawn_eye_water`), if the eye is near enough its surface
+/// for the medium to have faded in. Returns the uniform block's `eye_water`
+/// and `eye_body`.
 fn eye_medium(water: &ExtractedWater) -> ([f32; 4], [f32; 4]) {
-    let Some(here) = water.eye_water else {
+    let Some(here) = water.drawn_eye_water() else {
         return ([0.0; 4], [0.0; 4]);
     };
-    let drawn = match here.kind {
-        WaterKind::Sea => water.draw,
-        WaterKind::River | WaterKind::Lake => water.rivers_visible,
-    };
-    if !drawn || !water.settings.underwater_effects {
+    if !water.settings.underwater_effects {
         return ([0.0; 4], [0.0; 4]);
     }
     let height = water.camera_height - here.surface;
@@ -1421,4 +1426,54 @@ pub fn register_water_systems(render_app: &mut bevy::app::SubApp) {
     config = config.in_set(RenderSystems::Prepare);
     config = config.after(crate::render::prepare_forest_globals);
     render_app.add_systems(Render, config);
+}
+
+#[cfg(test)]
+mod eye_water_tests {
+    use super::*;
+    use bevy::math::Vec2;
+
+    /// A river's last reach over the sea floor at its mouth, its surface a
+    /// little over the sea's.
+    fn estuary() -> WaterHere {
+        WaterHere {
+            surface: SEA_LEVEL + 0.02,
+            ground: SEA_LEVEL - 2.0,
+            current: Vec2::new(0.5, 0.0),
+            turbulence: 0.1,
+            clarity: 0.3,
+            sea: 0.8,
+            still: 0.6,
+            kind: WaterKind::River,
+        }
+    }
+
+    #[test]
+    fn a_hidden_river_leaves_the_eye_in_the_sea_drawn_over_its_mouth() {
+        let mut water = ExtractedWater {
+            camera_height: SEA_LEVEL - 1.0,
+            eye_water: Some(estuary()),
+            ..ExtractedWater::default()
+        };
+        // Drawn, the river's water is the eye's.
+        assert!(water.eye_submerged(0.2));
+        let (eye, body) = eye_medium(&water);
+        assert_eq!((eye[0], eye[3], body[0], body[2]), (SEA_LEVEL + 0.02, 0.8, 0.6, 0.3));
+        // Hidden, the sea drawn over the mouth is: the eye is under it, the
+        // precipitation stops and the medium is the sea's.
+        water.rivers_visible = false;
+        assert!(water.eye_submerged(0.2));
+        let (eye, body) = eye_medium(&water);
+        assert_eq!((eye[0], eye[2], eye[3], body[0], body[2]), (SEA_LEVEL, 1.0, 1.0, 1.0, 0.0));
+        // With the sea hidden too, no water is drawn there at all.
+        water.draw = false;
+        assert!(!water.eye_submerged(0.2));
+        assert_eq!(eye_medium(&water), ([0.0; 4], [0.0; 4]));
+        // A hidden stream over dry ground leaves no sea to fall back to.
+        water.draw = true;
+        water.eye_water = Some(WaterHere { surface: SEA_LEVEL + 4.0, ground: SEA_LEVEL + 3.0, ..estuary() });
+        water.camera_height = SEA_LEVEL + 3.5;
+        assert!(!water.eye_submerged(0.2));
+        assert_eq!(eye_medium(&water), ([0.0; 4], [0.0; 4]));
+    }
 }

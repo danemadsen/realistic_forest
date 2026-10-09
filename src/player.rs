@@ -79,6 +79,20 @@ impl WaterHere {
         self.surface - self.ground
     }
 
+    /// The sea over ground at `ground`, if it covers it.
+    pub fn sea(ground: f32) -> Option<WaterHere> {
+        (ground < SEA_LEVEL).then_some(WaterHere {
+            surface: SEA_LEVEL,
+            ground,
+            current: Vec2::ZERO,
+            turbulence: 0.0,
+            clarity: 0.0,
+            sea: 1.0,
+            still: 1.0,
+            kind: WaterKind::Sea,
+        })
+    }
+
     /// Where the eye of a body floating head out in this water is, if it is
     /// too deep to stand in.
     pub fn float_eye(&self) -> Option<f32> {
@@ -111,16 +125,7 @@ pub fn water_at(erosion: &ErosionCache, noise: &NoiseField, x: f32, z: f32, visi
     let river = (envelope.bank_distance < 0.5)
         .then(|| inland(envelope.water, Vec2::from(envelope.velocity), envelope.turbulence, WaterKind::River));
     let lake = (ground < envelope.lake).then(|| inland(envelope.lake, Vec2::ZERO, 0.0, WaterKind::Lake));
-    let sea = (ground < SEA_LEVEL).then_some(WaterHere {
-        surface: SEA_LEVEL,
-        ground,
-        current: Vec2::ZERO,
-        turbulence: 0.0,
-        clarity: 0.0,
-        sea: 1.0,
-        still: 1.0,
-        kind: WaterKind::Sea,
-    });
+    let sea = WaterHere::sea(ground);
     [river, lake, sea]
         .into_iter()
         .flatten()
