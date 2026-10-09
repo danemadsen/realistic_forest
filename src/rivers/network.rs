@@ -2624,9 +2624,6 @@ pub struct RiverNetwork {
     pub segments: Vec<RiverSegment>,
     pub grid: SegmentGrid,
     pub lakes: Vec<Lake>,
-    /// The clarity of the lake over each flow cell its sheet covers
-    /// (`surface::lake_clarity`), the highest lake's where two meet.
-    pub lake_clarity: std::collections::HashMap<[i32; 2], f32>,
     /// The water surfaces, ready to upload.
     pub surface: super::surface::SurfaceMesh,
     /// Seconds the generation took.
@@ -2940,25 +2937,12 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
     }
     grid.set_lakes(&corners, FLOW_CELL as f32);
     let surface = super::surface::build(&finished, &lakes);
-    let mut lake_clarity: std::collections::HashMap<[i32; 2], (f32, f32)> = Default::default();
-    for lake in &lakes {
-        let area = lake.cells.len() as f32 * (FLOW_CELL * FLOW_CELL) as f32;
-        let clarity = super::surface::lake_clarity(lake.level, area);
-        for &cell in lake.cells.iter().chain(&lake.shore) {
-            let entry = lake_clarity.entry(cell).or_insert((lake.level, clarity));
-            if lake.level > entry.0 {
-                *entry = (lake.level, clarity);
-            }
-        }
-    }
-    let lake_clarity = lake_clarity.into_iter().map(|(cell, (_, clarity))| (cell, clarity)).collect();
     RiverNetwork {
         region,
         rivers: finished,
         segments,
         grid,
         lakes,
-        lake_clarity,
         surface,
         build_seconds: start.elapsed().as_secs_f32(),
     }
@@ -3924,12 +3908,6 @@ fn build_segments_on_ground(
 }
 
 impl RiverNetwork {
-    /// The clarity of the lake whose sheet covers `(x, z)`, if one does.
-    pub fn lake_clarity_at(&self, x: f32, z: f32) -> Option<f32> {
-        let cell = [(x / FLOW_CELL as f32).floor() as i32, (z / FLOW_CELL as f32).floor() as i32];
-        self.lake_clarity.get(&cell).copied()
-    }
-
     pub fn envelope(&self, x: f32, z: f32) -> super::carve::Envelope {
         super::carve::envelope_at(&self.segments, &self.grid, [x, z])
     }

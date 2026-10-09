@@ -59,8 +59,14 @@ pub struct WaterHere {
     /// Whitewater, 0..1.
     pub turbulence: f32,
     /// How clear it is, 0 (stained by the forest) to 1 (clear mountain
-    /// water): `rivers::surface::lake_clarity`. The sea's is its own.
+    /// water), how far it is the sea's water and how still it is, each 0..1,
+    /// as the surface drawn over it has them (`SurfaceMesh::drawn_at`): the
+    /// medium around a submerged eye is the water drawn overhead, which
+    /// blends into the sea toward a mouth and into a lake's still water
+    /// toward its sheet, and carries a clear lake's clarity down its outlet.
     pub clarity: f32,
+    pub sea: f32,
+    pub still: f32,
     pub kind: WaterKind,
 }
 
@@ -79,29 +85,30 @@ pub fn water_at(erosion: &ErosionCache, noise: &NoiseField, x: f32, z: f32, visi
         .as_ref()
         .map_or(crate::rivers::carve::Envelope::NONE, |network| network.envelope(x, z));
     let ground = crate::erosion::sample_eroded_height(erosion, noise, x, z, visibility_center);
-    let lake_clarity = erosion.rivers.as_ref().and_then(|network| network.lake_clarity_at(x, z));
-    let river = (envelope.bank_distance < 0.5).then(|| WaterHere {
-        surface: envelope.water,
-        ground,
-        current: Vec2::from(envelope.velocity),
-        turbulence: envelope.turbulence,
-        clarity: crate::rivers::surface::stream_clarity(envelope.water).max(lake_clarity.unwrap_or(0.0)),
-        kind: WaterKind::River,
-    });
-    let lake = (ground < envelope.lake).then(|| WaterHere {
-        surface: envelope.lake,
-        ground,
-        current: Vec2::ZERO,
-        turbulence: 0.0,
-        clarity: lake_clarity.unwrap_or_else(|| crate::rivers::surface::stream_clarity(envelope.lake)),
-        kind: WaterKind::Lake,
-    });
+    // A river's or a lake's water is the water drawn over this point. With
+    // nothing drawn there, it is the sea's where it lies at the sea's level
+    // (an estuary past the ribbon's end, where the sea's surface is the one
+    // drawn), else a stream's own.
+    let drawn = erosion.rivers.as_ref().and_then(|network| network.surface.drawn_at([x, z]));
+    let inland = |surface: f32, current: Vec2, turbulence: f32, kind: WaterKind| {
+        let (clarity, sea, still) = match drawn {
+            Some(drawn) => (drawn.clarity, drawn.sea, drawn.still),
+            None if ground < SEA_LEVEL && surface <= SEA_LEVEL + 0.03 => (0.0, 1.0, 1.0),
+            None => (crate::rivers::surface::stream_clarity(surface), 0.0, f32::from(u8::from(kind == WaterKind::Lake))),
+        };
+        WaterHere { surface, ground, current, turbulence, clarity, sea, still, kind }
+    };
+    let river = (envelope.bank_distance < 0.5)
+        .then(|| inland(envelope.water, Vec2::from(envelope.velocity), envelope.turbulence, WaterKind::River));
+    let lake = (ground < envelope.lake).then(|| inland(envelope.lake, Vec2::ZERO, 0.0, WaterKind::Lake));
     let sea = (ground < SEA_LEVEL).then_some(WaterHere {
         surface: SEA_LEVEL,
         ground,
         current: Vec2::ZERO,
         turbulence: 0.0,
         clarity: 0.0,
+        sea: 1.0,
+        still: 1.0,
         kind: WaterKind::Sea,
     });
     [river, lake, sea]

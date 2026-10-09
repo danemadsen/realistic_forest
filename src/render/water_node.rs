@@ -242,9 +242,9 @@ fn eye_medium(water: &ExtractedWater) -> ([f32; 4], [f32; 4]) {
     }
     let height = water.camera_height - here.surface;
     let fade = (-height / UNDERWATER_FADE_METRES + 0.5).clamp(0.0, 1.0);
-    let sea = if here.kind == WaterKind::Sea { 1.0 } else { 0.0 };
-    let still = if here.kind == WaterKind::River { 0.0 } else { 1.0 };
-    ([here.surface, height, fade, sea], [still, here.turbulence, here.clarity, 0.0])
+    // The water's colour is the drawn surface's over the eye (`water_at`), so
+    // the medium blends into the sea's and a lake's with the surface.
+    ([here.surface, height, fade, here.sea], [here.still, here.turbulence, here.clarity, 0.0])
 }
 
 // ---------------------------------------------------------------------------

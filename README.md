@@ -1173,7 +1173,9 @@ surface Space kicks a swimmer up out of the water as it jumps a walker off the
 ground, onto a bank or over a ledge; a body in the air over the water keeps
 the motion it left the water with, so a hop neither shakes off the current
 nor stops a body it was carrying dead. Once the eye is under, the view is
-that water's medium, whichever water it is.
+the medium of the water drawn over it, whichever water it is: a river's last
+reach is partly the sea's, as its surface is, and a stream out of a clear lake
+is as clear under the surface as it looks from above.
 The developer menu's **Rivers** section
 reports the network, the nearest channel and the current the player stands
 in, and can hide the river and lake surfaces.

@@ -302,6 +302,47 @@ pub struct SurfaceMesh {
     pub chunks: Vec<SurfaceChunk>,
 }
 
+impl SurfaceMesh {
+    /// The surface drawn on top over `p` (the highest ribbon or lake sheet
+    /// there), its attributes interpolated as the GPU interpolates them, or
+    /// `None` where no river or lake is drawn. Only the chunks whose bounds
+    /// hold `p` are searched.
+    ///
+    /// The water around a submerged eye is read from here, so the medium it
+    /// sees is the water drawn over it: its clarity carried down from a lake,
+    /// its blend into the sea toward a mouth and into still water toward a
+    /// lake, exactly as the surface overhead has them.
+    pub fn drawn_at(&self, p: [f32; 2]) -> Option<SurfaceVertex> {
+        let cross = |a: [f32; 2], b: [f32; 2]| a[0] * b[1] - a[1] * b[0];
+        let mut top: Option<SurfaceVertex> = None;
+        let holds = |chunk: &&SurfaceChunk| {
+            (chunk.minimum[0]..=chunk.maximum[0]).contains(&p[0]) && (chunk.minimum[2]..=chunk.maximum[2]).contains(&p[1])
+        };
+        for chunk in self.chunks.iter().filter(holds) {
+            let first = chunk.first_index as usize;
+            let triangles = &self.indices[first..first + chunk.index_count as usize];
+            for triangle in triangles.chunks_exact(3) {
+                let [a, b, c] = [0, 1, 2].map(|k| self.vertices[triangle[k] as usize]);
+                let flat = |v: &SurfaceVertex| [v.position[0] - p[0], v.position[2] - p[1]];
+                let (pa, pb, pc) = (flat(&a), flat(&b), flat(&c));
+                let det = cross([pb[0] - pa[0], pb[1] - pa[1]], [pc[0] - pa[0], pc[1] - pa[1]]);
+                if det.abs() < 1e-9 {
+                    continue;
+                }
+                let (wa, wb, wc) = (cross(pb, pc) / det, cross(pc, pa) / det, cross(pa, pb) / det);
+                if wa < -1e-5 || wb < -1e-5 || wc < -1e-5 {
+                    continue;
+                }
+                let here = weigh(&[(a, wa), (b, wb), (c, wc)]);
+                if top.is_none_or(|t| here.position[1] > t.position[1]) {
+                    top = Some(here);
+                }
+            }
+        }
+        top
+    }
+}
+
 fn normalize(v: [f32; 2]) -> [f32; 2] {
     let length = v[0].hypot(v[1]);
     if length < 1e-6 { [1.0, 0.0] } else { [v[0] / length, v[1] / length] }
@@ -1188,26 +1229,7 @@ mod tests {
     /// The surface drawn on top over `p`, the highest there, its attributes
     /// interpolated as the GPU interpolates them.
     fn top(mesh: &SurfaceMesh, p: [f32; 2]) -> Option<SurfaceVertex> {
-        let cross = |a: [f32; 2], b: [f32; 2]| a[0] * b[1] - a[1] * b[0];
-        let mut top: Option<SurfaceVertex> = None;
-        for triangle in mesh.indices.chunks_exact(3) {
-            let [a, b, c] = [0, 1, 2].map(|k| mesh.vertices[triangle[k] as usize]);
-            let flat = |v: &SurfaceVertex| [v.position[0] - p[0], v.position[2] - p[1]];
-            let (pa, pb, pc) = (flat(&a), flat(&b), flat(&c));
-            let det = cross([pb[0] - pa[0], pb[1] - pa[1]], [pc[0] - pa[0], pc[1] - pa[1]]);
-            if det.abs() < 1e-9 {
-                continue;
-            }
-            let (wa, wb, wc) = (cross(pb, pc) / det, cross(pc, pa) / det, cross(pa, pb) / det);
-            if wa < -1e-5 || wb < -1e-5 || wc < -1e-5 {
-                continue;
-            }
-            let here = weigh(&[(a, wa), (b, wb), (c, wc)]);
-            if top.is_none_or(|t| here.position[1] > t.position[1]) {
-                top = Some(here);
-            }
-        }
-        top
+        mesh.drawn_at(p)
     }
 
     /// A creek runs in at an angle down the side of a steep, white river.
@@ -1498,6 +1520,17 @@ mod tests {
             assert!((lake_clear - expected).abs() < 0.05, "{lake_clear}");
             let mesh = build(&[river(true)], std::slice::from_ref(&lake));
             let at = |x: f32| mesh.vertices.iter().find(|v| v.half_width > 0.0 && (v.position[0] - x).abs() < 1.0).unwrap().clarity;
+            // An eye under the water reads the same water as drawn over it:
+            // the lake's sheet over the lake (both lakes cover this point,
+            // well off the ribbon), the ribbon's carried clarity down the
+            // outlet.
+            let sheet = mesh.drawn_at([2.0, -80.0]).unwrap();
+            assert!((sheet.clarity - lake_clear).abs() < 1e-5 && sheet.still == 1.0 && sheet.half_width == 0.0, "{sheet:?}");
+            for x in [800.0, 1800.0, 3800.0] {
+                let drawn = mesh.drawn_at([x, 2.0]).unwrap();
+                assert!((drawn.clarity - at(x)).abs() < 1e-4, "{x}: {drawn:?}");
+            }
+            assert!(mesh.drawn_at([800.0, 40.0]).is_none(), "nothing is drawn off the water");
             assert!((at(200.0) - lake_clear).abs() < 1e-5, "in the lake it is the lake's water");
             assert!(at(1800.0) < at(800.0) || lake_clear == 0.0, "the clarity fades downstream");
             assert!(at(800.0) <= lake_clear + 1e-5);
@@ -1536,6 +1569,11 @@ mod tests {
         assert_eq!(row(coast).sea, 1.0);
         assert_eq!(row(coast + 1).sea, 1.0);
         assert_eq!(row(10).sea, 0.0, "far upstream the water is the river's own");
+        // An eye in the last reach reads the sea's share the surface over it
+        // is drawn with, not the river's 0.
+        let drawn = mesh.drawn_at([120.0, 0.3]).unwrap();
+        assert!((drawn.sea - row(24).sea).abs() < 1e-5, "{drawn:?}");
+        assert!((mesh.drawn_at([149.0, 0.3]).unwrap().sea - 1.0).abs() < 0.05);
         for r in 13..=coast {
             assert!(row(r).sea >= row(r - 1).sea, "{:?} {:?}", row(r - 1), row(r));
         }
