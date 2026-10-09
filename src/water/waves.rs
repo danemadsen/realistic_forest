@@ -96,12 +96,27 @@ pub const WIND_SHORTEST_METRES: f32 = 0.04;
 /// whole number of cycles over it (see [`wind_sea_components`]). Mirrored by
 /// `WIND_PERIOD` in the shader.
 pub const WIND_PERIOD_METRES: f32 = 512.0;
-/// The wind sea's own seed, picked like the swell's: no rung holds a mirrored
-/// pair, and the set heads with the wind at its spread's slope ratio.
-const WIND_SEED: u32 = 328;
-/// The golden ratio's fractional part. Each rung turns its strata on by it
-/// from the rung before, so no two rungs share their headings.
-const GOLDEN_RATIO_FRACTION: f32 = 0.618_034;
+/// How far each rung of the wind sea turns its headings on from the rung
+/// before, as a share of the quarter of the spread each heading owns. A few
+/// rungs are resolved at once wherever the eye looks, and their headings must
+/// fill the spread between them rather than gather into two or three
+/// directions, which read as crossing families of crests. Three tenths of a
+/// quarter puts each rung's headings between its neighbour's, and an
+/// octave's (two rungs') four tenths away, so no wave runs with its own
+/// octave harmonic. A golden-ratio turn would interleave neighbours as well
+/// but bring each octave back within a quarter of a quarter of itself.
+const WIND_STRATUM_TURN: f32 = 0.3;
+/// How far a heading wanders within its place, as a share of a quarter of
+/// the spread: enough that no rung's four headings are mirrored about the
+/// wind (which an even spacing is at every half turn), too little to gather
+/// neighbouring rungs' headings together.
+const WIND_STRATUM_JITTER: f32 = 0.2;
+/// The wind sea's own seed, picked like the swell's: no rung holds a pair
+/// mirrored within four degrees of each other, any two or three neighbouring
+/// rungs leave no gap in the spread wider than twice an even share, no wave
+/// heads within eight degrees of its octave's, and the set heads with the
+/// wind at its spread's slope ratio.
+const WIND_SEED: u32 = 258;
 
 const WIND_SPEED_KPH: f32 = 150.0;
 const KPH_PER_MPS: f32 = 3.6;
@@ -461,27 +476,29 @@ pub fn spread_angle(u: f32, beta: f32) -> f32 {
 /// the next.
 ///
 /// Every rung takes [`WIND_PER_RUNG`] headings, one from each equal share of
-/// the broadest spread ([`SPREAD_FLOOR`]), turned on by the golden ratio from
-/// rung to rung, so no rung pairs its waves mirrored about the wind to cross
-/// in a lattice and no two rungs share their headings. The wavelengths are
-/// spread across the rung's half octave and the phases are random, so the
-/// rungs do not lock to each other either. A wave vector is a whole number of
+/// the broadest spread ([`SPREAD_FLOOR`]), each wandering a little within its
+/// share so no rung pairs its waves mirrored about the wind to cross in a
+/// lattice. The shares turn on by [`WIND_STRATUM_TURN`] from rung to rung, so
+/// the few rungs a pixel resolves together fill the spread evenly between
+/// them. The wavelengths are spread across the rung's half octave and the
+/// phases are random, so the rungs do not lock to each other either. A wave
+/// vector is a whole number of
 /// cycles over the period so the shader can wrap the position into one period
 /// first and keep the phase exact far from the origin; snapping moves a
 /// heading by at most a third of a degree, and the period is far too long to
 /// see repeat.
 pub fn wind_sea_components(wind_radians: f32) -> [[f32; 4]; WIND_COMPONENTS] {
     let mut random = Random::new(WIND_SEED);
+    let start = random.next();
     let mut components = [[0.0f32; 4]; WIND_COMPONENTS];
     for (index, component) in components.iter_mut().enumerate() {
         let rung = index / WIND_PER_RUNG;
         let stratum = index % WIND_PER_RUNG;
-        let jitter = random.next();
+        let jitter = WIND_STRATUM_JITTER * (random.next() - 0.5);
         let stretch = random.next();
         let phase = random.next();
-        let u = ((stratum as f32 + jitter) / WIND_PER_RUNG as f32
-            + rung as f32 * GOLDEN_RATIO_FRACTION)
-            .fract();
+        let turn = (start + rung as f32 * WIND_STRATUM_TURN).fract();
+        let u = ((stratum as f32 + turn + jitter) / WIND_PER_RUNG as f32).rem_euclid(1.0);
         let angle = spread_angle(u, SPREAD_FLOOR);
         // Within a quarter octave either side of the rung's nominal length.
         let wavelength = f64::from(WIND_SHORTEST_METRES)
@@ -802,33 +819,64 @@ mod tests {
             for (index, a) in components.iter().enumerate() {
                 for b in &components[index + 1..] {
                     let mirror = (a[3] + b[3]).to_degrees().abs();
-                    assert!(mirror >= 3.0, "rung {rung}: {} and {} degrees", a[3].to_degrees(), b[3].to_degrees());
+                    assert!(mirror >= 4.0, "rung {rung}: {} and {} degrees", a[3].to_degrees(), b[3].to_degrees());
                 }
             }
         }
     }
 
-    /// Every rung takes one heading from each quarter of the spread, the
-    /// quarters turned on by the golden ratio from one rung to the next, and
-    /// its wavelengths within a quarter octave of its own.
+    /// The shares of the broadest spread under each of a rung's headings, in
+    /// order round the circle, and the gaps between them.
+    fn spread_gaps(components: &[[f32; 4]]) -> Vec<f32> {
+        let mut shares: Vec<f32> = components.iter().map(|component| spread_share(component[3], SPREAD_FLOOR)).collect();
+        shares.sort_by(f32::total_cmp);
+        let mut gaps: Vec<f32> = shares.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        gaps.push(1.0 + shares[0] - shares[shares.len() - 1]);
+        gaps
+    }
+
+    /// Every rung takes one heading from each quarter of the spread, each
+    /// wandering a tenth of a quarter at most, and its wavelengths within a
+    /// quarter octave of its own.
     #[test]
     fn every_rung_of_the_wind_sea_spans_its_spread() {
         let set = wind_sea_components(0.0);
         for (rung, components) in set.chunks(WIND_PER_RUNG).enumerate() {
-            let mut quarters: Vec<usize> = components
-                .iter()
-                .map(|component| {
-                    let share = spread_share(component[3], SPREAD_FLOOR) - rung as f32 * GOLDEN_RATIO_FRACTION;
-                    ((share.rem_euclid(1.0) * WIND_PER_RUNG as f32) as usize).min(WIND_PER_RUNG - 1)
-                })
-                .collect();
-            quarters.sort_unstable();
-            assert_eq!(quarters, [0, 1, 2, 3], "rung {rung}");
+            for gap in spread_gaps(components) {
+                assert!((0.2 - 1e-4..0.3 + 1e-4).contains(&gap), "rung {rung}: a gap of {gap} in the spread");
+            }
             let nominal = WIND_SHORTEST_METRES * 2.0f32.powf(0.5 * rung as f32);
             for component in components {
                 let wavelength = WIND_PERIOD_METRES / Vec2::new(component[0], component[1]).length();
                 let octaves = (wavelength / nominal).log2();
                 assert!(octaves.abs() < 0.26, "rung {rung}: {wavelength} m");
+            }
+        }
+    }
+
+    /// Wherever the eye looks it resolves a few neighbouring rungs at once,
+    /// and their headings must fill the spread between them: gathered into
+    /// two or three directions they read as crossing families of crests, the
+    /// cross this table replaced. Two or three neighbouring rungs leave no
+    /// gap in the spread more than twice an even share; headings drawn at
+    /// random within each rung's quarters leave gaps of three or more. Nor
+    /// may a wave run within eight degrees of one an octave from it, which
+    /// with it is one sharpened wave train in a single direction.
+    #[test]
+    fn neighbouring_rungs_of_the_wind_sea_fill_each_others_gaps() {
+        let set = wind_sea_components(0.733);
+        for span in [2, 3] {
+            for (first, window) in set.windows(span * WIND_PER_RUNG).step_by(WIND_PER_RUNG).enumerate() {
+                let widest = spread_gaps(window).into_iter().fold(0.0f32, f32::max) * window.len() as f32;
+                assert!(widest <= 2.0, "rungs {first} to {}: a gap {widest} times an even share", first + span - 1);
+            }
+        }
+        for rung in 0..WIND_RUNGS - 2 {
+            for a in &set[rung * WIND_PER_RUNG..(rung + 1) * WIND_PER_RUNG] {
+                for b in &set[(rung + 2) * WIND_PER_RUNG..(rung + 3) * WIND_PER_RUNG] {
+                    let apart = (a[3] - b[3]).to_degrees().abs();
+                    assert!(apart >= 8.0, "rungs {rung} and {}: {apart} degrees apart", rung + 2);
+                }
             }
         }
     }

@@ -1129,7 +1129,9 @@ to the next:
   1.65 times as steep up the wind as across it. Each half octave of
   wavelength holds four waves whose headings, lengths and phases are fixed
   for the wind's heading, drawn so that no two of them cross mirrored about
-  the wind; the local wind only shares the slope out between them, so a gust
+  the wind and the neighbouring half octaves the eye sees together fill the
+  spread between them; the local wind only shares the slope out between
+  them, so a gust
   or a nearer shore changes how high the ripples run and never where their
   crests lie. The sea's swell spreads the same way about the wind, its long
   waves long-crested, and its components no longer run as families of
