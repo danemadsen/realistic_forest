@@ -190,6 +190,9 @@ impl Player {
         self.velocity = Vec2::ZERO;
         self.swimming = false;
         self.water = None;
+        self.wading_depth = 0.0;
+        self.current = Vec2::ZERO;
+        self.swept = false;
         true
     }
 
@@ -390,13 +393,21 @@ pub fn update_player_system(
                     / (1.0 - SWIM_PITCH_DEAD_ZONE),
             };
             let candidate_xz = Vec2::new(candidate.x, candidate.z);
-            let mut bed = snow::sample_surface(&erosion, &noise, candidate_xz, visibility_center.to_array())
-                .height(&snow, candidate_xz);
+            let there = snow::sample_surface(&erosion, &noise, candidate_xz, visibility_center.to_array());
+            let mut bed = there.height(&snow, candidate_xz);
             // A bank is as solid to a swimmer as to a walker.
             if too_high_to_step(bed, ground, player.position.y) {
                 candidate.x = player.position.x;
                 candidate.z = player.position.z;
                 bed = ground;
+            }
+            // Crouched on dry ground, standing up, the feet tread the snow as
+            // a walker's do.
+            if water.is_none() && there.coverage > 0.0 && candidate_xz.distance_squared(visibility_center) > 0.000001
+                && candidate_xz == Vec2::new(candidate.x, candidate.z)
+            {
+                snow.stamp_segment(visibility_center, candidate_xz);
+                bed = there.height(&snow, candidate_xz);
             }
             let (y, vertical_velocity) = swim_vertical(player.position.y, player.vertical_velocity, stroke,
                                                        surface, ground, bed, dt);
@@ -545,8 +556,8 @@ fn update_walking_ground(
     if jumping {
         player.vertical_velocity = JUMP_SPEED;
     }
-    let swimmer = kicked(afloat, player.position.y, player.vertical_velocity, player.swimming);
-    (candidate.y, player.vertical_velocity) = ballistic(candidate.y, player.vertical_velocity, dt);
+    let swimmer = kicked(afloat, player.vertical_velocity, player.swimming);
+    (candidate.y, player.vertical_velocity) = fall(candidate.y, player.vertical_velocity, grounded_before && !jumping, dt);
     let ground_before_stamp = next_surface.height(snow, next_xz) + EYE_HEIGHT;
     let touching = candidate.y <= ground_before_stamp && player.vertical_velocity <= 0.0;
     if touching {
@@ -567,12 +578,15 @@ fn update_walking_ground(
     swimmer
 }
 
-/// A body's eye height and vertical velocity after a step in the air,
-/// integrated exactly, so a jump or a fall goes as high or as far at any
-/// frame rate.
-fn ballistic(eye: f32, vertical_velocity: f32, dt: f32) -> (f32, f32) {
+/// A body's eye height and vertical velocity after a step of falling. One in
+/// the air moves exactly, so a jump or a fall goes as high or as far at any
+/// frame rate. A walker on its feet (`on_feet`) is pulled down a whole step's
+/// fall a step, as hard again, so walking down a slope it keeps its footing,
+/// and Space finds it there to jump.
+fn fall(eye: f32, vertical_velocity: f32, on_feet: bool, dt: f32) -> (f32, f32) {
     let after = vertical_velocity - FALL_ACCELERATION * dt;
-    (eye + 0.5 * (vertical_velocity + after) * dt, after)
+    let moved = if on_feet { after } else { 0.5 * (vertical_velocity + after) };
+    (eye + moved * dt, after)
 }
 
 /// Where a body that comes down onto ground at `ground` this step, its eye
@@ -593,8 +607,6 @@ fn lands(eye: f32, ground: f32, swimmer: bool) -> (f32, bool) {
 const STEP_HEIGHT: f32 = 1.25;
 /// How fast a jump, or a swimmer's kick up out of the water, leaves, m/s.
 const JUMP_SPEED: f32 = 7.4;
-/// How high a jump or a kick lifts the eye, metres.
-const JUMP_HEIGHT: f32 = JUMP_SPEED * JUMP_SPEED / (2.0 * FALL_ACCELERATION);
 /// How fast a body in the air gathers downward speed, m/s². Stronger than
 /// gravity, so jumps and falls feel snappy rather than floaty.
 const FALL_ACCELERATION: f32 = 23.0;
@@ -635,11 +647,12 @@ pub struct SwimStroke {
 /// Whether ground at `next` is too high for a body to step onto from ground
 /// at `ground`, its eye at `eye` and falling at `-vertical_velocity`, over
 /// deep water at the surface `afloat` if it is. A walker steps up to
-/// `STEP_HEIGHT`. A swimmer kicked up out of the water steps up from its
-/// feet, not from the bed far under them, so it reaches a bank; a body
-/// falling onto the water from higher lands on nothing over its feet.
+/// `STEP_HEIGHT`. A swimmer kicked up out of the water, or a body leaping
+/// over it, steps up from its feet, not from the bed far under them, so it
+/// reaches a bank; a body falling faster than a jump does, from a cliff top
+/// say, lands on nothing over its feet.
 fn step_blocked(next: f32, ground: f32, eye: f32, vertical_velocity: f32, afloat: Option<f32>) -> bool {
-    if kicking(afloat, eye, vertical_velocity) {
+    if kicking(afloat, vertical_velocity) {
         too_high_to_step(next, ground, eye)
     } else if afloat.is_some() {
         next > ground.max(eye - EYE_HEIGHT)
@@ -648,19 +661,20 @@ fn step_blocked(next: f32, ground: f32, eye: f32, vertical_velocity: f32, afloat
     }
 }
 
-/// Whether a body over deep water at the surface `afloat`, its eye at `eye`
-/// and rising at `vertical_velocity`, is a swimmer's kick up out of it:
-/// within a kick's height of the water, and coming down no faster than a
-/// kick does.
-fn kicking(afloat: Option<f32>, eye: f32, vertical_velocity: f32) -> bool {
-    afloat.is_some_and(|surface| eye <= surface + SWIM_FREEBOARD + JUMP_HEIGHT && vertical_velocity >= -JUMP_SPEED)
+/// Whether a body in the air over deep water (`afloat`, its surface), rising
+/// at `vertical_velocity`, moves as a swimmer's kick up out of it or a leap
+/// over it does: coming down no faster than a kick or a jump does. Such a
+/// body steps up onto a bank from its feet; one falling faster, from a cliff
+/// top say, lands on nothing over its feet.
+fn kicking(afloat: Option<f32>, vertical_velocity: f32) -> bool {
+    afloat.is_some() && vertical_velocity >= -JUMP_SPEED
 }
 
 /// Whether a body in the air this step, over deep water at the surface
 /// `afloat` if it is, is a swimmer's kick up out of the water: within a
 /// kick of it (`kicking`), or still rising from a swim, out over a bank too.
-fn kicked(afloat: Option<f32>, eye: f32, vertical_velocity: f32, swam: bool) -> bool {
-    kicking(afloat, eye, vertical_velocity) || (swam && vertical_velocity > 0.0)
+fn kicked(afloat: Option<f32>, vertical_velocity: f32, swam: bool) -> bool {
+    kicking(afloat, vertical_velocity) || (swam && vertical_velocity > 0.0)
 }
 
 /// Whether Space kicks a swimmer whose eye is at `eye` up out of `water`
@@ -857,6 +871,7 @@ mod tests {
         assert_eq!(player.position, destination);
         assert_eq!(player.vertical_velocity, 0.0);
         assert_eq!(player.water, None, "the old pose's water is not the new pose's");
+        assert_eq!((player.wading_depth, player.current, player.swept), (0.0, Vec2::ZERO, false));
 
         player.vertical_velocity = 4.0;
         for invalid in [
@@ -1121,9 +1136,10 @@ mod tests {
             return (eye, velocity, true);
         }
         let afloat = water.filter(|water| water.float_eye().is_some()).map(|water| water.surface);
-        let swimmer = kicked(afloat, eye, velocity, swam);
+        let swimmer = kicked(afloat, velocity, swam);
+        let on_feet = eye <= from + EYE_HEIGHT + 0.03 && velocity <= 0.0;
         let before = (eye, velocity);
-        let (eye, velocity) = ballistic(eye, velocity, dt);
+        let (eye, velocity) = fall(eye, velocity, on_feet, dt);
         let (eye, velocity, crouched) = if eye <= to + EYE_HEIGHT && velocity <= 0.0 {
             let (eye, crouched) = lands(eye, to, swimmer);
             (eye, 0.0, crouched)
@@ -1168,9 +1184,10 @@ mod tests {
                 if step_blocked(ground(to), ground(x), eye, velocity, afloat) {
                     to = x;
                 }
-                let swimmer = kicked(afloat, eye, velocity, swam);
+                let swimmer = kicked(afloat, velocity, swam);
+                let on_feet = eye <= ground(x) + EYE_HEIGHT + 0.03 && velocity <= 0.0;
                 let before = (eye, velocity);
-                let (eye, velocity) = ballistic(eye, velocity, dt);
+                let (eye, velocity) = fall(eye, velocity, on_feet, dt);
                 body = if eye <= ground(to) + EYE_HEIGHT && velocity <= 0.0 {
                     let (eye, crouched) = lands(eye, ground(to), swimmer);
                     (eye, 0.0, crouched)
@@ -1312,6 +1329,8 @@ mod tests {
         // lands on nothing over its feet either.
         assert!(!step_blocked(10.0, 0.0, 11.0, -3.0, Some(10.0)));
         assert!(step_blocked(10.0, 0.0, 11.0, -JUMP_SPEED - 1.0, Some(10.0)));
+        // A leap over a deep channel catches the far bank's lip over its feet.
+        assert!(!step_blocked(11.5, -10.0, 11.3 + EYE_HEIGHT, -5.0, Some(10.0)));
         // Stretched out along a bed at 4 m: up a slope, but not up a wall
         // without first swimming up it.
         assert!(!too_high_to_step(5.0, 4.0, 4.0 + SWIM_BED_CLEARANCE));
@@ -1403,6 +1422,46 @@ mod tests {
         assert!(kicks_off(None, 11.0));
         assert!(kicks_off(still_water(10.0, 9.0), 10.2));
         assert!(!kicks_off(still_water(10.0, 9.0), 9.6));
+    }
+
+    #[test]
+    fn a_walker_keeps_its_footing_down_a_slope_and_jumps_alike_at_any_frame_rate() {
+        // Walking down a slope at walking speed and boosted, as
+        // update_walking_ground steps it: on its feet every frame, so Space
+        // finds it there.
+        for (grade, speed, fps) in [(0.13, 10.0, 60.0), (0.15, 10.0, 30.0), (0.05, 25.0, 60.0), (0.05, 25.0, 144.0)] {
+            {
+                let dt = 1.0 / fps;
+                let ground = |x: f32| -grade * x;
+                let (mut x, mut eye, mut velocity) = (0.0f32, EYE_HEIGHT, 0.0f32);
+                let mut footed = 0;
+                let frames = (3.0 * fps) as usize;
+                for _ in 0..frames {
+                    let on_feet = eye <= ground(x) + EYE_HEIGHT + 0.03 && velocity <= 0.0;
+                    footed += usize::from(on_feet);
+                    let to = x + speed * dt;
+                    (eye, velocity) = fall(eye, velocity, on_feet, dt);
+                    if eye <= ground(to) + EYE_HEIGHT && velocity <= 0.0 {
+                        (eye, velocity) = (ground(to) + EYE_HEIGHT, 0.0);
+                    }
+                    x = to;
+                }
+                assert_eq!(footed, frames, "{grade} {speed} {fps}");
+            }
+        }
+        // A jump from flat ground rises as high at any frame rate.
+        let apex = |fps: f32| {
+            let (mut eye, mut velocity, mut top) = (EYE_HEIGHT, JUMP_SPEED, EYE_HEIGHT);
+            while velocity > -JUMP_SPEED {
+                (eye, velocity) = fall(eye, velocity, false, 1.0 / fps);
+                top = top.max(eye);
+            }
+            top - EYE_HEIGHT
+        };
+        let exact = JUMP_SPEED * JUMP_SPEED / (2.0 * FALL_ACCELERATION);
+        for fps in [20.0, 30.0, 60.0, 144.0, 360.0] {
+            assert!((apex(fps) - exact).abs() < 0.01, "{fps}: {} vs {exact}", apex(fps));
+        }
     }
 
     #[test]

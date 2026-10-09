@@ -306,6 +306,16 @@ fn ground_position(
     Vec3::new(position.x, afloat.map_or(y, |eye| eye.max(y)), position.z)
 }
 
+/// Teleport the player, and give it the water at its new pose at once: the
+/// renderer draws this pose before the next player update looks.
+fn teleport(player: &mut Player, position: Vec3, cache: &ErosionCache, noise: &NoiseField) -> bool {
+    let moved = player.teleport(position);
+    if moved {
+        player.water = crate::player::water_at(cache, noise, position.x, position.z, [position.x, position.z]);
+    }
+    moved
+}
+
 fn draw_player_tools(
     ui: &mut egui::Ui,
     player: &mut Player,
@@ -369,7 +379,7 @@ fn draw_player_tools(
                     } else {
                         position
                     };
-                    if player.teleport(position) {
+                    if teleport(player, position, cache, noise) {
                         player.flying = !trainer.snap_to_ground;
                         trainer.status = Some(format!(
                             "Teleported to {:.2}, {:.2}, {:.2}",
@@ -381,7 +391,7 @@ fn draw_player_tools(
             }
         }
         if ui.button("Return to spawn").clicked() {
-            player.teleport(ground_position(Vec3::ZERO, cache, noise, snow));
+            teleport(player, ground_position(Vec3::ZERO, cache, noise, snow), cache, noise);
             player.flying = false;
             player.yaw = Player::default().yaw;
             player.pitch = Player::default().pitch;
@@ -391,11 +401,11 @@ fn draw_player_tools(
     });
     ui.horizontal(|ui| {
         if ui.button("Ground here").clicked() {
-            player.teleport(ground_position(player.position, cache, noise, snow));
+            teleport(player, ground_position(player.position, cache, noise, snow), cache, noise);
             player.flying = false;
         }
         if ui.button("Rise 100 m").clicked() {
-            player.teleport(player.position + Vec3::Y * 100.0);
+            teleport(player, player.position + Vec3::Y * 100.0, cache, noise);
             player.flying = true;
         }
         if ui.button("Reset speed").clicked() {
