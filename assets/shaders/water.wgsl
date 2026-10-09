@@ -131,7 +131,7 @@ struct WaterStageUniforms
     shore_map: vec4<f32>,     // world centre XZ, span (0 while undrawn), texel size
     wind: vec4<f32>,          // x surface wind at 10 m, m/s; y gustiness 0..1; z viewer's exposure, s; w unused
     eye_water: vec4<f32>,     // x level of the water at the eye, y eye height above it, z submerged fade, w its sea share
-    eye_body: vec4<f32>,      // x its stillness, y its whitewater, z its clarity; w unused
+    eye_body: vec4<f32>,      // x its stillness, y its whitewater, z its clarity; w the eye's share under it (its side)
     medium_sun: vec4<f32>,    // rgb sunlight at the surface for the medium, w moon radiance scale
     // The wind sea's components for the wind's heading (`windSea`): xy wave
     // vector in whole cycles over WIND_PERIOD, z phase in cycles, w heading
@@ -1280,7 +1280,8 @@ fn reflectionDepth(uv: vec2<f32>) -> vec4<f32>
 // texel across the sea: it leaves the analytic sky visible instead. Exponential
 // world-distance steps retain nearby detail while reaching distant headlands.
 fn marchWaterReflection(world_origin: vec3<f32>, world_normal: vec3<f32>,
-                         direction: vec3<f32>, roughness: f32, surface_level: f32) -> vec4<f32>
+                         direction: vec3<f32>, roughness: f32, surface_level: f32,
+                         from_below: bool) -> vec4<f32>
 {
     if (globals.raymarch.z < 0.5)
     {
@@ -1345,13 +1346,16 @@ fn marchWaterReflection(world_origin: vec3<f32>, world_normal: vec3<f32>,
             let thickness = clamp(0.4 - hit.z*0.0015, 0.4, 4.0);
             let depth_error = hit.z - hit_position.z;
             // Reject self hits, depth discontinuities and submerged geometry
-            // seen through the water's reflective side.
+            // seen through the water's reflective side. Seen from above
+            // (`from_below` false, the side fs_water sees the surface from),
+            // the reflected ray stays in the air however high the surface
+            // stands over the eye, and what lies under its level is the bed
+            // seen through it, not its reflection.
             let world_hit = globals.camera_position.xyz
                           + vec3<f32>(dot(globals.view[0].xyz, hit.xyz),
                                       dot(globals.view[1].xyz, hit.xyz),
                                       dot(globals.view[2].xyz, hit.xyz));
-            let above_surface = globals.camera_position.y < surface_level
-                             || world_hit.y >= surface_level - 0.25;
+            let above_surface = from_below || world_hit.y >= surface_level - 0.25;
             if (hit.a >= 0.5 && high > max(0.5, near_step)
                 && depth_error >= 0.0 && depth_error < thickness && above_surface)
             {
@@ -2587,6 +2591,68 @@ fn vs_inland(
 // The surface
 // ---------------------------------------------------------------------------
 
+// The unit normal of the triangle whose world position changes by `dx` and
+// `dy` to the next pixel across and down, turned up out of the water: the
+// sea's displaced wave face, a ribbon's tilted reach, a sheet's level, the
+// same whichever way the triangle is wound. A triangle seen so nearly edge
+// on that the two lie along one line keeps the level's.
+fn facetUp(dx: vec3<f32>, dy: vec3<f32>) -> vec3<f32>
+{
+    let normal = cross(dx, dy);
+    let area = dot(normal, normal);
+    let up = normal*inverseSqrt(max(area, 1e-30))*select(1.0, -1.0, normal.y < 0.0);
+    return select(vec3<f32>(0.0, 1.0, 0.0), up, area > 1e-6*dot(dx, dx)*dot(dy, dy));
+}
+
+// Which side of a surface the eye sees it from.
+struct SurfaceSide
+{
+    // Seen from under the water.
+    below: bool,
+    // How far its upper side faces the eye, 0..1: foam on it fades out over
+    // the last centimetres as the eye goes under it.
+    upper: f32,
+};
+
+// The side of a surface the eye sees, with `eye_under` how far the eye is
+// under its own water (`stage.eye_body.w`) and `eye_over_facet` the eye's
+// height over the surface's own plane, along its upturned normal.
+//
+// It is the side of the water the eye is on, not how high the eye stands: a
+// ray from the air meets every surface from the air, even one standing above
+// the eye, such as a rapid climbing away up its channel, a river upstream of
+// a swimmer or a swell's crest over a swimmer's head; a ray under the water
+// meets every surface from below. Only while the eye crosses its own water's
+// surface (`eye_under` between 0 and 1) can it see some surfaces from above
+// and others from below. Then each is seen from the side of its own plane the
+// eye is on, as a ray that reaches a surface through one medium must meet
+// it: on a level sheet that is the eye's height over it, on the sea the
+// wave's own face.
+fn surfaceSide(eye_under: f32, eye_over_facet: f32) -> SurfaceSide
+{
+    let under = clamp(eye_under, 0.0, 1.0);
+    let crossing = under > 0.0 && under < 1.0;
+    return SurfaceSide(select(under >= 1.0, eye_over_facet < 0.0, crossing),
+                       select(1.0 - under, smoothstepf(-0.08, 0.12, eye_over_facet), crossing));
+}
+
+// The deepest bed that shows through inland water. The bed's light crosses
+// the column twice, down to it and back up to the eye, and even the clearest
+// water, a tarn's in the blue, brings back only a thousandth of it from
+// ln(1000)/(2 x 0.12/m) = 29 m down: a deeper bed looks the same as none.
+const BED_DEPTH_MAX: f32 = 0.5*log(1000.0)
+                         /min(min(ALPINE_EXTINCTION.x, ALPINE_EXTINCTION.y), ALPINE_EXTINCTION.z);
+
+// How deep the bed lies under the surface, with `path` the straight line's
+// length from the surface to the bed drawn behind it and `rise` how steeply
+// the eye looks down along it (the sine of its elevation). The bed lies as
+// deep whatever the angle it is seen at; only a bed deeper than any light
+// comes back from is taken for one BED_DEPTH_MAX deep.
+fn bedDepth(path: f32, rise: f32) -> f32
+{
+    return min(path*max(rise, 0.0), BED_DEPTH_MAX);
+}
+
 @fragment
 fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
 {
@@ -2605,6 +2671,8 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     let pixel_dx = dpdx(in.wave_position);
     let pixel_dy = dpdy(in.wave_position);
     let pixel_footprint = max(length(pixel_dx), length(pixel_dy));
+    // The plane of the triangle drawn here, for the side the eye sees it from.
+    let facet = facetUp(dpdx(in.world_position), dpdy(in.world_position));
     let xz = in.world_position.xz;
 
     // --- What water this is -----------------------------------------------
@@ -2621,9 +2689,11 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     // Foam made by whitewater upstream and still drifting here.
     let supply = clamp(in.stream.z*3.0, 0.0, 1.0)*(1.0 - sea);
     // Seen from below, the surface is the same sheet of water from its other
-    // side.
-    let underside = camera_position.y < in.world_position.y;
-    let above_water = smoothstepf(-0.08, 0.12, camera_position.y - in.world_position.y);
+    // side; which side the eye sees is the side of the water it is on
+    // (`surfaceSide`), not how high it stands.
+    let side = surfaceSide(stage.eye_body.w, dot(facet, to_camera));
+    let underside = side.below;
+    let above_water = side.upper;
 
     let precipitation = weatherPrecipitation(vec3<f32>(xz.x, level, xz.y));
     // View space looks down -Z, so a *greater* z is nearer. The water
@@ -2825,6 +2895,9 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     // Inland water: the eye's ray bends down into the water, so it crosses
     // the column far more steeply than the straight line to the bed drawn
     // behind it: at a glance from the bank a shallow bed still shows through.
+    // The bed lies as deep under the surface whatever the angle it is seen
+    // at (`bedDepth`): a deep bed seen at a glance is no clearer than seen
+    // from above.
     // The bed was lit as if in air: its light also crossed the water on the
     // way down, a path of its depth over the sun's height. And the light
     // scattered back out of the column is lit less the deeper it lies: each
@@ -2832,7 +2905,7 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     if (sea < 1.0)
     {
         let medium = inlandMedium(body);
-        let bed_depth = min(optical_path, 8.0)*max(to_view.y, 0.0);
+        let bed_depth = bedDepth(optical_path, to_view.y);
         let water_path = select(optical_path, bed_depth/max(cos_refracted, 0.05), !scene_sky && !underside);
         let transmittance = exp(-medium.sigma_t*water_path);
         let downwelling = exp(-medium.sigma_t*bed_depth/max(to_sun.y, 0.25));
@@ -2877,7 +2950,7 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     // on them hide the sky below their horizon.
     let unseen = mix(seen.occluder, reflected_sky, seen.sky);
     let terrain_reflection = marchWaterReflection(in.world_position, normal,
-                                                  reflection_direction, alpha, level);
+                                                  reflection_direction, alpha, level, underside);
     let reflected = mix(unseen, terrain_reflection.rgb, terrain_reflection.a);
     // Fresnel-weighted and normalised (waterSpecular): a low sun's glitter
     // path keeps its clipped core and loses only its halo.

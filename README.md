@@ -1116,7 +1116,10 @@ to the next:
   one leaving a clear lake carries its clarity down into the forest for a
   kilometre or two before the stain takes over. The eye's path is bent down
   into the water and the light scattered back out of it is dimmed with
-  depth, so depth reads.
+  depth, so depth reads. A bed shows through as much water as lies over it,
+  however low the glance: deep water seen across a tarn is no clearer than
+  seen from above it, and a bed deeper than about 29 m, from which not even
+  a tarn's light comes back, looks the same as none.
 - **How rough it is.** Every water body feels the same wind (10 m up, about a
   third of the wind the clouds ride on) and raises the same kind of waves
   from it: a spectrum of short waves whose slope follows Cox and Munk's
@@ -1180,9 +1183,16 @@ to the next:
   the banks, on a tongue down the current and as scum in slack water, and an
   inlet carries it out into the pond. Stream foam is cream, stained like the
   water, and in the shade of the crowns it is lit only by the sky they leave.
-- **Seen from below.** Any surface over the eye is Snell's window: the sky
-  and banks refracted through it inside the critical angle, and outside it a
-  mirror of the water's own glow. The medium the eye is in is that water's:
+- **Seen from below.** Every surface is seen from the side of the water the
+  eye is on, not by how high it stands. From the air the eye sees every
+  surface from above, with its glints, its reflection and its whitewater,
+  even one standing over it: a rapid climbing away up its channel, a river
+  upstream of a swimmer or a swell's crest over a swimmer's head. From under
+  the water every surface is Snell's window: the sky and banks refracted
+  through it inside the critical angle, and outside it a mirror of the
+  water's own glow. Only while the eye crosses its own water's surface does
+  it see each surface from the side of that surface's own plane it is on, a
+  sheet's level or a wave's face. The medium the eye is in is that water's:
   the sea's preset, a pond's dark tea or a tarn's clear cyan.
 
 ### Wading and swimming

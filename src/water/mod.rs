@@ -161,7 +161,9 @@ pub struct WaterStageUniforms {
     pub eye_water: [f32; 4], // 1504
     /// x how still that water is (1 a lake or the sea, 0 a stream), y its
     /// whitewater, z its clarity, all as the surface drawn over the eye has
-    /// them (`player::WaterHere`); w unused.
+    /// them (`player::WaterHere`); w how far the eye is under the water
+    /// drawn at it (0 in the air, 1 under it), the side every surface is
+    /// seen from, written even with the medium turned off.
     pub eye_body: [f32; 4], // 1520
     /// rgb sunlight at the surface for the submerged medium, w moon radiance
     /// scale.

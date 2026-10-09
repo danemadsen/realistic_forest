@@ -284,18 +284,25 @@ impl ExtractedWater {
 /// (`ExtractedWater::drawn_eye_water`), if the eye is near enough its surface
 /// for the medium to have faded in. Returns the uniform block's `eye_water`
 /// and `eye_body`.
+///
+/// `eye_body.w` is how far the eye is under that water, across the same
+/// `UNDERWATER_FADE_METRES` band: the side of the water the eye is on, from
+/// which `fs_water` sees every surface. It is written whether or not the
+/// medium is drawn, since the side the eye is on is where it is, not an
+/// effect: with the underwater effects off, an eye under a pond still sees
+/// its surface from below.
 fn eye_medium(water: &ExtractedWater) -> ([f32; 4], [f32; 4]) {
     let Some(here) = water.drawn_eye_water() else {
         return ([0.0; 4], [0.0; 4]);
     };
-    if !water.settings.underwater_effects {
-        return ([0.0; 4], [0.0; 4]);
-    }
     let height = water.camera_height - here.surface;
-    let fade = (-height / UNDERWATER_FADE_METRES + 0.5).clamp(0.0, 1.0);
+    let submerged = (-height / UNDERWATER_FADE_METRES + 0.5).clamp(0.0, 1.0);
+    if !water.settings.underwater_effects {
+        return ([0.0; 4], [0.0, 0.0, 0.0, submerged]);
+    }
     // The water's colour is the drawn surface's over the eye (`water_at`), so
     // the medium blends into the sea's and a lake's with the surface.
-    ([here.surface, height, fade, here.sea], [here.still, here.turbulence, here.clarity, 0.0])
+    ([here.surface, height, submerged, here.sea], [here.still, here.turbulence, here.clarity, submerged])
 }
 
 // ---------------------------------------------------------------------------
@@ -1546,6 +1553,61 @@ mod eye_water_tests {
         assert!(!water.eye_submerged(0.2));
         assert_eq!(eye_medium(&water), ([0.0; 4], [0.0; 4]));
     }
+
+    /// A forest pond, its sheet 6 m over its bed.
+    fn pond() -> WaterHere {
+        WaterHere {
+            surface: 51.46,
+            ground: 45.46,
+            current: Vec2::ZERO,
+            turbulence: 0.0,
+            clarity: 0.0,
+            sea: 0.0,
+            still: 1.0,
+            kind: WaterKind::Lake,
+        }
+    }
+
+    /// The eye's side of the water, `eye_body.w`, which `fs_water` sees every
+    /// surface from: an eye in the air sees even a rapid climbing above it
+    /// from above, however high it stands over its own water, and only an
+    /// eye crossing its own surface leaves the side to each surface's plane.
+    #[test]
+    fn the_eye_sees_the_water_from_the_side_it_is_on_not_from_its_height() {
+        let over = |height: f32| ExtractedWater {
+            camera_height: pond().surface + height,
+            eye_water: Some(pond()),
+            ..ExtractedWater::default()
+        };
+        // Up in the air, 5 m over the pond: wholly out of it.
+        assert_eq!(eye_medium(&over(5.0)).1[3], 0.0);
+        // Just over the crossing band, still out of it.
+        assert_eq!(eye_medium(&over(UNDERWATER_FADE_METRES * 0.6)).1[3], 0.0);
+        // At the surface: half in, the side left to each surface's plane.
+        assert!((eye_medium(&over(0.0)).1[3] - 0.5).abs() < 1e-6);
+        // A metre under: wholly in it.
+        assert_eq!(eye_medium(&over(-1.0)).1[3], 1.0);
+        // The side moves with the eye through the band and agrees with the
+        // medium's fade wherever the medium is drawn.
+        let mut previous = 0.0;
+        for step in 0..=20 {
+            let height = 0.3 - 0.03 * step as f32;
+            let (eye, body) = eye_medium(&over(height));
+            assert!(body[3] >= previous, "the side runs back at {height} m");
+            assert_eq!(body[3], eye[2]);
+            previous = body[3];
+        }
+        // With the underwater effects off the medium is not drawn, but the
+        // eye under the pond still sees its surface from below.
+        let mut plain = over(-1.0);
+        plain.settings.underwater_effects = false;
+        assert_eq!(eye_medium(&plain), ([0.0; 4], [0.0, 0.0, 0.0, 1.0]));
+        plain.camera_height = pond().surface + 5.0;
+        assert_eq!(eye_medium(&plain), ([0.0; 4], [0.0; 4]));
+        // Over dry ground there is no water to be under.
+        let dry = ExtractedWater { camera_height: 0.0, eye_water: None, ..ExtractedWater::default() };
+        assert_eq!(eye_medium(&dry).1[3], 0.0);
+    }
 }
 
 #[cfg(test)]
@@ -1805,6 +1867,138 @@ mod shading_tests {
                 assert!((seen - (alpha * alpha + 0.18).sqrt()).abs() < 1e-4, "{input:?}: {seen}");
             }
         }
+    }
+
+    /// Which side of the water a surface is seen from is the side the eye is
+    /// on, not its height: an eye in the air sees even a rapid standing 20 m
+    /// over the eye's own plane from above, foam and all; an eye under the
+    /// water sees every surface from below; only an eye crossing its own
+    /// surface sees each from the side of the surface's plane it is on, the
+    /// foam on it fading out over the last centimetres.
+    #[test]
+    fn surfaces_are_seen_from_the_side_of_the_water_the_eye_is_on() {
+        let heads = ["fn smoothstepf(", "struct SurfaceSide", "fn surfaceSide("];
+        let body = "
+            let side = surfaceSide(input.x, input.y);
+            samples[id.x] = vec4<f32>(select(0.0, 1.0, side.below), side.upper, 0.0, 0.0);";
+        // x how far the eye is under its water, y its height over the
+        // surface's plane: below a rapid's, a sheet's or a crest's, or over it.
+        let overs = [-20.0f32, -1.0, -0.1, -0.01, 0.01, 0.05, 0.1, 1.0, 20.0];
+        let unders = [0.0f32, 0.25, 0.5, 0.75, 1.0];
+        let inputs: Vec<[f32; 4]> = unders
+            .iter()
+            .flat_map(|&under| overs.iter().map(move |&over| [under, over, 0.0, 0.0]))
+            .collect();
+        let Some(values) = evaluate(&heads, body, &inputs) else {
+            return;
+        };
+        for (input, value) in inputs.iter().zip(&values) {
+            let [under, over, ..] = *input;
+            let (below, upper) = (value[0] > 0.5, value[1]);
+            if under <= 0.0 {
+                assert!(!below && upper == 1.0, "an eye in the air sees a surface from below: {input:?} {value:?}");
+            } else if under >= 1.0 {
+                assert!(below && upper == 0.0, "an eye under the water sees a surface from above: {input:?} {value:?}");
+            } else {
+                assert_eq!(below, over < 0.0, "crossing, the side is the plane's: {input:?} {value:?}");
+                assert!((0.0..=1.0).contains(&upper), "{input:?} {value:?}");
+            }
+        }
+        // Crossing, the foam fades in as the eye rises through the surface's
+        // plane, and is whole a hand's breadth over it.
+        for row in values.chunks(overs.len()).skip(1).take(unders.len() - 2) {
+            assert!(row.windows(2).all(|pair| pair[1][1] >= pair[0][1]), "{row:?}");
+            assert_eq!((row[2][1], row[overs.len() - 2][1]), (0.0, 1.0), "{row:?}");
+        }
+    }
+
+    /// The plane a surface is seen by is its triangle's, its normal turned up
+    /// out of the water whichever way the triangle is wound, however it lies
+    /// across the screen and however small or stretched the pixel's
+    /// footprint on it; a triangle whose derivatives line up keeps the
+    /// level's.
+    #[test]
+    fn a_facet_is_turned_up_out_of_the_water() {
+        let heads = ["fn facetUp("];
+        // x the facet's tilt, y the heading of that tilt, z the footprint's
+        // size as a power of ten, w its winding: 1 or -1, or 0 for a
+        // footprint along one line.
+        let body = "
+            let normal = vec3<f32>(sin(input.x)*cos(input.y), cos(input.x), sin(input.x)*sin(input.y));
+            let u = normalize(cross(normal, vec3<f32>(0.3, 0.1, 0.95)));
+            let v = cross(normal, u);
+            let turn = input.x*3.7 + input.y*1.3;
+            let size = pow(10.0, input.z);
+            let across = (u*cos(turn) + v*sin(turn))*size;
+            let down = (v*cos(turn) - u*sin(turn))*size*(1.0 + 19.0*fract(input.y*0.7));
+            var dx = across;
+            var dy = down;
+            if (input.w < 0.0) { dx = down; dy = across; }
+            if (input.w == 0.0) { dy = across*2.0; }
+            let up = facetUp(dx, dy);
+            samples[id.x] = vec4<f32>(up, dot(up, normal));";
+        let mut inputs = Vec::new();
+        for tilt in [0.0f32, 0.05, 0.4, 0.9, 1.4] {
+            for heading in [0.0f32, 1.1, 2.5, 4.0, 5.6] {
+                for size in [-4.0f32, -2.0, 0.0, 1.5] {
+                    for winding in [1.0f32, -1.0, 0.0] {
+                        inputs.push([tilt, heading, size, winding]);
+                    }
+                }
+            }
+        }
+        let Some(values) = evaluate(&heads, body, &inputs) else {
+            return;
+        };
+        for (input, value) in inputs.iter().zip(&values) {
+            if input[3] == 0.0 {
+                assert_eq!([value[0], value[1], value[2]], [0.0, 1.0, 0.0], "{input:?}");
+            } else {
+                assert!(value[3] > 0.9999 && value[1] >= 0.0, "{input:?}: {value:?}");
+            }
+        }
+    }
+
+    /// A bed lies as deep under the surface whatever the angle it is seen
+    /// at: a level bed 10 m down shows through 10 m of water at a glance
+    /// across a tarn as from high over it, not through the shallower water
+    /// a cap on the length along the ray made of it. Only a bed deeper than
+    /// the clearest water returns a thousandth of its light from, there and
+    /// back, is taken for one that deep.
+    #[test]
+    fn a_bed_is_as_deep_seen_at_a_glance_as_from_above() {
+        let heads = ["const ALPINE_EXTINCTION:", "const BED_DEPTH_MAX:", "fn bedDepth("];
+        let body = "
+            let returned = exp(-2.0*ALPINE_EXTINCTION*BED_DEPTH_MAX);
+            samples[id.x] = vec4<f32>(bedDepth(input.x, input.y), BED_DEPTH_MAX,
+                                      max(max(returned.x, returned.y), returned.z), 0.0);";
+        // x the straight path from the surface to the bed, y the sine of the
+        // eye's elevation over the water.
+        let depths = [0.3f32, 2.0, 10.0, 25.0, 60.0];
+        let elevations = [3.0f32, 10.0, 30.0, 60.0, 90.0];
+        let inputs: Vec<[f32; 4]> = depths
+            .iter()
+            .flat_map(|&depth| {
+                elevations.iter().map(move |&elevation| {
+                    let rise = elevation.to_radians().sin();
+                    [depth / rise, rise, depth, elevation]
+                })
+            })
+            .collect();
+        let Some(values) = evaluate(&heads, body, &inputs) else {
+            return;
+        };
+        let cap = values[0][1];
+        assert!((values[0][2] - 1e-3).abs() < 1e-5, "the clearest water returns {} from {cap} m", values[0][2]);
+        for (input, value) in inputs.iter().zip(&values) {
+            let expected = input[2].min(cap);
+            assert!((value[0] - expected).abs() < 1e-3 * expected.max(1.0), "{input:?}: {} not {expected}", value[0]);
+        }
+        // Looking up from under the surface, no bed lies under it.
+        let Some(up) = evaluate(&heads, body, &[[10.0, -0.5, 0.0, 0.0]]) else {
+            return;
+        };
+        assert_eq!(up[0][0], 0.0);
     }
 
     /// The water places the canopy over the habitat capture by the window
