@@ -145,30 +145,29 @@ pub struct WaterStageUniforms {
     /// zero while the map is not drawn (the sea is off), which is how the
     /// rivers, which read it as their banks' ground, can tell.
     pub shore_map: [f32; 4], // 1472
-    /// The grass capture in the same layout: its alpha is the share of open
-    /// sky the tree crowns leave, which the water reads as the forest it
-    /// mirrors and the shelter it gives from the wind. All zero while there
-    /// is no capture.
-    pub canopy_map: [f32; 4], // 1488
+    // The canopy over the grass capture is placed by the capture's own window
+    // (`GbufferTargets::grass_habitat_mapping_buffer`), not by a field here:
+    // this block is written before the frame's capture is taken.
     /// x the surface wind at 10 m, m/s; y how gusty it is, 0..1; z the
-    /// frame's length in seconds, past which a texture the water carries
-    /// moves too far a frame to follow; w unused.
-    pub wind: [f32; 4], // 1504
+    /// viewer's exposure in seconds (`ExtractedWater::exposure_seconds`),
+    /// past which a texture the water carries moves too far a frame to
+    /// follow; w unused.
+    pub wind: [f32; 4], // 1488
     /// The water the eye is in, for the submerged medium: x its level, y the
     /// eye's height above it (negative under it), z how far the medium has
     /// faded in, w how far it is the sea's water. All zero out of the water.
-    pub eye_water: [f32; 4], // 1520
+    pub eye_water: [f32; 4], // 1504
     /// x how still that water is (1 a lake or the sea, 0 a stream), y its
     /// whitewater, z its clarity, all as the surface drawn over the eye has
     /// them (`player::WaterHere`); w unused.
-    pub eye_body: [f32; 4], // 1536
+    pub eye_body: [f32; 4], // 1520
     /// rgb sunlight at the surface for the submerged medium, w moon radiance
     /// scale.
-    pub medium_sun: [f32; 4], // 1552
+    pub medium_sun: [f32; 4], // 1536
 }
 
 const _: () = assert!(std::mem::size_of::<GpuWave>() == 32);
-const _: () = assert!(std::mem::size_of::<WaterStageUniforms>() == 1568);
+const _: () = assert!(std::mem::size_of::<WaterStageUniforms>() == 1552);
 
 impl Default for WaterStageUniforms {
     fn default() -> Self {
@@ -183,7 +182,6 @@ impl Default for WaterStageUniforms {
             misc: [0.5, 1.0, 1.0, 0.0],
             flags: [0.0, 1.0, 0.0, rings::horizon_wave_fade_end()],
             shore_map: [0.0; 4],
-            canopy_map: [0.0; 4],
             wind: [0.0, 0.5, 1.0 / 60.0, 0.0],
             eye_water: [0.0; 4],
             eye_body: [0.0; 4],

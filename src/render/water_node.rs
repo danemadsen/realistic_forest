@@ -78,6 +78,10 @@ const REFRACTION_SCALE: f32 = 0.5;
 /// turns foam off.
 const FOAM_SCALE: f32 = 1.0;
 
+/// Group 1's binding for the canopy capture's window (`canopy_window` in
+/// water.wgsl), past the five maps at 0..=4.
+const CANOPY_WINDOW_BINDING: u32 = 7;
+
 /// Eye height, in metres, over which the submerged-camera medium fades in
 /// across the surface. Wide enough that crossing the surface does not pop,
 /// narrow enough that it never reaches the camera while walking a shore or
@@ -96,6 +100,26 @@ const MEDIUM_SUN_GAIN: f32 = 15.0;
 /// up, so the default 18 m/s cloud wind is a moderate 6.3 m/s breeze at the
 /// water, a few whitecaps on the open sea.
 const SURFACE_WIND_SHARE: f32 = 0.35;
+
+/// The frame the viewer is shown, seconds: what a pattern the water carries
+/// is judged against, since one carried more than a fraction of its own size
+/// between frames strobes and seems to run backwards. That is the frame time
+/// the eye (or a camera) has settled into, not the length of the last frame:
+/// a single slow frame does not change what the eye integrates, and taking
+/// it at face value stripped the ripples and foam from that one frame and
+/// spread their slope into a wider glint, a flash at every hitch. So the
+/// exposure follows the frame time with a time constant of
+/// `EXPOSURE_SETTLE_SECONDS`, and a frame further than a factor of two from
+/// it moves it only as far as that factor.
+const EXPOSURE_SETTLE_SECONDS: f32 = 0.75;
+/// The exposure's range: a 240 Hz display at the short end; at the long end
+/// a tenth of a second, past which no frame rate is followed as motion.
+const EXPOSURE_MIN_SECONDS: f32 = 1.0 / 240.0;
+const EXPOSURE_MAX_SECONDS: f32 = 0.1;
+/// The frame a screenshot run is drawn for. Its frames take seconds on a
+/// software adapter, which the picture must not show: it is the still of a
+/// game running at 60 fps.
+const SHOT_EXPOSURE_SECONDS: f32 = 1.0 / 60.0;
 
 /// Byte offset of `WaterStageUniforms::params` — 40 waves at 32 bytes plus five
 /// LOD ranges at 16. The clock is rewritten here every frame, so the block's
@@ -116,8 +140,9 @@ pub struct ExtractedWater {
     pub settings: WaterSettings,
     /// Seconds since startup, the Gerstner phase clock.
     pub elapsed: f32,
-    /// The last frame's length, seconds.
-    pub frame_seconds: f32,
+    /// The viewer's exposure, seconds: the frame time the eye has settled
+    /// into (see `EXPOSURE_SETTLE_SECONDS`), carried from frame to frame.
+    pub exposure_seconds: f32,
     /// World-space eye height, for the submerged-camera admission test.
     pub camera_height: f32,
     /// The water the eye is over or in, if any.
@@ -140,7 +165,7 @@ impl Default for ExtractedWater {
         Self {
             settings: WaterSettings::default(),
             elapsed: 0.0,
-            frame_seconds: 1.0 / 60.0,
+            exposure_seconds: SHOT_EXPOSURE_SECONDS,
             camera_height: 0.0,
             eye_water: None,
             draw: true,
@@ -172,6 +197,9 @@ fn extract_water(
     let draw_ocean = world
         .get_resource::<crate::WorldOptions>()
         .is_none_or(|options| options.draw_ocean);
+    let shot = world
+        .get_resource::<crate::automation::AutomationSettings>()
+        .is_some_and(|automation| automation.shot_path.is_some());
     // The player is the camera; `extract_forest_view` reads the same component
     // to build `globals.camera_position`, so the two agree by construction.
     let (camera_height, eye_water) = {
@@ -189,7 +217,7 @@ fn extract_water(
 
     extracted.settings = settings;
     extracted.elapsed = elapsed;
-    extracted.frame_seconds = frame_seconds;
+    extracted.exposure_seconds = viewer_exposure(extracted.exposure_seconds, frame_seconds, shot);
     extracted.camera_height = camera_height;
     extracted.eye_water = eye_water;
     extracted.draw = draw_ocean && settings.enabled;
@@ -197,6 +225,22 @@ fn extract_water(
     extracted.weather_wave_target = app.as_ref().map_or(1.0, |app| weather_wave_target(app.cloud_wind_speed));
     extracted.surface_wind = conditions.map_or(0.0, |conditions| conditions.wind_speed * SURFACE_WIND_SHARE);
     extracted.gustiness = conditions.map_or(0.5, |conditions| (0.45 + 0.55 * conditions.gust_strength).clamp(0.0, 1.0));
+}
+
+/// The viewer's exposure after a frame of `frame_seconds`: an exponential
+/// average of the frame time over `EXPOSURE_SETTLE_SECONDS`, into which a
+/// frame counts as no more than twice and no less than half the exposure, so
+/// a hitch nudges it and a lasting change of frame rate is followed within a
+/// second or two. A screenshot run's is always `SHOT_EXPOSURE_SECONDS`.
+fn viewer_exposure(exposure: f32, frame_seconds: f32, shot: bool) -> f32 {
+    if shot {
+        return SHOT_EXPOSURE_SECONDS;
+    }
+    let exposure = exposure.clamp(EXPOSURE_MIN_SECONDS, EXPOSURE_MAX_SECONDS);
+    let frame = frame_seconds.max(0.0);
+    let blend = 1.0 - (-frame / EXPOSURE_SETTLE_SECONDS).exp();
+    let sample = frame.clamp(0.5 * exposure, 2.0 * exposure);
+    (exposure + (sample - exposure) * blend).clamp(EXPOSURE_MIN_SECONDS, EXPOSURE_MAX_SECONDS)
 }
 
 /// The square-root wind response gives calm water residual wave energy and
@@ -320,7 +364,8 @@ struct WaterInner {
     samplers: Option<WaterSamplers>,
     /// Group 1 for every water pass: the composited frame at 0/8, the
     /// G-buffer position at 1/9, lighting heightfield at 2/10, local seabed
-    /// heightfield at 3/11 and the canopy over the grass capture at 4/12.
+    /// heightfield at 3/11, the canopy over the grass capture at 4/12 and the
+    /// capture's window at 7.
     screen: Option<BindGroupLayoutDescriptor>,
     /// The `WaterStageUniforms` block.
     stage_buffer: Option<Buffer>,
@@ -564,7 +609,8 @@ fn prepare_water(
     if inner.screen.is_none() {
         // Group 1: composited frame, the lighting and seabed maps and the
         // canopy over the grass capture (bilinear), plus G-buffer position
-        // (point). Texture N pairs with sampler N + 8.
+        // (point). Texture N pairs with sampler N + 8; the canopy capture's
+        // window is the uniform at CANOPY_WINDOW_BINDING.
         inner.screen = Some(screen_layout(
             "forest_water_screen_layout",
             &[true, false, true, true, true],
@@ -639,17 +685,12 @@ fn prepare_water(
         std::mem::offset_of!(WaterStageUniforms, shore_map),
         if water.draw { shore_heightfield_mapping(globals.globals.camera_position) } else { [0.0; 4] },
     );
-    // Where the canopy capture lies, while there is one to read.
-    write(
-        std::mem::offset_of!(WaterStageUniforms, canopy_map),
-        gbuffer_guard
-            .as_ref()
-            .filter(|gbuffer| gbuffer.grass_habitat_ready)
-            .map_or([0.0; 4], |gbuffer| gbuffer.grass_habitat_mapping),
-    );
+    // Where the canopy capture lies is not written here: this runs before
+    // the frame's capture, and the capture's own pass writes its window
+    // (`GbufferTargets::grass_habitat_mapping_buffer`, group 1).
     write(
         std::mem::offset_of!(WaterStageUniforms, wind),
-        [water.surface_wind, water.gustiness, water.frame_seconds.clamp(0.0, 0.25), 0.0],
+        [water.surface_wind, water.gustiness, water.exposure_seconds, 0.0],
     );
 
     // Submerged-camera admission. The medium fades in over
@@ -1175,7 +1216,9 @@ pub fn forest_underwater_pass(view: ViewQuery<&ViewTarget>, world: &World, mut c
 
 /// Every water pass's group-1 bind group: the composited frame at 0/8, the
 /// G-buffer position at 1/9, lighting heightfield at 2/10, local seabed
-/// heightfield at 3/11 and the canopy over the grass capture at 4/12.
+/// heightfield at 3/11, the canopy over the grass capture at 4/12 and, at
+/// CANOPY_WINDOW_BINDING, the window of the capture that canopy was laid over,
+/// written with its texels.
 fn screen_bind_group(
     device: &RenderDevice,
     cache: &PipelineCache,
@@ -1192,6 +1235,7 @@ fn screen_bind_group(
         &gbuffer.position_view,
         source,
         &[&gbuffer.heightfield_view, &gbuffer.shore_heightfield_view, &gbuffer.grass_ground_average_view],
+        &gbuffer.grass_habitat_mapping_buffer,
     )
 }
 
@@ -1205,6 +1249,7 @@ fn screen_group(
     source: &wgpu::TextureView,
     // Bilinear maps at bindings 2, 3, ... with their samplers at 10, 11, ...
     maps: &[&wgpu::TextureView],
+    canopy_window: &Buffer,
 ) -> Option<BindGroup> {
     let mut entries = vec![
         BindGroupEntry {
@@ -1222,6 +1267,10 @@ fn screen_group(
         BindGroupEntry {
             binding: 9,
             resource: BindingResource::Sampler(&samplers.point_clamp),
+        },
+        BindGroupEntry {
+            binding: CANOPY_WINDOW_BINDING,
+            resource: canopy_window.as_entire_binding(),
         },
     ];
     for (index, &map) in maps.iter().enumerate() {
@@ -1241,10 +1290,21 @@ fn screen_group(
 }
 
 /// One group-1 layout: for every entry in `filterable`, a float texture at
-/// binding N whose sampler sits at binding N + 8. The same shape the post
-/// passes' `screen_group_layout` builds.
+/// binding N whose sampler sits at binding N + 8, the same shape the post
+/// passes' `screen_group_layout` builds; and the canopy capture's window.
 fn screen_layout(label: &'static str, filterable: &[bool]) -> BindGroupLayoutDescriptor {
-    let mut entries: Vec<BindGroupLayoutEntry> = Vec::with_capacity(filterable.len() * 2);
+    assert!(filterable.len() <= CANOPY_WINDOW_BINDING as usize, "a map would take the window's binding");
+    let mut entries: Vec<BindGroupLayoutEntry> = Vec::with_capacity(filterable.len() * 2 + 1);
+    entries.push(BindGroupLayoutEntry {
+        binding: CANOPY_WINDOW_BINDING,
+        visibility: ShaderStages::FRAGMENT,
+        ty: BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: BufferSize::new(std::mem::size_of::<[f32; 4]>() as u64),
+        },
+        count: None,
+    });
     for (index, filterable) in filterable.iter().enumerate() {
         entries.push(BindGroupLayoutEntry {
             binding: index as u32,
@@ -1484,5 +1544,300 @@ mod eye_water_tests {
         water.camera_height = SEA_LEVEL + 3.5;
         assert!(!water.eye_submerged(0.2));
         assert_eq!(eye_medium(&water), ([0.0; 4], [0.0; 4]));
+    }
+}
+
+#[cfg(test)]
+mod exposure_tests {
+    use super::*;
+
+    /// Runs `frames` frames of `frame_seconds` from `exposure`.
+    fn run(mut exposure: f32, frame_seconds: f32, frames: usize) -> f32 {
+        for _ in 0..frames {
+            exposure = viewer_exposure(exposure, frame_seconds, false);
+        }
+        exposure
+    }
+
+    #[test]
+    fn a_hitch_barely_moves_the_exposure() {
+        let steady = run(1.0 / 60.0, 1.0 / 60.0, 600);
+        assert!((steady - 1.0 / 60.0).abs() < 1e-6);
+        // One 50 ms frame among 60 fps ones, the hitch of a capture or a tile
+        // streaming in: the water's detail must not drop out with it.
+        let hitch = viewer_exposure(steady, 0.05, false);
+        assert!(hitch < steady * 1.08, "{hitch}");
+        // Even the longest frame Bevy hands over moves it by under a third.
+        assert!(viewer_exposure(steady, 0.25, false) < steady * 1.3);
+        // And it settles back.
+        assert!((run(hitch, 1.0 / 60.0, 300) - steady).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_lasting_frame_rate_is_followed_within_a_second_or_two() {
+        let thirty = run(1.0 / 60.0, 1.0 / 30.0, 60);
+        assert!(thirty > 0.9 / 30.0 && thirty <= 1.0 / 30.0, "{thirty}");
+        let back = run(thirty, 1.0 / 60.0, 120);
+        assert!(back < 1.1 / 60.0, "{back}");
+        // A paused clock leaves it where it was.
+        assert_eq!(viewer_exposure(thirty, 0.0, false), thirty);
+    }
+
+    #[test]
+    fn the_exposure_keeps_to_its_range() {
+        assert_eq!(run(1.0 / 60.0, 1.0 / 1000.0, 10_000), EXPOSURE_MIN_SECONDS);
+        assert_eq!(run(1.0 / 60.0, 0.25, 200), EXPOSURE_MAX_SECONDS);
+        assert_eq!(viewer_exposure(f32::INFINITY, 0.0, false), EXPOSURE_MAX_SECONDS);
+    }
+
+    /// A screenshot run's frames take seconds on a software adapter; its
+    /// picture is a still of the game at 60 fps all the same.
+    #[test]
+    fn a_screenshot_is_exposed_as_a_sixty_fps_frame() {
+        assert_eq!(viewer_exposure(EXPOSURE_MAX_SECONDS, 0.25, true), 1.0 / 60.0);
+        assert_eq!(viewer_exposure(1.0 / 60.0, 3.0, true), 1.0 / 60.0);
+    }
+}
+
+#[cfg(test)]
+mod shading_tests {
+    use super::*;
+    use bevy::tasks::block_on;
+    use wgpu::util::DeviceExt;
+
+    const WATER: &str = include_str!("../../assets/shaders/water.wgsl");
+
+    /// The water shader's module-scope item starting with `head` (`fn name(`
+    /// or `const NAME:`), through its end.
+    fn item(head: &str) -> &'static str {
+        let start = WATER.find(&format!("\n{head}")).unwrap_or_else(|| panic!("water.wgsl has no {head}")) + 1;
+        let rest = &WATER[start..];
+        let end = if head.starts_with("const") {
+            rest.find(";\n").expect("a constant ends") + 2
+        } else {
+            rest.find("\n}\n").expect("a function ends") + 3
+        };
+        &rest[..end]
+    }
+
+    /// Runs `body`, which turns `input` into `samples[id.x]`, over `inputs`
+    /// with the water shader's `heads` in scope, on whatever adapter there
+    /// is. `None` without one.
+    fn evaluate(heads: &[&str], body: &str, inputs: &[[f32; 4]]) -> Option<Vec<[f32; 4]>> {
+        let instance = wgpu::Instance::default();
+        let Ok(adapter) = block_on(instance.request_adapter(&Default::default())) else {
+            eprintln!("skipping water shading check: no GPU adapter");
+            return None;
+        };
+        let (device, queue) = block_on(adapter.request_device(&Default::default())).expect("a device");
+        let items = heads.iter().map(|head| item(head)).collect::<Vec<_>>().join("\n");
+        let source = format!(
+            "{items}
+             @group(0) @binding(0) var<storage, read_write> samples: array<vec4<f32>>;
+             @compute @workgroup_size(64)
+             fn evaluate(@builtin(global_invocation_id) id: vec3<u32>) {{
+                 if (id.x >= arrayLength(&samples)) {{ return; }}
+                 let input = samples[id.x];
+                 {body}
+             }}"
+        );
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("water shading check"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("water shading check"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("evaluate"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let samples = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("water shading samples"),
+            contents: bytemuck::cast_slice(inputs),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("water shading readback"),
+            size: samples.size(),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("water shading check"),
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: samples.as_entire_binding() }],
+        });
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups((inputs.len() as u32).div_ceil(64), 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&samples, 0, &readback, 0, samples.size());
+        queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        readback.map_async(wgpu::MapMode::Read, .., move |result| sender.send(result).unwrap());
+        device.poll(wgpu::PollType::wait_indefinitely()).expect("poll");
+        receiver.recv().expect("mapping callback").expect("map readback");
+        let bytes = readback.get_mapped_range(..).to_vec();
+        Some(bytes.chunks_exact(16).map(bytemuck::pod_read_unaligned).collect())
+    }
+
+    /// Spread over a rapid at pixel footprints from a few centimetres to tens
+    /// of metres, the whitewater over the steps must cover as much of the
+    /// river as the near pattern does, and must not change from one pixel to
+    /// the next once the pixel can no longer resolve the steps, which is the
+    /// crawl and sparkle of a far rapid as the camera moves. The point sample
+    /// it was is the measure of that crawl.
+    #[test]
+    fn distant_rapids_stay_as_white_and_do_not_crawl() {
+        let heads = [
+            "fn smoothstepf(", "fn hash21(", "fn valueNoise(", "const RIVER_STEP_SPACING:",
+            "const VALUE_NOISE_DEVIATION:", "fn octaveResolved(", "fn riverSteps(",
+            "fn riverStepShares(", "fn streamFoam(",
+        ];
+        // Whitewater at full churn, the lace pattern beyond resolving: the
+        // shader's own sums, over the thirds of the pixel and at its centre.
+        let body = "
+            let steps = riverSteps(input.x, input.y, input.zw);
+            let shares = riverStepShares(steps.x, steps.y);
+            let made = mix(vec3<f32>(0.15), vec3<f32>(0.8), shares);
+            let foam = (streamFoam(made.x, 0.5, 0.0) + streamFoam(made.y, 0.5, 0.0)
+                        + streamFoam(made.z, 0.5, 0.0))/3.0;
+            let point = riverSteps(input.x, input.y, vec2<f32>(0.0));
+            let point_made = mix(0.15, 0.8, smoothstepf(0.25, 0.75, point.x));
+            samples[id.x] = vec4<f32>(foam, streamFoam(point_made, 0.5, 0.0), 0.0, 0.0);";
+        // Metres along and half widths across, scattered down a rapid; each
+        // with its neighbours a pixel along and a pixel across.
+        let mut seed = 0x2545_f491_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        let positions: Vec<[f32; 2]> = (0..4096).map(|_| [next() * 4000.0, next() * 2.0 - 1.0]).collect();
+        let footprints = [[0.4f32, 0.03], [2.0, 0.15], [6.0, 0.5], [24.0, 1.2]];
+        let mut inputs = Vec::new();
+        for footprint in footprints {
+            for offset in [[0.0, 0.0], [footprint[0], 0.0], [0.0, footprint[1]]] {
+                inputs.extend(positions.iter().map(|p| {
+                    [p[0] + offset[0], p[1] + offset[1], footprint[0], footprint[1]]
+                }));
+            }
+        }
+        let Some(values) = evaluate(&heads, body, &inputs) else {
+            return;
+        };
+        let n = positions.len();
+        let mean = |values: &[[f32; 4]], k: usize| values.iter().map(|v| v[k]).sum::<f32>() / values.len() as f32;
+        let crawl = |values: &[[f32; 4]], k: usize| {
+            let (here, rest) = values.split_at(n);
+            let squares: f32 = rest.chunks(n).flat_map(|next| next.iter().zip(here).map(|(a, b)| (a[k] - b[k]).powi(2))).sum();
+            (squares / (2 * n) as f32).sqrt()
+        };
+        let near = mean(&values[..n], 1);
+        assert!(near > 0.1, "a rapid is white over its steps: {near}");
+        for (index, footprint) in footprints.iter().enumerate() {
+            let set = &values[index * 3 * n..(index + 1) * 3 * n];
+            let coverage = mean(&set[..n], 0);
+            assert!((coverage / near - 1.0).abs() < 0.1, "{footprint:?}: covers {coverage}, near {near}");
+            let (filtered, point) = (crawl(set, 0), crawl(set, 1));
+            match index {
+                // Resolved: the pattern is the near one.
+                0 => assert!((filtered - point).abs() < 0.1 * point, "{footprint:?}: {filtered} vs {point}"),
+                // The boulders averaged away, the ledges still drawn.
+                1 => assert!(filtered < 0.6 * point, "{footprint:?}: {filtered} vs {point}"),
+                // Nothing left to resolve: the same from pixel to pixel.
+                _ => assert!(filtered < 0.05 * point, "{footprint:?}: {filtered} vs {point}"),
+            }
+        }
+    }
+
+    /// A glint is as wide as the surface's roughness. Where the normal turns
+    /// slowly enough across the pixels that the glint spans two of them or
+    /// more, it is resolved and must hardly widen; where it turns so fast the
+    /// glint would fall between pixels, the glint must spread over its pixel;
+    /// and where the normal jumps, the widening stops at its cap.
+    #[test]
+    fn glints_widen_only_where_a_pixel_cannot_resolve_them() {
+        let heads = ["const PIXEL_FILTER_VARIANCE:", "fn pixelRoughness("];
+        // x the roughness, y the normal's turn per pixel, z the direction of
+        // that turn across the screen.
+        let body = "
+            let turn = input.y*vec3<f32>(cos(input.z), 0.0, sin(input.z));
+            samples[id.x] = vec4<f32>(pixelRoughness(input.x, vec3<f32>(turn.x, 0.0, 0.0),
+                                                     vec3<f32>(0.0, 0.0, turn.z)), 0.0, 0.0, 0.0);";
+        let mut inputs = Vec::new();
+        for alpha in [0.02f32, 0.05, 0.1, 0.3] {
+            for direction in [0.0f32, 0.6, 1.3] {
+                for turn in [alpha / 2.0, 3.0 * alpha, 3.0] {
+                    inputs.push([alpha, turn, direction, 0.0]);
+                }
+            }
+        }
+        let Some(values) = evaluate(&heads, body, &inputs) else {
+            return;
+        };
+        for (input, value) in inputs.iter().zip(&values) {
+            let [alpha, turn, ..] = *input;
+            let seen = value[0];
+            assert!(seen >= alpha, "{input:?}: {seen}");
+            if turn <= alpha / 2.0 {
+                assert!(seen < 1.05 * alpha, "a resolved glint widened: {input:?} {seen}");
+            } else if turn < 1.0 {
+                assert!(seen / turn > 0.55, "a glint narrower than its pixel: {input:?} {seen}");
+            } else {
+                assert!((seen - (alpha * alpha + 0.18).sqrt()).abs() < 1e-4, "{input:?}: {seen}");
+            }
+        }
+    }
+
+    /// The water places the canopy over the habitat capture by the window
+    /// that capture's own pass writes, bound beside the canopy texture, and
+    /// by nothing in its own block, which is written before the frame's
+    /// capture.
+    #[test]
+    fn the_canopy_is_placed_by_its_capture_window() {
+        let binding = format!("@group(1) @binding({CANOPY_WINDOW_BINDING}) var<uniform> canopy_window: vec4<f32>;");
+        assert!(WATER.contains(&binding), "water.wgsl must declare {binding}");
+        let canopy = item("fn riverCanopy(");
+        assert!(canopy.contains("canopy_window.xy") && canopy.contains("canopy_window.z"));
+        assert!(!WATER.contains("canopy_map"), "the stage block must not carry a canopy window");
+    }
+
+    /// The stage block is mirrored by hand on both sides; a field added to one
+    /// alone would shift everything after it.
+    #[test]
+    fn the_stage_block_matches_its_wgsl_mirror() {
+        let module = naga::front::wgsl::parse_str(WATER).expect("water.wgsl parses");
+        let (span, members) = module
+            .types
+            .iter()
+            .find_map(|(_, ty)| match (&ty.name, &ty.inner) {
+                (Some(name), naga::TypeInner::Struct { members, span }) if name == "WaterStageUniforms" => {
+                    Some((*span as usize, members.clone()))
+                }
+                _ => None,
+            })
+            .expect("water.wgsl declares WaterStageUniforms");
+        let wgsl: Vec<(String, usize)> = members
+            .iter()
+            .map(|member| (member.name.clone().unwrap_or_default(), member.offset as usize))
+            .collect();
+        macro_rules! offsets {
+            ($($field:ident),+) => {
+                vec![$((stringify!($field).to_string(), std::mem::offset_of!(WaterStageUniforms, $field))),+]
+            };
+        }
+        let rust = offsets!(
+            waves, ranges, params, extinction, scatter, surface, sss_tint, misc, flags, shore_map, wind,
+            eye_water, eye_body, medium_sun
+        );
+        assert_eq!(wgsl, rust);
+        assert_eq!(span, std::mem::size_of::<WaterStageUniforms>());
     }
 }

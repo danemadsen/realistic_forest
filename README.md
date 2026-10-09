@@ -142,7 +142,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | Flag | Effect |
 | --- | --- |
 | `--camera x,y,z,yawDeg,pitchDeg` | Pin the camera pose and fly, for reproducible shots; with `--shot`, mouse and keyboard input cannot move it |
-| `--shot path.png` | Render, save a screenshot, then exit; the log reports average, p95 and maximum frame time over the `--wait` window, split into frames while erosion tiles stream and settled frames |
+| `--shot path.png` | Render, save a screenshot, then exit; the log reports average, p95 and maximum frame time over the `--wait` window, split into frames while erosion tiles stream and settled frames. The water is drawn as a still of the game at 60 fps however long the frames take |
 | `--snow-trail x,z,x,z` | Seed one compressed snow segment between the two world XZ positions for reproducible screenshots |
 | `--wait n` | Frames to render before the screenshot, counted once the prewarmed erosion tiles, plants and grass are ready |
 | `--erosion-prewarm N` | Simulate the `N` nearest erosion tiles at full budget before streaming (default `4`, the quartet around the player); raise it so a capture shows erosion beyond the player's own lattice cell |
@@ -1094,7 +1094,12 @@ screen-space reflections, sun glitter, refraction, rain rings and fog, the
 plants' shadow cascades and the same underside. Sun and moon glints are a
 normalised GGX lobe weighted by the water's own Fresnel at each facet, so
 water mirrors the sun only where its facets line up, as sparkles and a soft
-path, never as a white sheet. What differs from one water to the next:
+path, never as a white sheet. Where the surface turns faster across a pixel
+than a glint is wide, the lobe is widened by the spread of the normals the
+pixel spans (geometric specular antialiasing), so a glint too fine to draw
+spreads dimly over its pixel instead of flickering as the camera moves; a
+glint two pixels across or more barely changes. What differs from one water
+to the next:
 
 - **Its colour.** The sea's is its optics preset. Forest water is stained
   like tea by the tannins the rain leaches from the forest floor: dissolved
@@ -1123,7 +1128,10 @@ path, never as a white sheet. What differs from one water to the next:
   from its upwind shore across it, calm in the lee of the trees there and
   rougher toward its far shore. A pond ringed by forest, or a creek in its
   cut under the crowns, lies sheltered and nearly glassy but for the cat's
-  paws gusts send across it. A river adds what its current does to it.
+  paws gusts send across it. A river adds what its current does to it. The
+  crowns are read from the grass's 512-metre capture, placed by the window
+  the capture itself records as it is taken, so in the frame the camera
+  crosses into the next window the forest the water sees does not jump.
 - **What the water mirrors.** Where the screen cannot show a reflection, the
   shader walks out along the reflected ray's bearing over the ground and the
   canopy (the shore map near the camera, the lighting map beyond, and the
@@ -1143,10 +1151,16 @@ path, never as a white sheet. What differs from one water to the next:
   swell glassy on runs and pools, and the wind's waves ride the current. A
   texture the current carries further in one frame than a third of its own
   size would strobe and seem to run backwards; it becomes roughness instead,
-  as what a pixel cannot resolve does, by its true slope variance.
+  as what a pixel cannot resolve does, by its true slope variance. The frame
+  is the one the eye has settled into, the frame time averaged over three
+  quarters of a second: a single slow frame hardly moves it, so a hitch
+  neither strips the ripples for a frame nor flashes the glints.
 - **Foam.** On the sea, breaking crests and the shore's wash; on any water, a
   strong wind's whitecaps. Rapids churn white over the steps and boulders of
-  their bed, with dark glassy tongues of water between; foam they make
+  their bed, with dark glassy tongues of water between. Far off, where a
+  pixel spans several boulders, it shows them as it would average them,
+  each third of the pixel at its own share of white, so a distant rapid is
+  as white as a near one without crawling; foam they make
   drifts downstream for some fifteen seconds as lace gathered on the seams by
   the banks, on a tongue down the current and as scum in slack water, and an
   inlet carries it out into the pond. Stream foam is cream, stained like the

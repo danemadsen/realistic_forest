@@ -126,8 +126,7 @@ struct WaterStageUniforms
     misc: vec4<f32>,          // x refraction scale, y foam scale, z max amplitude, w significant wave height
     flags: vec4<f32>,         // x flat-surface debug, y sea state amplitude, z wind radians, w wave fade end
     shore_map: vec4<f32>,     // world centre XZ, span (0 while undrawn), texel size
-    canopy_map: vec4<f32>,    // canopy capture: world centre XZ, span (0 while absent), texel size
-    wind: vec4<f32>,          // x surface wind at 10 m, m/s; y gustiness 0..1; zw unused
+    wind: vec4<f32>,          // x surface wind at 10 m, m/s; y gustiness 0..1; z viewer's exposure, s; w unused
     eye_water: vec4<f32>,     // x level of the water at the eye, y eye height above it, z submerged fade, w its sea share
     eye_body: vec4<f32>,      // x its stillness, y its whitewater, z its clarity; w unused
     medium_sun: vec4<f32>,    // rgb sunlight at the surface for the medium, w moon radiance scale
@@ -149,6 +148,11 @@ struct WaterStageUniforms
 // water mirrors, and the shelter it gives from the wind.
 @group(1) @binding(4) var canopy_texture: texture_2d<f32>;
 @group(1) @binding(12) var canopy_sampler: sampler;
+// Where that capture lies, as its own pass wrote it along with its texels:
+// world centre XZ, span (0 until there is a capture), texel size. Never a
+// window written before the frame's capture, which for the frame the camera
+// crosses into the next 8 m window would shift every crown by 8 m.
+@group(1) @binding(7) var<uniform> canopy_window: vec4<f32>;
 // The sky probe is raymarched with a short reuse window (see
 // PROBE_INTEGRATION_PERIOD in src/render/cloud_node.rs). Waves sample it in
 // their reflected direction, so the complete cloud sky remains visible
@@ -1398,6 +1402,28 @@ fn vSmithGGX(n_dot_l: f32, n_dot_v: f32, alpha: f32) -> f32
     return 0.5/max(ggx_l + ggx_v, 1e-7);
 }
 
+// Variance, in pixels squared, of the pixel filter the shading is judged
+// over: the Gaussian whose peak is one (Tokuyoshi and Kaplanyan 2019).
+const PIXEL_FILTER_VARIANCE: f32 = 0.15915494;
+
+// The surface's roughness `alpha` as the pixel sees it, with `normal_dx` and
+// `normal_dy` the change of the normal to the next pixel across and down.
+// What is resolved can still turn faster across a pixel than its glint is
+// wide: the crest of a riffle, the kink of a standing wave, a ripple seen
+// edge-on far off. One normal for the pixel would make a glint that falls
+// between pixels and flickers as the camera moves; the pixel sees every
+// normal its footprint spans, so the normal's spread over the pixel filter
+// widens the lobe (geometric specular antialiasing: Kaplanyan et al. 2016,
+// Tokuyoshi and Kaplanyan 2019). A ripple's glint two pixels across or more
+// is resolved and widens by under five percent; one narrower than a pixel
+// spreads over the pixel, as dim as it is wide. The widening is capped where
+// the normal jumps rather than turns, at an edge-on facet.
+fn pixelRoughness(alpha: f32, normal_dx: vec3<f32>, normal_dy: vec3<f32>) -> f32
+{
+    let spread = PIXEL_FILTER_VARIANCE*(dot(normal_dx, normal_dx) + dot(normal_dy, normal_dy));
+    return sqrt(min(alpha*alpha + min(2.0*spread, 0.18), 1.0));
+}
+
 /// Sun- or moonlight a water surface reflects toward the eye per unit of
 /// irradiance: f_r*n.l of a GGX microfacet dielectric. D carries its 1/pi
 /// (irradiance here follows the composite's albedo/pi convention), V is the
@@ -1888,14 +1914,63 @@ const RIVER_NOISE_SLOPE_VARIANCE: f32 = 0.187;
 const RIVER_STEP_SPACING: f32 = 4.0;
 const RIVER_TONGUE_WANDER: f32 = 18.0;
 
-// Where a rapid's bed steps, 0..1 about 0.5, at metres `along` its channel
-// and `across` it in half widths: ledges a few metres apart drawn out
-// downstream, broken by boulders at a third of their scale.
-fn riverSteps(along: f32, across: f32) -> f32
+// Standard deviation of valueNoise about its mean of 0.5 (cubic-smoothed
+// value noise over uniform hashes; measured).
+const VALUE_NOISE_DEVIATION: f32 = 0.214;
+
+// How much of a value-noise octave a pixel resolves, from its footprint in
+// the octave's cells along each axis: all of it under a quarter of a cell,
+// none from half a cell, where the octave's finest detail passes a pixel.
+fn octaveResolved(cells: vec2<f32>) -> f32
 {
-    let ledges = valueNoise(vec2<f32>(along/(1.6*RIVER_STEP_SPACING), across*1.7 + 3.1));
-    let boulders = valueNoise(vec2<f32>(along/(0.45*RIVER_STEP_SPACING) + 7.3, across*4.1 + 1.7));
-    return 0.5 + (ledges - 0.5)*1.15 + (boulders - 0.5)*0.55;
+    return 1.0 - smoothstepf(0.25, 0.5, max(cells.x, cells.y));
+}
+
+// Where a rapid's bed steps, at metres `along` its channel and `across` it in
+// half widths: ledges a few metres apart drawn out downstream, broken by
+// boulders at a third of their scale. x is the pattern as the pixel, of
+// `footprint` (metres along, half widths across), resolves it, about 0.5;
+// y is the variance of the detail it cannot, which is not dropped but
+// averaged over (see riverStepShares). Unfiltered, the boulders' cells, a
+// quarter of a half width across, fall under a pixel some tens of metres off
+// and the whitewater over them crawls and sparkles as the camera moves.
+fn riverSteps(along: f32, across: f32, footprint: vec2<f32>) -> vec2<f32>
+{
+    let ledge_resolved = octaveResolved(footprint*vec2<f32>(1.0/(1.6*RIVER_STEP_SPACING), 1.7));
+    let boulder_resolved = octaveResolved(footprint*vec2<f32>(1.0/(0.45*RIVER_STEP_SPACING), 4.1));
+    var ledges = 0.5;
+    var boulders = 0.5;
+    if (ledge_resolved > 0.0)
+    {
+        ledges = valueNoise(vec2<f32>(along/(1.6*RIVER_STEP_SPACING), across*1.7 + 3.1));
+    }
+    if (boulder_resolved > 0.0)
+    {
+        boulders = valueNoise(vec2<f32>(along/(0.45*RIVER_STEP_SPACING) + 7.3, across*4.1 + 1.7));
+    }
+    let value = 0.5 + (ledges - 0.5)*1.15*ledge_resolved + (boulders - 0.5)*0.55*boulder_resolved;
+    let lost = VALUE_NOISE_DEVIATION*VALUE_NOISE_DEVIATION
+             * (1.15*1.15*(1.0 - ledge_resolved*ledge_resolved)
+                + 0.55*0.55*(1.0 - boulder_resolved*boulder_resolved));
+    return vec2<f32>(value, lost);
+}
+
+// How much of each of three equally likely thirds of a pixel lies below a
+// step, 0..1: from the steps as the pixel resolves them (`steps`,
+// riverSteps' x) and the variance of the detail it does not (`lost`), which
+// spreads the thirds about it. Each third sits at the middle of its third of
+// value noise's distribution, 1.05 standard deviations out (measured; a
+// normal distribution's would be 0.97). Whatever is made of the steps is
+// made of each third and averaged, never of their mean: the whitewater over
+// the steps is a threshold, which the mean of a pixel half below steps and
+// half over tongues would never reach, and the white would go out of a
+// rapid far off. A resolved pixel's thirds are one and the same.
+fn riverStepShares(steps: f32, lost: f32) -> vec3<f32>
+{
+    let spread = 1.05*sqrt(lost);
+    return vec3<f32>(smoothstepf(0.25, 0.75, steps - spread),
+                     smoothstepf(0.25, 0.75, steps),
+                     smoothstepf(0.25, 0.75, steps + spread));
 }
 
 // One cycle of a flow-mapped layer: a texture carried by the current for
@@ -2073,6 +2148,16 @@ fn riverFoamPattern(st: vec2<f32>, flow: vec2<f32>, stretch: f32, time: f32,
     return clamp(pattern, 0.0, 1.0);
 }
 
+// The foam on a stream where `amount` of it is made or carried, as the
+// pattern of its lace (riverFoamPattern) covers it, and far off, where that
+// pattern is unresolved, the share of the water it covers.
+fn streamFoam(amount: f32, pattern: f32, resolved: f32) -> f32
+{
+    let made = clamp(amount, 0.0, 1.0);
+    return mix(smoothstepf(1.05 - made, 1.3 - made*0.6, 0.58),
+               smoothstepf(1.05 - made, 1.3 - made*0.6, pattern), resolved)*made;
+}
+
 // ---------------------------------------------------------------------------
 // What the water sees and what shades it
 // ---------------------------------------------------------------------------
@@ -2186,11 +2271,11 @@ fn riverGround(world_xz: vec2<f32>) -> vec2<f32>
 // darkens under every crown. Open ground outside it.
 fn riverCanopy(world_xz: vec2<f32>) -> vec4<f32>
 {
-    if (stage.canopy_map.z < 1.0)
+    if (canopy_window.z < 1.0)
     {
         return OPEN_GROUND;
     }
-    let uv = (world_xz - stage.canopy_map.xy)/stage.canopy_map.z + vec2<f32>(0.5);
+    let uv = (world_xz - canopy_window.xy)/canopy_window.z + vec2<f32>(0.5);
     let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
     let texel = textureSampleLevel(canopy_texture, canopy_sampler,
                                    clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
@@ -2412,6 +2497,10 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     let view_distance = length(to_camera);
     let to_view = to_camera/max(view_distance, 1e-3);
     let time = stage.params.x;
+    // The frame the viewer sees: the frame time the eye has settled into,
+    // which one slow frame barely moves (see EXPOSURE_SETTLE_SECONDS in
+    // water_node.rs), so a hitch neither strips the ripples nor flashes the
+    // glints.
     let frame_seconds = stage.wind.z;
     // Derivatives first, in uniform control flow.
     let pixel_dx = dpdx(in.wave_position);
@@ -2593,6 +2682,10 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     {
         alpha = mix(alpha, clamp(stage.surface.z, 0.01, 1.0), sea);
     }
+    // The normals the pixel spans, from the final normal's screen
+    // derivatives, taken here at the top level where every pixel of the
+    // quad runs.
+    alpha = pixelRoughness(alpha, dpdx(normal), dpdy(normal));
     let n_dot_v = max(dot(normal, to_view), 0.0);
     let reflection_direction = reflect(-to_view, normal);
     let seen = surroundings(xz, level, reflection_direction, alpha, here, across, half_width,
@@ -2620,8 +2713,12 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     // white water out in a train downstream of it, and the boulders between
     // break it up, so the steps are drawn out along the flow and broken by a
     // finer scale, not laid as round patches.
-    let step_noise = mix(riverSteps(along, across), riverSteps(joined_st.x, across), joining);
-    let steps = smoothstepf(0.25, 0.75, 0.5 + (step_noise - 0.5)*restore);
+    let step_footprint = vec2<f32>(footprint.x, footprint.y/max(half_width, 0.01));
+    let own_steps = riverSteps(along, across, step_footprint);
+    let joined_steps = riverSteps(joined_st.x, across, step_footprint);
+    let step_noise = mix(own_steps.x, joined_steps.x, joining);
+    let step_shares = riverStepShares(0.5 + (step_noise - 0.5)*restore, own_steps.y);
+    let steps = (step_shares.x + step_shares.y + step_shares.z)/3.0;
     // Rapids turn milky below each step, where the water plunges and fills
     // with bubbles, and run clear over the smooth tongues between.
     let aeration = select(0.0, smoothstepf(0.3, 0.9, turbulence)*mix(0.15, 0.7, steps), river);
@@ -2814,8 +2911,9 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
             let other = riverFoamPattern(joined_st, flow, foam_stretch, time, footprint, frame_seconds);
             pattern = 0.5 + (mix(pattern, other, joining) - 0.5)*restore;
         }
-        // Whitewater where the bed breaks the surface, below the steps.
-        let whitewater = smoothstepf(0.35, 0.85, turbulence)*mix(0.15, 0.8, steps);
+        // Whitewater where the bed breaks the surface, below the steps, in
+        // each third of the pixel (riverStepShares).
+        let whitewater = smoothstepf(0.35, 0.85, turbulence)*mix(vec3<f32>(0.15), vec3<f32>(0.8), step_shares);
         // Flecks on the faces of a riffle's standing waves.
         let flecks = water_surface.crest*riffle*0.5;
         // Foam the whitewater upstream made drifts down as a thin lace,
@@ -2825,18 +2923,23 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
         // slack edges of pools.
         let wander = (mix(valueNoise(vec2<f32>(along/RIVER_TONGUE_WANDER, 5.3)),
                           valueNoise(vec2<f32>(joined_st.x/RIVER_TONGUE_WANDER, 5.3)), joining) - 0.5)*0.8;
-        let off_tongue = (across - wander)*6.0;
-        let tongue = exp(-off_tongue*off_tongue);
+        // The tongue is a line a sixth of a half width wide; where the pixel
+        // is wider the line is spread over it, dimmer by as much, so it
+        // neither breaks into dashes nor brightens far off.
+        let tongue_width = sqrt(1.0/36.0 + 2.0*PIXEL_FILTER_VARIANCE*step_footprint.y*step_footprint.y);
+        let off_tongue = (across - wander)/tongue_width;
+        let tongue = exp(-off_tongue*off_tongue)*(1.0/6.0)/tongue_width;
         let seam = smoothstepf(0.5, 0.75, abs(across))*(1.0 - smoothstepf(0.82, 0.97, abs(across)));
         let slack = smoothstepf(0.8, 0.98, abs(across))*(1.0 - smoothstepf(0.25, 0.7, speed));
         let drift = select(0.0, supply*(0.05 + 0.25*max(tongue, seam) + 0.2*slack), river);
         // A creek's jet carries its foam out into the pond it feeds.
         let mouth = select(smoothstepf(0.08, 0.5, speed)*0.3, 0.0, river)*(1.0 - sea);
-        let amount = clamp(max(max(whitewater, flecks), max(drift, mouth)), 0.0, 1.0);
         // Far off the texture averages away; keep the share of water it covers.
         let foam_resolved = 1.0 - smoothstepf(0.15, 0.5, max(footprint.x/foam_stretch, footprint.y)*2.1);
-        let stream_foam = mix(smoothstepf(1.05 - amount, 1.3 - amount*0.6, 0.58),
-                              smoothstepf(1.05 - amount, 1.3 - amount*0.6, pattern), foam_resolved)*amount;
+        let carried = max(flecks, max(drift, mouth));
+        let stream_foam = (streamFoam(max(whitewater.x, carried), pattern, foam_resolved)
+                         + streamFoam(max(whitewater.y, carried), pattern, foam_resolved)
+                         + streamFoam(max(whitewater.z, carried), pattern, foam_resolved))/3.0;
         foam = max(foam, stream_foam);
     }
     foam = clamp(foam + impacts.splash*0.2 + impacts.snow_fleck*0.06, 0.0, 1.0);

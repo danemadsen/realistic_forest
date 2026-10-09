@@ -274,7 +274,7 @@ fn clear_canopy(
         && resources
             .canopy_stamp
             .take()
-            .is_some_and(|(capture, _)| capture == gbuffer.grass_habitat_generation)
+            .is_some_and(|(capture, _)| capture == gbuffer.grass_habitat.generation)
     {
         terrain_node::copy_ground_average(ctx.command_encoder(), gbuffer);
     }
@@ -1198,11 +1198,11 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
     let mut cull = CullUniform {
         planes: frustum_planes(&globals.globals.view, &globals.globals.projection),
         camera: [camera[0], camera[1], camera[2], view.settings.vegetation_detail.clamp(0.25, 4.0)],
-        habitat_mapping: gbuffer.grass_habitat_mapping,
+        habitat_mapping: gbuffer.grass_habitat.mapping,
         counts: [
             snapshot.plant_count,
             snapshot.plant_count,
-            gbuffer.grass_habitat_ready as u32,
+            gbuffer.grass_habitat.ready as u32,
             0,
         ],
         ground: [SEA_LEVEL + LOWEST_ROOT, STEEPEST_ROOT, DEEPEST_FURROW, CULLING_SLACK],
@@ -1363,8 +1363,8 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
     // Shade under the crowns for the grass, which is drawn next. It only
     // changes with the capture it is drawn over and the plants it is drawn
     // from, so it is not redrawn every frame.
-    let stamp = (gbuffer.grass_habitat_generation, snapshot.generation);
-    if gbuffer.grass_habitat_ready
+    let stamp = (gbuffer.grass_habitat.generation, snapshot.generation);
+    if gbuffer.grass_habitat.ready
         && resources.canopy_stamp != Some(stamp)
         && let Some(canopy_pipeline) = cache.get_render_pipeline(library.canopy_pipeline)
     {
