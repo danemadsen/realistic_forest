@@ -21,7 +21,9 @@
 //! renderer's idiom:
 //!
 //! - [`waves`] — the 40-component Crest Gerstner spectrum and its LOD band
-//!   partition, ported essentially verbatim.
+//!   partition, ported essentially verbatim but for where its waves head and
+//!   their phases, which follow a measured directional spectrum; and the
+//!   components of the wind sea every water body shares.
 //! - [`rings`] — Crest's concentric tile topology ("patches"), ported
 //!   verbatim; the tiles become an instance buffer instead of entities.
 //! - [`optics`] — the `WaterOptics` presets and their four-`vec4` shader
