@@ -1466,8 +1466,113 @@ mod tests {
         let network = network::generate(&noise, network::region_of(2222.3, 5721.5));
         let (samples, _, perched) = ribbons_around(&noise, &network, [2232.0, 5721.0], 24.0);
         assert!(samples > 200, "{samples}");
-        eprintln!("reported cascade: {perched} m perched");
-        assert!(perched < 0.7, "the cascade's water stands {perched} m over the ground beside it");
+        assert!(perched < 0.15, "the cascade's water stands {perched} m over the ground beside it");
+    }
+
+    /// Reported: a tributary running through a lake that joined its parent
+    /// on the parent's outlet approach was carved on as a broad outlet's
+    /// mouth, cutting the hillside beside the lake's outlet down into a dry
+    /// pit under the lake's level, walled by the water drawn around it.
+    /// Near every lake's mouths, ground cut from above the lake's level to
+    /// more than 10 cm under it, beside water standing at or over the
+    /// lake's, always has water drawn over it, a ribbon, a sheet or the sea,
+    /// but for at most ten samples (2.5 square metres) by any one mouth,
+    /// where a ribbon's edge rounds down at its waterline. A channel running
+    /// away below its lake past the sill, and its banks however deep they
+    /// are cut into the hill, stand clear of the lake's water and are left
+    /// alone.
+    #[test]
+    fn spawn_region_lake_mouths_leave_no_dry_pit_under_the_lake() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, [0, 0]);
+        let index = SurfaceIndex::new(&network);
+        let mut seen = std::collections::HashSet::new();
+        let mut samples = 0;
+        let mut worst = (0usize, [0.0f32; 2]);
+        for river in &network.rivers {
+            for pair in river.nodes.windows(2) {
+                if pair[0].lake == pair[1].lake {
+                    continue;
+                }
+                let (mouth, level) = if pair[0].lake { (&pair[1], pair[0].water) } else { (&pair[0], pair[1].water) };
+                let reach = 20.0f32;
+                let steps = (2.0 * reach / 0.5) as i32;
+                let mut pits = 0;
+                for zi in 0..=steps {
+                    for xi in 0..=steps {
+                        let p = [
+                            (mouth.position[0] - reach + xi as f32 * 0.5).floor() + 0.25,
+                            (mouth.position[1] - reach + zi as f32 * 0.5).floor() + 0.25,
+                        ];
+                        let near = (p[0] - mouth.position[0]).hypot(p[1] - mouth.position[1]) <= reach;
+                        if !near || !seen.insert([(p[0] * 4.0) as i64, (p[1] * 4.0) as i64]) {
+                            continue;
+                        }
+                        if base_height(&noise, p[0], p[1]) <= level + 0.05 {
+                            continue;
+                        }
+                        samples += 1;
+                        let (ground, envelope) = carved_height(&noise, &network, p[0], p[1]);
+                        let (ribbon, sheet, _) = index.owned(p);
+                        let drawn = ribbon.max(sheet).max(SEA_LEVEL);
+                        if ground < level - 0.1 && envelope.water >= level - 0.05 && drawn <= ground {
+                            pits += 1;
+                        }
+                    }
+                }
+                if pits > worst.0 {
+                    worst = (pits, mouth.position);
+                }
+            }
+        }
+        assert!(samples > 10_000, "{samples}");
+        assert!(worst.0 <= 10, "{} samples of dry ground under the lake's level by the mouth at {:?}", worst.0, worst.1);
+    }
+
+    /// Reported: a channel's levee heaped a mound out of a pond beside its
+    /// outlet. Natural ground under a lake's drawn sheet is never raised over
+    /// it by a channel's levee, but for a few square metres (under 0.1% of
+    /// the sheets' wet area) where two channels' levees meet by a lake, none
+    /// by more than half a metre.
+    #[test]
+    fn spawn_region_levees_never_raise_a_lakes_bed_over_its_water() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, [0, 0]);
+        let index = SurfaceIndex::new(&network);
+        let cell = network::FLOW_CELL as f32;
+        let (mut wet, mut raised, mut worst) = (0usize, 0usize, (0.0f32, [0.0f32; 2]));
+        for (number, lake) in network.lakes.iter().enumerate() {
+            let (mut minimum, mut maximum) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+            for c in lake.cells.iter().chain(&lake.shore) {
+                for axis in 0..2 {
+                    minimum[axis] = minimum[axis].min(c[axis] as f32 * cell);
+                    maximum[axis] = maximum[axis].max((c[axis] + 1) as f32 * cell);
+                }
+            }
+            let width = ((maximum[0] - minimum[0]) * 2.0).ceil() as usize;
+            let depth = ((maximum[1] - minimum[1]) * 2.0).ceil() as usize;
+            for zi in 0..depth {
+                for xi in 0..width {
+                    let p = [minimum[0] + xi as f32 * 0.5 + 0.25, minimum[1] + zi as f32 * 0.5 + 0.25];
+                    let (ribbon, sheet, owner) = index.owned(p);
+                    let natural = base_height(&noise, p[0], p[1]);
+                    if owner != number || sheet < lake.level - 0.02 || sheet <= natural + 0.02 || sheet < ribbon {
+                        continue;
+                    }
+                    wet += 1;
+                    let (ground, _) = carved_height(&noise, &network, p[0], p[1]);
+                    if ground > sheet + 0.02 {
+                        raised += 1;
+                        if ground - sheet > worst.0 {
+                            worst = (ground - sheet, p);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(wet > 100_000, "{wet}");
+        assert!(raised * 1000 < wet, "{raised} of {wet} samples of lake bed raised over the water");
+        assert!(worst.0 < 0.5, "a lake's bed is raised {} m over its water at {:?}", worst.0, worst.1);
     }
 
     /// The lakes' surface the terrain, the plants and the player measure

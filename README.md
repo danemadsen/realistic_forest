@@ -761,7 +761,11 @@ over it; its whitewater stays its own to the parent's waterline and becomes
 the parent's halfway in to its centre. Its surface does the same where they meet (see The water). A
 tributary standing under its parent where it reaches it (out of a lake at
 the foot of the parent's fall into it) keeps its own water, and lies just
-under the parent's ribbon wherever that reaches over it. A lake's water keeps its level:
+under the parent's ribbon wherever that reaches over it. A tributary
+running through a lake its parent also runs through ends in the lake, its
+water leaving by the lake's one outlet, rather than cutting the rim a
+second time beside it; none of its water becomes the parent's, so its
+inlet's cascade runs on into the lake as its own. A lake's water keeps its level:
 where a tributary leaves a pond too close above the confluence to fall at
 3 cm per metre, it runs down from the pond's level as one even rapid to where
 it meets its parent, rather than dropping off the pond's edge. Where water seems held
@@ -837,7 +841,10 @@ over the lake, 0.05 to 0.3 m, its banks are held up again), so no levee
 raises a bar across its own mouth between its water and the still water it
 meets; but a cascade running into a lake, or an outlet's rapid below its
 sill, has banks held up right down to the lake, as a delta's natural
-levees are, however near it. An estuary's bed falls toward the sea and meets the seabed: at its
+levees are, however near it, though never out of the lake's own water:
+where its water stands at or over the lake's, its levee comes back up the
+shore from just under the water (the lake's level, where its sheet's edge
+is drawn sunk lower), no steeper than 45 degrees. An estuary's bed falls toward the sea and meets the seabed: at its
 mouth it is no deeper than the highest ground its water still crosses to
 reach open water (a bar, or the shelving seabed), and up its flare nowhere
 deeper than downstream, so no pool lies behind the shore.
@@ -1075,7 +1082,17 @@ to end just under the ground at its edge, as the front of water running
 over dry ground does where the bed's friction holds it back (its depth
 falling as the square root of the distance behind the front, Whitham
 1955): a thin wet film over the ground rather than a slab standing in the
-air. The strip is rounded by the ground as the rivers carve it, and again
+air. Over dry land the strip always curves down at least 0.12 to 0.3 m (6%
+of its half width) under the water at its edge, whatever the ground
+measured there, so a bank only a little under the water, from the erosion
+or between the ground's samples, never holds a flat edge in the air; where
+the bank stands higher the curve lies inside it, out of sight. A cascade's
+foot curves down the same way over its first 2 m inside the lake's sheet
+and its last 2 m before the lake's first
+node, to end just under the lake's level (or its sheet, where that is
+drawn sunk lower) whether or not the sheet is drawn over it, its rows laid
+half a metre apart there, so the rapid meets the pond without a lip. The strip is
+rounded by the ground as the rivers carve it, and again
 in the shader by the camera's one-metre map of the ground as the erosion
 has worn it since, wherever its edge lies on dry land; never where a
 tributary's water is becoming its parent's, whose surface it follows. A lake is a flat sheet at its level over its basin, in

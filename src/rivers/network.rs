@@ -1857,6 +1857,13 @@ pub(super) fn merge_weights(nodes: &[RiverNode], parent: &River) -> (usize, Vec<
     if nodes.is_empty() {
         return (0, Vec::new());
     }
+    // A tributary that ends in a lake its parent also runs through never
+    // reaches the parent's channel: its water is the lake's, and leaves by
+    // the lake's outlet, the parent. None of it becomes the parent's, least
+    // of all its inlet's cascade just above the lake.
+    if nodes[nodes.len() - 1].lake {
+        return (nodes.len() - 1, vec![0.0; nodes.len()]);
+    }
     let past: Vec<f32> = nodes.iter().map(|n| beside_river(parent, [n.position[0] as f64, n.position[1] as f64]).0).collect();
     let areas: Vec<f32> = nodes.iter().map(|n| n.area).collect();
     let lakes: Vec<bool> = nodes.iter().map(|n| n.lake).collect();
@@ -2463,7 +2470,7 @@ const SEA_SPREAD: f32 = 1.2;
 /// banks stand over its water, the river runs in its own channel. The
 /// sea's level rises and falls with its waves, and an estuary is graded to
 /// it over a long reach, so a river opens to the sea from further up.
-const LAKE_MOUTH: [f32; 2] = [0.05, 0.3];
+const LAKE_MOUTH: [f32; 2] = super::carve::OVER_LAKE;
 const SEA_MOUTH: [f32; 2] = [0.3, 1.2];
 /// Most a lake's mouth opens per metre along the river, as a share of its
 /// whole flare: its channel widens by at most a tenth of its own half width
@@ -3008,6 +3015,32 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
             continue;
         }
         settle_lake_runs(&mut nodes, |p| base_height(noise, p[0], p[1]));
+        // A tributary that runs through a lake its parent also runs through
+        // ends in it: its water is the lake's from there on, and leaves by
+        // the lake's one outlet, the parent. Its course past the lake's
+        // last cell is only the routing's way across the lake's margin to
+        // the parent's channel, over the outlet's approach and sill or down
+        // beside its rapid. Carved, it notched the lake's rim a second time
+        // beside the outlet, and on the flat approach, held at the lake's
+        // level, it opened as a broad outlet's mouth, cutting its shoulders
+        // metres deep into the hillside.
+        if let RiverEnd::Confluence(parent, _) = end
+            && let Some(parent_river) = rivers[parent].as_ref()
+            && let Some(last) = nodes.iter().rposition(|node| node.lake)
+            && last + 1 < nodes.len()
+        {
+            let lake_of = |node: &RiverNode| {
+                lakes.cells.get(&Corridor::cell_of([node.position[0] as f64, node.position[1] as f64])).copied()
+            };
+            let first = (0..=last).rev().take_while(|&k| nodes[k].lake).last().unwrap_or(last);
+            let crossed: std::collections::HashSet<u32> = nodes[first..=last].iter().filter_map(lake_of).collect();
+            if parent_river.nodes.iter().any(|node| node.lake && lake_of(node).is_some_and(|lake| crossed.contains(&lake))) {
+                nodes.truncate(last + 1);
+                if nodes.len() < 2 {
+                    continue;
+                }
+            }
+        }
         let mut surface_end = nodes.len() - 1;
         match end {
             RiverEnd::Confluence(parent, _) => {
@@ -3145,7 +3178,9 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
 }
 
 /// The ground around a lake as the rivers carve it, cell by cell (at cell
-/// centres) and point by point.
+/// centres) and point by point. The lakes' surfaces are not yet laid over
+/// the grid, so it takes the lake's own water to stand over its basin, where
+/// no levee raises its bed (`Envelope::held`), as the finished ground has it.
 struct LakeGround<'a> {
     noise: &'a NoiseField,
     segments: &'a [RiverSegment],
@@ -3176,7 +3211,7 @@ impl<'a> LakeGround<'a> {
     /// the river's water instead of diving to the bed beneath it, where it
     /// showed as a pit with the ribbon's cut end standing over it.
     fn cover(&self, p: [f32; 2]) -> f32 {
-        let envelope = super::carve::envelope_at(self.segments, self.grid, p);
+        let envelope = super::carve::envelope_beside(self.segments, self.grid, p, self.level);
         let ground = envelope.clamp(base_height(self.noise, p[0], p[1])) - SHEET_SINK;
         if envelope.bank_distance < RIBBON_COVER * envelope.half_width {
             ground.max(envelope.water.min(self.level) - SHEET_UNDER_RIBBON)
@@ -3190,7 +3225,7 @@ impl<'a> LakeGround<'a> {
         let cell_ground = || -> CellGround {
             let c = Corridor::centre(cell);
             let p = [c[0] as f32, c[1] as f32];
-            let envelope = super::carve::envelope_at(segments, grid, p);
+            let envelope = super::carve::envelope_beside(segments, grid, p, level);
             let natural = base_height(noise, p[0], p[1]);
             CellGround {
                 carved: envelope.clamp(natural),
@@ -3233,7 +3268,7 @@ const RUNAWAY_BANKS: f32 = 6.0;
 /// sill, half the deepest sill's depth under the level and a little more
 /// (`SILL_DEPTH`). Ground beside the approach under the level is the lake's
 /// bed; only past the sill does a channel run away below it.
-const SILL_TIE: f32 = 0.2;
+const SILL_TIE: f32 = super::carve::UNDER_LAKE[0];
 const _: () = assert!(SILL_TIE >= 0.5 * SILL_DEPTH[1] + 0.02);
 
 #[derive(Clone, Copy, PartialEq)]
@@ -3263,16 +3298,28 @@ fn basin_samples(noise: &NoiseField, segments: &[RiverSegment], grid: &SegmentGr
     let mut classify = |s: [i64; 2]| -> Basin {
         *kinds.entry(s).or_insert_with(|| {
             let p = [(s[0] as f32 + 0.5) * step, (s[1] as f32 + 0.5) * step];
-            let envelope = super::carve::envelope_at(segments, grid, p);
+            let envelope = super::carve::envelope_beside(segments, grid, p, lake.level);
             let runaway = envelope.water < lake.level - SILL_TIE;
             if envelope.bank_distance < 0.0 {
                 return if runaway { Basin::Runaway } else { Basin::Above };
             }
             let ground = envelope.clamp(base_height(noise, p[0], p[1]));
-            match (ground < lake.level, runaway && envelope.bank_distance < RUNAWAY_BANKS) {
-                (false, _) => Basin::Above,
-                (true, true) => Basin::Runaway,
-                (true, false) => Basin::Under,
+            if ground >= lake.level {
+                return Basin::Above;
+            }
+            // Beside the head of an outlet's rapid the nearest water may
+            // still be the sill's, at the lake's level, while the ground
+            // already falls away beyond the rim with the rapid: whichever
+            // channel runs away below the level near it, not only the
+            // nearest, takes it down with it.
+            let falls_with = |index: &u32| {
+                let beside = super::carve::segment_envelope(&segments[*index as usize], p);
+                beside.bank_distance < RUNAWAY_BANKS && beside.water < lake.level - SILL_TIE
+            };
+            if (runaway && envelope.bank_distance < RUNAWAY_BANKS) || grid.candidates(p).iter().any(falls_with) {
+                Basin::Runaway
+            } else {
+                Basin::Under
             }
         })
     };
@@ -3469,7 +3516,7 @@ fn lake_surface(
                 continue;
             }
             let p = [corner[0] as f32 * cell, corner[1] as f32 * cell];
-            let envelope = super::carve::envelope_at(segments, grid, p);
+            let envelope = super::carve::envelope_beside(segments, grid, p, lake.level);
             let ground = envelope.clamp(base_height(noise, p[0], p[1]));
             let low = 1.0 - smoothstep(lake.level, lake.level + LAKE_FIELD_RISE, ground);
             let mut height = lake.level - (lake.level - ground + LAKE_FIELD_SINK) * low
@@ -4025,6 +4072,9 @@ fn build_segments_on_ground(
                 *near = Some((at - node.along, level));
             }
         }
+        // The still water each node's levee may not build ground out of
+        // (`RiverSegment::still`).
+        let still_at = |k: usize| still[k].map_or(super::carve::NO_LAKE, |(_, level)| level);
         // How firmly each node's banks are held up: not at all in a lake, nor
         // where its water is the lake's or the sea's.
         let levee_at = |k: usize| -> f32 {
@@ -4090,6 +4140,7 @@ fn build_segments_on_ground(
                 levee: [levee_at(i), levee_at(i + 1)],
                 cap_slope: [before, after],
                 turbulence: [a.turbulence, b.turbulence],
+                still: [still_at(i), still_at(i + 1)],
             };
             segments.push(reach_segment);
         }

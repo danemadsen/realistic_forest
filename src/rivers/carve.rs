@@ -11,6 +11,8 @@
 //! - **Lower envelope.** Just outside the waterline the ground is held a
 //!   little above the water, so the channel always contains its river even
 //!   where the floodplain dips; a short outer slope returns to the terrain.
+//!   A channel's levee never raises a lake's bed out of the water of the
+//!   lake the channel runs into (`Envelope::held`).
 //!
 //! The terrain height is `min(max(h, lower), upper)`, with the upper bound
 //! the minimum and the lower bound the maximum over every nearby segment, so
@@ -111,9 +113,14 @@ pub struct RiverSegment {
     /// and foam), at the start and end: given at both ends like the rest, so
     /// the bed does not change from gravel to rock along a line at a node.
     pub turbulence: [f32; 2],
+    /// The level of the still water nearest along the river from the start
+    /// and the end: the lake it runs into or out of, or `NO_LAKE` on a river
+    /// with none. Where the channel's water stands at or over it, its levee
+    /// never builds ground out of the lake's water (`Envelope::held`).
+    pub still: [f32; 2],
 }
 
-const _: () = assert!(std::mem::size_of::<RiverSegment>() == 88);
+const _: () = assert!(std::mem::size_of::<RiverSegment>() == 96);
 
 /// `cap_slope[0]` of a segment no reach comes before.
 pub const FLAT_START: f32 = -1.0;
@@ -172,12 +179,36 @@ pub struct Envelope {
     /// The level of a lake whose basin reaches here, or -infinity: ground
     /// below it lies under the lake.
     pub lake: f32,
+    /// How much of the levee here holds water standing at or over the still
+    /// water of its lake (`UNDER_LAKE`), 0 to 1: blended over the segments
+    /// by how near each one's levee comes to the highest (`LeveeBlend`), so
+    /// it never switches where two channels' levees meet.
+    pub perched: f32,
+    /// The level of the still water those perched levees' channels run
+    /// into or out of (`RiverSegment::still`), blended as `perched` is, or
+    /// -infinity.
+    pub still: f32,
 }
 
 /// Metres from a lake's shore per metre the ground stands above or below
 /// its water, for a shore's typical slope; how near the shore a point is,
 /// in the same terms as a river's bank distance.
 pub const LAKE_SHORE_RUN: f32 = 6.0;
+/// The steepest face, rise over run, a levee meets a lake's water in: about
+/// the angle of repose of loose wet soil, 45 degrees.
+pub const LEVEE_LAKE_FACE: f32 = 1.0;
+/// How far a river's water stands over a lake's where it stops being the
+/// lake's own: within the lower it is the lake's water backed up its mouth,
+/// past the higher (a hand or two, as high as a creek's banks stand over its
+/// water) it runs in a channel of its own above the lake. A lake's mouths
+/// open over the same window (`network::LAKE_MOUTH`).
+pub const OVER_LAKE: [f32; 2] = [0.05, 0.3];
+/// How far under a lake's level a river's water may stand and still be the
+/// lake's own (`network::SILL_TIE`, its outlet's approach and the water over
+/// its sill), and how near the level it is the lake's for certain: a
+/// channel's water further under it runs away below the lake, beyond its
+/// rim, and its levees hold it there (`Envelope::perched`).
+pub const UNDER_LAKE: [f32; 2] = [0.2, 0.05];
 
 impl Envelope {
     pub const NONE: Envelope = Envelope {
@@ -190,6 +221,8 @@ impl Envelope {
         turbulence: 0.0,
         bend: 0.0,
         lake: f32::NEG_INFINITY,
+        perched: 0.0,
+        still: f32::NEG_INFINITY,
     };
 
     /// Distance past the nearest waterline, river or lake, for ground at
@@ -213,7 +246,33 @@ impl Envelope {
     /// carve meets the natural ground rounded off: a bank's top curves over
     /// into the land above it, and a levee's foot into the land below.
     pub fn clamp(&self, height: f32) -> f32 {
-        smooth_min(smooth_max(height, self.lower, CARVE_ROUNDING), self.upper, CARVE_ROUNDING)
+        smooth_min(smooth_max(height, self.held(height), CARVE_ROUNDING), self.upper, CARVE_ROUNDING)
+    }
+
+    /// How high the levees hold up ground standing at `height`. A levee
+    /// holds a river's water over the land beside its channel, but where
+    /// that water stands at or over its lake's (`perched`), a cascade coming
+    /// down the lake's shore or the lake's own water backed up its mouth,
+    /// there is nothing to hold over the lake's basin: the water is the
+    /// lake's there, or falls into it. Such a levee never builds ground out
+    /// of the lake's water (`lake`, its surface here, or its level, `still`,
+    /// where its sheet's edge is drawn sunk lower), which heaped a dyke
+    /// into the lake beside a cascade and, behind the head of an outlet's
+    /// rapid, a mound into the open water by its sill. Up the shore it comes
+    /// back in a face no steeper than `LEVEE_LAKE_FACE` over the distance
+    /// from the waterline ground that high stands at (`LAKE_SHORE_RUN`
+    /// metres per metre), its foot `CARVE_ROUNDING` under the water so the
+    /// rounded crease never lifts the lake's bed either. A channel running
+    /// away below its lake's level (an outlet below its sill, beyond the
+    /// rim) keeps its levees. Mirrored by `riverHeld` in
+    /// river-functions.wgslinc.
+    pub fn held(&self, height: f32) -> f32 {
+        if self.lake == f32::NEG_INFINITY || self.perched <= 0.0 {
+            return self.lower;
+        }
+        let lake = self.lake.max(self.still);
+        let face = lake - CARVE_ROUNDING + (height - lake) * LAKE_SHORE_RUN * LEVEE_LAKE_FACE;
+        self.lower - self.perched * (self.lower - face).max(0.0)
     }
 
     pub fn is_none(&self) -> bool {
@@ -228,6 +287,20 @@ fn mix(a: f32, b: f32, t: f32) -> f32 {
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// How far `water` stands at or over the still water of its lake (`still`
+/// at a segment's two ends, `t` of the way along it; `NO_LAKE` on a river
+/// with none), 0 to 1 (`UNDER_LAKE`). Up a start cap the water rises with
+/// the reach before, so behind the head of an outlet's rapid it comes back
+/// up to its lake's level, over the lake's basin. Mirrored by
+/// `riverPerched` in river-functions.wgslinc.
+fn perched(water: f32, still: [f32; 2], t: f32) -> f32 {
+    if still[0] <= NO_LAKE || still[1] <= NO_LAKE {
+        return 0.0;
+    }
+    let level = mix(still[0], still[1], t);
+    smoothstep(level - UNDER_LAKE[0], level - UNDER_LAKE[1], water)
 }
 
 /// One segment's envelope at `p`. Mirrored line for line by
@@ -284,6 +357,12 @@ pub fn segment_envelope(segment: &RiverSegment, p: [f32; 2]) -> Envelope {
         turbulence: mix(segment.turbulence[0], segment.turbulence[1], t),
         bend: skew * across,
         lake: f32::NEG_INFINITY,
+        perched: perched(water, [segment.still[0], segment.still[1]], t),
+        still: if segment.still[0] <= NO_LAKE || segment.still[1] <= NO_LAKE {
+            f32::NEG_INFINITY
+        } else {
+            mix(segment.still[0], segment.still[1], t)
+        },
     };
     if past_bank < 0.0 {
         // A flat-bottomed bowl, skewed: (1 - u^4)(1 + skew u) is zero at
@@ -679,6 +758,67 @@ impl SegmentGrid {
     }
 }
 
+/// How far under the highest levee at a point, metres, another levee still
+/// counts toward whether the levee there holds water over a lake: each
+/// weighs `exp(-under / LEVEE_BLEND)`.
+pub const LEVEE_BLEND: f32 = 0.1;
+
+/// Whether the levee holding the ground up at a point holds water at or over
+/// a lake's (`Envelope::perched`): blended over the segments by how near
+/// each one's levee comes to the highest, so where two channels' levees
+/// meet, one over its lake and one under it, the share hands over smoothly
+/// instead of switching along a line. An online softmax, as `OwnerBlend`;
+/// mirrored by `RiverLeveeBlend` in river-functions.wgslinc.
+#[derive(Clone, Copy, Debug)]
+pub struct LeveeBlend {
+    best: f32,
+    weight: f32,
+    perched: f32,
+    /// The perched levees' still water, summed by weight times `perched`.
+    still: f32,
+    still_weight: f32,
+}
+
+impl LeveeBlend {
+    pub const NONE: LeveeBlend = LeveeBlend { best: 0.0, weight: 0.0, perched: 0.0, still: 0.0, still_weight: 0.0 };
+
+    pub fn add(&mut self, next: &Envelope) {
+        if next.lower == f32::NEG_INFINITY {
+            return;
+        }
+        let perched = next.perched;
+        let k = if self.weight == 0.0 {
+            self.best = next.lower;
+            1.0
+        } else if next.lower > self.best {
+            // A higher levee: what was gathered so far falls under it.
+            let fade = (-(next.lower - self.best) / LEVEE_BLEND).exp();
+            self.weight *= fade;
+            self.perched *= fade;
+            self.still *= fade;
+            self.still_weight *= fade;
+            self.best = next.lower;
+            1.0
+        } else {
+            (-(self.best - next.lower) / LEVEE_BLEND).exp()
+        };
+        self.weight += k;
+        self.perched += k * perched;
+        if next.still > f32::NEG_INFINITY {
+            self.still += k * perched * next.still;
+            self.still_weight += k * perched;
+        }
+    }
+
+    pub fn perched(&self) -> f32 {
+        if self.weight > 0.0 { self.perched / self.weight } else { 0.0 }
+    }
+
+    pub fn still(&self) -> f32 {
+        if self.still_weight > 0.0 { self.still / self.still_weight } else { f32::NEG_INFINITY }
+    }
+}
+
 /// How far behind the nearest channel, in the `combine` score (metres past
 /// a waterline in that channel's widths), another channel's water still
 /// counts: each weighs `exp(-behind / OWNER_BLEND)`.
@@ -752,8 +892,21 @@ impl OwnerBlend {
 
 /// The envelope of every segment near `p`.
 pub fn envelope_at(segments: &[RiverSegment], grid: &SegmentGrid, p: [f32; 2]) -> Envelope {
+    let lake = grid.lake(p);
+    envelope_beside(segments, grid, p, if lake > NO_LAKE { lake } else { f32::NEG_INFINITY })
+}
+
+/// The envelope at `p` with a lake's surface standing at `lake` there (or
+/// -infinity): as `envelope_at` has it once the lakes' surfaces are laid
+/// over the grid, and as a lake sees the ground around it before then
+/// (`network::LakeGround`), its own water standing over its basin. There
+/// the lake's surface is its level, never under its sheet as drawn (sunk
+/// where its edge slips under a bank), so the finished ground is never
+/// lower than the lake took it to be when it hid its sheet's edge.
+pub fn envelope_beside(segments: &[RiverSegment], grid: &SegmentGrid, p: [f32; 2], lake: f32) -> Envelope {
     let mut total = Envelope::NONE;
     let mut blend = OwnerBlend::NONE;
+    let mut levees = LeveeBlend::NONE;
     let candidates = grid.candidates(p);
     let mut primary = None;
     for &index in candidates.iter().take(MAX_CANDIDATES) {
@@ -763,13 +916,13 @@ pub fn envelope_at(segments: &[RiverSegment], grid: &SegmentGrid, p: [f32; 2]) -
         }
         combine(&mut total, &envelope);
         blend.add(&envelope);
+        levees.add(&envelope);
     }
     blend.apply(&mut total);
+    total.perched = levees.perched();
+    total.still = levees.still();
     round_bank_union(&mut total, segments, candidates, p, primary);
-    let lake = grid.lake(p);
-    if lake > NO_LAKE {
-        total.lake = lake;
-    }
+    total.lake = lake;
     total
 }
 
@@ -788,6 +941,7 @@ mod tests {
             bank: [0.8; 2],
             skew: [0.0; 2],
             levee: [1.0; 2],
+            still: [NO_LAKE; 2],
             ..Default::default()
         }
         .alone()

@@ -217,6 +217,35 @@ const WIDE_RIBBON: f32 = 1.6;
 /// centimetres of the metre-spaced ground the strip is rounded by, never
 /// bare it. Mirrored by `EDGE_TUCK` in water.wgsl.
 pub const EDGE_TUCK: f32 = 0.05;
+/// How far under its water a ribbon's edge always ends, whatever the ground
+/// measured beside it: a share of its half width, at least `EDGE_DROP[0]`
+/// and at most `EDGE_DROP[1]` metres. The ground the strip is rounded by is
+/// only ever an estimate of the ground drawn: the terrain's triangles
+/// stand a few centimetres off the metre-spaced map between its samples,
+/// the erosion wears banks down by decimetres after the ribbon is built, and
+/// far from the coast the shader has no map of the ground to round the strip
+/// by again. A bank a hand under its water there would leave the strip
+/// standing over it in a flat glassy edge. Curving every edge down by about
+/// a hand or two keeps a bank that low under the water's front; where the
+/// bank stands higher the curve lies inside it, out of sight. A wider river
+/// stands deeper in its channel and its banks wear further, so the share
+/// grows with it, while at the waterline, a quarter ellipse being level
+/// where it starts, the water lowers by only a few centimetres.
+pub const EDGE_DROP: [f32; 2] = [0.12, 0.3];
+pub const EDGE_DROP_SHARE: f32 = 0.06;
+/// Metres inside a lake's sheet, and before the lake's first node along
+/// the river, over which a ribbon still standing over the lake's level (a
+/// cascade's foot) curves down under it, as its outer strips do onto the
+/// ground (`round_edge`): about the run over which
+/// a shallow rapid's water plunges under the still water it meets, so the
+/// rapid ends in the pond rather than in a straight raised edge over it.
+const TOE_RUN: f32 = 2.0;
+
+/// The least depth under its water a ribbon `half_width` metres either side
+/// ends at (`EDGE_DROP`).
+pub fn edge_drop(half_width: f32) -> f32 {
+    (EDGE_DROP_SHARE * half_width).clamp(EDGE_DROP[0], EDGE_DROP[1])
+}
 
 /// The height of a ribbon's outer strip `t` of the way across it (0 where it
 /// leaves the channel's open water, 1 at its edge), where the row's water
@@ -772,6 +801,10 @@ struct Draft {
     side: Vec<f32>,
     reached: bool,
     past_coast: bool,
+    /// Where the row runs down into a lake (its next node, or its own, is a
+    /// lake's): the lake's level and how far along the river the lake's
+    /// node lies ahead (`TOE_RUN`).
+    toe: Option<(f32, f32)>,
 }
 
 impl Draft {
@@ -785,6 +818,7 @@ impl Draft {
             side: self.side.iter().zip(&other.side).map(|(&a, &b)| lerp(a, b)).collect(),
             reached: self.reached && other.reached,
             past_coast: self.past_coast && other.past_coast,
+            toe: self.toe.zip(other.toe).map(|(a, b)| (lerp(a.0, b.0), lerp(a.1, b.1))),
         }
     }
 }
@@ -1029,7 +1063,13 @@ fn ribbon(
             })
             .collect();
         let side = offsets.iter().map(|&offset| across_strip(offset).1).collect();
-        Draft { vertices, water, merge: merge[i], to_end: nodes[end].along - node.along, side, reached: i >= contact, past_coast }
+        // The lake it runs into from here: its own node's, or the next's.
+        let toe = if node.lake {
+            Some((node.water, 0.0))
+        } else {
+            nodes[..=end].get(i + 1).filter(|next| next.lake).map(|next| (next.water, next.along - node.along))
+        };
+        Draft { vertices, water, merge: merge[i], to_end: nodes[end].along - node.along, side, reached: i >= contact, past_coast, toe }
     };
     let mut ribbon = Ribbon::default();
     let mut lay = |draft: &Draft| {
@@ -1064,13 +1104,47 @@ fn ribbon(
                 hidden &= depth >= HIDDEN_DEPTH;
             } else {
                 hidden = false;
+                // Standing over a lake's sheet, a cascade's foot curves
+                // down under it over `TOE_RUN` metres inside its edge, as
+                // its outer strips do onto the ground, wherever that edge
+                // crosses it.
+                if let Some((lake, depth)) = sheets.under(p)
+                    && water > lake + LEVEL_TIE
+                    && draft.merge <= 0.0
+                {
+                    let sheet = sheets.height(p).unwrap_or(lake).min(lake) - UNDER_SHEET;
+                    vertex.position[1] = vertex.position[1].min(round_edge(water, sheet, depth / TOE_RUN));
+                }
+            }
+            // Along the river it curves down the same way over the last
+            // `TOE_RUN` metres before the lake's first node, to end just
+            // under the lake's level there (or under its sheet,
+            // where that is drawn sunk lower at its edge), as its outer
+            // strips do onto the ground, whether or not the sheet is drawn
+            // over it: the rapid plunges into the pond rather than ending
+            // over it in a straight raised edge.
+            if let Some((level, ahead)) = draft.toe
+                && water > level + LEVEL_TIE
+                && draft.merge <= 0.0
+            {
+                let sheet = match sheets.under(p) {
+                    Some((lake, _)) if (lake - level).abs() <= LEVEL_TIE => sheets.height(p).unwrap_or(level).min(level),
+                    _ => level,
+                };
+                let toe = round_edge(water, sheet - UNDER_SHEET, 1.0 - ahead / TOE_RUN);
+                vertex.position[1] = vertex.position[1].min(toe);
             }
             // Its outer strips round down onto whatever lies lower than its
             // water at their edges (`round_edge`): the dry ground beside the
             // channel, or a lake's sheet whatever the row's water, where a
-            // cascade's edge reaches out over the lake it runs into. Never
-            // where its water is becoming its parent's, whose surface it
-            // follows, nor past the coast, under the sea.
+            // cascade's edge reaches out over the lake it runs into. Over
+            // dry land always at least `edge_drop` under its water, so a
+            // bank standing a little under the water whatever the reason
+            // never holds a flat edge in the air; a sheet is drawn just as
+            // it is measured. Never where its edge lies in another
+            // channel's water, which it runs on into, nor where
+            // its water is becoming its parent's, whose surface it follows,
+            // nor past the coast, under the sea.
             let out = vertex.rim[2];
             let mut on_ground = false;
             if out > 0.0 && draft.merge <= 0.0 && vertex.joined[2] <= 0.0 && !draft.past_coast {
@@ -1081,10 +1155,11 @@ fn ribbon(
                     (Some(g), Some(s)) => Some(g.max(s)),
                     (g, s) => g.or(s),
                 };
-                if let Some(cover) = cover {
-                    vertex.position[1] = vertex.position[1].min(round_edge(vertex.rim[3], cover, out));
-                }
                 on_ground = ground.is_some_and(|g| sheet.is_none_or(|s| s <= g));
+                if let Some(cover) = cover {
+                    let least = if on_ground { vertex.rim[3] - edge_drop(vertex.half_width) } else { cover };
+                    vertex.position[1] = vertex.position[1].min(round_edge(vertex.rim[3], cover.min(least), out));
+                }
             }
             // The shader rounds it again where the erosion has since worn
             // the ground at its edge lower, only where that edge is dry land.
@@ -1121,10 +1196,35 @@ fn ribbon(
         side.extend(row.side.last());
         Draft { vertices, side, ..row }
     };
+    // Where a cascade runs down into a lake, its rows between its last
+    // node over the lake's level and the lake's first are laid closely, so
+    // its foot curves down into the lake (`TOE_RUN`) rather than crossing
+    // the lake's water in one straight quad.
+    let runs_into_lake = |before: &Draft, here: &Draft| {
+        here.toe.is_some_and(|(level, ahead)| ahead <= 0.0 && before.water > level + LEVEL_TIE)
+    };
+    let mut plain: Option<Draft> = None;
     let mut previous: Option<Draft> = None;
     for (i, offsets) in base_offsets.iter().enumerate() {
         if i < merging {
-            lay(&draft(i, offsets));
+            let here = draft(i, offsets);
+            if let Some(before) = plain.as_ref()
+                && before.vertices.len() == here.vertices.len()
+                && runs_into_lake(before, &here)
+            {
+                let reach = before
+                    .vertices
+                    .iter()
+                    .zip(&here.vertices)
+                    .map(|(a, b)| (a.position[0] - b.position[0]).hypot(a.position[2] - b.position[2]))
+                    .fold(0.0f32, f32::max);
+                let steps = ((reach / MERGE_STEP).ceil() as usize).clamp(1, 16);
+                for s in 1..steps {
+                    lay(&before.mix(&here, s as f32 / steps as f32));
+                }
+            }
+            lay(&here);
+            plain = Some(here);
             continue;
         }
         let here = dense(draft(i, offsets));
@@ -1493,8 +1593,9 @@ mod tests {
     /// ribbon's outer strip rounds down onto it, level where it leaves the
     /// open water and steepening to end just under the ground at its edge,
     /// instead of ending in the air over it; where the bank stands over the
-    /// water the strip stays level. Both strips, over dry land, are left for
-    /// the shader to round again by the ground as the erosion leaves it.
+    /// water the strip still curves down into it by the least depth, out of
+    /// sight. Both strips, over dry land, are left for the shader to round
+    /// again by the ground as the erosion leaves it.
     #[test]
     fn a_ribbons_edge_rounds_down_onto_ground_lower_than_its_water() {
         let level = 5.0;
@@ -1516,7 +1617,9 @@ mod tests {
         let row = &mesh.vertices[4 * columns..5 * columns];
         for (v, across) in row.iter().zip(WIDE_COLUMNS) {
             let out = ((across.abs() - WIDE_STRIP) / (WIDE_COLUMNS[columns - 1] - WIDE_STRIP)).clamp(0.0, 1.0);
-            let expected = if across > 0.0 { round_edge(level, 4.0 - EDGE_TUCK, out) } else { level };
+            // Even into the high bank, by the least depth.
+            let cover = if across > 0.0 { 4.0 - EDGE_TUCK } else { level - edge_drop(2.0) };
+            let expected = round_edge(level, cover, out);
             assert!((v.position[1] - expected).abs() < 1e-4, "{across}: {v:?}");
             assert_eq!(v.rim[2] > 0.0, out > 0.0, "{across}: {v:?}");
         }
@@ -1526,6 +1629,96 @@ mod tests {
         // column is a small share of the one to the edge.
         let drop = |k: usize| level - row[k].position[1];
         assert!(drop(columns / 2 + 2) < 0.15 * drop(columns - 1), "{row:?}");
+    }
+
+    /// Reported: a ribbon's edge over a bank only a little under its water
+    /// stood over it in a flat glassy edge. Over ground 2 to 10 cm under the
+    /// water the outer strip still curves down, a quarter ellipse, to end
+    /// under the ground, by at least the least depth.
+    #[test]
+    fn a_ribbons_edge_over_ground_just_under_its_water_still_curves_under_it() {
+        let level = 5.0;
+        for under in [0.02, 0.05, 0.1] {
+            let node = |k: i32| RiverNode {
+                position: [2.5 * k as f32, 0.0],
+                water: level,
+                half_width: 2.0,
+                depth: 0.6,
+                speed: 1.0,
+                along: 2.5 * k as f32,
+                ..Default::default()
+            };
+            let river = River { nodes: (0..=8).map(node).collect(), end: RiverEnd::Edge, surface_end: 8 };
+            let ground = move |p: [f32; 2]| (p[1].abs() > 2.0).then_some(level - under);
+            let mesh = build(&[river], &[], &ground);
+            let columns = WIDE_COLUMNS.len();
+            let row = &mesh.vertices[4 * columns..5 * columns];
+            for side in [&row[..=columns / 2], &row[columns / 2..]] {
+                let edge = if side[0].across < 0.0 { side[0] } else { side[side.len() - 1] };
+                assert!(edge.position[1] < level - under - EDGE_TUCK + 1e-4, "{under}: {edge:?}");
+                assert!(edge.position[1] <= level - edge_drop(2.0) + 1e-4, "{under}: {edge:?}");
+            }
+            // Curved: level where it leaves the open water, steepening to
+            // the edge, each step down larger than the one before.
+            let half = &row[columns / 2..];
+            let drops: Vec<f32> = half.windows(2).map(|pair| pair[0].position[1] - pair[1].position[1]).collect();
+            assert!(drops[0].abs() < 1e-5, "{under}: {drops:?}");
+            assert!(drops[1..].windows(2).all(|pair| pair[1] > pair[0]), "{under}: {drops:?}");
+        }
+    }
+
+    /// Reported: where a cascade ran down into a pond, its foot stood over
+    /// the pond in a straight raised edge. Its rows are laid closely down to
+    /// the lake's first node, and over the last `TOE_RUN` metres its water
+    /// curves down under the straight run of the rapid to end under the
+    /// lake's level there, whether or not the lake's sheet is drawn over it,
+    /// and never rises again.
+    #[test]
+    fn a_cascades_foot_curves_down_under_the_lake_it_runs_into() {
+        let level = 5.0;
+        // The sheet covers x 20..60 m, z -16..16 m; the lake's first node
+        // lies at x 22.5 m, the rapid's last at x 20 m.
+        let cells: Vec<[i32; 2]> = (5..15).flat_map(|x| (-4..4).map(move |z| [x, z])).collect();
+        let lake = Lake { level, cells, shore: Vec::new(), edge: Vec::new(), current: Vec::new() };
+        let water_at = |x: f32| if x < 22.5 { level + 0.1 * (22.5 - x) + 0.1 } else { level };
+        let node = |k: i32| RiverNode {
+            position: [2.5 * k as f32, 0.0],
+            water: water_at(2.5 * k as f32),
+            half_width: 1.0,
+            depth: 0.3,
+            speed: 1.0,
+            along: 2.5 * k as f32,
+            lake: 2.5 * k as f32 >= 22.5,
+            ..Default::default()
+        };
+        let river = River { nodes: (0..=16).map(node).collect(), end: RiverEnd::Edge, surface_end: 16 };
+        for lakes in [vec![lake], Vec::new()] {
+            let sheet = !lakes.is_empty();
+            let mesh = build(std::slice::from_ref(&river), &lakes, &no_ground);
+            let ribbon: Vec<&SurfaceVertex> = mesh.vertices.iter().filter(|v| v.half_width > 0.5).collect();
+            // More rows than nodes: the step from the rapid's last node into
+            // the lake is laid closely.
+            assert!(ribbon.len() > 17 * NARROW_COLUMNS.len(), "{sheet}: {}", ribbon.len());
+            let mut centre: Vec<[f32; 2]> =
+                ribbon.iter().filter(|v| v.position[2].abs() < 1e-3 && v.position[0] >= 15.0).map(|v| [v.position[0], v.position[1]]).collect();
+            centre.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            assert!(centre.windows(2).all(|pair| pair[1][1] <= pair[0][1] + 1e-5), "{sheet}: {centre:?}");
+            let foot = water_at(20.0);
+            let mut curved = 0;
+            for &[x, y] in &centre {
+                if x >= 22.5 {
+                    // No lip: at the lake's first node and past it, at or
+                    // under the lake's level.
+                    assert!(y <= level + 1e-4, "{sheet}: {centre:?}");
+                } else if x > 20.0 + 1e-3 {
+                    // Under the rapid's straight run down to the lake.
+                    let straight = foot + (level - foot) * (x - 20.0) / 2.5;
+                    assert!(y <= straight + 1e-4, "{sheet}: {centre:?}");
+                    curved += usize::from(x >= 22.5 - TOE_RUN && y < straight - 0.01);
+                }
+            }
+            assert!(curved >= 2, "{sheet}: {centre:?}");
+        }
     }
 
     /// A cascade's edge reaching out over the lake it runs into rounds down
@@ -1551,7 +1744,10 @@ mod tests {
         let river = River { nodes: (0..=8).map(node).collect(), end: RiverEnd::Edge, surface_end: 8 };
         let mesh = build(&[river], &[lake], &no_ground);
         let columns = WIDE_COLUMNS.len();
-        let row = &mesh.vertices[4 * columns..5 * columns];
+        // The row at the fifth node, 10 m along (rows between are laid closely
+        // where it stands over the sheet).
+        let first = mesh.vertices.iter().position(|v| (v.along - 10.0).abs() < 1e-4).unwrap();
+        let row = &mesh.vertices[first..first + columns];
         assert!((row[columns - 1].position[1] - (level - UNDER_SHEET)).abs() < 1e-4, "{row:?}");
         assert!((row[0].position[1] - (level + 0.3)).abs() < 1e-4, "{row:?}");
         assert!(row.iter().all(|v| v.rim[2] == 0.0), "{row:?}");
