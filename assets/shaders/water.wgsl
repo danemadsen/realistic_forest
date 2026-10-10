@@ -2545,6 +2545,21 @@ fn vs_sea(
     return out;
 }
 
+// How far under the ground at its edge a ribbon's rounded strip ends:
+// `EDGE_TUCK` in src/rivers/surface.rs.
+const EDGE_TUCK: f32 = 0.05;
+
+// The height of a ribbon's outer strip `out` of the way across it, where the
+// row's water stands at `level` and its edge must end under `cover`: level
+// while the cover stands over the water, and where it lies under it rounded
+// down onto it as a quarter ellipse, the front of water spreading over dry
+// ground. `round_edge` in src/rivers/surface.rs.
+fn roundEdge(level: f32, cover: f32, out: f32) -> f32
+{
+    let t = clamp(out, 0.0, 1.0);
+    return level - max(level - cover, 0.0)*(1.0 - sqrt(max(1.0 - t*t, 0.0)));
+}
+
 // A river's ribbon or a lake's sheet: `SurfaceVertex` in
 // src/rivers/surface.rs.
 @vertex
@@ -2561,8 +2576,26 @@ fn vs_inland(
     @location(9) side: f32,
     @location(10) joined: vec3<f32>,
     @location(11) clarity: f32,
+    @location(12) rim: vec4<f32>,
 ) -> WaterVertexOutput
 {
+    // A ribbon's outer strip was rounded down onto the ground beside its
+    // channel as the rivers carve it (`SurfaceVertex::rim`: its edge, how
+    // far across the strip this vertex lies, the row's water). The erosion
+    // has worn that ground on since, most where nothing holds a bank up, at
+    // a cascade's foot by still water: round the strip down again onto the
+    // camera's one-metre map of the ground as it now stands, so the erosion
+    // never bares an edge in the air. Never where a tributary's water is
+    // becoming its parent's, nor where the map does not reach.
+    var height = position.y;
+    if (rim.z > 0.0 && joined.z <= 0.0 && stage.shore_map.z >= 1.0)
+    {
+        let uv = (rim.xy - stage.shore_map.xy)/stage.shore_map.z + vec2<f32>(0.5);
+        let inside = smoothstepf(0.0, 0.03, min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y)));
+        let ground = textureSampleLevel(shoreline_heightfield, shoreline_sampler,
+                                        clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).r;
+        height = mix(height, min(height, roundEdge(rim.w, ground - EDGE_TUCK, rim.z)), inside);
+    }
     // A distant channel is narrower than the clipmap's triangles there,
     // which round its banks off above the water. Lift a distant surface by
     // about the bank those triangles leave (their spacing grows with
@@ -2573,13 +2606,13 @@ fn vs_inland(
     // a river where it meets a lake or the sea (`still` is 1 there, fading to
     // 0 some 30 m along it), so the two surfaces still meet from afar.
     let lift = smoothstepf(150.0, 650.0, flat_distance)*min(spacing*0.45, 12.0)*(1.0 - clamp(still, 0.0, 1.0));
-    let world = vec3<f32>(position.x, position.y + lift, position.z);
+    let world = vec3<f32>(position.x, height + lift, position.z);
     var out: WaterVertexOutput;
     out.clip_position = globals.projection*globals.view*vec4<f32>(world, 1.0);
     out.world_position = world;
     out.wave_position = world.xz;
     out.velocity = velocity;
-    out.channel = vec4<f32>(across, turbulence, position.y, still);
+    out.channel = vec4<f32>(across, turbulence, height, still);
     out.stream = vec4<f32>(along, half_width, foam, sea);
     out.side = side;
     out.joined = joined;
@@ -2645,12 +2678,25 @@ const BED_DEPTH_MAX: f32 = 0.5*log(1000.0)
 
 // How deep the bed lies under the surface, with `path` the straight line's
 // length from the surface to the bed drawn behind it and `rise` how steeply
-// the eye looks down along it (the sine of its elevation). The bed lies as
-// deep whatever the angle it is seen at; only a bed deeper than any light
-// comes back from is taken for one BED_DEPTH_MAX deep.
+// the eye looks down along it (the sine of its elevation over the surface,
+// `viewRise`). The bed lies as deep whatever the angle it is seen at; only a
+// bed deeper than any light comes back from is taken for one BED_DEPTH_MAX
+// deep.
 fn bedDepth(path: f32, rise: f32) -> f32
 {
     return min(path*max(rise, 0.0), BED_DEPTH_MAX);
+}
+
+// How steeply the eye looks down into the water through a surface (the
+// sine of its elevation over the surface's plane, `facet` turned up out of
+// the water), for the depth of the water column it sees and the angle its
+// ray bends to. Seen from above it is taken over the surface's own plane,
+// not the level: a rapid climbing away above the eye's height, seen from
+// the air, still has its water under its tilted face. Seen from below the
+// eye looks up, and no bed lies under the surface.
+fn viewRise(to_view: vec3<f32>, facet: vec3<f32>, underside: bool) -> f32
+{
+    return select(max(dot(to_view, facet), 0.0), to_view.y, underside);
 }
 
 @fragment
@@ -2890,7 +2936,8 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     let aeration = select(0.0, smoothstepf(0.3, 0.9, turbulence)*mix(0.15, 0.7, steps), river);
     let body = WaterBody(sea, stillness, clamp(in.clarity, 0.0, 1.0)*(1.0 - sea), aeration);
 
-    let cos_refracted = sqrt(1.0 - (1.0 - to_view.y*to_view.y)/(N_WATER*N_WATER));
+    let rise = viewRise(to_view, facet, underside);
+    let cos_refracted = sqrt(1.0 - (1.0 - rise*rise)/(N_WATER*N_WATER));
     var water_body = vec3<f32>(0.0);
     // Inland water: the eye's ray bends down into the water, so it crosses
     // the column far more steeply than the straight line to the bed drawn
@@ -2905,7 +2952,7 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     if (sea < 1.0)
     {
         let medium = inlandMedium(body);
-        let bed_depth = bedDepth(optical_path, to_view.y);
+        let bed_depth = bedDepth(optical_path, rise);
         let water_path = select(optical_path, bed_depth/max(cos_refracted, 0.05), !scene_sky && !underside);
         let transmittance = exp(-medium.sigma_t*water_path);
         let downwelling = exp(-medium.sigma_t*bed_depth/max(to_sun.y, 0.25));

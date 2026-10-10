@@ -796,9 +796,19 @@ the rim it spills over (the fill sees each 4 m cell at its centre, so the rim
 is checked again metre by metre, and where it dips lower between centres the
 water stands no higher than that gap), every river that reaches it shares it (a basin
 holding a smaller lake drowns it), the reaches above it are backed up to its
-level, and the river leaves it at its outlet over a sill: for its first 25 m
-the water draws down gently from the lake's level and always stands a little
-under the ground beside it, so the outlet has banks from the start. Backed up
+level, and the river leaves it at its outlet over a sill. The lake's still
+water runs on at its level past its last 4 m cell, over its own basin and
+up the rim, to the rim's crest (within 8 m of the lake), and crosses it at
+the critical depth of a broad-crested weir, h_c = (q²/g)^(1/3) for the
+discharge per metre of the sill's width: some 16 cm for a square kilometre's
+outlet, the crest 1.5 h_c under the lake and the water over it half h_c
+under, as a smooth, glassy tongue running at the critical speed, its bed
+ramping up over the approach to the lip and back down to the rapid's own
+over two widths below it. So a lake is held by its lip, not drained through
+a trench in its rim, and never stands a metre over the pool a few metres
+past its edge. Below the sill, for 25 m, the water draws down gently from
+the sill's and always stands a little under the ground beside it, so the
+outlet has banks from the start. Backed up
 to the lake's level, the water stands over any ground below it along the
 reach above, however shallow that hollow seemed: the lake floods it too,
 rather than the river being held over it between dikes. A river
@@ -821,9 +831,13 @@ graded down to it along a smooth profile from its surface 120 m upstream of the 
 cutting a notch at most 3 m deep through the beach and the dune behind it;
 from where its water reaches the sea's level, the sea fills its channel out
 to the open water. Nothing holds the ground up beside a river's last stretch
-to the sea, or beside it where it runs into or out of a lake, so no levee
+to the sea, or beside it where its water is a lake's, backed up to within
+a few centimetres of the lake's level (as its water rises a hand or two
+over the lake, 0.05 to 0.3 m, its banks are held up again), so no levee
 raises a bar across its own mouth between its water and the still water it
-meets. An estuary's bed falls toward the sea and meets the seabed: at its
+meets; but a cascade running into a lake, or an outlet's rapid below its
+sill, has banks held up right down to the lake, as a delta's natural
+levees are, however near it. An estuary's bed falls toward the sea and meets the seabed: at its
 mouth it is no deeper than the highest ground its water still crosses to
 reach open water (a bar, or the shelving seabed), and up its flare nowhere
 deeper than downstream, so no pool lies behind the shore.
@@ -864,13 +878,18 @@ shoulders (an estuary's a little firmer, cut through the beach rather than
 scooping a bowl out of it, and shallowing as it widens), with submerged bed
 transitions into the pond or seabed. The
 current slows as its cross-section expands, and accelerates again below
-an outlet's sill. A mouth is the reach drowned in the still water, though: it
-opens fully only where the river's water stands within 0.3 m of the lake's
-or the sea's level, and not at all where it stands 1.2 m from it, so a
-cascade down into a lake or to the sea, or an outlet's rapid well below its
-sill, keeps its own channel, banks and whitewater until it meets the water,
-rather than spreading into a broad, glassy, low-banked sheet sliding down
-the hillside over its banks. The thalweg hugs the outside of every bend.
+an outlet's sill. A mouth is the reach drowned in the still water, though: a
+lake's opens fully only where the river's water stands within 5 cm of the
+lake's level, and not at all where it stands 0.3 m from it (the sea's,
+whose level rises and falls with its waves, within 0.3 m and 1.2 m), and it
+opens no faster along the river than a tenth of the channel's own half
+width a metre, about as fast as a jet spreads into still water. So a
+cascade down into a lake or to the sea, or an outlet's rapid below its sill,
+keeps its own channel, banks and whitewater until it meets the water, and
+its mouth opens over the drowned reach past its foot, under the lake's
+sheet, rather than spreading within a node into a broad, glassy,
+low-banked wedge splayed over the foot of the cascade. The thalweg hugs the
+outside of every bend.
 
 Submerged transitions follow the routed course and taper to zero within
 10 m, or less than half a pond crossing. Their footprint is checked against
@@ -892,7 +911,9 @@ water (rivers darting out of a lake and back, how far outlets fall below
 their lakes, river mouths cut off from the open sea, how far sheets dip
 under a river where they meet), how the ribbons sit (how often one stands in
 the air over dry ground beside its banks, or one river's water shows under
-another's), how smoothly the water meets at each confluence (steps, sampled
+another's, and whether any ribbon's edge stands over the ground beside it),
+how often the ground just past a waterline lies under the channel's water
+and where most, how smoothly the water meets at each confluence (steps, sampled
 every quarter metre around it, in the height, current, whitewater and ripple
 frame of the water drawn on top and in the whitewater, speed and level of the
 bed the terrain paints under it), and the rivers and lakes nearest
@@ -901,8 +922,12 @@ to 8 km here. The spawn region holds some 160 rivers, 86 km of channel and
 170 lakes and ponds covering 290 ha; on gentle reaches the water stands about
 1.0 m under the natural ground on average (half of it under 0.71 m), under
 1 % of their length is trenched more than 3 m into it, one of 127 river
-mouths does not reach open sea (a creek down a sea cliff), and fewer than one
-in a thousand samples across the ribbons stands over dry ground past a bank.
+mouths does not reach open sea (a creek down a sea cliff), fewer than one in
+five thousand samples across the ribbons stands over dry ground past a bank,
+under one in a hundred samples of ground just past a waterline lies more
+than 10 cm under the channel's water, and no ribbon edge stands more than a
+few centimetres over the ground beside it (only on the shelf a confluence's
+rounded banks open, where the tributary's water follows its parent's).
 
 ### How they shape the ground
 
@@ -945,7 +970,8 @@ first segment, and its first out of a lake, starts flat.
 Gentle junction banks spread their shoulders over up to twice the ordinary
 bank run. Both carve bounds relax smoothly before the lookup's support ends,
 so a cut into high ground cannot stop in a vertical wall at that boundary.
-Levees also retreat continuously as the channel approaches still water.
+Levees also retreat continuously as the channel's water comes down to the
+still water's level.
 Intersecting banks at river confluences are rounded once against their
 original shapes. The rounding continues through the waterline, opening a
 shallow shelf no more than 0.6 m outside either channel. It fades into the
@@ -1040,7 +1066,19 @@ forest's shade.
 
 Each river's surface is a ribbon across its channel at the water level,
 reaching under both banks so the waterline is wherever the carved bank rises
-through the water. A lake is a flat sheet at its level over its basin, in
+through the water. No water edge ever ends in the air: wherever the ground
+beside a channel lies lower than its water, or a lake's sheet does where a
+cascade reaches out over the lake it runs into, the ribbon's outer strip
+(from about half its width out, and the whole of a narrow creek's half)
+rounds down onto it, level where it leaves the open water and steepening
+to end just under the ground at its edge, as the front of water running
+over dry ground does where the bed's friction holds it back (its depth
+falling as the square root of the distance behind the front, Whitham
+1955): a thin wet film over the ground rather than a slab standing in the
+air. The strip is rounded by the ground as the rivers carve it, and again
+in the shader by the camera's one-metre map of the ground as the erosion
+has worn it since, wherever its edge lies on dry land; never where a
+tributary's water is becoming its parent's, whose surface it follows. A lake is a flat sheet at its level over its basin, in
 4 m cells: over the basin, every metre of ground below its level joined to
 it that the cell-by-cell fill stepped past, the closed hollows beside it
 (which fill to its level, as a waterlogged hollow by a pond does) and a few
@@ -1049,7 +1087,12 @@ meets the water. It never reaches past its outlet or over a narrow rim,
 where the ground falls away below its level (nor along an outlet's banks
 below the sill), nor over a river's channel, and wherever the ground under
 its outer edge still lies lower than the water, that edge sinks just under
-the ground, so the sheet never ends in the air. Where a river meets a
+the ground, so the sheet never ends in the air. Each corner of its outer
+edge sinks only as far as the edges meeting there must (the corner nearer
+whatever lies low under the edge goes down, and the far one keeps the
+lake's level), so a channel crossing one stretch of the edge sinks the
+corner beside it alone and the open water beside an outlet stays level.
+Where a river meets a
 lake, coming in or going out, the two surfaces cross inside the sheet's last
 cell: the sheet's edge slips just under the river's water, and the river's
 ribbon runs on just under the sheet, a little deeper the further in, until it
@@ -1192,8 +1235,11 @@ to the next:
   through it inside the critical angle, and outside it a mirror of the
   water's own glow. Only while the eye crosses its own water's surface does
   it see each surface from the side of that surface's own plane it is on, a
-  sheet's level or a wave's face. The medium the eye is in is that water's:
-  the sea's preset, a pond's dark tea or a tarn's clear cyan.
+  sheet's level or a wave's face. Seen from above, the water under a
+  surface is measured across the surface's own plane: a rapid climbing away
+  above the eye still shows the depth of its water. The medium the eye is
+  in is that water's: the sea's preset, a pond's dark tea or a tarn's clear
+  cyan.
 
 ### Wading and swimming
 

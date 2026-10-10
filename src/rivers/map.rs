@@ -505,7 +505,7 @@ const SURFACE_BUCKET: f32 = 8.0;
 impl<'a> SurfaceIndex<'a> {
     pub fn new(network: &'a RiverNetwork) -> Self {
         let mesh = &network.surface;
-        let counts: Vec<usize> = network.lakes.iter().map(|lake| super::surface::build(&[], std::slice::from_ref(lake)).vertices.len()).collect();
+        let counts: Vec<usize> = network.lakes.iter().map(|lake| super::surface::build(&[], std::slice::from_ref(lake), &|_| None).vertices.len()).collect();
         let first_lake = mesh.vertices.len() - counts.iter().sum::<usize>();
         let advance_start = |start: &mut usize, &count: &usize| {
             *start += count;
@@ -590,6 +590,7 @@ impl<'a> SurfaceIndex<'a> {
                 side: mix(&|v| v.side),
                 joined: [mix(&|v| v.joined[0]), mix(&|v| v.joined[1]), mix(&|v| v.joined[2])],
                 clarity: mix(&|v| v.clarity),
+                rim: [mix(&|v| v.rim[0]), mix(&|v| v.rim[1]), mix(&|v| v.rim[2]), mix(&|v| v.rim[3])],
             });
         });
         top
@@ -953,6 +954,107 @@ pub fn ribbon_checks(noise: &NoiseField, network: &RiverNetwork) -> RibbonFit {
     fit
 }
 
+/// Where the ground just outside a channel lies under its water, with no
+/// bank to hold it in and nothing but the ribbon's rounded edge between the
+/// water and the lower ground: of the samples taken out to a metre past
+/// every channel's waterline (24 directions around every node outside the
+/// lakes, a quarter metre apart), on dry land, how many lie more than 0.1 m
+/// under the water of the channel there, and the 16 m cells holding most.
+/// A start cap rising along its own axis on the inside of a steep bend or
+/// flare undercuts the reach before it so (`network::build_segments`).
+pub struct BankFit {
+    pub samples: usize,
+    pub under: usize,
+    pub cells: Vec<(usize, [f32; 2])>,
+}
+
+pub fn bank_checks(noise: &NoiseField, network: &RiverNetwork) -> BankFit {
+    const CELL: f32 = 16.0;
+    let mut fit = BankFit { samples: 0, under: 0, cells: Vec::new() };
+    let mut cells: std::collections::HashMap<[i32; 2], usize> = Default::default();
+    for river in &network.rivers {
+        let drawn = &river.nodes[..=river.surface_end.min(river.nodes.len() - 1)];
+        for node in drawn.iter().filter(|node| !node.lake) {
+            for k in 0..24 {
+                let angle = k as f32 / 24.0 * std::f32::consts::TAU;
+                for past in [0.25f32, 0.5, 0.75, 1.0] {
+                    let reach = node.half_width + past;
+                    let p = [node.position[0] + angle.cos() * reach, node.position[1] + angle.sin() * reach];
+                    let (ground, envelope) = carved_height(noise, network, p[0], p[1]);
+                    // Just past a waterline, on dry land: not a lake's bed
+                    // nor the sea's.
+                    if !(0.0..=1.0).contains(&envelope.bank_distance) || ground <= envelope.lake || ground <= SEA_LEVEL {
+                        continue;
+                    }
+                    fit.samples += 1;
+                    if ground < envelope.water - 0.1 {
+                        fit.under += 1;
+                        *cells.entry([(p[0] / CELL).floor() as i32, (p[1] / CELL).floor() as i32]).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+    fit.cells = cells.into_iter().map(|(c, n)| (n, [(c[0] as f32 + 0.5) * CELL, (c[1] as f32 + 0.5) * CELL])).collect();
+    fit.cells.sort_by(|a, b| b.0.cmp(&a.0).then(a.1[0].total_cmp(&b.1[0])).then(a.1[1].total_cmp(&b.1[1])));
+    fit
+}
+
+/// Where a ribbon's edge, past its waterline, stands over what lies there:
+/// over dry ground, or over a lake's sheet drawn there, more than a
+/// centimetre, so the water would end in the air. Its outer strip rounds
+/// down to end under both (`surface::round_edge`), except where a
+/// tributary's water becomes its parent's, which those vertices follow
+/// (`joined`). (edge vertices, how many stand over, the worst and where.)
+pub struct EdgeFit {
+    pub edges: usize,
+    pub over: usize,
+    pub worst: (f32, [f32; 2]),
+}
+
+pub fn edge_checks(noise: &NoiseField, network: &RiverNetwork) -> EdgeFit {
+    let index = SurfaceIndex::new(network);
+    let mut fit = EdgeFit { edges: 0, over: 0, worst: (0.0, [0.0; 2]) };
+    for vertex in &network.surface.vertices {
+        if vertex.half_width <= 0.0 || vertex.across.abs() <= 1.0 || vertex.joined[2] > 0.0 || vertex.position[1] < SEA_LEVEL {
+            continue;
+        }
+        let p = [vertex.position[0], vertex.position[2]];
+        let (ground, envelope) = carved_height(noise, network, p[0], p[1]);
+        let (_, sheet, _) = index.owned(p);
+        let dry = envelope.bank_distance > 0.0 && ground > envelope.lake && ground > SEA_LEVEL;
+        let cover = if sheet > ground { sheet } else if dry { ground } else { continue };
+        fit.edges += 1;
+        let over = vertex.position[1] - cover;
+        if over > 0.01 {
+            fit.over += 1;
+            if over > fit.worst.0 {
+                fit.worst = (over, p);
+            }
+        }
+    }
+    fit
+}
+
+pub fn bank_fit(noise: &NoiseField, network: &RiverNetwork) -> Vec<String> {
+    let banks = bank_checks(noise, network);
+    let edges = edge_checks(noise, network);
+    let mut lines = vec![
+        format!(
+            "banks: of {} samples just past a waterline on dry land, {} lie over 0.1 m under the channel's water",
+            banks.samples, banks.under
+        ),
+        format!(
+            "ribbon edges: of {} over dry ground or a lake's sheet, {} stand over it (worst {:.2} m at {:.1},{:.1})",
+            edges.edges, edges.over, edges.worst.0, edges.worst.1[0], edges.worst.1[1]
+        ),
+    ];
+    for (count, at) in banks.cells.iter().take(6) {
+        lines.push(format!("  {count} bank samples under the water around {:.0},{:.0}", at[0], at[1]));
+    }
+    lines
+}
+
 pub fn ribbon_fit(noise: &NoiseField, network: &RiverNetwork) -> String {
     let fit = ribbon_checks(noise, network);
     let (perched, p) = fit.worst_perched;
@@ -980,6 +1082,9 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
         println!("{line}");
     }
     println!("{}", ribbon_fit(noise, &network));
+    for line in bank_fit(noise, &network) {
+        println!("{line}");
+    }
     println!("{}", seam_fit(noise, &network));
     // The nodes nearest the map's centre, for framing a camera on them: the
     // heading is the `--camera` yaw that looks downstream.
@@ -1214,15 +1319,48 @@ mod tests {
     /// The rivers' water sits in their channels: a ribbon stands over dry
     /// ground beyond its banks only here and there, and only a little, and
     /// a tributary's water rarely shows under its parent's where they meet.
+    /// Banks held up by how high the water stands over the lake it meets,
+    /// not by how near it is, hold a cascade's water right down to the lake.
     #[test]
     fn spawn_region_ribbons_sit_in_their_channels() {
         let noise = NoiseField::new();
         let network = network::generate(&noise, [0, 0]);
         let fit = ribbon_checks(&noise, &network);
         assert!(fit.samples > 500_000, "{}", fit.samples);
-        assert!(fit.perched * 1000 <= fit.samples, "{} of {} perched", fit.perched, fit.samples);
-        assert!(fit.worst_perched.0 < 1.5, "perched {:?}", fit.worst_perched);
+        assert!(fit.perched * 4000 <= fit.samples, "{} of {} perched", fit.perched, fit.samples);
+        assert!(fit.worst_perched.0 < 0.8, "perched {:?}", fit.worst_perched);
         assert!(fit.under * 5000 <= fit.samples, "{} of {} under another", fit.under, fit.samples);
+    }
+
+    /// No ribbon's edge ends in the air: past its waterline it ends under
+    /// the dry ground there or under the lake's sheet it reaches over,
+    /// rounding down onto it where the ground lies lower than its water.
+    /// What is left stands a few centimetres over the shelf a confluence's
+    /// rounded banks open just past the waterline, where the tributary's
+    /// water follows its parent's.
+    #[test]
+    fn spawn_region_ribbon_edges_never_end_in_the_air() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, [0, 0]);
+        let edges = edge_checks(&noise, &network);
+        assert!(edges.edges > 20_000, "{}", edges.edges);
+        assert!(edges.over * 500 <= edges.edges, "{} of {} edges over the ground", edges.over, edges.edges);
+        assert!(edges.worst.0 < 0.1, "an edge stands {:?} over the ground", edges.worst);
+    }
+
+    /// The ground just past a waterline seldom lies under the channel's
+    /// water: its banks hold it, and where they are low the levee holds them
+    /// up, as near a lake as the water stands clear of it. A guard on the
+    /// carve, whose start caps rise along their own axis and can undercut
+    /// the reach before them on the inside of a steep bend.
+    #[test]
+    fn spawn_region_banks_hold_their_water() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, [0, 0]);
+        let banks = bank_checks(&noise, &network);
+        assert!(banks.samples > 500_000, "{}", banks.samples);
+        assert!(banks.under * 100 <= banks.samples, "{} of {} under the water", banks.under, banks.samples);
+        assert!(banks.cells.first().is_none_or(|cell| cell.0 <= 200), "{:?}", &banks.cells[..banks.cells.len().min(4)]);
     }
 
     /// The highest gap between two ribbons over a point, with the lower over
@@ -1328,6 +1466,7 @@ mod tests {
         let network = network::generate(&noise, network::region_of(2222.3, 5721.5));
         let (samples, _, perched) = ribbons_around(&noise, &network, [2232.0, 5721.0], 24.0);
         assert!(samples > 200, "{samples}");
+        eprintln!("reported cascade: {perched} m perched");
         assert!(perched < 0.7, "the cascade's water stands {perched} m over the ground beside it");
     }
 

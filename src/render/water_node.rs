@@ -686,11 +686,15 @@ fn prepare_water(
         queue.write_buffer(&stage_buffer, offset as u64, bytemuck::bytes_of(&value));
     };
     // The seabed map is only drawn while the sea is; the rivers and lakes read
-    // it too, as the ground of their banks and shores, and must know when it
-    // is not there.
+    // it too, as the ground of their banks and shores (their ribbons' edges
+    // round down onto it), and must know when it is not there. Before its
+    // first capture, or the first after a resize, it holds no ground at all:
+    // it is there once a capture has been made, and the terrain pass then
+    // captures each new window before the water is drawn.
+    let shore_captured = gbuffer_guard.as_ref().is_some_and(|gbuffer| gbuffer.shore_heightfield_ready);
     write(
         std::mem::offset_of!(WaterStageUniforms, shore_map),
-        if water.draw { shore_heightfield_mapping(globals.globals.camera_position) } else { [0.0; 4] },
+        if water.draw && shore_captured { shore_heightfield_mapping(globals.globals.camera_position) } else { [0.0; 4] },
     );
     // Where the canopy capture lies is not written here: this runs before
     // the frame's capture, and the capture's own pass writes its window
@@ -1031,6 +1035,7 @@ fn river_vertex_layout() -> Vec<VertexBufferLayout> {
             attribute(9, 48, VertexFormat::Float32),
             attribute(10, 52, VertexFormat::Float32x3),
             attribute(11, 64, VertexFormat::Float32),
+            attribute(12, 68, VertexFormat::Float32x4),
         ],
     }]
 }
@@ -1999,6 +2004,76 @@ mod shading_tests {
             return;
         };
         assert_eq!(up[0][0], 0.0);
+    }
+
+    /// A rapid climbing away above the eye's height, seen from the air, has
+    /// its column of water under its tilted face: the eye looks down into it
+    /// over the face's own plane, though the ray to it rises. Seen from
+    /// below, no bed lies under a surface; a level sheet seen from above is
+    /// as deep as it ever was.
+    #[test]
+    fn a_rapid_above_the_eye_keeps_its_water_column() {
+        let heads = ["const ALPINE_EXTINCTION:", "const BED_DEPTH_MAX:", "fn bedDepth(", "fn viewRise("];
+        // x the facet's tilt in degrees, y the ray's elevation toward the
+        // eye in degrees, z whether the eye sees it from below, w the
+        // straight path to the bed behind it.
+        let body = "
+            let tilt = radians(input.x);
+            let facet = vec3<f32>(-sin(tilt), cos(tilt), 0.0);
+            let elevation = radians(input.y);
+            let to_view = vec3<f32>(-cos(elevation), sin(elevation), 0.0);
+            let rise = viewRise(to_view, facet, input.z > 0.5);
+            samples[id.x] = vec4<f32>(rise, bedDepth(input.w, rise), 0.0, 0.0);";
+        // A 35 degree face climbing away from the eye, which looks up at it
+        // from 10 degrees below the point it sees: the ray meets the face 25
+        // degrees over its plane.
+        let inputs = [[35.0f32, -10.0, 0.0, 2.0], [35.0, -10.0, 1.0, 2.0], [0.0, 30.0, 0.0, 2.0], [0.0, -30.0, 1.0, 2.0]];
+        let Some(values) = evaluate(&heads, body, &inputs) else {
+            return;
+        };
+        let expected = 25.0f32.to_radians().sin();
+        assert!((values[0][0] - expected).abs() < 1e-4 && (values[0][1] - 2.0 * expected).abs() < 1e-3, "{:?}", values[0]);
+        assert_eq!(values[1][1], 0.0, "seen from below, no bed under it: {:?}", values[1]);
+        assert!((values[2][0] - 0.5).abs() < 1e-4 && (values[2][1] - 1.0).abs() < 1e-3, "a level sheet: {:?}", values[2]);
+        assert_eq!(values[3][1], 0.0, "{:?}", values[3]);
+    }
+
+    /// The shader rounds a ribbon's outer strip down onto the ground exactly
+    /// as the CPU does (`surface::round_edge`), to the same depth under it.
+    #[test]
+    fn the_shader_rounds_a_ribbons_edge_as_the_cpu_does() {
+        use crate::rivers::surface;
+        assert!(item("const EDGE_TUCK:").contains(&format!("= {:?};", surface::EDGE_TUCK)));
+        let heads = ["fn roundEdge("];
+        let body = "samples[id.x] = vec4<f32>(roundEdge(input.x, input.y, input.z), 0.0, 0.0, 0.0);";
+        let mut inputs = Vec::new();
+        for (level, cover) in [(10.0f32, 9.2f32), (10.0, 10.4), (52.3, 51.95), (5.0, 2.0)] {
+            for out in [0.0f32, 0.3, 0.44, 0.74, 0.97, 1.0, 1.4] {
+                inputs.push([level, cover, out, 0.0]);
+            }
+        }
+        let Some(values) = evaluate(&heads, body, &inputs) else {
+            return;
+        };
+        for (input, value) in inputs.iter().zip(&values) {
+            let expected = surface::round_edge(input[0], input[1], input[2]);
+            assert!((value[0] - expected).abs() < 1e-4, "{input:?}: {} not {expected}", value[0]);
+        }
+    }
+
+    /// The side each surface is seen from is the side of the water the eye
+    /// is on (`surfaceSide`), never how high the eye stands: a source guard,
+    /// since every helper may be right while the fragment stage goes back
+    /// to the eye's altitude.
+    #[test]
+    fn the_surface_is_shaded_from_the_eyes_side_not_its_height() {
+        let fragment = item("fn fs_water(");
+        assert!(fragment.contains("surfaceSide(stage.eye_body.w,"), "fs_water must take its side from surfaceSide");
+        assert!(fragment.contains("let underside = side.below;"));
+        let squeezed: String = fragment.split_whitespace().collect();
+        for altitude in ["camera_position.y<", "camera_position.y>", "<camera_position.y", ">camera_position.y"] {
+            assert!(!squeezed.contains(altitude), "fs_water compares the eye's altitude: {altitude}");
+        }
     }
 
     /// The water places the canopy over the habitat capture by the window
