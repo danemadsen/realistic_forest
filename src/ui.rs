@@ -299,7 +299,21 @@ fn ground_position(
 ) -> Vec3 {
     let xz = Vec2::new(position.x, position.z);
     let y = snow::sample_surface(cache, noise, xz, xz.to_array()).height(snow, xz) + EYE_HEIGHT;
-    Vec3::new(position.x, y, position.z)
+    // Over water too deep to stand in, the player is set afloat on it, not
+    // on its bed.
+    let afloat = crate::player::water_at(cache, noise, position.x, position.z, xz.to_array())
+        .and_then(|water| water.float_eye());
+    Vec3::new(position.x, afloat.map_or(y, |eye| eye.max(y)), position.z)
+}
+
+/// Teleport the player, and give it the water at its new pose at once: the
+/// renderer draws this pose before the next player update looks.
+fn teleport(player: &mut Player, position: Vec3, cache: &ErosionCache, noise: &NoiseField) -> bool {
+    let moved = player.teleport(position);
+    if moved {
+        player.water = crate::player::water_at(cache, noise, position.x, position.z, [position.x, position.z]);
+    }
+    moved
 }
 
 fn draw_player_tools(
@@ -314,11 +328,9 @@ fn draw_player_tools(
         trainer.use_position(player.position);
     }
     separator_text(ui, "Player and teleport");
-    if ui
-        .checkbox(&mut player.flying, "Fly / noclip [V]")
-        .changed()
-    {
-        player.vertical_velocity = 0.0;
+    let mut flying = player.flying;
+    if ui.checkbox(&mut flying, "Fly / noclip [V]").changed() {
+        player.set_flying(flying);
     }
     let mut movement_speed_slider = egui::Slider::new(&mut player.movement_speed_multiplier, 0.1..=20.0);
     movement_speed_slider = movement_speed_slider.text("Movement speed");
@@ -367,7 +379,7 @@ fn draw_player_tools(
                     } else {
                         position
                     };
-                    if player.teleport(position) {
+                    if teleport(player, position, cache, noise) {
                         player.flying = !trainer.snap_to_ground;
                         trainer.status = Some(format!(
                             "Teleported to {:.2}, {:.2}, {:.2}",
@@ -379,7 +391,7 @@ fn draw_player_tools(
             }
         }
         if ui.button("Return to spawn").clicked() {
-            player.teleport(ground_position(Vec3::ZERO, cache, noise, snow));
+            teleport(player, ground_position(Vec3::ZERO, cache, noise, snow), cache, noise);
             player.flying = false;
             player.yaw = Player::default().yaw;
             player.pitch = Player::default().pitch;
@@ -389,11 +401,11 @@ fn draw_player_tools(
     });
     ui.horizontal(|ui| {
         if ui.button("Ground here").clicked() {
-            player.teleport(ground_position(player.position, cache, noise, snow));
+            teleport(player, ground_position(player.position, cache, noise, snow), cache, noise);
             player.flying = false;
         }
         if ui.button("Rise 100 m").clicked() {
-            player.teleport(player.position + Vec3::Y * 100.0);
+            teleport(player, player.position + Vec3::Y * 100.0, cache, noise);
             player.flying = true;
         }
         if ui.button("Reset speed").clicked() {
@@ -785,6 +797,18 @@ fn draw_advanced_controls(
                     player.wading_depth,
                     player.current.length(),
                     if player.swept { ", swept off your feet" } else { "" }
+                ));
+            }
+            if let Some(water) = player.water.filter(|water| player.position.y < water.surface) {
+                let kind = match water.kind {
+                    crate::player::WaterKind::River => "a river's",
+                    crate::player::WaterKind::Lake => "a lake's",
+                    crate::player::WaterKind::Sea => "the sea's",
+                };
+                ui.label(format!(
+                    "Eye {:.1} m under {kind} water, {:.1} m deep",
+                    water.surface - player.position.y,
+                    water.depth()
                 ));
             }
         }

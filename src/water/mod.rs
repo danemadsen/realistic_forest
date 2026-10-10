@@ -21,27 +21,31 @@
 //! renderer's idiom:
 //!
 //! - [`waves`] — the 40-component Crest Gerstner spectrum and its LOD band
-//!   partition, ported essentially verbatim.
+//!   partition, ported essentially verbatim but for where its waves head and
+//!   their phases, which follow a measured directional spectrum; and the
+//!   components of the wind sea every water body shares.
 //! - [`rings`] — Crest's concentric tile topology ("patches"), ported
 //!   verbatim; the tiles become an instance buffer instead of entities.
 //! - [`optics`] — the `WaterOptics` presets and their four-`vec4` shader
 //!   contract, ported verbatim.
-//! - `assets/shaders/water-surface.wgsl` — the surface shading: shoaling,
-//!   chop, Fresnel, Beer-Lambert body, refraction of the composited frame,
-//!   foam. This is a consolidation of aqua's `cascade/material.wgsl`,
-//!   `waves/displace.wgsl`, `optics/optics.wgsl` and `medium/medium.wgsl`
-//!   onto one sun and one opaque buffer.
-//! - `assets/shaders/water-underwater.wgsl` — the submerged-camera medium
-//!   pass, from aqua's `volume.wgsl` + `medium.wgsl`.
+//! - `assets/shaders/water.wgsl` — all the water, in one shader: the surface
+//!   shading (shoaling, chop, Fresnel, Beer-Lambert body, refraction of the
+//!   composited frame, foam), a consolidation of aqua's
+//!   `cascade/material.wgsl`, `waves/displace.wgsl`, `optics/optics.wgsl` and
+//!   `medium/medium.wgsl` onto one sun and one opaque buffer, and the
+//!   submerged-camera medium pass from aqua's `volume.wgsl` + `medium.wgsl`.
+//!   The same surface shader draws the rivers and lakes (`src/rivers`), which
+//!   aqua does not have: it adapts its colour, roughness and motion to the
+//!   water it is shading rather than being one shader per kind of water.
 //!
 //! Deliberately not ported: the FFT spectral wave model, planar reflections,
 //! screen-space reflections, the environment cubemap probe, clustered local
-//! lights, caustics, Hanabi spray, motion vectors, bounded water bodies and
-//! rivers, and the GPU wave-query readback. Each needs renderer facilities
-//! this project does not have (a light probe, a motion-vector prepass, a
-//! second camera, an HDR target). The analytic Gerstner model, the cascade
-//! rings, the optics and the underwater medium are the parts that make the
-//! ocean read as water, and those are all here.
+//! lights, caustics, Hanabi spray, motion vectors, bounded water bodies, and
+//! the GPU wave-query readback. Each needs renderer facilities this project
+//! does not have (a light probe, a motion-vector prepass, a second camera, an
+//! HDR target). The analytic Gerstner model, the cascade rings, the optics
+//! and the underwater medium are the parts that make the ocean read as water,
+//! and those are all here.
 
 pub mod optics;
 pub mod rings;
@@ -95,11 +99,12 @@ pub const WATER_SNAP: f32 = WATER_BASE_SCALE;
 
 // The medium's own constants — aqua's `PATH_LENGTH_MAX` (256 m), `N_WATER`
 // (1.333), `PARTICLE_SCATTER` and `RAYLEIGH` — live in
-// `assets/shaders/water-underwater.wgsl`, which is the only place that
-// evaluates them; the port does not mirror them here, so there is no second
-// copy to drift. Aqua's `TRANSMISSION_OPAQUE_OPTICAL_DEPTH` clamp is not
-// ported: the underwater pass lets `exp(-sigma_t * path)` fall to zero on its
-// own.
+// `assets/shaders/water.wgsl`, which is the only place that evaluates them;
+// the port does not mirror them here, so there is no second copy to drift.
+// So do the inland waters' own optics (forest-stained streams and ponds, and
+// clear mountain water), which are not presets: they follow from where the
+// water lies. Aqua's `TRANSMISSION_OPAQUE_OPTICAL_DEPTH` clamp is not ported:
+// the underwater pass lets `exp(-sigma_t * path)` fall to zero on its own.
 
 /// One Gerstner component as the shader sees it. Seven floats padded to eight
 /// so the array stride is 32 bytes in both Rust and WGSL.
@@ -142,31 +147,37 @@ pub struct WaterStageUniforms {
     /// zero while the map is not drawn (the sea is off), which is how the
     /// rivers, which read it as their banks' ground, can tell.
     pub shore_map: [f32; 4], // 1472
-    /// The grass capture in the same layout: its alpha is the share of open
-    /// sky the tree crowns leave, which the rivers read as the forest they
-    /// mirror. All zero while there is no capture.
-    pub canopy_map: [f32; 4], // 1488
+    // The canopy over the grass capture is placed by the capture's own window
+    // (`GbufferTargets::grass_habitat_mapping_buffer`), not by a field here:
+    // this block is written before the frame's capture is taken.
+    /// x the surface wind at 10 m, m/s; y how gusty it is, 0..1; z the
+    /// viewer's exposure in seconds (`ExtractedWater::exposure_seconds`),
+    /// past which a texture the water carries moves too far a frame to
+    /// follow; w unused.
+    pub wind: [f32; 4], // 1488
+    /// The water the eye is in, for the submerged medium: x its level, y the
+    /// eye's height above it (negative under it), z how far the medium has
+    /// faded in, w how far it is the sea's water. All zero out of the water.
+    pub eye_water: [f32; 4], // 1504
+    /// x how still that water is (1 a lake or the sea, 0 a stream), y its
+    /// whitewater, z its clarity, all as the surface drawn over the eye has
+    /// them (`player::WaterHere`); w how far the eye is under the water
+    /// drawn at it (0 in the air, 1 under it), the side every surface is
+    /// seen from, written even with the medium turned off.
+    pub eye_body: [f32; 4], // 1520
+    /// rgb sunlight at the surface for the submerged medium, w moon radiance
+    /// scale.
+    pub medium_sun: [f32; 4], // 1536
+    /// The wind sea's components for the wind's heading
+    /// ([`waves::wind_sea_components`]): xy wave vector in whole cycles over
+    /// the wind sea's period, z phase in cycles, w heading off the wind in
+    /// radians. Written with the wave spectrum, when the sea state or the
+    /// heading changes.
+    pub wind_waves: [[f32; 4]; waves::WIND_COMPONENTS], // 1552 896
 }
 
 const _: () = assert!(std::mem::size_of::<GpuWave>() == 32);
-const _: () = assert!(std::mem::size_of::<WaterStageUniforms>() == 1504);
-
-/// The submerged-camera medium block, group 2 binding 0 of the underwater
-/// pass.
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct UnderwaterUniforms {
-    /// x sea level, y camera height above it, z elapsed seconds, w fade.
-    pub params: [f32; 4],
-    /// rgb extinction per metre, w scatter scale.
-    pub extinction: [f32; 4],
-    /// rgb scatter tint, w asymmetry.
-    pub scatter: [f32; 4],
-    /// rgb sun radiance reaching the surface, w moon radiance scale.
-    pub sun: [f32; 4],
-}
-
-const _: () = assert!(std::mem::size_of::<UnderwaterUniforms>() == 64);
+const _: () = assert!(std::mem::size_of::<WaterStageUniforms>() == 2448);
 
 impl Default for WaterStageUniforms {
     fn default() -> Self {
@@ -181,18 +192,11 @@ impl Default for WaterStageUniforms {
             misc: [0.5, 1.0, 1.0, 0.0],
             flags: [0.0, 1.0, 0.0, rings::horizon_wave_fade_end()],
             shore_map: [0.0; 4],
-            canopy_map: [0.0; 4],
-        }
-    }
-}
-
-impl Default for UnderwaterUniforms {
-    fn default() -> Self {
-        Self {
-            params: [crate::constants::SEA_LEVEL, 0.0, 0.0, 1.0],
-            extinction: [0.86, 0.24, 0.39, 1.0],
-            scatter: [1.0, 1.0, 1.0, 0.8],
-            sun: [0.0, 0.0, 0.0, 0.0],
+            wind: [0.0, 0.5, 1.0 / 60.0, 0.0],
+            eye_water: [0.0; 4],
+            eye_body: [0.0; 4],
+            medium_sun: [0.0; 4],
+            wind_waves: waves::wind_sea_components(0.0),
         }
     }
 }

@@ -655,6 +655,10 @@ struct RiverSegment {
     cap_slope: vec2<f32>,
     // Whitewater at the start and end, interpolated like the rest.
     turbulence: vec2<f32>,
+    // The level of the still water nearest along the river from each end,
+    // or RIVER_NO_LAKE: where the channel's water stands at or over it, its
+    // levee never builds ground out of the lake's water (riverHeld).
+    still: vec2<f32>,
 };
 
 struct RiverEnvelope {
@@ -672,6 +676,12 @@ struct RiverEnvelope {
     bend: f32,
     // The surface of a lake reaching here, or RIVER_NO_LAKE.
     lake: f32,
+    // How much of the levee here holds water standing at or over the still
+    // water of its lake, 0 to 1, blended over the segments (RiverLeveeBlend).
+    perched: f32,
+    // The level of the still water those perched levees' channels run into
+    // or out of, blended as perched is, or RIVER_NO_LAKE.
+    still: f32,
 };
 
 const RIVER_NONE: f32 = 1.0e30;
@@ -684,6 +694,11 @@ const RIVER_LAKE_DEPTH_UNIT: f32 = 0.002;
 const RIVER_LAKE_NO_CORNER: u32 = 0xffffu;
 // Metres of shore per metre of rise above a lake's water.
 const RIVER_LAKE_SHORE_RUN: f32 = 6.0;
+// The steepest face, rise over run, a levee meets a lake's water in
+// (LEVEE_LAKE_FACE), and how far under a lake's level a river's water may
+// stand and still be the lake's own, and is for certain (UNDER_LAKE).
+const RIVER_LEVEE_LAKE_FACE: f32 = 1.0;
+const RIVER_UNDER_LAKE: vec2<f32> = vec2<f32>(0.2, 0.05);
 const RIVER_BANK_REACH: f32 = 12.0;
 const RIVER_BANK_CURVE: f32 = 0.16;
 const RIVER_LEVEE_OUTER_SLOPE: f32 = 0.15;
@@ -697,11 +712,23 @@ const RIVER_MAX_CANDIDATES: u32 = 64u;
 // How far behind the nearest channel, in riverScore, another channel's water
 // still counts: each weighs exp(-behind/RIVER_OWNER_BLEND) (OWNER_BLEND).
 const RIVER_OWNER_BLEND: f32 = 0.25;
+// How far under the highest levee at a point, metres, another levee still
+// counts toward whether the levee there holds water over a lake (LEVEE_BLEND).
+const RIVER_LEVEE_BLEND: f32 = 0.1;
 
 fn riverNone() -> RiverEnvelope
 {
     return RiverEnvelope(RIVER_NONE, -RIVER_NONE, RIVER_NONE, -RIVER_NONE,
-                         vec2<f32>(0.0), 0.0, 0.0, 0.0, RIVER_NO_LAKE);
+                         vec2<f32>(0.0), 0.0, 0.0, 0.0, RIVER_NO_LAKE, 0.0, RIVER_NO_LAKE);
+}
+
+// How far `water` stands at or over the still water of its lake, 0 to 1
+// (carve.rs perched, UNDER_LAKE).
+fn riverPerched(water: f32, still: vec2<f32>, t: f32) -> f32
+{
+    if (min(still.x, still.y) <= RIVER_NO_LAKE) { return 0.0; }
+    let level = mix(still.x, still.y, t);
+    return smoothstep(level - RIVER_UNDER_LAKE.x, level - RIVER_UNDER_LAKE.y, water);
 }
 
 fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
@@ -736,9 +763,11 @@ fn riverSegmentEnvelope(segment: RiverSegment, p: vec2<f32>) -> RiverEnvelope
     let across = lateral/max(centreDistance, 1e-6);
     let skew = mix(segment.skew.x, segment.skew.y, t);
     let speed = mix(segment.speed.x, segment.speed.y, t);
+    var still = RIVER_NO_LAKE;
+    if (min(segment.still.x, segment.still.y) > RIVER_NO_LAKE) { still = mix(segment.still.x, segment.still.y, t); }
     var envelope = RiverEnvelope(RIVER_NONE, -RIVER_NONE, pastBank, water,
                                  direction*speed, halfWidth, mix(segment.turbulence.x, segment.turbulence.y, t), skew*across,
-                                 RIVER_NO_LAKE);
+                                 RIVER_NO_LAKE, riverPerched(water, segment.still, t), still);
     if (pastBank < 0.0)
     {
         // A flat-bottomed bowl, skewed: zero at both banks, deep right up to
@@ -866,6 +895,50 @@ fn riverOwnerBlendApply(blend: RiverOwnerBlend, total: ptr<function, RiverEnvelo
     (*total).bend = blend.bend*inverse;
 }
 
+// Whether the levee holding the ground up at a point holds water at or over
+// a lake's, blended over the segments by how near each one's levee comes to
+// the highest (carve.rs LeveeBlend): an online softmax, so it never switches
+// where two channels' levees meet.
+struct RiverLeveeBlend {
+    best: f32,
+    weight: f32,
+    perched: f32,
+    // The perched levees' still water, summed by weight times perched.
+    still: f32,
+    still_weight: f32,
+};
+
+fn riverLeveeBlendAdd(blend: ptr<function, RiverLeveeBlend>, next: RiverEnvelope)
+{
+    if (next.lower <= -RIVER_NONE) { return; }
+    var k = 1.0;
+    if ((*blend).weight == 0.0)
+    {
+        (*blend).best = next.lower;
+    }
+    else if (next.lower > (*blend).best)
+    {
+        // A higher levee: what was gathered so far falls under it.
+        let fade = exp(-(next.lower - (*blend).best)/RIVER_LEVEE_BLEND);
+        (*blend).weight *= fade;
+        (*blend).perched *= fade;
+        (*blend).still *= fade;
+        (*blend).still_weight *= fade;
+        (*blend).best = next.lower;
+    }
+    else
+    {
+        k = exp(-((*blend).best - next.lower)/RIVER_LEVEE_BLEND);
+    }
+    (*blend).weight += k;
+    (*blend).perched += k*next.perched;
+    if (next.still > RIVER_NO_LAKE)
+    {
+        (*blend).still += k*next.perched*next.still;
+        (*blend).still_weight += k*next.perched;
+    }
+}
+
 // Round a pair against the unchanged raw upper minimum. The caller takes
 // the lowest pair once, so segment count cannot accumulate excavation.
 fn riverBankSurfaceSlope(segment: RiverSegment) -> f32
@@ -911,8 +984,17 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
     let entry = 8u + (u32(cell.y)*resolution + u32(cell.x))*RIVER_GRID_CELL_WORDS;
     let offset = river_grid[entry];
     let count = min(river_grid[entry + 1u], RIVER_MAX_CANDIDATES);
+    var lake = RIVER_NO_LAKE;
+    let record = river_grid[entry + 2u];
+    if (record != RIVER_NO_LAKE_RECORD)
+    {
+        let local = (p - origin)/(bitcast<f32>(river_grid[2])/f32(RIVER_LAKE_CELLS_ACROSS))
+                  - cell*f32(RIVER_LAKE_CELLS_ACROSS);
+        lake = riverLakeSurface(record, local);
+    }
     var primary = 0xffffffffu;
     var blend = RiverOwnerBlend(0.0, 0.0, 0.0, vec2<f32>(0.0), 0.0, 0.0, 0.0);
+    var levees = RiverLeveeBlend(0.0, 0.0, 0.0, 0.0, 0.0);
     for (var i = 0u; i < count; i += 1u)
     {
         let index = river_grid[offset + i];
@@ -920,8 +1002,11 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
         if (envelope.upper < total.upper) { primary = index; }
         riverCombine(&total, envelope);
         riverOwnerBlendAdd(&blend, envelope);
+        riverLeveeBlendAdd(&levees, envelope);
     }
     riverOwnerBlendApply(blend, &total);
+    if (levees.weight > 0.0) { total.perched = levees.perched/levees.weight; }
+    if (levees.still_weight > 0.0) { total.still = levees.still/levees.still_weight; }
     // Continue the bank rounding through its shallow shoreline strip, then
     // fade it out smoothly before the undisturbed channel bed.
     if (primary != 0xffffffffu && total.bank_distance > -RIVER_BANK_UNION_SHORE_BLEND)
@@ -951,13 +1036,7 @@ fn riverEnvelope(p: vec2<f32>) -> RiverEnvelope
             }
         }
     }
-    let record = river_grid[entry + 2u];
-    if (record != RIVER_NO_LAKE_RECORD)
-    {
-        let local = (p - origin)/(bitcast<f32>(river_grid[2])/f32(RIVER_LAKE_CELLS_ACROSS))
-                  - cell*f32(RIVER_LAKE_CELLS_ACROSS);
-        total.lake = riverLakeSurface(record, local);
-    }
+    total.lake = lake;
     return total;
 }
 
@@ -1014,12 +1093,26 @@ fn riverSmoothMax(a: f32, b: f32, k: f32) -> f32
     return max(a, b) + h*h*k*0.25;
 }
 
+// How high the levees hold up ground standing at `height` (Envelope::held):
+// a channel whose water stands at or over its lake's never builds ground out
+// of the lake's water (its surface, or its level where the sheet's edge is
+// drawn sunk lower), and its levee comes back up the shore in a face no
+// steeper than RIVER_LEVEE_LAKE_FACE over the run from the waterline.
+fn riverHeld(envelope: RiverEnvelope, height: f32) -> f32
+{
+    if (envelope.lake <= RIVER_NO_LAKE || envelope.perched <= 0.0) { return envelope.lower; }
+    let lake = max(envelope.lake, envelope.still);
+    let face = lake - RIVER_CARVE_ROUNDING
+             + (height - lake)*RIVER_LAKE_SHORE_RUN*RIVER_LEVEE_LAKE_FACE;
+    return envelope.lower - envelope.perched*max(envelope.lower - face, 0.0);
+}
+
 // The ground with the channels cut into it and their banks held up, the
 // creases where the carve meets the natural ground rounded off: a bank's top
 // curves over into the land above it, and a levee's foot into the land below.
 fn riverClamp(envelope: RiverEnvelope, height: f32) -> f32
 {
-    return riverSmoothMin(riverSmoothMax(height, envelope.lower, RIVER_CARVE_ROUNDING),
+    return riverSmoothMin(riverSmoothMax(height, riverHeld(envelope, height), RIVER_CARVE_ROUNDING),
                           envelope.upper, RIVER_CARVE_ROUNDING);
 }
 // END SHARED RIVERS

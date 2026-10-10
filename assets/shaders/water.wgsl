@@ -1,8 +1,36 @@
-// Ocean surface. Derived from bevy-aqua (MIT OR Apache-2.0): the Gerstner sum
-// is bevy-aqua-waves/src/anim_waves.wgsl, the Fresnel is
+// All the water: the sea, rivers and creeks, ponds and lakes, and the medium
+// the eye looks through once it goes under any of them. Derived from
+// bevy-aqua (MIT OR Apache-2.0): the Gerstner sum is
+// bevy-aqua-waves/src/anim_waves.wgsl, the Fresnel is
 // bevy-aqua-optics/src/optics.wgsl (godot_fresnel), the body radiance is
-// bevy-aqua-medium/src/medium.wgsl, and the foam/SSS/composition is
-// bevy-aqua-core/src/cascade/material.wgsl. See src/water/ATTRIBUTION.md.
+// bevy-aqua-medium/src/medium.wgsl, the foam/SSS/composition is
+// bevy-aqua-core/src/cascade/material.wgsl, and the submerged medium is
+// bevy-aqua-volume/src/volume.wgsl. See src/water/ATTRIBUTION.md.
+//
+// ONE WATER. Every surface is shaded by `fs_water`, whichever mesh it comes
+// from: the sea's camera-centred Crest tiles (`vs_sea`) or the rivers'
+// ribbons and the lakes' sheets (`vs_inland`). Both hand it the same
+// `WaterVertexOutput`, which describes the water there rather than naming a
+// kind of it:
+//
+// - How much of it is the open sea's (1 on the sea, ramping up a river's last
+//   reach to its mouth), how still it is (1 on a lake), its level, its
+//   current, its whitewater and the foam drifting on it.
+// - Its colour follows from those: the sea's optics preset, the tea of a
+//   forest stream or a pond, or the clear cyan of a mountain lake above the
+//   forest, where nothing stains it (`waterBody`).
+// - Its roughness follows from the wind and from how much of it the water
+//   feels (`windSea`): the open sea takes all of it over unlimited fetch, a
+//   lake grows waves with the distance the wind has blown over it from its
+//   upwind shore, and a pond or a creek under the trees lies sheltered and
+//   nearly glassy. The sea adds its swell (the Gerstner sum) and its surf; a
+//   river adds what its current does to it (`flowSurface`).
+// - Seen from below, any of them is the same sheet: Snell's window and the
+//   total internal reflection outside it.
+//
+// `fs_underwater` is the medium around a submerged eye: the same optics, for
+// whichever water the eye is in. `fs_blit` copies the composited frame into
+// the water pass's output target first.
 //
 // DIVERGENCE FROM AQUA, and why:
 //
@@ -20,6 +48,10 @@
 //   on the flat horizon skirt. Unresolved waves become specular roughness.
 //   Neither limit depends on the tile's LOD; `ranges` is uploaded for parity
 //   but not read.
+// - Waves shorter than the sea's 2 m spectrum are not aqua's: they are the
+//   wind sea every water body shares (`windSea`), with a fetch-limited peak
+//   and a saturated short-wave tail whose slope variance follows Cox and
+//   Munk's measurements of the sea surface.
 // - A local metre-resolution seabed map samples the same procedural terrain
 //   and streamed erosion as the ground. Waves damp in shallow water and a
 //   depth-limited, shoreward travelling wave train supplies small breakers and
@@ -28,12 +60,20 @@
 //   it does not determine the surf band's width or direction.
 // - Visible terrain reflections are raymarched against the view-position
 //   buffer. Offscreen and disoccluded rays fade to the shared sky plus a
-//   raymarched cloud probe. Scene taps are gamma-decoded and inverse-ACES transformed
-//   before mixing with linear radiance; clipped highlights cannot be recovered.
+//   raymarched cloud probe, below the horizon the banks, hills and crowns
+//   raise around the water. Scene taps are gamma-decoded and inverse-ACES
+//   transformed before mixing with linear radiance; clipped highlights cannot
+//   be recovered.
+// - Aqua runs its medium as a fullscreen `ViewNode` writing a volume texture
+//   that its material shaders then sample; `fs_underwater` applies the medium
+//   straight to the frame, which is equivalent for a single camera whose
+//   whole frustum sits in one homogeneous medium. Not ported: caustics, god
+//   rays, bubble spray, and the post-process distortion from aqua's
+//   `Effects`. None of them are part of the medium.
 //
 // WGSL CONSTRAINT: `textureSample` uses implicit derivatives and is illegal in
-// non-uniform control flow. Refraction samples and wave derivatives are taken
-// before discard; raymarching uses textureLoad or textureSampleLevel explicitly.
+// non-uniform control flow. Screen derivatives are taken first; every texture
+// read after them uses textureLoad or textureSampleLevel explicitly.
 
 struct GlobalUniforms
 {
@@ -73,6 +113,9 @@ struct GpuWave
 
 const WAVE_SLOTS: u32 = 40u;
 const LOD_COUNT: u32 = 5u;
+const WIND_RUNGS: u32 = 14u;
+const WIND_PER_RUNG: u32 = 4u;
+const WIND_COMPONENTS: u32 = 56u;
 
 struct WaterStageUniforms
 {
@@ -86,7 +129,14 @@ struct WaterStageUniforms
     misc: vec4<f32>,          // x refraction scale, y foam scale, z max amplitude, w significant wave height
     flags: vec4<f32>,         // x flat-surface debug, y sea state amplitude, z wind radians, w wave fade end
     shore_map: vec4<f32>,     // world centre XZ, span (0 while undrawn), texel size
-    canopy_map: vec4<f32>,    // canopy capture: world centre XZ, span (0 while absent), texel size
+    wind: vec4<f32>,          // x surface wind at 10 m, m/s; y gustiness 0..1; z viewer's exposure, s; w unused
+    eye_water: vec4<f32>,     // x level of the water at the eye, y eye height above it, z submerged fade, w its sea share
+    eye_body: vec4<f32>,      // x its stillness, y its whitewater, z its clarity; w the eye's share under it (its side)
+    medium_sun: vec4<f32>,    // rgb sunlight at the surface for the medium, w moon radiance scale
+    // The wind sea's components for the wind's heading (`windSea`): xy wave
+    // vector in whole cycles over WIND_PERIOD, z phase in cycles, w heading
+    // off the wind in radians.
+    wind_waves: array<vec4<f32>, WIND_COMPONENTS>,
 };
 @group(2) @binding(0) var<uniform> stage: WaterStageUniforms;
 
@@ -102,9 +152,14 @@ struct WaterStageUniforms
 @group(1) @binding(11) var shoreline_sampler: sampler;
 // The grass capture's ground colour, whose alpha is the share of open sky
 // the tree crowns leave (vegetation.wgsl's canopy pass): the forest the
-// rivers mirror.
+// water mirrors, and the shelter it gives from the wind.
 @group(1) @binding(4) var canopy_texture: texture_2d<f32>;
 @group(1) @binding(12) var canopy_sampler: sampler;
+// Where that capture lies, as its own pass wrote it along with its texels:
+// world centre XZ, span (0 until there is a capture), texel size. Never a
+// window written before the frame's capture, which for the frame the camera
+// crosses into the next 8 m window would shift every crown by 8 m.
+@group(1) @binding(7) var<uniform> canopy_window: vec4<f32>;
 // The sky probe is raymarched with a short reuse window (see
 // PROBE_INTEGRATION_PERIOD in src/render/cloud_node.rs). Waves sample it in
 // their reflected direction, so the complete cloud sky remains visible
@@ -116,6 +171,8 @@ const PI: f32 = 3.141592653589793;
 const PATH_LENGTH_MAX: f32 = 256.0;
 const PARTICLE_SCATTER: f32 = 0.02;
 const RAYLEIGH: vec3<f32> = vec3<f32>(0.00095, 0.00193, 0.00456);
+const N_WATER: f32 = 1.333;
+const GRAVITY: f32 = 9.81;
 
 // ---------------------------------------------------------------------------
 // Waves
@@ -1223,7 +1280,8 @@ fn reflectionDepth(uv: vec2<f32>) -> vec4<f32>
 // texel across the sea: it leaves the analytic sky visible instead. Exponential
 // world-distance steps retain nearby detail while reaching distant headlands.
 fn marchWaterReflection(world_origin: vec3<f32>, world_normal: vec3<f32>,
-                         direction: vec3<f32>, roughness: f32, surface_level: f32) -> vec4<f32>
+                         direction: vec3<f32>, roughness: f32, surface_level: f32,
+                         from_below: bool) -> vec4<f32>
 {
     if (globals.raymarch.z < 0.5)
     {
@@ -1288,13 +1346,16 @@ fn marchWaterReflection(world_origin: vec3<f32>, world_normal: vec3<f32>,
             let thickness = clamp(0.4 - hit.z*0.0015, 0.4, 4.0);
             let depth_error = hit.z - hit_position.z;
             // Reject self hits, depth discontinuities and submerged geometry
-            // seen through the water's reflective side.
+            // seen through the water's reflective side. Seen from above
+            // (`from_below` false, the side fs_water sees the surface from),
+            // the reflected ray stays in the air however high the surface
+            // stands over the eye, and what lies under its level is the bed
+            // seen through it, not its reflection.
             let world_hit = globals.camera_position.xyz
                           + vec3<f32>(dot(globals.view[0].xyz, hit.xyz),
                                       dot(globals.view[1].xyz, hit.xyz),
                                       dot(globals.view[2].xyz, hit.xyz));
-            let above_surface = globals.camera_position.y < surface_level
-                             || world_hit.y >= surface_level - 0.25;
+            let above_surface = from_below || world_hit.y >= surface_level - 0.25;
             if (hit.a >= 0.5 && high > max(0.5, near_step)
                 && depth_error >= 0.0 && depth_error < thickness && above_surface)
             {
@@ -1352,6 +1413,28 @@ fn vSmithGGX(n_dot_l: f32, n_dot_v: f32, alpha: f32) -> f32
     return 0.5/max(ggx_l + ggx_v, 1e-7);
 }
 
+// Variance, in pixels squared, of the pixel filter the shading is judged
+// over: the Gaussian whose peak is one (Tokuyoshi and Kaplanyan 2019).
+const PIXEL_FILTER_VARIANCE: f32 = 0.15915494;
+
+// The surface's roughness `alpha` as the pixel sees it, with `normal_dx` and
+// `normal_dy` the change of the normal to the next pixel across and down.
+// What is resolved can still turn faster across a pixel than its glint is
+// wide: the crest of a riffle, the kink of a standing wave, a ripple seen
+// edge-on far off. One normal for the pixel would make a glint that falls
+// between pixels and flickers as the camera moves; the pixel sees every
+// normal its footprint spans, so the normal's spread over the pixel filter
+// widens the lobe (geometric specular antialiasing: Kaplanyan et al. 2016,
+// Tokuyoshi and Kaplanyan 2019). A ripple's glint two pixels across or more
+// is resolved and widens by under five percent; one narrower than a pixel
+// spreads over the pixel, as dim as it is wide. The widening is capped where
+// the normal jumps rather than turns, at an edge-on facet.
+fn pixelRoughness(alpha: f32, normal_dx: vec3<f32>, normal_dy: vec3<f32>) -> f32
+{
+    let spread = PIXEL_FILTER_VARIANCE*(dot(normal_dx, normal_dx) + dot(normal_dy, normal_dy));
+    return sqrt(min(alpha*alpha + min(2.0*spread, 0.18), 1.0));
+}
+
 /// Sun- or moonlight a water surface reflects toward the eye per unit of
 /// irradiance: f_r*n.l of a GGX microfacet dielectric. D carries its 1/pi
 /// (irradiance here follows the composite's albedo/pi convention), V is the
@@ -1387,6 +1470,27 @@ fn valueNoise(p: vec2<f32>) -> f32
     let b = hash21(i + vec2<f32>(1.0, 0.0));
     let c = hash21(i + vec2<f32>(0.0, 1.0));
     let d = hash21(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+// A random unit gradient at every lattice point.
+fn latticeGradient(cell: vec2<f32>) -> vec2<f32>
+{
+    let angle = 6.2831853*hash21(cell);
+    return vec2<f32>(cos(angle), sin(angle));
+}
+
+// Gradient noise, blended quintically: about 0 on average, within +-0.7,
+// with a deviation of 0.215.
+fn gradientNoise(p: vec2<f32>) -> f32
+{
+    let i = floor(p);
+    let f = p - i;
+    let u = f*f*f*(f*(f*6.0 - 15.0) + 10.0);
+    let a = dot(latticeGradient(i), f);
+    let b = dot(latticeGradient(i + vec2<f32>(1.0, 0.0)), f - vec2<f32>(1.0, 0.0));
+    let c = dot(latticeGradient(i + vec2<f32>(0.0, 1.0)), f - vec2<f32>(0.0, 1.0));
+    let d = dot(latticeGradient(i + vec2<f32>(1.0, 1.0)), f - vec2<f32>(1.0, 1.0));
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
@@ -1502,23 +1606,905 @@ fn waterImpacts(world_xz: vec2<f32>, time: f32, footprint: f32,
 }
 
 // ---------------------------------------------------------------------------
-// Vertex stage
+// The water body: what it is, and so what colour it is
+// ---------------------------------------------------------------------------
+//
+// The sea's colour is its optics preset (src/water/optics.rs, uploaded as
+// `stage.extinction` and `stage.scatter`). Inland water takes one of three
+// natural colours, blended by what the water is and where it lies:
+//
+// - Forest stream water: clear, but stained the colour of weak tea by the
+//   tannins and humic acids the rain leaches from the forest floor.
+//   Dissolved organic matter absorbs steeply toward the blue (about 1.5/m at
+//   440 nm, a fifth of that in the green), pure water takes the red, and a
+//   little silt adds to all three. Through a hand's depth the bed shows
+//   golden; through a metre its light is amber and a third of what it was; a
+//   pool two metres deep is a dark brown. The silt's backscatter is nearly
+//   grey, so a deep body keeps that dull amber-brown and never the sea's blue
+//   or a swimming pool's green.
+// - A pond gathers more of the forest's tannin and grows its own plankton:
+//   browner and darker, a mirror over its depths with a golden margin.
+// - Above the forest nothing stains the water. A mountain lake or stream is
+//   snowmelt and spring water over bare rock: pure water's own absorption,
+//   which takes the red (about 0.3/m at 620 nm) and leaves the blue and the
+//   green, and a fine flour of ground rock held in suspension whose
+//   backscatter leans a little toward the short wavelengths. Its shallows are
+//   glass over the stones; a few metres down it turns turquoise, and its
+//   depths a deep blue-cyan.
+//
+// Which a piece of water is, its clarity, is decided on the CPU per water
+// body and handed over with it (`lake_clarity` in src/rivers/surface.rs):
+// above the treeline every tarn is clear; among the thinning trees below it
+// a lake large enough to hold its snowmelt clear is too, where a pond the
+// same height stays humic; a stream is clear above the forest and carries
+// the clarity of the lake it leaves down into the forest, where the stain
+// takes over again.
+const RIVER_EXTINCTION: vec3<f32> = vec3<f32>(0.40, 0.38, 1.05);
+const RIVER_SCATTER: vec3<f32> = vec3<f32>(0.012, 0.012, 0.010);
+const POND_EXTINCTION: vec3<f32> = vec3<f32>(0.55, 0.58, 1.60);
+const POND_SCATTER: vec3<f32> = vec3<f32>(0.010, 0.010, 0.008);
+const ALPINE_EXTINCTION: vec3<f32> = vec3<f32>(0.48, 0.13, 0.12);
+const ALPINE_SCATTER: vec3<f32> = vec3<f32>(0.026, 0.031, 0.031);
+// Bubbles beaten into whitewater scatter every colour alike and absorb none
+// (per metre at full aeration); half of it is counted as leaving the eye ray.
+const BUBBLE_SCATTER: f32 = 2.4;
+
+// What a piece of water is. Every input is a share, so a river's last reach
+// blends into the sea and a stream leaving a tarn carries its colour down.
+struct WaterBody
+{
+    // How much of it is the open sea's water.
+    sea: f32,
+    // Still water (a lake, a pond or the sea) rather than a running stream.
+    still: f32,
+    // Clear mountain water rather than the forest's stained water: its
+    // clarity.
+    alpine: f32,
+    // Bubbles beaten in by whitewater, 0..1.
+    aeration: f32,
+};
+
+// Extinction and scattering, per metre.
+struct WaterMedium
+{
+    sigma_t: vec3<f32>,
+    sigma_s: vec3<f32>,
+};
+
+fn seaMedium() -> WaterMedium
+{
+    let sigma_t = max(stage.extinction.xyz, vec3<f32>(1e-4));
+    let sigma_s = min(sigma_t, PARTICLE_SCATTER*stage.extinction.w*stage.scatter.xyz + RAYLEIGH);
+    return WaterMedium(sigma_t, sigma_s);
+}
+
+fn inlandMedium(body: WaterBody) -> WaterMedium
+{
+    let stained_t = mix(RIVER_EXTINCTION, POND_EXTINCTION, body.still);
+    let stained_s = mix(RIVER_SCATTER, POND_SCATTER, body.still);
+    let sigma_t = mix(stained_t, ALPINE_EXTINCTION, body.alpine) + vec3<f32>(BUBBLE_SCATTER*body.aeration);
+    let sigma_s = mix(stained_s, ALPINE_SCATTER, body.alpine) + vec3<f32>(0.5*BUBBLE_SCATTER*body.aeration);
+    return WaterMedium(sigma_t, sigma_s);
+}
+
+// The medium around a submerged eye: its water's, the sea's blended in by
+// its share.
+fn waterMedium(body: WaterBody) -> WaterMedium
+{
+    let inland = inlandMedium(body);
+    let sea = seaMedium();
+    return WaterMedium(mix(inland.sigma_t, sea.sigma_t, body.sea), mix(inland.sigma_s, sea.sigma_s, body.sea));
+}
+
+// ---------------------------------------------------------------------------
+// The wind sea: the waves the wind raises on any water
+// ---------------------------------------------------------------------------
+//
+// Wind roughens every water body the same way; what differs is how much wind
+// reaches the water and how far it has blown over it. Three measured
+// relations set the waves:
+//
+// - Cox and Munk's sun-glitter surveys give the mean square slope of a wind
+//   sea, 0.00512 per m/s of wind at mast height (their clean-surface fit,
+//   less its 0.003 intercept, which is swell). Almost all of it lives in the
+//   short waves, whose slope spectrum is saturated: each octave of
+//   wavenumber between the peak and the capillary cutoff (1.7 cm, where
+//   surface tension takes over) holds the same slope variance. That fixes the
+//   saturation level from the wind alone.
+// - JONSWAP gives the peak of a fetch-limited sea: the further the wind has
+//   blown over the water, the longer its dominant waves, until the sea is
+//   fully developed (Pierson-Moskowitz). Below the peak the spectrum falls
+//   away, and at it a fetch-limited sea is peaked (JONSWAP's enhancement).
+// - Under about 1 m/s no capillary ripples form at all, and the water is a
+//   mirror.
+//
+// So the open sea takes all of the wind over unlimited fetch; a lake's waves
+// grow from its upwind shore across it; a pond sheltered by the trees round
+// it, or a creek in its cut, sees little wind and few waves; and a gust's
+// cat's paw crosses any of them as a patch of ripples. The sea's longer waves
+// are its Gerstner spectrum, so on the sea these waves stop at the 2 m that
+// spectrum starts at.
+//
+// The waves are laid in half-octave rungs of four components, each moving
+// with the capillary-gravity dispersion `w^2 = g k + (sigma/rho) k^3`. They
+// head round the wind as a measured wind sea's do: a sech^2 spread, narrowest
+// just past the peak and broader for the shorter waves (Donelan, Hamilton and
+// Hui; Banner), but never broader than Cox and Munk found the short waves,
+// whose slope runs 1.65 times as steep up the wind as across it. Where each
+// component heads, its wavelength and its phase are fixed for the wind's
+// heading (`stage.wind_waves`, drawn on the CPU from that broadest spread by
+// `wind_sea_components` in src/water/waves.rs); the local wind and fetch only
+// weight them, so where the spread is narrower the waves across the wind
+// carry less. A gust or a nearer shore then changes how high the ripples run,
+// never where their crests lie, and nothing re-phases them from one frame to
+// the next. On running water they ride the current (`drift`). What a pixel
+// cannot resolve, or a frame cannot follow, becomes roughness at the slope
+// variance it has.
+const WIND_SHORTEST: f32 = 0.04;
+const CAPILLARY_CUTOFF: f32 = 0.017;
+// Surface tension over density, m^3/s^2.
+const SURFACE_TENSION: f32 = 7.28e-5;
+// Mean square slope of a wind sea per m/s of wind (Cox and Munk).
+const COX_MUNK_SLOPE: f32 = 0.00512;
+// Half an octave of wavenumber, as a natural log: one rung's share.
+const RUNG_LOG_SPAN: f32 = 0.34657359;
+// The period, metres, every wind wave repeats over (see `windSea`): far too
+// long to see repeat.
+const WIND_PERIOD: f32 = 512.0;
+// The broadest the wind sea is spread, the spread its components are drawn
+// from (`SPREAD_FLOOR` in src/water/waves.rs).
+const SPREAD_FLOOR: f32 = 0.955;
+// A component's wavelength lies within a quarter octave of its rung's.
+const WIND_RUNG_STRETCH: f32 = 1.1892071;
+
+struct WindSea
+{
+    slope: vec2<f32>,
+    variance: f32,
+    height: f32,
+    // Variance of the resolved height, to judge a crest by.
+    height_variance: f32,
+};
+
+// The saturation level of the short-wave slope spectrum per unit of log
+// wavenumber: Cox and Munk's mean square slope shared over the decades of
+// wavenumber between a developed sea's peak and the capillary cutoff.
+fn windSaturation(wind: f32) -> f32
+{
+    let u = max(wind, 0.5);
+    let developed_peak = pow(2.0*PI*0.13*GRAVITY/u, 2.0)/GRAVITY;
+    let decades = log((2.0*PI/CAPILLARY_CUTOFF)/developed_peak);
+    return COX_MUNK_SLOPE*u/max(decades, 1.0)*smoothstepf(0.7, 2.6, wind);
+}
+
+// The peak wavenumber of a sea the wind has raised over `fetch` metres:
+// JONSWAP's fetch-limited peak frequency, no lower than a fully developed
+// sea's.
+fn windPeakWavenumber(wind: f32, fetch: f32) -> f32
+{
+    let u = max(wind, 0.5);
+    let reduced_fetch = GRAVITY*max(fetch, 1.0)/(u*u);
+    let peak_frequency = max(3.5*GRAVITY/u*pow(reduced_fetch, -0.33), 0.13*GRAVITY/u);
+    let omega = 2.0*PI*peak_frequency;
+    return omega*omega/GRAVITY;
+}
+
+// How narrowly the waves at `frequency_ratio` times the peak's angular
+// frequency are spread about the wind, as the `beta` of a sech^2(beta*theta)
+// spread: Donelan, Hamilton and Hui's fit eased into Banner's, floored at
+// SPREAD_FLOOR. Mirrors `spreading_beta` in src/water/waves.rs, which
+// carries the measurements.
+fn spreadingBeta(frequency_ratio: f32) -> f32
+{
+    let r = max(frequency_ratio, 1e-3);
+    let donelan = select(2.28*pow(r, -0.65), 2.61*pow(r, 1.3), r < 0.95);
+    let banner = pow(10.0, -0.4 + 0.8393*exp(-0.567*log(r*r)));
+    return max(mix(donelan, banner, smoothstepf(1.6, 2.0, r)), SPREAD_FLOOR);
+}
+
+fn windSea(xz: vec2<f32>, drift: vec2<f32>, wind: f32, fetch: f32,
+           longest: f32, time: f32, pixel_dx: vec2<f32>, pixel_dy: vec2<f32>, current: f32,
+           frame_seconds: f32) -> WindSea
+{
+    var result = WindSea(vec2<f32>(0.0), 1e-5, 0.0, 0.0);
+    let saturation = windSaturation(wind);
+    if (saturation <= 0.0 || stage.flags.x > 0.5)
+    {
+        return result;
+    }
+    let k_peak = windPeakWavenumber(wind, fetch);
+    let omega_peak = sqrt(GRAVITY*k_peak);
+    // The capillary ripples under the shortest rung are always unresolved.
+    result.variance += saturation*log(WIND_SHORTEST/CAPILLARY_CUTOFF);
+    // Every wave vector is a whole number of cycles over WIND_PERIOD metres,
+    // and the position is wrapped into one period first, so the phase stays
+    // exact however far out the water lies: k*x itself passes a million
+    // radians a few kilometres from the origin, beyond what a 32-bit float
+    // can resolve.
+    let p = xz - drift;
+    let wrapped = p - WIND_PERIOD*floor(p/WIND_PERIOD);
+    // The pixel's narrowest width in any direction: it resolves no wave
+    // shorter than twice that, whichever way the wave runs.
+    let finest = abs(pixel_dx.x*pixel_dy.y - pixel_dx.y*pixel_dy.x)
+               / max(length(pixel_dx) + length(pixel_dy), 1e-6);
+    for (var rung = 0u; rung < WIND_RUNGS; rung += 1u)
+    {
+        let nominal = WIND_SHORTEST*exp2(f32(rung)*0.5);
+        if (nominal/WIND_RUNG_STRETCH > longest)
+        {
+            break;
+        }
+        let k = 2.0*PI/nominal;
+        let below_peak = k_peak/k;
+        let from_peak = log(k/k_peak);
+        // Pierson-Moskowitz roll-off below the peak, JONSWAP's enhancement
+        // at it (gamma 3.3 over a sigma of 0.08 in frequency, 0.16 in log
+        // wavenumber).
+        let shape = exp(-1.25*below_peak*below_peak)
+                  * (1.0 + 2.3*exp(-from_peak*from_peak/(2.0*0.16*0.16)));
+        let rung_variance = saturation*RUNG_LOG_SPAN*shape;
+        if (rung_variance < 1e-7)
+        {
+            if (below_peak > 1.0) { break; }
+            continue;
+        }
+        // Every wave of the rung is too short for the pixel: all of it is
+        // roughness, and none of it needs evaluating.
+        let rung_longest = nominal*WIND_RUNG_STRETCH*1.01;
+        if (finest >= 0.5*rung_longest && rung_longest <= 0.85*longest)
+        {
+            result.variance += rung_variance;
+            continue;
+        }
+        // The components were drawn from the broadest spread. Each carries
+        // the ratio of the rung's own spread to that one at its heading, and
+        // the rung's slope variance is shared out by those weights; at the
+        // broadest spread itself, which is every rung well short of the
+        // peak, they share it equally.
+        let omega = sqrt(GRAVITY*k + SURFACE_TENSION*k*k*k);
+        let beta = spreadingBeta(omega/omega_peak);
+        var weights: array<f32, WIND_PER_RUNG>;
+        var total = 0.0;
+        for (var j = 0u; j < WIND_PER_RUNG; j += 1u)
+        {
+            weights[j] = 1.0;
+            if (beta > SPREAD_FLOOR)
+            {
+                let heading = stage.wind_waves[rung*WIND_PER_RUNG + j].w;
+                let ratio = cosh(SPREAD_FLOOR*heading)/cosh(beta*heading);
+                weights[j] = ratio*ratio;
+            }
+            total += weights[j];
+        }
+        for (var j = 0u; j < WIND_PER_RUNG; j += 1u)
+        {
+            let wave = stage.wind_waves[rung*WIND_PER_RUNG + j];
+            let cycles = max(length(wave.xy), 1.0);
+            let direction = wave.xy/cycles;
+            let wavelength = WIND_PERIOD/cycles;
+            let k_wave = 2.0*PI/wavelength;
+            let omega_wave = sqrt(GRAVITY*k_wave + SURFACE_TENSION*k_wave*k_wave*k_wave);
+            // A frame must not carry a crest more than a fraction of its
+            // wavelength, or it seems to run backwards.
+            let per_frame = (omega_wave/k_wave + current)*frame_seconds/wavelength;
+            let steady = 1.0 - smoothstepf(0.22, 0.42, per_frame);
+            // Up to the longest wave this water raises, they fade out rather
+            // than stop.
+            let kept = 1.0 - smoothstepf(0.85*longest, longest, wavelength);
+            let cycles_per_pixel = max(abs(dot(direction, pixel_dx)), abs(dot(direction, pixel_dy)))/wavelength;
+            let resolved = (1.0 - smoothstepf(0.125, 0.5, cycles_per_pixel))*steady;
+            let component_variance = rung_variance*kept*weights[j]/total;
+            result.variance += component_variance*(1.0 - resolved*resolved);
+            if (resolved <= 0.0 || component_variance <= 0.0)
+            {
+                continue;
+            }
+            // Slope variance (a k)^2 / 2 per component.
+            let amplitude = sqrt(2.0*component_variance)/k_wave;
+            let phase = 6.2831853*(fract(dot(wave.xy, wrapped)/WIND_PERIOD) + wave.z) - omega_wave*time;
+            result.slope -= direction*(amplitude*k_wave*sin(phase)*resolved);
+            result.height += amplitude*cos(phase)*resolved;
+            result.height_variance += 0.5*amplitude*amplitude*resolved*resolved;
+        }
+    }
+    return result;
+}
+
+// Gusts cross the water as cat's paws: patches of ripples blown along at
+// about the wind's speed and drawn out down it, some three times as long as
+// they are wide, as the streaks a gust leaves on water are. The field lives
+// in the wind's own frame, so no patch lines up with the world's axes, and
+// is gradient noise, whose blobs have no corners. Its cells are as wide
+// across the wind as the value noise's it replaced and three times as long,
+// which keeps the paws as large and the gusts as strong. About 0.5 on
+// average, and within 0..1 over most of the water.
+const GUST_STRETCH: f32 = 3.0;
+
+fn windGust(xz: vec2<f32>, wind_direction: vec2<f32>, wind: f32, time: f32) -> f32
+{
+    let speed = max(wind, 1.0);
+    let frame = vec2<f32>(dot(xz, wind_direction), dot(xz, vec2<f32>(-wind_direction.y, wind_direction.x)));
+    let broad = (10.0 + 2.5*speed)*vec2<f32>(GUST_STRETCH, 1.0);
+    let fine = (4.0 + speed)*vec2<f32>(GUST_STRETCH, 1.0);
+    return 0.5 + 0.65*gradientNoise((frame - vec2<f32>(time*speed*0.8, 0.0))/broad)
+               + 0.35*gradientNoise((frame - vec2<f32>(time*speed, 0.0))/fine + vec2<f32>(7.3, 1.9));
+}
+
+// How much of the wind reaches the water, and over what fetch. Walk upwind
+// from the water to its upwind shore: the fetch is the distance to it, and
+// whatever stands there, a bank or a hill and the crowns on it, casts a wind
+// shadow some ten times its height downwind, out of which the wind comes
+// back down to the water. A channel's banks bound the fetch across it even
+// beyond the one-metre map, which does not see a creek's own cut. Crowns
+// over the water itself shelter it as well.
+struct WindExposure
+{
+    fetch: f32,
+    shelter: f32,
+};
+
+fn windExposure(xz: vec2<f32>, level: f32, upwind: vec2<f32>, open_sky: f32, sea: f32,
+                across: f32, half_width: f32, cross_stream: vec2<f32>) -> WindExposure
+{
+    // No shore within reach: the open sea, whose wind sea is fully developed
+    // a hundred kilometres out, or a lake wider than the walk, which in this
+    // landscape is a few hundred metres at most.
+    var fetch = mix(400.0, 1.0e5, sea);
+    var obstacle = 0.0;
+    var previous = 0.0;
+    for (var i = 0u; i < 8u; i += 1u)
+    {
+        // 3 m out to 235 m.
+        let distance = 3.0*exp2(f32(i)*0.9);
+        let p = xz + upwind*distance;
+        let ground = riverGround(p).x;
+        if (ground > level + 0.05)
+        {
+            fetch = 0.5*(previous + distance);
+            let canopy = riverCanopy(p);
+            obstacle = ground - level + (1.0 - canopy.a)*CANOPY_HEIGHT;
+            break;
+        }
+        previous = distance;
+    }
+    if (half_width > 0.01)
+    {
+        let sideways = dot(upwind, cross_stream);
+        let to_bank = half_width*(1.0 - across*sign(sideways))/max(abs(sideways), 0.05);
+        let bank_fetch = min(max(to_bank, 0.5), 40.0*half_width);
+        if (bank_fetch < fetch)
+        {
+            fetch = bank_fetch;
+            let canopy = riverCanopy(xz + upwind*(bank_fetch + 2.0));
+            obstacle = max(obstacle, 0.6 + 0.15*half_width + (1.0 - canopy.a)*CANOPY_HEIGHT);
+        }
+    }
+    // Gusts still find their way down into the lee, so even a pond ringed by
+    // trees feels a little of the wind.
+    let shadow = max(smoothstepf(3.0*obstacle, 14.0*obstacle + 2.0, fetch), 0.15);
+    return WindExposure(fetch, shadow*mix(0.25, 1.0, open_sky));
+}
+
+// ---------------------------------------------------------------------------
+// The current's own surface
 // ---------------------------------------------------------------------------
 
-struct VertexOutput
+// Value noise with its analytic gradient (x value, yz d/dp), quintic.
+fn riverNoise(p: vec2<f32>) -> vec3<f32>
+{
+    let i = floor(p);
+    let f = p - i;
+    let u = f*f*f*(f*(f*6.0 - 15.0) + 10.0);
+    let du = 30.0*f*f*(f*(f - 2.0) + 1.0);
+    let a = hash21(i);
+    let b = hash21(i + vec2<f32>(1.0, 0.0));
+    let c = hash21(i + vec2<f32>(0.0, 1.0));
+    let d = hash21(i + vec2<f32>(1.0, 1.0));
+    let k = a - b - c + d;
+    let value = a + (b - a)*u.x + (c - a)*u.y + k*u.x*u.y;
+    let gradient = du*vec2<f32>(b - a + k*u.y, c - a + k*u.x);
+    return vec3<f32>(value, gradient);
+}
+
+// Mean square of riverNoise's gradient along one axis, per unit of its
+// domain (quintic value noise over uniform hashes; measured). The slope a
+// pixel cannot resolve is moved into roughness at exactly this variance.
+const RIVER_NOISE_SLOPE_VARIANCE: f32 = 0.187;
+// Metres between a rapid's steps, and over which the current's tongue
+// wanders across its channel. Constant, not in the channel's widths: the
+// half width varies along the ribbon, and dividing the distance from the
+// river's head by it would scramble the pattern's scale far downstream.
+const RIVER_STEP_SPACING: f32 = 4.0;
+const RIVER_TONGUE_WANDER: f32 = 18.0;
+
+// Standard deviation of valueNoise about its mean of 0.5 (cubic-smoothed
+// value noise over uniform hashes; measured).
+const VALUE_NOISE_DEVIATION: f32 = 0.214;
+
+// How much of a value-noise octave a pixel resolves, from its footprint in
+// the octave's cells along each axis: all of it under a quarter of a cell,
+// none from half a cell, where the octave's finest detail passes a pixel.
+fn octaveResolved(cells: vec2<f32>) -> f32
+{
+    return 1.0 - smoothstepf(0.25, 0.5, max(cells.x, cells.y));
+}
+
+// Where a rapid's bed steps, at metres `along` its channel and `across` it in
+// half widths: ledges a few metres apart drawn out downstream, broken by
+// boulders at a third of their scale. x is the pattern as the pixel, of
+// `footprint` (metres along, half widths across), resolves it, about 0.5;
+// y is the variance of the detail it cannot, which is not dropped but
+// averaged over (see riverStepShares). Unfiltered, the boulders' cells, a
+// quarter of a half width across, fall under a pixel some tens of metres off
+// and the whitewater over them crawls and sparkles as the camera moves.
+fn riverSteps(along: f32, across: f32, footprint: vec2<f32>) -> vec2<f32>
+{
+    let ledge_resolved = octaveResolved(footprint*vec2<f32>(1.0/(1.6*RIVER_STEP_SPACING), 1.7));
+    let boulder_resolved = octaveResolved(footprint*vec2<f32>(1.0/(0.45*RIVER_STEP_SPACING), 4.1));
+    var ledges = 0.5;
+    var boulders = 0.5;
+    if (ledge_resolved > 0.0)
+    {
+        ledges = valueNoise(vec2<f32>(along/(1.6*RIVER_STEP_SPACING), across*1.7 + 3.1));
+    }
+    if (boulder_resolved > 0.0)
+    {
+        boulders = valueNoise(vec2<f32>(along/(0.45*RIVER_STEP_SPACING) + 7.3, across*4.1 + 1.7));
+    }
+    let value = 0.5 + (ledges - 0.5)*1.15*ledge_resolved + (boulders - 0.5)*0.55*boulder_resolved;
+    let lost = VALUE_NOISE_DEVIATION*VALUE_NOISE_DEVIATION
+             * (1.15*1.15*(1.0 - ledge_resolved*ledge_resolved)
+                + 0.55*0.55*(1.0 - boulder_resolved*boulder_resolved));
+    return vec2<f32>(value, lost);
+}
+
+// How much of each of three equally likely thirds of a pixel lies below a
+// step, 0..1: from the steps as the pixel resolves them (`steps`,
+// riverSteps' x) and the variance of the detail it does not (`lost`), which
+// spreads the thirds about it. Each third sits at the middle of its third of
+// value noise's distribution, 1.05 standard deviations out (measured; a
+// normal distribution's would be 0.97). Whatever is made of the steps is
+// made of each third and averaged, never of their mean: the whitewater over
+// the steps is a threshold, which the mean of a pixel half below steps and
+// half over tongues would never reach, and the white would go out of a
+// rapid far off. A resolved pixel's thirds are one and the same.
+fn riverStepShares(steps: f32, lost: f32) -> vec3<f32>
+{
+    let spread = 1.05*sqrt(lost);
+    return vec3<f32>(smoothstepf(0.25, 0.75, steps - spread),
+                     smoothstepf(0.25, 0.75, steps),
+                     smoothstepf(0.25, 0.75, steps + spread));
+}
+
+// One cycle of a flow-mapped layer: a texture carried by the current for
+// `period` seconds and then laid down afresh, two such layers half a cycle
+// apart so one is always at its height while the other is renewed. Their
+// weights are sin and cos of the cycle, whose squares sum to one: two
+// independent patterns blended so keep the contrast of one, and the water
+// does not pulse as they hand over.
+struct FlowLayer
+{
+    offset: vec2<f32>,
+    jitter: vec2<f32>,
+    weight: f32,
+};
+
+fn flowLayer(time: f32, period: f32, layer: u32, seed: f32, flow: vec2<f32>) -> FlowLayer
+{
+    let cycle_time = time/period + f32(layer)*0.5 + seed;
+    let phase = fract(cycle_time);
+    let cycle = floor(cycle_time);
+    let jitter = vec2<f32>(hash21(vec2<f32>(cycle, f32(layer)*17.3 + seed*31.0)),
+                           hash21(vec2<f32>(f32(layer)*5.1 + seed*13.0, cycle)))*31.0;
+    return FlowLayer(flow*(phase*period), jitter, sin(PI*phase));
+}
+
+struct FlowSurface
+{
+    // Height gradient in the channel's frame: (downstream, across).
+    slope: vec2<f32>,
+    // Slope variance the pixel (or the frame) cannot resolve.
+    variance: f32,
+    // 0..1 on the faces of standing waves, where a riffle's flecks sit.
+    crest: f32,
+};
+
+// What the current does to the surface, in the channel's own frame `st`
+// (metres downstream and across; a lake's is world XZ), with `flow` the
+// current in that frame.
+//
+// - Turbulence welling up from the bed breaks the surface into small
+//   ripples the current carries. Their slope grows with the bed's roughness
+//   and the current (RMS about 0.02 on a run, 0.07 on a riffle, 0.17 in
+//   whitewater), and fast water draws them out into streaks along the flow.
+//   Each scale is carried on its own cycle, so the hand-overs between its
+//   layers never line up across scales.
+// - Boils: in runs and pools the turbulence of the reach above wells up as
+//   glassy domes a couple of metres across, ringed by ripples, drifting
+//   down.
+// - Standing waves over riffles, fixed to the bed: a gravity wave holds
+//   still against a current running at its own phase speed, so its
+//   wavelength is 2*pi*U^2/g (0.6 m at 1 m/s, 1.4 m at 1.5 m/s). Crests lie
+//   across the flow, kinked and broken by the bed, and swell and ebb in
+//   place: their envelope morphs between two fixed patterns rather than
+//   travelling, since anything travelling over a riffle reads as the water's
+//   own motion, and a swell that drifted upstream made the river look as if
+//   it ran backwards.
+//
+// A texture the current carries further in one frame than about a third of
+// its own scale can no longer be followed by the eye (it strobes, and seems
+// to run backwards); it goes to roughness instead, as an unresolved one does.
+fn flowSurface(st: vec2<f32>, flow: vec2<f32>, time: f32, roughness: f32, riffle: f32,
+               river: bool, footprint: vec2<f32>, frame_seconds: f32) -> FlowSurface
+{
+    var result = FlowSurface(vec2<f32>(0.0), 0.0, 0.0);
+    let speed = length(flow);
+    // Only a channel has a frame to stretch its ripples along.
+    let stretch = select(1.0, 1.0 + 1.8*smoothstepf(0.3, 1.8, speed)*(1.0 - 0.6*roughness), river);
+    let steepness = 0.018 + 0.20*roughness + 0.012*min(speed, 3.0);
+    let travel = speed*frame_seconds;
+
+    // Boils, and how they stir the ripples: glassy on their domes, stirred
+    // at their rims.
+    let boils = select(0.0, smoothstepf(0.3, 1.0, speed)*(1.0 - smoothstepf(0.25, 0.6, roughness)), river);
+    var stir = 1.0;
+    if (boils > 0.001)
+    {
+        let boil_resolved = (1.0 - smoothstepf(0.4, 1.2, max(footprint.x, footprint.y)))
+                          * (1.0 - smoothstepf(0.25, 0.45, travel/2.2));
+        let boil_slope = 0.035/2.2;
+        var dome = 0.0;
+        var rim = 0.0;
+        for (var layer = 0u; layer < 2u; layer += 1u)
+        {
+            let cycle = flowLayer(time, 2.6, layer, 0.61, flow);
+            let boil = riverNoise((st - cycle.offset)*(1.0/2.2) + cycle.jitter*0.37 + vec2<f32>(3.1, 8.9));
+            let share = cycle.weight*cycle.weight;
+            dome += smoothstepf(0.58, 0.85, boil.x)*share;
+            rim += (1.0 - abs(2.0*smoothstepf(0.45, 0.75, boil.x) - 1.0))*share;
+            result.slope += boil.yz*(boil_slope*boils*cycle.weight*boil_resolved);
+        }
+        result.variance += boil_slope*boil_slope*RIVER_NOISE_SLOPE_VARIANCE*2.0*boils*boils
+                         *(1.0 - boil_resolved*boil_resolved);
+        stir = 1.0 - 0.75*dome*boils + 0.6*rim*boils;
+    }
+
+    for (var octave = 0u; octave < 3u; octave += 1u)
+    {
+        let wavelength = select(select(0.85, 0.32, octave == 1u), 0.12, octave == 2u);
+        let period = select(select(2.3, 1.45, octave == 1u), 0.95, octave == 2u);
+        let c = steepness*stir*select(1.0, 0.8, octave == 2u);
+        let along_scale = wavelength*stretch;
+        let resolved = (1.0 - smoothstepf(0.18, 0.6, footprint.x/along_scale))
+                     * (1.0 - smoothstepf(0.18, 0.6, footprint.y/wavelength))
+                     * (1.0 - smoothstepf(0.22, 0.4, travel/along_scale));
+        result.variance += c*c*RIVER_NOISE_SLOPE_VARIANCE*(1.0/(stretch*stretch) + 1.0)
+                         *(1.0 - resolved*resolved);
+        if (resolved <= 0.0)
+        {
+            continue;
+        }
+        for (var layer = 0u; layer < 2u; layer += 1u)
+        {
+            let cycle = flowLayer(time, period, layer, f32(octave)*0.37, flow);
+            let advected = st - cycle.offset;
+            let q = vec2<f32>(advected.x/along_scale, advected.y/wavelength)
+                  + cycle.jitter + vec2<f32>(f32(octave)*7.7);
+            let noise = riverNoise(q);
+            // Height c*wavelength*noise: d/ds = c*noise.y/stretch, d/dt = c*noise.z.
+            result.slope += vec2<f32>(noise.y/stretch, noise.z)*(c*cycle.weight*resolved);
+        }
+    }
+    if (riffle > 0.001)
+    {
+        // Wavelengths are taken between fixed half-octave rungs, so a crest
+        // stays continuous where the current slows toward the banks.
+        let level = 2.0*log2(clamp(0.64*speed*speed, 0.35, 2.5)/0.35);
+        let base = floor(level);
+        // The two fixed envelopes the swell morphs between, in place.
+        let ebb = 0.5 + 0.5*sin(time*0.9);
+        for (var k = 0u; k < 2u; k += 1u)
+        {
+            let rung = base + f32(k);
+            let share = select(1.0 - (level - base), level - base, k == 1u);
+            let wavelength = 0.35*exp2(rung*0.5);
+            let seed = vec2<f32>(rung*13.7, rung*7.1);
+            let kink = valueNoise(vec2<f32>(st.x/(4.0*wavelength), st.y/(1.3*wavelength)) + seed);
+            let lengths = smoothstepf(0.3, 0.7, valueNoise(vec2<f32>(st.x/(3.0*wavelength),
+                                                                     st.y/(0.9*wavelength)) + seed.yx));
+            let swell_a = valueNoise(vec2<f32>(st.x/(2.0*wavelength), st.y/(1.1*wavelength)) + seed*1.9);
+            let swell_b = valueNoise(vec2<f32>(st.x/(2.0*wavelength), st.y/(1.1*wavelength)) + seed*2.7 + 5.3);
+            let pulse = 0.72 + 0.28*mix(swell_a, swell_b, ebb);
+            let wave = 6.2831853*fract(st.x/wavelength + 0.9*kink);
+            let amplitude = 0.20*riffle*lengths*pulse*share;
+            let resolved = 1.0 - smoothstepf(0.2, 0.6, footprint.x/wavelength);
+            result.slope.x += amplitude*cos(wave)*resolved;
+            result.variance += 0.5*amplitude*amplitude*(1.0 - resolved*resolved);
+            result.crest += smoothstepf(0.55, 0.95, sin(wave))*lengths*share*resolved;
+        }
+    }
+    return result;
+}
+
+// Foam carried downstream in the channel's frame and drawn out into streaks
+// along the current, 0..1 about a mean of 0.5. Its two layers hand over as
+// the ripples' do, so the foam keeps its contrast through the hand-over, and
+// its fine bubbles average away once the current carries them too far a
+// frame to follow.
+fn riverFoamPattern(st: vec2<f32>, flow: vec2<f32>, stretch: f32, time: f32,
+                    footprint: vec2<f32>, frame_seconds: f32) -> f32
+{
+    let squeeze = vec2<f32>(1.0/stretch, 1.0);
+    let extent = max(footprint.x/stretch, footprint.y);
+    let travel = length(flow)*frame_seconds/stretch;
+    let coarse_blur = max(smoothstepf(0.25, 0.75, extent*2.1), smoothstepf(0.1, 0.2, travel*2.1));
+    let fine_blur = max(smoothstepf(0.25, 0.75, extent*7.3), smoothstepf(0.1, 0.2, travel*7.3));
+    var pattern = 0.5;
+    for (var layer = 0u; layer < 2u; layer += 1u)
+    {
+        let cycle = flowLayer(time, 2.2, layer, 0.13, flow);
+        let q = (st - cycle.offset)*squeeze + cycle.jitter*0.74;
+        let coarse = mix(valueNoise(q*2.1), 0.5, coarse_blur);
+        let bubbles = mix(valueNoise(q*7.3 + vec2<f32>(13.1, 4.7)), 0.5, fine_blur);
+        pattern += (coarse*0.62 + bubbles*0.38 - 0.5)*cycle.weight;
+    }
+    return clamp(pattern, 0.0, 1.0);
+}
+
+// The foam on a stream where `amount` of it is made or carried, as the
+// pattern of its lace (riverFoamPattern) covers it, and far off, where that
+// pattern is unresolved, the share of the water it covers.
+fn streamFoam(amount: f32, pattern: f32, resolved: f32) -> f32
+{
+    let made = clamp(amount, 0.0, 1.0);
+    return mix(smoothstepf(1.05 - made, 1.3 - made*0.6, 0.58),
+               smoothstepf(1.05 - made, 1.3 - made*0.6, pattern), resolved)*made;
+}
+
+// ---------------------------------------------------------------------------
+// What the water sees and what shades it
+// ---------------------------------------------------------------------------
+
+// The plants' shadow cascades, as the composite reads them, so water under
+// the forest lies in the same shade as its banks. Mirrors
+// `VegetationShadows` in composite.wgsl.
+struct VegetationShadows {
+    view_projection: array<mat4x4<f32>, 3>,
+    splits: vec4<f32>, // horizontal radius of each cascade; w far radius, metres
+    texel: vec4<f32>,
+    light: vec4<f32>,
+    params: vec4<f32>,
+};
+@group(2) @binding(1) var vegetation_shadow_map_0: texture_depth_2d;
+@group(2) @binding(4) var vegetation_shadow_map_1: texture_depth_2d;
+@group(2) @binding(5) var vegetation_shadow_map_2: texture_depth_2d;
+@group(2) @binding(2) var<uniform> vegetation_shadows: VegetationShadows;
+@group(2) @binding(3) var vegetation_shadow_sampler: sampler_comparison;
+
+fn plantShadowPcf(map: texture_depth_2d, uv: vec2<f32>, depth: f32) -> f32 {
+    let step = 1.0/f32(textureDimensions(map).x);
+    var lit = 0.0;
+    for (var y = 0; y < 2; y++) {
+        for (var x = 0; x < 2; x++) {
+            let offset = vec2<f32>(f32(x) - 0.5, f32(y) - 0.5)*step*1.5;
+            lit += textureSampleCompareLevel(map, vegetation_shadow_sampler,
+                                             uv + offset, depth);
+        }
+    }
+    return lit;
+}
+
+fn plantShadowCascade(world_position: vec3<f32>, cascade: u32) -> f32 {
+    let texel = vegetation_shadows.texel[cascade];
+    let lookup = world_position + vec3<f32>(0.0, texel*1.5, 0.0) - vegetation_shadows.light.xyz*texel*1.5;
+    let clip = vegetation_shadows.view_projection[cascade]*vec4<f32>(lookup, 1.0);
+    let uv = vec2<f32>(0.5 + 0.5*clip.x, 0.5 - 0.5*clip.y);
+    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || clip.z > 1.0) {
+        return 1.0;
+    }
+    switch cascade {
+        case 0u: { return plantShadowPcf(vegetation_shadow_map_0, uv, clip.z)*0.25; }
+        case 1u: { return plantShadowPcf(vegetation_shadow_map_1, uv, clip.z)*0.25; }
+        default: { return plantShadowPcf(vegetation_shadow_map_2, uv, clip.z)*0.25; }
+    }
+}
+
+// Light reaching a water point through the plants: the cascade covering its
+// horizontal distance from the camera, blended into the next as on the banks,
+// with a 2x2 grid of bilinear comparisons (the composite's 4x4 tent is more
+// than a rippling surface needs).
+fn plantShadow(world_position: vec3<f32>) -> f32 {
+    let horizontal_distance = length(world_position.xz - globals.camera_position.xz);
+    if (vegetation_shadows.light.w < 0.5 || horizontal_distance >= vegetation_shadows.splits.w) {
+        return 1.0;
+    }
+    var cascade = 2u;
+    for (var c = 0u; c < 2u; c++) {
+        if (horizontal_distance < vegetation_shadows.splits[c]) {
+            cascade = c;
+            break;
+        }
+    }
+    var lit = plantShadowCascade(world_position, cascade);
+    if (cascade < 2u) {
+        let start = select(0.0, vegetation_shadows.splits[max(cascade, 1u) - 1u], cascade > 0u);
+        let end = vegetation_shadows.splits[cascade];
+        let band = (end - start)*vegetation_shadows.params.x;
+        let blend = smoothstep(0.0, 1.0, (horizontal_distance - (end - band))/max(band, 1e-3));
+        if (blend > 0.0) {
+            lit = mix(lit, plantShadowCascade(world_position, cascade + 1u), blend);
+        }
+    }
+    let far_fade = smoothstepf(vegetation_shadows.splits.w*0.85, vegetation_shadows.splits.w, horizontal_distance);
+    return mix(1.0, mix(lit, 1.0, far_fade), vegetation_shadows.params.y);
+}
+
+// What a reflection meets where it does not meet the sky: foliage seen from
+// the water, and how tall a closed canopy stands over its ground.
+const CANOPY_ALBEDO: vec3<f32> = vec3<f32>(0.05, 0.085, 0.035);
+const CANOPY_HEIGHT: f32 = 18.0;
+// Open ground of no particular colour, outside the canopy capture.
+const OPEN_GROUND: vec4<f32> = vec4<f32>(0.10, 0.12, 0.06, 1.0);
+
+// The ground at `world_xz` (x) and how much of it the camera's one-metre map
+// gave (y). That map holds the carved channels and their banks; beyond it
+// only the twelve-metre lighting map remains, which sees valleys but not a
+// creek's own cut.
+fn riverGround(world_xz: vec2<f32>) -> vec2<f32>
+{
+    var coarse = -1.0e4;
+    if (globals.heightfield.z >= 1.0)
+    {
+        coarse = terrainHeightAt(world_xz);
+    }
+    if (stage.shore_map.z < 1.0)
+    {
+        return vec2<f32>(coarse, 0.0);
+    }
+    let uv = (world_xz - stage.shore_map.xy)/stage.shore_map.z + vec2<f32>(0.5);
+    let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
+    let weight = smoothstepf(0.0, 0.03, edge);
+    let fine = textureSampleLevel(shoreline_heightfield, shoreline_sampler,
+                                  clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).r;
+    return vec2<f32>(mix(coarse, fine, weight), weight);
+}
+
+// The ground's colour (rgb) and the share of open sky the tree crowns leave
+// over it (a): the grass capture, whose alpha vegetation.wgsl's canopy pass
+// darkens under every crown. Open ground outside it.
+fn riverCanopy(world_xz: vec2<f32>) -> vec4<f32>
+{
+    if (canopy_window.z < 1.0)
+    {
+        return OPEN_GROUND;
+    }
+    let uv = (world_xz - canopy_window.xy)/canopy_window.z + vec2<f32>(0.5);
+    let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
+    let texel = textureSampleLevel(canopy_texture, canopy_sampler,
+                                   clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
+    return mix(OPEN_GROUND, vec4<f32>(texel.rgb, clamp(texel.a, 0.0, 1.0)),
+               smoothstepf(0.0, 0.03, edge));
+}
+
+struct Surroundings
+{
+    // Share of the reflected lobe that reaches open sky.
+    sky: f32,
+    // Radiance of the banks and crowns that hide the rest.
+    occluder: vec3<f32>,
+    // Open sky over the water itself, for its ambient light.
+    sky_view: f32,
+};
+
+// What a reflection sees where the screen cannot show it. Walk out from the
+// water along the reflected ray's bearing and find the highest elevation the
+// banks and the crowns on them reach: the ground, plus CANOPY_HEIGHT where
+// the canopy capture is closed. A ray below that elevation meets the bank or
+// the forest, not the sky. Beyond the one-metre map a river's own cut stands
+// in: banks rising from about 0.35 m to 1.35 m over the two metres past its
+// waterline. So a creek in its cut under the trees mirrors dark banks and
+// foliage everywhere but up its own corridor, a pond in a clearing keeps its
+// sky, and the sea mirrors its wooded headlands near the shore and the open
+// sky beyond them.
+fn surroundings(world_xz: vec2<f32>, level: f32, reflection: vec3<f32>, alpha: f32,
+                here: vec4<f32>, across: f32, half_width: f32, cross_stream: vec2<f32>,
+                sun_open: vec3<f32>, to_sun: vec3<f32>,
+                world_position: vec3<f32>) -> Surroundings
+{
+    let run = length(reflection.xz);
+    let bearing = select(vec2<f32>(1.0, 0.0), reflection.xz/max(run, 1e-4), run > 1e-4);
+    // Tangent of the reflected ray's elevation.
+    let rise = reflection.y/max(run, 1e-3);
+    var horizon = 0.0;
+    var crown_share = 0.0;
+    var bank_albedo = here.rgb;
+    var fine = 1.0;
+    for (var i = 0u; i < 6u; i += 1u)
+    {
+        // 1.5 m out to 81 m.
+        let distance = 1.5*exp2(f32(i)*1.15);
+        let p = world_xz + bearing*distance;
+        let ground = riverGround(p);
+        let canopy = riverCanopy(p);
+        let crown = (1.0 - canopy.a)*CANOPY_HEIGHT;
+        let top = ground.x + crown - level;
+        if (top > horizon*distance)
+        {
+            horizon = top/distance;
+            crown_share = clamp(crown/max(top, 0.5), 0.0, 1.0);
+            bank_albedo = canopy.rgb;
+        }
+        if (i == 0u)
+        {
+            fine = ground.y;
+        }
+    }
+    if (half_width > 0.01)
+    {
+        let sideways = dot(bearing, cross_stream);
+        let to_bank = half_width*(1.0 - across*sign(sideways))/max(abs(sideways), 0.05);
+        horizon = max(horizon, 1.35/(max(to_bank, 0.0) + 2.0)*(1.0 - fine));
+    }
+    // The lobe's spread, in the same tangent measure, widened by how little
+    // six taps and a canopy map can say about where the horizon really is:
+    // a crown's silhouette is not a line, and on glassy water a hard edge
+    // would cut the trees' reflection out of the sky as one flat blot.
+    let spread = (0.04 + 1.5*alpha)*(1.0 + rise*rise) + 0.3*horizon;
+    var sky = smoothstepf(horizon - spread, horizon + spread, rise);
+    // Crowns over the water itself hide even the steep rays.
+    sky *= mix(1.0, here.a, smoothstepf(0.3, 1.5, rise));
+    // The banks and crowns face the water: lit by the sky's fill, and by
+    // the sun where it falls on the side the ray meets.
+    let facing = normalize(vec3<f32>(-bearing.x, 0.35, -bearing.y));
+    let albedo = mix(bank_albedo, CANOPY_ALBEDO, crown_share);
+    let occluder = albedo*(sun_open*(max(dot(facing, to_sun), 0.0)*0.45/PI)
+                           + skyAmbient(facing, world_position)*0.35);
+    let sky_view = here.a*(0.65 + 0.35/(1.0 + horizon*horizon));
+    return Surroundings(sky, occluder, sky_view);
+}
+
+// ---------------------------------------------------------------------------
+// Vertex stages
+// ---------------------------------------------------------------------------
+
+// What every surface hands the fragment stage, whichever mesh it came from.
+struct WaterVertexOutput
 {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) world_position: vec3<f32>,
+    // Where the waves are evaluated: on the sea its Gerstner parameter
+    // position, before the horizontal chop, so fragment crests and their
+    // displaced geometry have the same phase; elsewhere the plain world XZ.
     @location(1) wave_position: vec2<f32>,
+    // The surface current, world XZ, m/s.
+    @location(2) velocity: vec2<f32>,
+    // x across the channel (-1..1 between the waterlines, 0 off a channel),
+    // y whitewater, z the water's own level, w still water (1 on a lake's
+    // sheet and on the sea, and on a river where it meets them).
+    @location(3) channel: vec4<f32>,
+    // x metres downstream from the river's head, y its half width (0 on a
+    // lake's sheet and on the sea), z foam drifting down from whitewater
+    // upstream, w how far the water is the sea's (1 on the sea and where a
+    // river meets it).
+    @location(4) stream: vec4<f32>,
+    // Metres across the channel in its own frame.
+    @location(5) side: f32,
+    // Where a tributary's water becomes its parent's: the parent's frame
+    // (xy) and how far its ripples and foam are laid in it (z).
+    @location(6) joined: vec3<f32>,
+    // How clear the water is: 0 stained by the forest, 1 clear mountain
+    // water. The sea's colour is its own, so 0 there.
+    @location(7) clarity: f32,
 };
 
+// The sea: one of Crest's concentric tiles, displaced by the Gerstner sum.
 @vertex
-fn vs_main(
+fn vs_sea(
     @location(0) local: vec2<f32>,
     @location(1) tile_centre: vec2<f32>,
     @location(2) tile_scale: f32,
     @location(3) tile_rotation: f32,
-) -> VertexOutput
+) -> WaterVertexOutput
 {
     let cos_r = cos(tile_rotation);
     let sin_r = sin(tile_rotation);
@@ -1546,218 +2532,477 @@ fn vs_main(
                                    stage.params.z + surface.displaced.y,
                                    surface.displaced.z);
 
-    var out: VertexOutput;
+    var out: WaterVertexOutput;
     out.clip_position = globals.projection*globals.view*vec4<f32>(world_position, 1.0);
     out.world_position = world_position;
-    // Preserve the Gerstner parameter position, before horizontal chop, so
-    // fragment crests and their displaced geometry have the same phase.
     out.wave_position = world_xz;
+    out.velocity = vec2<f32>(0.0);
+    out.channel = vec4<f32>(0.0, 0.0, stage.params.z, 1.0);
+    out.stream = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    out.side = 0.0;
+    out.joined = vec3<f32>(0.0);
+    out.clarity = 0.0;
+    return out;
+}
+
+// How far under the ground at its edge a ribbon's rounded strip ends:
+// `EDGE_TUCK` in src/rivers/surface.rs.
+const EDGE_TUCK: f32 = 0.05;
+
+// The height of a ribbon's outer strip `out` of the way across it, where the
+// row's water stands at `level` and its edge must end under `cover`: level
+// while the cover stands over the water, and where it lies under it rounded
+// down onto it as a quarter ellipse, the front of water spreading over dry
+// ground. `round_edge` in src/rivers/surface.rs.
+fn roundEdge(level: f32, cover: f32, out: f32) -> f32
+{
+    let t = clamp(out, 0.0, 1.0);
+    return level - max(level - cover, 0.0)*(1.0 - sqrt(max(1.0 - t*t, 0.0)));
+}
+
+// A river's ribbon or a lake's sheet: `SurfaceVertex` in
+// src/rivers/surface.rs.
+@vertex
+fn vs_inland(
+    @location(0) position: vec3<f32>,
+    @location(1) velocity: vec2<f32>,
+    @location(2) across: f32,
+    @location(3) turbulence: f32,
+    @location(4) still: f32,
+    @location(5) along: f32,
+    @location(6) half_width: f32,
+    @location(7) foam: f32,
+    @location(8) sea: f32,
+    @location(9) side: f32,
+    @location(10) joined: vec3<f32>,
+    @location(11) clarity: f32,
+    @location(12) rim: vec4<f32>,
+) -> WaterVertexOutput
+{
+    // A ribbon's outer strip was rounded down onto the ground beside its
+    // channel as the rivers carve it (`SurfaceVertex::rim`: its edge, how
+    // far across the strip this vertex lies, the row's water). The erosion
+    // has worn that ground on since, most where nothing holds a bank up, at
+    // a cascade's foot by still water: round the strip down again onto the
+    // camera's one-metre map of the ground as it now stands, so the erosion
+    // never bares an edge in the air. Never where a tributary's water is
+    // becoming its parent's, nor where the map does not reach.
+    var height = position.y;
+    if (rim.z > 0.0 && joined.z <= 0.0 && stage.shore_map.z >= 1.0)
+    {
+        let uv = (rim.xy - stage.shore_map.xy)/stage.shore_map.z + vec2<f32>(0.5);
+        let inside = smoothstepf(0.0, 0.03, min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y)));
+        let ground = textureSampleLevel(shoreline_heightfield, shoreline_sampler,
+                                        clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).r;
+        height = mix(height, min(height, roundEdge(rim.w, ground - EDGE_TUCK, rim.z)), inside);
+    }
+    // A distant channel is narrower than the clipmap's triangles there,
+    // which round its banks off above the water. Lift a distant surface by
+    // about the bank those triangles leave (their spacing grows with
+    // distance, a metre per 110 m), so a river still shows from a ridge.
+    let flat_distance = length(position.xz - globals.camera_position.xz);
+    let spacing = max(1.0, flat_distance/110.0);
+    // A lake is wide enough for any triangles and stays at its level. So does
+    // a river where it meets a lake or the sea (`still` is 1 there, fading to
+    // 0 some 30 m along it), so the two surfaces still meet from afar.
+    let lift = smoothstepf(150.0, 650.0, flat_distance)*min(spacing*0.45, 12.0)*(1.0 - clamp(still, 0.0, 1.0));
+    let world = vec3<f32>(position.x, height + lift, position.z);
+    var out: WaterVertexOutput;
+    out.clip_position = globals.projection*globals.view*vec4<f32>(world, 1.0);
+    out.world_position = world;
+    out.wave_position = world.xz;
+    out.velocity = velocity;
+    out.channel = vec4<f32>(across, turbulence, height, still);
+    out.stream = vec4<f32>(along, half_width, foam, sea);
+    out.side = side;
+    out.joined = joined;
+    out.clarity = clarity;
     return out;
 }
 
 // ---------------------------------------------------------------------------
-// Fragment stage
+// The surface
 // ---------------------------------------------------------------------------
 
+// The unit normal of the triangle whose world position changes by `dx` and
+// `dy` to the next pixel across and down, turned up out of the water: the
+// sea's displaced wave face, a ribbon's tilted reach, a sheet's level, the
+// same whichever way the triangle is wound. A triangle seen so nearly edge
+// on that the two lie along one line keeps the level's.
+fn facetUp(dx: vec3<f32>, dy: vec3<f32>) -> vec3<f32>
+{
+    let normal = cross(dx, dy);
+    let area = dot(normal, normal);
+    let up = normal*inverseSqrt(max(area, 1e-30))*select(1.0, -1.0, normal.y < 0.0);
+    return select(vec3<f32>(0.0, 1.0, 0.0), up, area > 1e-6*dot(dx, dx)*dot(dy, dy));
+}
+
+// Which side of a surface the eye sees it from.
+struct SurfaceSide
+{
+    // Seen from under the water.
+    below: bool,
+    // How far its upper side faces the eye, 0..1: foam on it fades out over
+    // the last centimetres as the eye goes under it.
+    upper: f32,
+};
+
+// The side of a surface the eye sees, with `eye_under` how far the eye is
+// under its own water (`stage.eye_body.w`) and `eye_over_facet` the eye's
+// height over the surface's own plane, along its upturned normal.
+//
+// It is the side of the water the eye is on, not how high the eye stands: a
+// ray from the air meets every surface from the air, even one standing above
+// the eye, such as a rapid climbing away up its channel, a river upstream of
+// a swimmer or a swell's crest over a swimmer's head; a ray under the water
+// meets every surface from below. Only while the eye crosses its own water's
+// surface (`eye_under` between 0 and 1) can it see some surfaces from above
+// and others from below. Then each is seen from the side of its own plane the
+// eye is on, as a ray that reaches a surface through one medium must meet
+// it: on a level sheet that is the eye's height over it, on the sea the
+// wave's own face.
+fn surfaceSide(eye_under: f32, eye_over_facet: f32) -> SurfaceSide
+{
+    let under = clamp(eye_under, 0.0, 1.0);
+    let crossing = under > 0.0 && under < 1.0;
+    return SurfaceSide(select(under >= 1.0, eye_over_facet < 0.0, crossing),
+                       select(1.0 - under, smoothstepf(-0.08, 0.12, eye_over_facet), crossing));
+}
+
+// The deepest bed that shows through inland water. The bed's light crosses
+// the column twice, down to it and back up to the eye, and even the clearest
+// water, a tarn's in the blue, brings back only a thousandth of it from
+// ln(1000)/(2 x 0.12/m) = 29 m down: a deeper bed looks the same as none.
+const BED_DEPTH_MAX: f32 = 0.5*log(1000.0)
+                         /min(min(ALPINE_EXTINCTION.x, ALPINE_EXTINCTION.y), ALPINE_EXTINCTION.z);
+
+// How deep the bed lies under the surface, with `path` the straight line's
+// length from the surface to the bed drawn behind it and `rise` how steeply
+// the eye looks down along it (the sine of its elevation over the surface,
+// `viewRise`). The bed lies as deep whatever the angle it is seen at; only a
+// bed deeper than any light comes back from is taken for one BED_DEPTH_MAX
+// deep.
+fn bedDepth(path: f32, rise: f32) -> f32
+{
+    return min(path*max(rise, 0.0), BED_DEPTH_MAX);
+}
+
+// How steeply the eye looks down into the water through a surface (the
+// sine of its elevation over the surface's plane, `facet` turned up out of
+// the water), for the depth of the water column it sees and the angle its
+// ray bends to. Seen from above it is taken over the surface's own plane,
+// not the level: a rapid climbing away above the eye's height, seen from
+// the air, still has its water under its tilted face. Seen from below the
+// eye looks up, and no bed lies under the surface.
+fn viewRise(to_view: vec3<f32>, facet: vec3<f32>, underside: bool) -> f32
+{
+    return select(max(dot(to_view, facet), 0.0), to_view.y, underside);
+}
+
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
+fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
 {
     let uv = in.clip_position.xy*globals.viewport.zw;
     let camera_position = globals.camera_position.xyz;
     let to_camera = camera_position - in.world_position;
     let view_distance = length(to_camera);
     let to_view = to_camera/max(view_distance, 1e-3);
-    // Derivatives must be evaluated before any data-dependent branch/discard.
+    let time = stage.params.x;
+    // The frame the viewer sees: the frame time the eye has settled into,
+    // which one slow frame barely moves (see EXPOSURE_SETTLE_SECONDS in
+    // water_node.rs), so a hitch neither strips the ripples nor flashes the
+    // glints.
+    let frame_seconds = stage.wind.z;
+    // Derivatives first, in uniform control flow.
     let pixel_dx = dpdx(in.wave_position);
     let pixel_dy = dpdy(in.wave_position);
     let pixel_footprint = max(length(pixel_dx), length(pixel_dy));
-    let shore = sampleShore(in.wave_position);
-    let surface = sampleSurface(in.wave_position, 0.0, pixel_dx, pixel_dy, 1.0, shore);
-    let precipitation = weatherPrecipitation(vec3<f32>(in.world_position.x,
-                                                       stage.params.z,
-                                                       in.world_position.z));
-    let impacts = waterImpacts(in.world_position.xz, globals.storm.z, pixel_footprint,
-                               view_distance, precipitation.x, precipitation.y,
-                               precipitation.w);
+    // The plane of the triangle drawn here, for the side the eye sees it from.
+    let facet = facetUp(dpdx(in.world_position), dpdy(in.world_position));
+    let xz = in.world_position.xz;
 
+    // --- What water this is -----------------------------------------------
+    let sea = clamp(in.stream.w, 0.0, 1.0);
+    let stillness = clamp(in.channel.w, 0.0, 1.0);
+    let level = in.channel.z;
+    let across = in.channel.x;
+    let half_width = in.stream.y;
+    let river = half_width > 0.01;
+    let along = in.stream.x;
+    // Down its last reach a river spreads and slows into the sea's: its
+    // rapids and its foam give out as its water turns to the sea's.
+    let turbulence = in.channel.y*(1.0 - sea);
+    // Foam made by whitewater upstream and still drifting here.
+    let supply = clamp(in.stream.z*3.0, 0.0, 1.0)*(1.0 - sea);
+    // Seen from below, the surface is the same sheet of water from its other
+    // side; which side the eye sees is the side of the water it is on
+    // (`surfaceSide`), not how high it stands.
+    let side = surfaceSide(stage.eye_body.w, dot(facet, to_camera));
+    let underside = side.below;
+    let above_water = side.upper;
+
+    let precipitation = weatherPrecipitation(vec3<f32>(xz.x, level, xz.y));
     // View space looks down -Z, so a *greater* z is nearer. The water
     // surface's own view-space z, to compare against the G-buffer's.
     let water_view = (globals.view*vec4<f32>(in.world_position, 1.0)).xyz;
-
-    // Every texture sample is taken in uniform control flow, before discard.
-    // Two-sided: seen from below, the surface is the same sheet of water lit
-    // from the other side, so the geometric normal is flipped toward the eye
-    // rather than the pass culling backfaces.
-    var normal = surface.normal;
-    if (camera_position.y >= in.world_position.y) {
-        normal = normalize(normal + vec3<f32>(-impacts.slope.x, 0.0, -impacts.slope.y));
-    }
-    if (dot(normal, to_view) < 0.0)
-    {
-        normal = -normal;
-    }
-    let packed = textureSample(gbuffer_position, gbuffer_sampler, uv);
+    let packed = reflectionDepth(uv);
     let scene_sky = packed.a < 0.5;
     var optical_path = PATH_LENGTH_MAX;
     if (!scene_sky)
     {
         optical_path = min(distance(packed.xyz, water_view), PATH_LENGTH_MAX);
     }
-
-    // Refraction: perturb the screen uv by the surface slope, scaled by how
-    // much water the ray crosses and by the inverse distance, since a metre of
-    // slope covers fewer pixels far away.
-    let refracted_uv = clamp(uv + normal.xz*(stage.misc.x*clamp(optical_path, 0.0, 1.0)
-                           /max(view_distance, 1.0)), vec2<f32>(0.0), vec2<f32>(1.0));
-    let flat_background = textureSample(scene_texture, scene_sampler, uv);
-    let refracted_background = textureSample(scene_texture, scene_sampler, refracted_uv);
-    let refracted_packed = textureSample(gbuffer_position, gbuffer_sampler, refracted_uv);
-
-    // Hidden surfaces never get here: the pass depth-tests against the
-    // G-buffer's depth in hardware, ahead of this shader, so there is no
-    // discard to defeat the early test.
-
-    // The refracted tap is only trustworthy when it is sky or genuinely behind
-    // the water; otherwise it reached over a nearer surface and would smear
-    // foreground colour into the water.
-    let accept_refraction = refracted_packed.a < 0.5
-                         || refracted_packed.z <= water_view.z;
-    let background = select(flat_background.rgb, refracted_background.rgb, accept_refraction);
-    let scene_linear = sceneRadiance(background);
-
-    // --- Body: Beer-Lambert extinction plus in-scatter -----------------------
-    let sea_level = stage.params.z;
-    let sigma_t = max(stage.extinction.xyz, vec3<f32>(1e-4));
-    let sigma_s = min(sigma_t,
-                      PARTICLE_SCATTER*stage.extinction.w*stage.scatter.xyz + RAYLEIGH);
-    let transmittance = exp(-sigma_t*optical_path);
-
     let to_sun = normalize(-globals.sun_direction.xyz);
-    let sun_visibility = terrainShadow(in.world_position, normal, to_sun)
-                       *cloudShadow(in.world_position, to_sun);
-    let sun_colour = globals.sun_colour.rgb*globals.settings_a.x
-                     *weatherSunMultiplier(weatherSeverity(in.world_position.xz))
-                     *mix(1.0, 0.11, precipitation.z)*sun_visibility;
     let to_moon = normalize(-globals.moon_direction.xyz);
+
+    // --- The current --------------------------------------------------------
+    // A river's surface lives in its own frame, metres downstream and across,
+    // so its ripples and standing waves follow every bend. Still water has no
+    // frame and keeps world axes; a current running on into a lake only
+    // carries its ripples.
+    let velocity = in.velocity;
+    let speed = length(velocity);
+    let downstream = select(vec2<f32>(1.0, 0.0), velocity/max(speed, 1e-4), river && speed > 1e-4);
+    let cross_stream = vec2<f32>(-downstream.y, downstream.x);
+    let st = select(xz, vec2<f32>(along, in.side), river);
+    // Where a tributary's water becomes its parent's, its ripples, steps and
+    // foam cross-fade into those laid in the parent's own frame: two frames
+    // at an angle cannot be blended into one without squeezing the ripples
+    // between them. Two patterns mixed lose contrast, which `restore` puts
+    // back.
+    let joined_st = in.joined.xy;
+    let joining = select(0.0, clamp(in.joined.z, 0.0, 1.0), river);
+    let restore = inverseSqrt((1.0 - joining)*(1.0 - joining) + joining*joining);
+    let flow = select(velocity, vec2<f32>(speed, 0.0), river);
+    // The pixel's footprint along each axis of that frame: a grazing view
+    // stretches it along the view, not across the flow.
+    let footprint = vec2<f32>(max(abs(dot(pixel_dx, downstream)), abs(dot(pixel_dy, downstream))),
+                              max(abs(dot(pixel_dx, cross_stream)), abs(dot(pixel_dy, cross_stream))));
+    let roughness = clamp(turbulence*0.8 + smoothstepf(0.6, 3.0, speed)*0.25*(1.0 - sea), 0.0, 1.0);
+    let riffle = select(0.0, smoothstepf(0.03, 0.2, turbulence)*smoothstepf(0.45, 1.2, speed), river);
+
+    // --- The surface: swell, wind sea, current, rain ---------------------------
+    var slope = vec2<f32>(0.0);
+    var variance = 0.0;
+    var crest = 0.0;
+    var shore_foam = 0.0;
+    // The sea's swell and surf, dying out up a river's mouth.
+    if (sea > 0.0)
+    {
+        let shore = sampleShore(in.wave_position);
+        let swell = sampleSurface(in.wave_position, 0.0, pixel_dx, pixel_dy, sea, shore);
+        slope += -swell.normal.xz/max(swell.normal.y, 0.05);
+        variance += swell.slope_variance;
+        crest = clamp(1.0 - swell.jacobian, 0.0, 1.0);
+        shore_foam = swell.shore_foam;
+    }
+    // The wind sea, as much as the wind and the fetch allow.
+    let wind_direction = vec2<f32>(cos(stage.flags.z), sin(stage.flags.z));
+    let here = riverCanopy(xz);
+    let exposure = windExposure(xz, level, -wind_direction, here.a, sea, across, half_width, cross_stream);
+    let gust = windGust(xz, wind_direction, stage.wind.x, time);
+    let gust_factor = 1.0 + stage.wind.y*(gust - 0.5)*1.6;
+    let local_wind = stage.wind.x*exposure.shelter*max(gust_factor, 0.0)*(1.0 + 0.31*precipitation.w);
+    // On the sea the wind sea stops where the swell's spectrum begins.
+    let longest = mix(3.7, 2.0, sea);
+    var wind_sea = WindSea(vec2<f32>(0.0), 0.0, 0.0, 0.0);
+    if (speed > 0.02)
+    {
+        // Running water carries its wind waves along with it.
+        for (var layer = 0u; layer < 2u; layer += 1u)
+        {
+            let cycle = flowLayer(time, 3.0, layer, 0.29, velocity);
+            let waves = windSea(xz, cycle.offset, local_wind, exposure.fetch, longest,
+                                time, pixel_dx, pixel_dy, speed, frame_seconds);
+            wind_sea.slope += waves.slope*cycle.weight;
+            wind_sea.height += waves.height*cycle.weight;
+            wind_sea.height_variance += waves.height_variance*cycle.weight*cycle.weight;
+            wind_sea.variance += waves.variance*cycle.weight*cycle.weight;
+        }
+    }
+    else
+    {
+        wind_sea = windSea(xz, vec2<f32>(0.0), local_wind, exposure.fetch, longest,
+                           time, pixel_dx, pixel_dy, 0.0, frame_seconds);
+    }
+    slope += wind_sea.slope;
+    variance += wind_sea.variance;
+    // The current's own surface: turbulence, boils, standing waves.
+    var water_surface = FlowSurface(vec2<f32>(0.0), 0.0, 0.0);
+    if (river || speed > 0.02)
+    {
+        water_surface = flowSurface(st, flow, time, roughness, riffle, river, footprint, frame_seconds);
+        if (joining > 0.001)
+        {
+            let other = flowSurface(joined_st, flow, time, roughness, riffle, river, footprint, frame_seconds);
+            water_surface.slope = mix(water_surface.slope, other.slope, joining)*restore;
+            water_surface.variance = mix(water_surface.variance, other.variance, joining);
+            water_surface.crest = mix(water_surface.crest, other.crest, joining);
+        }
+        slope += downstream*water_surface.slope.x + cross_stream*water_surface.slope.y;
+        variance += water_surface.variance;
+    }
+    let impacts = waterImpacts(xz, globals.storm.z, pixel_footprint,
+                               view_distance, precipitation.x, precipitation.y, precipitation.w);
+    if (!underside)
+    {
+        slope += impacts.slope;
+    }
+    var normal = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
+    // Seen from above, a facet tipped away from the eye is met edge-on, not
+    // from behind: bend it back just into view. From below, the surface is
+    // the other side of the same sheet.
+    let facing = dot(normal, to_view);
+    if (!underside)
+    {
+        normal = normalize(normal + to_view*max(0.02 - facing, 0.0));
+    }
+    else if (facing < 0.0)
+    {
+        normal = -normal;
+    }
+
+    // --- Light ----------------------------------------------------------------
+    // Trees shade the water as they shade its banks: by the sun's cascades
+    // by day, the moon's by night.
+    let plants = plantShadow(in.world_position);
+    let sun_plants = select(1.0, plants, vegetation_shadows.light.w < 1.5);
+    let moon_plants = select(1.0, plants, vegetation_shadows.light.w > 1.5);
+    let severity = weatherSeverity(xz);
+    // Sunlight over the banks and crowns, for what the water mirrors of them.
+    let sun_open = globals.sun_colour.rgb*globals.settings_a.x*weatherSunMultiplier(severity)
+                   *mix(1.0, 0.11, precipitation.z)*cloudShadow(in.world_position, to_sun);
+    let sun_colour = sun_open*terrainShadow(in.world_position, normal, to_sun)*sun_plants;
     var moon_visibility = 1.0;
     if (globals.atmosphere.y > 0.001)
     {
         moon_visibility = terrainShadow(in.world_position, normal, to_moon)
-                         *cloudShadow(in.world_position, to_moon);
+                        *cloudShadow(in.world_position, to_moon);
     }
     let moon_colour = vec3<f32>(0.63, 0.74, 1.0)*globals.atmosphere.y
-                      *weatherSunMultiplier(weatherSeverity(in.world_position.xz))
-                      *mix(1.0, 0.42, precipitation.z)
-                      *moon_visibility;
-    let cos_theta = dot(to_view, -to_sun);
-    let phase = mix(henyeyGreenstein(cos_theta, clamp(stage.scatter.w, -0.99, 0.99)),
-                    phaseRayleigh(cos_theta), 0.5);
+                      *weatherSunMultiplier(severity)*mix(1.0, 0.42, precipitation.z)
+                      *moon_visibility*moon_plants;
+    let sky_light = skyAmbient(vec3<f32>(0.0, 1.0, 0.0), in.world_position);
 
-    // Sunlight reaching the top of the column, attenuated over the water above
-    // the shaded point. Aqua's closed-form in-scatter integral reduces to this
-    // for a single direction and a homogeneous medium.
-    let sun_attenuation = exp(-sigma_t*max(sea_level - in.world_position.y, 0.0));
-    let moon_phase = mix(henyeyGreenstein(dot(to_view, -to_moon),
-                         clamp(stage.scatter.w, -0.99, 0.99)),
-                         phaseRayleigh(dot(to_view, -to_moon)), 0.5);
-    let ambient_source = skyAmbient(vec3<f32>(0.0, 1.0, 0.0), in.world_position)
-                         *(0.35/(4.0*PI));
-    let scattered = sigma_s*sun_attenuation*(sun_colour*phase + moon_colour*moon_phase
-                    + ambient_source)*(1.0 - transmittance)/sigma_t;
-    var body = scene_linear*transmittance + scattered;
-
-    // --- Crest subsurface scattering ----------------------------------------
-    // Where the horizontal displacement compresses the surface, light crosses
-    // a thinner sheet of water and the crest glows.
-    //
-    // `jacobian` is 1 for an undisturbed surface, so measuring the pinch as
-    // `1 - jacobian` puts the glow on the compressed crests and nowhere else.
-    // Aqua's `1 - 0.5*jacobian` — which is what this port started from — reads
-    // half strength *everywhere*, and since this term is a flat cyan-green
-    // additive it then dominates the water body and washes the whole sea out
-    // to a pale mint that no water ever is.
-    let crest = clamp(1.0 - surface.jacobian, 0.0, 1.0);
-    let sss = pow(crest, 2.0)*stage.sss_tint.rgb*max(to_sun.y, 0.0);
-    body += sss*sun_colour*0.35;
-
-    // --- Whitecaps and shoreline wash ----------------------------------------
-    // Only an energetic, breaking wave generates foam. The local seabed
-    // confines the shore term to a narrow band; a calm shallow flat stays clear.
-    let whitecap = smoothstepf(0.10, 0.30, crest);
-    let drift = vec2<f32>(cos(stage.flags.z), sin(stage.flags.z))*stage.params.x*0.075;
-    let foam_uv = in.wave_position - drift;
-    let coarse = mix(valueNoise(foam_uv*1.3), 0.5,
-                     smoothstepf(0.25, 0.75, pixel_footprint*1.3));
-    let bubbles = mix(valueNoise(foam_uv*5.7 + vec2<f32>(23.4, 7.1)), 0.5,
-                      smoothstepf(0.25, 0.75, pixel_footprint*5.7));
-    let lace = smoothstepf(0.22, 0.72, coarse*0.68 + bubbles*0.32);
-    let shore_foam = surface.shore_foam*mix(0.22, 1.15, lace);
-    let caps = whitecap*0.70*foamBreakup(foam_uv, pixel_footprint);
-    // Bubbles sit on the upper surface. Avoid a bright foam sheet underwater.
-    let above_water = smoothstepf(-0.08, 0.12, camera_position.y - in.world_position.y);
-    let foam = clamp((1.0 - (1.0 - caps)*(1.0 - shore_foam))*stage.misc.y
-                     + impacts.splash*0.22 + impacts.snow_fleck*0.06, 0.0, 1.0)
-             * above_water;
-    // Foam is a bright diffuse surface, so its radiance sits a little above the
-    // sky it is lit by — not the two-and-a-half times that `sun_colour*0.25`
-    // produced, which clipped the shore break to flat white.
-    let foam_colour = vec3<f32>(0.92, 0.95, 0.96)
-                    * ((sun_colour*max(dot(normal, to_sun), 0.0)
-                        + moon_colour*max(dot(normal, to_moon), 0.0))*0.05
-                       + skyAmbient(normal, in.world_position)*0.75);
-
-    // --- Reflection ----------------------------------------------------------
-    //
-    // The 0.75 gain is authored, and it is the one number in this block that is
-    // not trying to be physical. Fresnel pins the far sea at roughly full
-    // reflectance — a grazing ray reflects 0.92 of its radiance into the eye,
-    // measured on this scene at a 10 m eye height — so the far water can only
-    // ever be as dark as the sky it mirrors. That is correct optics and it is
-    // also why the horizon reads as a continuation of the sky here: this sea is
-    // kilometres wide, so a grazing ray finds sky, where the reference lake
-    // found a dark forested shore. The optics doc already names that difference
-    // as the reason the reference's water looks darker than this renderer's.
-    //
-    // Dimming the mirrored copy stands in for it. It is deliberately applied
-    // here, at the call site, and not to `cloudSkyRadiance` itself: the sky the
-    // camera sees directly must stay exactly as the composite pass draws it, or
-    // the waterline gains a step in the wrong direction. Note the asymmetry
-    // that follows — the raymarched terrain reflection below is mixed in
-    // unscaled, so a dark headland mirrored in the water now sits against a
-    // dimmed sky. Over open water the march returns no hit and the two never
-    // meet; near shore it is the one visible cost of this constant.
-    //
-    // 0.85 was the previous value. The step to 0.75 is a 12% cut in the
-    // reflection, which moves the far band about 10 luma against an unchanged
-    // sky; the Fresnel exponent handles 60-85 degrees incidence and this
-    // handles the 85-90 degree band where the curve is pinned flat. Under a
-    // thunder cell, rain roughness and a small local reduction deepen the
-    // reflection further while the shared atmosphere darkens the cloud sky.
-    let reflection_direction = reflect(-to_view, normal);
-    let reflected_sky = cloudSkyRadiance(reflection_direction)
-                        *mix(0.75, 0.66, precipitation.z);
-
-    // Sun specular: GGX over the wave roughness, which is what produces a
-    // glitter path rather than one broad highlight.
-    let n_dot_l = max(dot(normal, to_sun), 0.0);
-    let n_dot_v = max(dot(normal, to_view), 0.0);
-    var roughness = clamp(mix(0.18, 0.045, clamp(n_dot_l, 0.0, 1.0)), 0.02, 1.0);
+    // --- Roughness ------------------------------------------------------------
+    // Everything the pixel could not resolve, from the swell to the capillary
+    // ripples, widens the glints by the slope variance it really has. A
+    // preset's fixed sun roughness overrides it on the sea.
+    let base_roughness = mix(0.02, 0.10, roughness);
+    var alpha = clamp(sqrt(base_roughness*base_roughness + variance + impacts.slope_variance), 0.02, 1.0);
     if (stage.surface.z > 0.0)
     {
-        roughness = clamp(stage.surface.z, 0.01, 1.0);
+        alpha = mix(alpha, clamp(stage.surface.z, 0.01, 1.0), sea);
     }
-    // Filtered-out slopes broaden the glitter instead of leaving a perfectly
-    // smooth mirror or aliasing into isolated bright pixels at the horizon.
-    let alpha = clamp(sqrt(pow(roughness, 4.0) + surface.slope_variance
-                           + impacts.slope_variance), 1e-3, 1.0);
+    // The normals the pixel spans, from the final normal's screen
+    // derivatives, taken here at the top level where every pixel of the
+    // quad runs.
+    alpha = pixelRoughness(alpha, dpdx(normal), dpdy(normal));
+    let n_dot_v = max(dot(normal, to_view), 0.0);
+    let reflection_direction = reflect(-to_view, normal);
+    let seen = surroundings(xz, level, reflection_direction, alpha, here, across, half_width,
+                            cross_stream, sun_open, to_sun, in.world_position);
+
+    // --- Refraction and the body of the water -------------------------------
+    // Perturb the screen uv by the surface slope, scaled by how much water the
+    // ray crosses and by the inverse distance, since a metre of slope covers
+    // fewer pixels far away.
+    let refraction_scale = mix(0.35, stage.misc.x, sea);
+    let refracted_uv = clamp(uv + normal.xz*(refraction_scale*clamp(optical_path, 0.0, 1.0)
+                             /max(view_distance, 1.0)), vec2<f32>(0.0), vec2<f32>(1.0));
+    let flat_background = textureSampleLevel(scene_texture, scene_sampler, uv, 0.0).rgb;
+    let refracted_background = textureSampleLevel(scene_texture, scene_sampler, refracted_uv, 0.0).rgb;
+    let refracted_packed = reflectionDepth(refracted_uv);
+    // The refracted tap is only trustworthy when it is sky or genuinely behind
+    // the water; otherwise it reached over a nearer surface and would smear
+    // foreground colour into the water.
+    let accept_refraction = refracted_packed.a < 0.5 || refracted_packed.z <= water_view.z;
+    let scene_linear = sceneRadiance(select(flat_background, refracted_background, accept_refraction));
+
+    // Whitewater gathers where the bed steps: over the ledges and boulders
+    // of a rapid, with dark glassy tongues of water running between them.
+    // The steps stay put as the water runs over them. A ledge throws its
+    // white water out in a train downstream of it, and the boulders between
+    // break it up, so the steps are drawn out along the flow and broken by a
+    // finer scale, not laid as round patches.
+    let step_footprint = vec2<f32>(footprint.x, footprint.y/max(half_width, 0.01));
+    let own_steps = riverSteps(along, across, step_footprint);
+    let joined_steps = riverSteps(joined_st.x, across, step_footprint);
+    let step_noise = mix(own_steps.x, joined_steps.x, joining);
+    let step_shares = riverStepShares(0.5 + (step_noise - 0.5)*restore, own_steps.y);
+    let steps = (step_shares.x + step_shares.y + step_shares.z)/3.0;
+    // Rapids turn milky below each step, where the water plunges and fills
+    // with bubbles, and run clear over the smooth tongues between.
+    let aeration = select(0.0, smoothstepf(0.3, 0.9, turbulence)*mix(0.15, 0.7, steps), river);
+    let body = WaterBody(sea, stillness, clamp(in.clarity, 0.0, 1.0)*(1.0 - sea), aeration);
+
+    let rise = viewRise(to_view, facet, underside);
+    let cos_refracted = sqrt(1.0 - (1.0 - rise*rise)/(N_WATER*N_WATER));
+    var water_body = vec3<f32>(0.0);
+    // Inland water: the eye's ray bends down into the water, so it crosses
+    // the column far more steeply than the straight line to the bed drawn
+    // behind it: at a glance from the bank a shallow bed still shows through.
+    // The bed lies as deep under the surface whatever the angle it is seen
+    // at (`bedDepth`): a deep bed seen at a glance is no clearer than seen
+    // from above.
+    // The bed was lit as if in air: its light also crossed the water on the
+    // way down, a path of its depth over the sun's height. And the light
+    // scattered back out of the column is lit less the deeper it lies: each
+    // metre of the eye's path is also a metre further down.
+    if (sea < 1.0)
+    {
+        let medium = inlandMedium(body);
+        let bed_depth = bedDepth(optical_path, rise);
+        let water_path = select(optical_path, bed_depth/max(cos_refracted, 0.05), !scene_sky && !underside);
+        let transmittance = exp(-medium.sigma_t*water_path);
+        let downwelling = exp(-medium.sigma_t*bed_depth/max(to_sun.y, 0.25));
+        let sigma_column = medium.sigma_t*(1.0 + cos_refracted/max(to_sun.y, 0.25));
+        let source = sun_colour*0.08 + moon_colour*0.08 + sky_light*0.35*seen.sky_view;
+        let in_scatter = medium.sigma_s*source*(1.0 - exp(-sigma_column*water_path))
+                       /max(sigma_column, vec3<f32>(1e-3));
+        water_body = scene_linear*transmittance*downwelling + in_scatter;
+    }
+    // The sea, as its optics preset was calibrated: Beer-Lambert along the
+    // straight path to what lies behind, in-scatter of the sunlight reaching
+    // the top of the column through the water above the shaded point, and the
+    // glow of light crossing the thinner sheet where crests are pinched.
+    if (sea > 0.0)
+    {
+        let medium = seaMedium();
+        let transmittance = exp(-medium.sigma_t*optical_path);
+        let asymmetry = clamp(stage.scatter.w, -0.99, 0.99);
+        let sun_phase = mix(henyeyGreenstein(dot(to_view, -to_sun), asymmetry),
+                            phaseRayleigh(dot(to_view, -to_sun)), 0.5);
+        let moon_phase = mix(henyeyGreenstein(dot(to_view, -to_moon), asymmetry),
+                             phaseRayleigh(dot(to_view, -to_moon)), 0.5);
+        let sun_attenuation = exp(-medium.sigma_t*max(stage.params.z - in.world_position.y, 0.0));
+        let sea_source = sun_colour*sun_phase + moon_colour*moon_phase + sky_light*(0.35/(4.0*PI));
+        var sea_body = scene_linear*transmittance
+                     + medium.sigma_s*sun_attenuation*sea_source*(1.0 - transmittance)/medium.sigma_t;
+        // `1 - jacobian` is 0 on undisturbed water, so the glow sits on the
+        // compressed crests and nowhere else (aqua's `1 - 0.5*jacobian` read
+        // half strength everywhere and washed the sea out to a pale mint).
+        sea_body += pow(crest, 2.0)*stage.sss_tint.rgb*max(to_sun.y, 0.0)*sun_colour*0.35;
+        water_body = mix(water_body, sea_body, sea);
+    }
+
+    // --- Reflection and glitter -----------------------------------------------
+    // The sky's authored gain stands in for the shores a grazing ray would
+    // find past the reach of the surroundings walk (see optics.rs): 0.75 on
+    // the open sea, 0.8 on the narrower inland water, a little less under a
+    // thunder cell, whose roughness and darkness deepen the reflection.
+    let reflected_sky = cloudSkyRadiance(reflection_direction)
+                      *mix(mix(0.8, 0.68, precipitation.z), mix(0.75, 0.66, precipitation.z), sea);
+    // Where the screen cannot show the reflection, the banks and the crowns
+    // on them hide the sky below their horizon.
+    let unseen = mix(seen.occluder, reflected_sky, seen.sky);
+    let terrain_reflection = marchWaterReflection(in.world_position, normal,
+                                                  reflection_direction, alpha, level, underside);
+    let reflected = mix(unseen, terrain_reflection.rgb, terrain_reflection.a);
     // Fresnel-weighted and normalised (waterSpecular): a low sun's glitter
-    // path keeps its clipped core and loses only its halo, and a high sun
-    // seen from a cliff no longer whitens a broad patch of sea.
+    // path keeps its clipped core and loses only its halo.
     let specular = waterSpecular(normal, to_view, to_sun, alpha);
     let moon_specular = waterSpecular(normal, to_view, to_moon, alpha);
-    let terrain_reflection = marchWaterReflection(in.world_position, normal,
-                                                   reflection_direction, alpha, stage.params.z);
-    let reflected = mix(reflected_sky, terrain_reflection.rgb, terrain_reflection.a);
 
     // A lightning strike is a short-lived local source. Its cool reflection
     // follows the wave normal, while a narrow corridor approximates the image
@@ -1803,703 +3048,304 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32>
         }
     }
 
-    // --- Fresnel composition -------------------------------------------------
-    let fresnel = clamp(godotFresnel(clamp(dot(normal, to_view), 0.0, 1.0),
-                                     stage.surface.x, stage.surface.y), 0.0, 1.0);
-    var lit = mix(body, reflected, fresnel) + specular*sun_colour + moon_specular*moon_colour
-              + flash_specular + bolt_reflection*fresnel;
+    var lit = vec3<f32>(0.0);
+    if (!underside)
+    {
+        let fresnel = clamp(godotFresnel(n_dot_v, stage.surface.x, stage.surface.y), 0.0, 1.0);
+        lit = mix(water_body, reflected, fresnel) + specular*sun_colour + moon_specular*moon_colour
+            + flash_specular + bolt_reflection*fresnel;
+    }
+    else
+    {
+        // From below, light leaving the water bends away from the normal and
+        // past the critical angle cannot leave at all: inside Snell's window
+        // the sky and the banks pour through, refracted; outside it the
+        // surface is a mirror of the water's own glow. The medium between
+        // the eye and the surface is `fs_underwater`'s.
+        let sin2_air = N_WATER*N_WATER*(1.0 - n_dot_v*n_dot_v);
+        let medium = waterMedium(body);
+        let deep = medium.sigma_s*(sun_colour*0.08 + sky_light*0.35)/max(medium.sigma_t*2.0, vec3<f32>(1e-3));
+        if (sin2_air >= 1.0)
+        {
+            lit = deep;
+        }
+        else
+        {
+            let cos_air = sqrt(1.0 - sin2_air);
+            let fresnel = godotFresnel(cos_air, stage.surface.x, stage.surface.y);
+            let leaving = refract(-to_view, normal, N_WATER);
+            let window = select(scene_linear, cloudSkyRadiance(leaving), scene_sky);
+            lit = mix(window, deep, fresnel);
+        }
+    }
 
-    // Foam is a diffuse layer above the reflecting surface: it replaces both
-    // transmission and reflection, including at grazing view angles.
+    // --- Foam -----------------------------------------------------------------
+    // Foam is a diffuse layer over the reflecting surface: it replaces both
+    // transmission and reflection, including at grazing view angles. Where it
+    // comes from depends on the water:
+    //
+    // - On the sea, the breaking crests and the shore's wash.
+    // - On any water a strong enough wind breaks the crests of its own waves:
+    //   whitecaps cover 3.84e-6 U^3.41 of a wind sea (Monahan), from about a
+    //   fresh breeze, less where the fetch has not let the sea develop.
+    // - On a river, whitewater below the bed's steps, flecks on a riffle's
+    //   standing waves, and the foam that drifts down from them.
+    var foam = 0.0;
+    let foam_uv = in.wave_position - wind_direction*stage.params.x*0.075;
+    if (sea > 0.0)
+    {
+        let whitecap = smoothstepf(0.10, 0.30, crest);
+        let coarse = mix(valueNoise(foam_uv*1.3), 0.5,
+                         smoothstepf(0.25, 0.75, pixel_footprint*1.3));
+        let bubbles = mix(valueNoise(foam_uv*5.7 + vec2<f32>(23.4, 7.1)), 0.5,
+                          smoothstepf(0.25, 0.75, pixel_footprint*5.7));
+        let lace = smoothstepf(0.22, 0.72, coarse*0.68 + bubbles*0.32);
+        let caps = whitecap*0.70*foamBreakup(foam_uv, pixel_footprint);
+        foam = (1.0 - (1.0 - caps)*(1.0 - shore_foam*mix(0.22, 1.15, lace)))*stage.misc.y*sea;
+    }
+    let coverage = 3.84e-6*pow(max(local_wind, 0.0), 3.41)
+                 * smoothstepf(0.05, 0.5, windPeakWavenumber(local_wind, 1.0e6)/windPeakWavenumber(local_wind, exposure.fetch));
+    if (coverage > 1e-5)
+    {
+        // A crest breaks once it stands as high as the share of the sea that
+        // is white would put it.
+        let sigma = sqrt(max(wind_sea.height_variance, 1e-8));
+        let threshold = 0.85*sqrt(-2.0*log(clamp(coverage, 1e-5, 0.5)));
+        let breaking = smoothstepf(threshold, threshold + 0.7, wind_sea.height/sigma)
+                     * foamBreakup(foam_uv*2.3, pixel_footprint*2.3);
+        let unresolved = smoothstepf(0.5, 2.0, pixel_footprint*4.0);
+        foam = max(foam, mix(breaking, coverage, unresolved)*0.8);
+    }
+    if (river || speed > 0.02)
+    {
+        // Foam on a run is drawn out along the current; churned in a rapid it
+        // breaks into short ragged patches.
+        let foam_stretch = select(1.0, 1.0 + 2.5*smoothstepf(0.3, 1.5, speed)*(1.0 - 0.75*turbulence), river);
+        var pattern = riverFoamPattern(st, flow, foam_stretch, time, footprint, frame_seconds);
+        if (joining > 0.001)
+        {
+            let other = riverFoamPattern(joined_st, flow, foam_stretch, time, footprint, frame_seconds);
+            pattern = 0.5 + (mix(pattern, other, joining) - 0.5)*restore;
+        }
+        // Whitewater where the bed breaks the surface, below the steps, in
+        // each third of the pixel (riverStepShares).
+        let whitewater = smoothstepf(0.35, 0.85, turbulence)*mix(vec3<f32>(0.15), vec3<f32>(0.8), step_shares);
+        // Flecks on the faces of a riffle's standing waves.
+        let flecks = water_surface.crest*riffle*0.5;
+        // Foam the whitewater upstream made drifts down as a thin lace,
+        // gathered into lines where the surface currents converge: the seams
+        // between the fast core and the slack water by the banks, a tongue
+        // down the current that wanders across the channel, and a scum in the
+        // slack edges of pools.
+        let wander = (mix(valueNoise(vec2<f32>(along/RIVER_TONGUE_WANDER, 5.3)),
+                          valueNoise(vec2<f32>(joined_st.x/RIVER_TONGUE_WANDER, 5.3)), joining) - 0.5)*0.8;
+        // The tongue is a line a sixth of a half width wide; where the pixel
+        // is wider the line is spread over it, dimmer by as much, so it
+        // neither breaks into dashes nor brightens far off.
+        let tongue_width = sqrt(1.0/36.0 + 2.0*PIXEL_FILTER_VARIANCE*step_footprint.y*step_footprint.y);
+        let off_tongue = (across - wander)/tongue_width;
+        let tongue = exp(-off_tongue*off_tongue)*(1.0/6.0)/tongue_width;
+        let seam = smoothstepf(0.5, 0.75, abs(across))*(1.0 - smoothstepf(0.82, 0.97, abs(across)));
+        let slack = smoothstepf(0.8, 0.98, abs(across))*(1.0 - smoothstepf(0.25, 0.7, speed));
+        let drift = select(0.0, supply*(0.05 + 0.25*max(tongue, seam) + 0.2*slack), river);
+        // A creek's jet carries its foam out into the pond it feeds.
+        let mouth = select(smoothstepf(0.08, 0.5, speed)*0.3, 0.0, river)*(1.0 - sea);
+        // Far off the texture averages away; keep the share of water it covers.
+        let foam_resolved = 1.0 - smoothstepf(0.15, 0.5, max(footprint.x/foam_stretch, footprint.y)*2.1);
+        let carried = max(flecks, max(drift, mouth));
+        let stream_foam = (streamFoam(max(whitewater.x, carried), pattern, foam_resolved)
+                         + streamFoam(max(whitewater.y, carried), pattern, foam_resolved)
+                         + streamFoam(max(whitewater.z, carried), pattern, foam_resolved))/3.0;
+        foam = max(foam, stream_foam);
+    }
+    foam = clamp(foam + impacts.splash*0.2 + impacts.snow_fleck*0.06, 0.0, 1.0);
+    // Bubbles sit on the upper surface. Avoid a bright foam sheet underwater.
+    foam *= above_water;
+    // Sea foam is white; stream foam is cream with the same tannins that
+    // stain the water, and under the trees it sees only the sky the crowns
+    // leave. It is a bright diffuse surface, so its radiance sits a little
+    // above the sky it is lit by.
+    let stained = (1.0 - sea)*(1.0 - body.alpine);
+    let foam_albedo = mix(vec3<f32>(0.92, 0.95, 0.96), vec3<f32>(0.86, 0.84, 0.76), stained);
+    let foam_colour = foam_albedo
+                    * ((sun_colour*max(dot(normal, to_sun), 0.0)
+                        + moon_colour*max(dot(normal, to_moon), 0.0))*mix(0.05, 0.06, stained)
+                       + skyAmbient(normal, in.world_position)*mix(0.75, 0.8*seen.sky_view, stained));
     lit = mix(lit, foam_colour, foam);
     // Resolve the last few centimetres into the actual bank instead of a hard
     // cutout. The measured ray length makes this agree with visible geometry.
-    let contact_coverage = smoothstepf(0.0, 0.12, optical_path);
-    lit = mix(scene_linear, lit, contact_coverage);
+    lit = mix(scene_linear, lit, smoothstepf(0.0, mix(0.05, 0.12, sea), optical_path));
 
     // Raymarch aerial scattering only up to this water surface. Height fog,
-    // sunset shafts and the volumetric switch now agree with the terrain pass.
+    // sunset shafts and the volumetric switch agree with the terrain pass.
     let fog = integrateAtmosphere(-to_view, view_distance);
     lit = lit*fog.transmittance + fog.scattering;
-
     return vec4<f32>(pow(acesFilm(lit*globals.params.z), vec3<f32>(1.0/2.2)), 1.0);
 }
 
-// ===========================================================================
-// Rivers and creeks
-// ===========================================================================
-//
-// The same water as the sea, flowing. Each river's surface is a ribbon at
-// its water level (src/rivers/surface.rs) whose vertices carry the current,
-// and each lake's a flat sheet. The surface is shaded with the sea's optics (Fresnel, sky and screen-space reflections,
-// Beer-Lambert body and refraction, sun glitter, rain rings, fog) and two
-// things the sea does not have:
-//
-// - Flow-mapped ripples. Two phases of procedural ripple noise are carried
-//   downstream by the local current and cross-faded, so the texture streams
-//   with the water at its own speed, stretched along the flow where it runs
-//   fast and choppy where the bed is rough.
-// - Whitewater. Rapids and eddy lines along fast banks carry advected
-//   foam.
+// ---------------------------------------------------------------------------
+// Fullscreen passes: the copy under the surfaces, and the submerged medium
+// ---------------------------------------------------------------------------
 
-// The plants' shadow cascades, as the composite reads them, so a creek under
-// the forest lies in the same shade as its banks. Mirrors
-// `VegetationShadows` in composite.wgsl.
-struct VegetationShadows {
-    view_projection: array<mat4x4<f32>, 3>,
-    splits: vec4<f32>, // horizontal radius of each cascade; w far radius, metres
-    texel: vec4<f32>,
-    light: vec4<f32>,
-    params: vec4<f32>,
-};
-@group(2) @binding(1) var vegetation_shadow_map_0: texture_depth_2d;
-@group(2) @binding(4) var vegetation_shadow_map_1: texture_depth_2d;
-@group(2) @binding(5) var vegetation_shadow_map_2: texture_depth_2d;
-@group(2) @binding(2) var<uniform> vegetation_shadows: VegetationShadows;
-@group(2) @binding(3) var vegetation_shadow_sampler: sampler_comparison;
-
-fn riverPlantShadowPcf(map: texture_depth_2d, uv: vec2<f32>, depth: f32) -> f32 {
-    let step = 1.0/f32(textureDimensions(map).x);
-    var lit = 0.0;
-    for (var y = 0; y < 2; y++) {
-        for (var x = 0; x < 2; x++) {
-            let offset = vec2<f32>(f32(x) - 0.5, f32(y) - 0.5)*step*1.5;
-            lit += textureSampleCompareLevel(map, vegetation_shadow_sampler,
-                                             uv + offset, depth);
-        }
-    }
-    return lit;
-}
-
-fn riverPlantShadowCascade(world_position: vec3<f32>, cascade: u32) -> f32 {
-    let texel = vegetation_shadows.texel[cascade];
-    let lookup = world_position + vec3<f32>(0.0, texel*1.5, 0.0) - vegetation_shadows.light.xyz*texel*1.5;
-    let clip = vegetation_shadows.view_projection[cascade]*vec4<f32>(lookup, 1.0);
-    let uv = vec2<f32>(0.5 + 0.5*clip.x, 0.5 - 0.5*clip.y);
-    if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || clip.z > 1.0) {
-        return 1.0;
-    }
-    switch cascade {
-        case 0u: { return riverPlantShadowPcf(vegetation_shadow_map_0, uv, clip.z)*0.25; }
-        case 1u: { return riverPlantShadowPcf(vegetation_shadow_map_1, uv, clip.z)*0.25; }
-        default: { return riverPlantShadowPcf(vegetation_shadow_map_2, uv, clip.z)*0.25; }
-    }
-}
-
-// Light reaching a water point through the plants: the cascade covering its
-// horizontal distance from the camera, blended into the next as on the banks,
-// with a 2x2 grid of bilinear comparisons (the composite's 4x4 tent is more
-// than a rippling surface needs).
-fn riverPlantShadow(world_position: vec3<f32>) -> f32 {
-    let horizontal_distance = length(world_position.xz - globals.camera_position.xz);
-    if (vegetation_shadows.light.w < 0.5 || horizontal_distance >= vegetation_shadows.splits.w) {
-        return 1.0;
-    }
-    var cascade = 2u;
-    for (var c = 0u; c < 2u; c++) {
-        if (horizontal_distance < vegetation_shadows.splits[c]) {
-            cascade = c;
-            break;
-        }
-    }
-    var lit = riverPlantShadowCascade(world_position, cascade);
-    if (cascade < 2u) {
-        let start = select(0.0, vegetation_shadows.splits[max(cascade, 1u) - 1u], cascade > 0u);
-        let end = vegetation_shadows.splits[cascade];
-        let band = (end - start)*vegetation_shadows.params.x;
-        let blend = smoothstep(0.0, 1.0, (horizontal_distance - (end - band))/max(band, 1e-3));
-        if (blend > 0.0) {
-            lit = mix(lit, riverPlantShadowCascade(world_position, cascade + 1u), blend);
-        }
-    }
-    let far_fade = smoothstepf(vegetation_shadows.splits.w*0.85, vegetation_shadows.splits.w, horizontal_distance);
-    return mix(1.0, mix(lit, 1.0, far_fade), vegetation_shadows.params.y);
-}
-
-// Forest stream water: clear, but stained the colour of weak tea by the
-// tannins and humic acids the rain leaches from the forest floor. Dissolved
-// organic matter absorbs steeply toward the blue (about 1.5/m at 440 nm,
-// a fifth of that in the green), pure water takes the red, and a little silt
-// adds to all three. Through a hand's depth the bed shows golden; through a
-// metre its light is amber and a third of what it was; a pool two metres
-// deep is a dark brown. The silt's backscatter is nearly grey, so a deep
-// body keeps that dull amber-brown and never the sea's blue or a swimming
-// pool's green.
-// Metres between a rapid's steps, and over which the current's tongue
-// wanders across its channel. Constant, not in the channel's widths: the
-// half width varies along the ribbon, and dividing the distance from the
-// river's head by it would scramble the pattern's scale far downstream.
-const RIVER_STEP_SPACING: f32 = 4.0;
-const RIVER_TONGUE_WANDER: f32 = 18.0;
-const RIVER_EXTINCTION: vec3<f32> = vec3<f32>(0.40, 0.38, 1.05);
-const RIVER_SCATTER: vec3<f32> = vec3<f32>(0.012, 0.012, 0.010);
-// A pond gathers more of the forest's tannin and grows its own plankton:
-// browner and darker, a mirror over its depths with a golden margin.
-const LAKE_EXTINCTION: vec3<f32> = vec3<f32>(0.55, 0.58, 1.60);
-const LAKE_SCATTER: vec3<f32> = vec3<f32>(0.010, 0.010, 0.008);
-// Bubbles beaten into whitewater scatter every colour alike and absorb none
-// (per metre at full aeration); half of it is counted as leaving the eye ray.
-const BUBBLE_SCATTER: f32 = 2.4;
-// What a reflection meets where it does not meet the sky: foliage seen from
-// the water, and how tall a closed canopy stands over its ground.
-const CANOPY_ALBEDO: vec3<f32> = vec3<f32>(0.05, 0.085, 0.035);
-const CANOPY_HEIGHT: f32 = 18.0;
-// Open ground of no particular colour, outside the canopy capture.
-const OPEN_GROUND: vec4<f32> = vec4<f32>(0.10, 0.12, 0.06, 1.0);
-// Mean square of riverNoise's gradient along one axis, per unit of its
-// domain (quintic value noise over uniform hashes; measured). The slope a
-// pixel cannot resolve is moved into roughness at exactly this variance.
-const RIVER_NOISE_SLOPE_VARIANCE: f32 = 0.187;
-
-struct RiverVertexOutput
+struct FullscreenOutput
 {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) world_position: vec3<f32>,
-    @location(1) velocity: vec2<f32>,
-    // x across the channel (-1..1 between the waterlines), y whitewater,
-    // z the surface's own height, w still water (1 on a lake).
-    @location(2) channel: vec4<f32>,
-    // x metres downstream from the river's head, y its half width (0 on a
-    // lake's sheet), z foam drifting down from whitewater upstream, w how far
-    // the water has turned to the sea's (1 where a river meets the sea).
-    @location(3) stream: vec4<f32>,
-    // Metres across the channel in its own frame.
-    @location(4) side: f32,
-    // Where a tributary's water becomes its parent's: the parent's frame
-    // (xy) and how far its ripples and foam are laid in it (z).
-    @location(5) joined: vec3<f32>,
+    @builtin(position) position: vec4<f32>,
 };
 
 @vertex
-fn vs_river(
-    @location(0) position: vec3<f32>,
-    @location(1) velocity: vec2<f32>,
-    @location(2) across: f32,
-    @location(3) turbulence: f32,
-    @location(4) still: f32,
-    @location(5) along: f32,
-    @location(6) half_width: f32,
-    @location(7) foam: f32,
-    @location(8) sea: f32,
-    @location(9) side: f32,
-    @location(10) joined: vec3<f32>,
-) -> RiverVertexOutput
+fn vs_fullscreen(@builtin(vertex_index) vertex: u32) -> FullscreenOutput
 {
-    // A distant channel is narrower than the clipmap's triangles there,
-    // which round its banks off above the water. Lift a distant surface by
-    // about the bank those triangles leave (their spacing grows with
-    // distance, a metre per 110 m), so a river still shows from a ridge.
-    let flat_distance = length(position.xz - globals.camera_position.xz);
-    let spacing = max(1.0, flat_distance/110.0);
-    // A lake is wide enough for any triangles and stays at its level. So does
-    // a river where it meets a lake or the sea (`still` is 1 there, fading to
-    // 0 some 30 m along it), so the two surfaces still meet from afar.
-    let lift = smoothstepf(150.0, 650.0, flat_distance)*min(spacing*0.45, 12.0)*(1.0 - clamp(still, 0.0, 1.0));
-    let world = vec3<f32>(position.x, position.y + lift, position.z);
-    var out: RiverVertexOutput;
-    out.clip_position = globals.projection*globals.view*vec4<f32>(world, 1.0);
-    out.world_position = world;
-    out.velocity = velocity;
-    out.channel = vec4<f32>(across, turbulence, position.y, still);
-    out.stream = vec4<f32>(along, half_width, foam, sea);
-    out.side = side;
-    out.joined = joined;
-    return out;
+    var corner = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    var output: FullscreenOutput;
+    output.position = vec4<f32>(corner[vertex], 0.0, 1.0);
+    return output;
 }
 
-// Value noise with its analytic gradient (x value, yz d/dp), quintic.
-fn riverNoise(p: vec2<f32>) -> vec3<f32>
-{
-    let i = floor(p);
-    let f = p - i;
-    let u = f*f*f*(f*(f*6.0 - 15.0) + 10.0);
-    let du = 30.0*f*f*(f*(f - 2.0) + 1.0);
-    let a = hash21(i);
-    let b = hash21(i + vec2<f32>(1.0, 0.0));
-    let c = hash21(i + vec2<f32>(0.0, 1.0));
-    let d = hash21(i + vec2<f32>(1.0, 1.0));
-    let k = a - b - c + d;
-    let value = a + (b - a)*u.x + (c - a)*u.y + k*u.x*u.y;
-    let gradient = du*vec2<f32>(b - a + k*u.y, c - a + k*u.x);
-    return vec3<f32>(value, gradient);
-}
-
-struct RiverSurface
-{
-    // Height gradient in the channel's frame: (downstream, across).
-    slope: vec2<f32>,
-    // Slope variance the pixel cannot resolve.
-    variance: f32,
-    // 0..1 on the faces of standing waves, where a riffle's flecks sit.
-    crest: f32,
-};
-
-// The water's surface in the channel's own frame `st` (metres downstream and
-// across; a lake's is world XZ), with `flow` the current in that frame.
-//
-// - Turbulent ripples ride the current in two cross-faded phases. Their
-//   slope grows with the bed's roughness and the current (RMS about 0.02 on
-//   a run, 0.07 on a riffle, 0.17 in whitewater), and fast water draws them
-//   out into streaks along the flow.
-// - Boils: in runs and pools the turbulence of the reach above wells up as
-//   glassy domes a couple of metres across, ringed by ripples, drifting down.
-// - Standing waves over riffles, fixed to the bed: a gravity wave holds still
-//   against a current running at its own phase speed, so its wavelength is
-//   2*pi*U^2/g (0.6 m at 1 m/s, 1.4 m at 1.5 m/s). Crests lie across the
-//   flow, kinked and broken by the bed, and swell and ebb.
-//
-// What the pixel cannot resolve leaves the normal and becomes roughness, at
-// the variance it really had (it used to be counted some 80 times over,
-// which spread the sun across the whole of any distant water).
-fn riverSurface(st: vec2<f32>, flow: vec2<f32>, time: f32, roughness: f32, riffle: f32,
-                river: bool, footprint: vec2<f32>) -> RiverSurface
-{
-    var result = RiverSurface(vec2<f32>(0.0), 0.0, 0.0);
-    let speed = length(flow);
-    // Only a channel has a frame to stretch its ripples along.
-    let stretch = select(1.0, 1.0 + 1.8*smoothstepf(0.3, 1.8, speed)*(1.0 - 0.6*roughness), river);
-    let steepness = 0.018 + 0.20*roughness + 0.012*min(speed, 3.0);
-    let boils = select(0.0, smoothstepf(0.3, 1.0, speed)*(1.0 - smoothstepf(0.25, 0.6, roughness)), river);
-    let boil_resolved = 1.0 - smoothstepf(0.4, 1.2, max(footprint.x, footprint.y));
-    let boil_slope = 0.035/2.2;
-    let period = 1.6;
-    for (var layer = 0u; layer < 2u; layer += 1u)
-    {
-        let cycle_time = time/period + f32(layer)*0.5;
-        let phase = fract(cycle_time);
-        let cycle = floor(cycle_time);
-        let weight = 1.0 - abs(2.0*phase - 1.0);
-        let jitter = vec2<f32>(hash21(vec2<f32>(cycle, f32(layer)*17.3)),
-                               hash21(vec2<f32>(f32(layer)*5.1, cycle)))*31.0;
-        let advected = st - flow*(phase*period);
-        let boil = riverNoise(advected*(1.0/2.2) + jitter*0.37 + vec2<f32>(3.1, 8.9));
-        let dome = smoothstepf(0.58, 0.85, boil.x)*boils;
-        let rim = (1.0 - abs(2.0*smoothstepf(0.45, 0.75, boil.x) - 1.0))*boils;
-        result.slope += boil.yz*boil_slope*boils*weight*boil_resolved;
-        result.variance += boil_slope*boil_slope*RIVER_NOISE_SLOPE_VARIANCE*2.0*boils*boils
-                         *weight*weight*(1.0 - boil_resolved*boil_resolved);
-        // A dome is glassy on top and stirred at its rim.
-        let stir = 1.0 - 0.75*dome + 0.6*rim;
-        for (var octave = 0u; octave < 3u; octave += 1u)
-        {
-            let wavelength = select(select(0.85, 0.32, octave == 1u), 0.12, octave == 2u);
-            let c = steepness*stir*select(1.0, 0.8, octave == 2u);
-            let along_scale = wavelength*stretch;
-            let q = vec2<f32>(advected.x/along_scale, advected.y/wavelength)
-                  + jitter + vec2<f32>(f32(octave)*7.7);
-            let noise = riverNoise(q);
-            let resolved = (1.0 - smoothstepf(0.18, 0.6, footprint.x/along_scale))
-                         *(1.0 - smoothstepf(0.18, 0.6, footprint.y/wavelength));
-            // Height c*wavelength*noise: d/ds = c*noise.y/stretch, d/dt = c*noise.z.
-            result.slope += vec2<f32>(noise.y/stretch, noise.z)*c*weight*resolved;
-            result.variance += c*c*RIVER_NOISE_SLOPE_VARIANCE*(1.0/(stretch*stretch) + 1.0)
-                             *weight*weight*(1.0 - resolved*resolved);
-        }
-    }
-    if (riffle > 0.001)
-    {
-        // Wavelengths are taken between fixed half-octave rungs, so a crest
-        // stays continuous where the current slows toward the banks.
-        let level = 2.0*log2(clamp(0.64*speed*speed, 0.35, 2.5)/0.35);
-        let base = floor(level);
-        for (var k = 0u; k < 2u; k += 1u)
-        {
-            let rung = base + f32(k);
-            let share = select(1.0 - (level - base), level - base, k == 1u);
-            let wavelength = 0.35*exp2(rung*0.5);
-            let seed = vec2<f32>(rung*13.7, rung*7.1);
-            let kink = valueNoise(vec2<f32>(st.x/(4.0*wavelength), st.y/(1.3*wavelength)) + seed);
-            let lengths = smoothstepf(0.3, 0.7, valueNoise(vec2<f32>(st.x/(3.0*wavelength),
-                                                                     st.y/(0.9*wavelength)) + seed.yx));
-            let pulse = 0.8 + 0.2*sin(time*(4.0/sqrt(wavelength)) + 6.2831853*lengths);
-            let wave = 6.2831853*fract(st.x/wavelength + 0.9*kink);
-            let amplitude = 0.20*riffle*lengths*pulse*share;
-            let resolved = 1.0 - smoothstepf(0.2, 0.6, footprint.x/wavelength);
-            result.slope.x += amplitude*cos(wave)*resolved;
-            result.variance += 0.5*amplitude*amplitude*(1.0 - resolved*resolved);
-            result.crest += smoothstepf(0.55, 0.95, sin(wave))*lengths*share*resolved;
-        }
-    }
-    return result;
-}
-
-// Foam carried downstream in the channel's frame and drawn out into streaks
-// along the current, 0..1 about a mean of 0.5.
-fn riverFoamPattern(st: vec2<f32>, flow: vec2<f32>, stretch: f32, time: f32,
-                    footprint: vec2<f32>) -> f32
-{
-    let period = 2.2;
-    let squeeze = vec2<f32>(1.0/stretch, 1.0);
-    let extent = max(footprint.x/stretch, footprint.y);
-    let coarse_blur = smoothstepf(0.25, 0.75, extent*2.1);
-    let fine_blur = smoothstepf(0.25, 0.75, extent*7.3);
-    var pattern = 0.0;
-    for (var layer = 0u; layer < 2u; layer += 1u)
-    {
-        let cycle_time = time/period + f32(layer)*0.5;
-        let phase = fract(cycle_time);
-        let weight = 1.0 - abs(2.0*phase - 1.0);
-        let jitter = vec2<f32>(hash21(vec2<f32>(floor(cycle_time), f32(layer) + 3.0)),
-                               hash21(vec2<f32>(f32(layer) + 11.0, floor(cycle_time))))*23.0;
-        let q = (st - flow*(phase*period))*squeeze + jitter;
-        let coarse = mix(valueNoise(q*2.1), 0.5, coarse_blur);
-        let bubbles = mix(valueNoise(q*7.3 + vec2<f32>(13.1, 4.7)), 0.5, fine_blur);
-        pattern += (coarse*0.62 + bubbles*0.38)*weight;
-    }
-    return pattern;
-}
-
-// The ground at `world_xz` (x) and how much of it the camera's one-metre map
-// gave (y). That map holds the carved channels and their banks; beyond it
-// only the twelve-metre lighting map remains, which sees valleys but not a
-// creek's own cut.
-fn riverGround(world_xz: vec2<f32>) -> vec2<f32>
-{
-    var coarse = -1.0e4;
-    if (globals.heightfield.z >= 1.0)
-    {
-        coarse = terrainHeightAt(world_xz);
-    }
-    if (stage.shore_map.z < 1.0)
-    {
-        return vec2<f32>(coarse, 0.0);
-    }
-    let uv = (world_xz - stage.shore_map.xy)/stage.shore_map.z + vec2<f32>(0.5);
-    let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
-    let weight = smoothstepf(0.0, 0.03, edge);
-    let fine = textureSampleLevel(shoreline_heightfield, shoreline_sampler,
-                                  clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).r;
-    return vec2<f32>(mix(coarse, fine, weight), weight);
-}
-
-// The ground's colour (rgb) and the share of open sky the tree crowns leave
-// over it (a): the grass capture, whose alpha vegetation.wgsl's canopy pass
-// darkens under every crown. Open ground outside it.
-fn riverCanopy(world_xz: vec2<f32>) -> vec4<f32>
-{
-    if (stage.canopy_map.z < 1.0)
-    {
-        return OPEN_GROUND;
-    }
-    let uv = (world_xz - stage.canopy_map.xy)/stage.canopy_map.z + vec2<f32>(0.5);
-    let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
-    let texel = textureSampleLevel(canopy_texture, canopy_sampler,
-                                   clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0);
-    return mix(OPEN_GROUND, vec4<f32>(texel.rgb, clamp(texel.a, 0.0, 1.0)),
-               smoothstepf(0.0, 0.03, edge));
-}
-
-struct RiverSurroundings
-{
-    // Share of the reflected lobe that reaches open sky.
-    sky: f32,
-    // Radiance of the banks and crowns that hide the rest.
-    occluder: vec3<f32>,
-    // Open sky over the water itself, for its ambient light.
-    sky_view: f32,
-};
-
-// What a reflection sees where the screen cannot show it. Walk out from the
-// water along the reflected ray's bearing and find the highest elevation the
-// banks and the crowns on them reach: the ground, plus CANOPY_HEIGHT where
-// the canopy capture is closed. A ray below that elevation meets the bank or
-// the forest, not the sky. Beyond the one-metre map a river's own cut stands
-// in: banks rising from about 0.35 m to 1.35 m over the two metres past its
-// waterline. So a creek in its cut under the trees mirrors dark banks and
-// foliage everywhere but up its own corridor, and a pond in a clearing keeps
-// its sky.
-fn riverSurroundings(world_xz: vec2<f32>, level: f32, reflection: vec3<f32>, alpha: f32,
-                     here: vec4<f32>, across: f32, half_width: f32, cross_stream: vec2<f32>,
-                     sun_open: vec3<f32>, to_sun: vec3<f32>,
-                     world_position: vec3<f32>) -> RiverSurroundings
-{
-    let run = length(reflection.xz);
-    let bearing = select(vec2<f32>(1.0, 0.0), reflection.xz/max(run, 1e-4), run > 1e-4);
-    // Tangent of the reflected ray's elevation.
-    let rise = reflection.y/max(run, 1e-3);
-    var horizon = 0.0;
-    var crown_share = 0.0;
-    var bank_albedo = here.rgb;
-    var fine = 1.0;
-    for (var i = 0u; i < 6u; i += 1u)
-    {
-        // 1.5 m out to 81 m.
-        let distance = 1.5*exp2(f32(i)*1.15);
-        let p = world_xz + bearing*distance;
-        let ground = riverGround(p);
-        let canopy = riverCanopy(p);
-        let crown = (1.0 - canopy.a)*CANOPY_HEIGHT;
-        let top = ground.x + crown - level;
-        if (top > horizon*distance)
-        {
-            horizon = top/distance;
-            crown_share = clamp(crown/max(top, 0.5), 0.0, 1.0);
-            bank_albedo = canopy.rgb;
-        }
-        if (i == 0u)
-        {
-            fine = ground.y;
-        }
-    }
-    if (half_width > 0.01)
-    {
-        let sideways = dot(bearing, cross_stream);
-        let to_bank = half_width*(1.0 - across*sign(sideways))/max(abs(sideways), 0.05);
-        horizon = max(horizon, 1.35/(max(to_bank, 0.0) + 2.0)*(1.0 - fine));
-    }
-    // The lobe's spread, in the same tangent measure.
-    let spread = (0.04 + 1.5*alpha)*(1.0 + rise*rise);
-    var sky = smoothstepf(horizon - spread, horizon + spread, rise);
-    // Crowns over the water itself hide even the steep rays.
-    sky *= mix(1.0, here.a, smoothstepf(0.3, 1.5, rise));
-    // The banks and crowns face the water: lit by the sky's fill, and by
-    // the sun where it falls on the side the ray meets.
-    let facing = normalize(vec3<f32>(-bearing.x, 0.35, -bearing.y));
-    let albedo = mix(bank_albedo, CANOPY_ALBEDO, crown_share);
-    let occluder = albedo*(sun_open*(max(dot(facing, to_sun), 0.0)*0.45/PI)
-                           + skyAmbient(facing, world_position)*0.35);
-    let sky_view = here.a*(0.65 + 0.35/(1.0 + horizon*horizon));
-    return RiverSurroundings(sky, occluder, sky_view);
-}
-
+// Copies the composited frame into the water pass's output target. Not from
+// bevy-aqua: `ViewTarget::post_process_write()` ping-pongs between two
+// textures, and the water surfaces only cover the pixels they draw, so the
+// pass writes the composite's output for every pixel first and the surfaces
+// over it. Same top-down uv convention as the composite and FXAA: `position`
+// is in the target's pixel space, so `position.xy * viewport.zw` is a plain
+// same-frame blit with no flip.
 @fragment
-fn fs_river(in: RiverVertexOutput) -> @location(0) vec4<f32>
+fn fs_blit(in: FullscreenOutput) -> @location(0) vec4<f32>
 {
-    let uv = in.clip_position.xy*globals.viewport.zw;
-    let camera_position = globals.camera_position.xyz;
-    let to_camera = camera_position - in.world_position;
-    let view_distance = length(to_camera);
-    let to_view = to_camera/max(view_distance, 1e-3);
-    let time = stage.params.x;
-    let across = in.channel.x;
-    // Down its last reach a river spreads and slows into the sea's: its
-    // rapids and its foam give out as its water turns to the sea's.
-    let sea = clamp(in.stream.w, 0.0, 1.0);
-    let turbulence = in.channel.y*(1.0 - sea);
-    let surface_level = in.channel.z;
-    let stillness = clamp(in.channel.w, 0.0, 1.0);
-    let along = in.stream.x;
-    let half_width = in.stream.y;
-    let river = half_width > 0.01;
-    // Foam made by whitewater upstream and still drifting here.
-    let supply = clamp(in.stream.z*3.0, 0.0, 1.0)*(1.0 - sea);
-    // Derivatives first, in uniform control flow.
-    let pixel_dx = dpdx(in.world_position);
-    let pixel_dy = dpdy(in.world_position);
-    let pixel_footprint = max(length(pixel_dx.xz), length(pixel_dy.xz));
+    return textureSample(scene_texture, scene_sampler, in.position.xy*globals.viewport.zw);
+}
 
-    let precipitation = weatherPrecipitation(in.world_position);
-    let water_view = (globals.view*vec4<f32>(in.world_position, 1.0)).xyz;
-    let packed = reflectionDepth(uv);
-    let scene_sky = packed.a < 0.5;
+/// World-space direction of the view ray through `uv`. Built from the
+/// projection's own scale terms rather than an inverse matrix: for a symmetric
+/// perspective, view space x/y are `ndc / (projection[0][0], projection[1][1])`
+/// at unit depth. uv.y is top-down and view space y is up, so it flips.
+///
+/// View -> world is the TRANSPOSE of `globals.view`, which is world -> view and
+/// whose rotation is orthonormal. A transpose is the dot product of the vector
+/// with each ROW, and WGSL stores the matrix column-major, so row `i` is
+/// `vec3(view[0][i], view[1][i], view[2][i])` — NOT `view[i].xyz`, which is
+/// column `i`. The three dot products below are that transpose.
+///
+/// This used to read `v.x*view[0] + v.y*view[1] + v.z*view[2]`, which is the
+/// other contraction — `view * v`, world -> view applied to a view-space
+/// vector. For an orthonormal basis the two differ only by which index is
+/// summed, so the error is a function of orientation rather than a constant,
+/// and it is exactly zero in two orientations reachable by accident: pitch 0,
+/// and yaw 180, where this matrix is symmetric and `view * v` coincides with
+/// its transpose. Everywhere else it is severe — at yaw 90 it returned
+/// (-1, 0, 0) for a true forward of (0.906, -0.423, 0), 155 degrees away, and
+/// at yaw 0 pitch -25 it put the horizon on row 381 of 450 where the truth is
+/// row 69. `to_view.y` decides which rays reach the surface overhead (and
+/// drove the Snell window this pass used to draw, which therefore sat where
+/// the camera was not pointing: at yaw 0, 90 and 270 the contraction never
+/// reached the window's 0.5412 threshold at all, so the window was simply
+/// absent, and it appeared only at yaw 180 where the matrix is symmetric).
+fn rayDirection(uv: vec2<f32>) -> vec3<f32>
+{
+    let ndc = vec2<f32>(uv.x*2.0 - 1.0, 1.0 - uv.y*2.0);
+    let view_direction = normalize(vec3<f32>(ndc.x/max(globals.projection[0][0], 1e-6),
+                                             ndc.y/max(globals.projection[1][1], 1e-6),
+                                             -1.0));
+    return vec3<f32>(dot(globals.view[0].xyz, view_direction),
+                     dot(globals.view[1].xyz, view_direction),
+                     dot(globals.view[2].xyz, view_direction));
+}
+
+// Trace cloud occlusion from where light enters the water. The homogeneous
+// medium uses its optical midpoint as a representative scattering position.
+fn underwaterCloudShadow(position: vec3<f32>, to_light: vec3<f32>) -> f32 {
+    let depth = max(stage.eye_water.x - position.y, 0.0);
+    let water_light = normalize(vec3<f32>(to_light.x/N_WATER,
+        sqrt(max(1.0 - (1.0 - to_light.y*to_light.y)/(N_WATER*N_WATER), 0.001)),
+        to_light.z/N_WATER));
+    let entry = position + water_light*(depth/max(water_light.y, 0.1));
+    return cloudShadow(entry, to_light);
+}
+
+// The medium around a submerged eye, whichever water it is in: the sea's, a
+// river's or a lake's (`stage.eye_water`, `stage.eye_body`), with that
+// water's own optics. The incoming composite has been exposed, tone-mapped
+// and gamma encoded; the transform is inverted before attenuation and
+// applied once to the final HDR result. Sunlight, moonlight and the sky
+// through Snell's window follow the day clock.
+@fragment
+fn fs_underwater(in: FullscreenOutput) -> @location(0) vec4<f32>
+{
+    let uv = in.position.xy*globals.viewport.zw;
+    let fade = clamp(stage.eye_water.z, 0.0, 1.0);
+
+    // Every sample up front: this shader branches on sampled data below and
+    // WGSL forbids implicit-derivative sampling in non-uniform control flow.
+    let scene = textureSample(scene_texture, scene_sampler, uv);
+    let packed = textureSample(gbuffer_position, gbuffer_sampler, uv);
+    if (fade <= 0.0)
+    {
+        return scene;
+    }
+    let level = stage.eye_water.x;
+
+    // Optical path: the world distance from the eye to whatever the ray hits,
+    // capped at the medium's maximum and, for upward rays, at the surface.
     var optical_path = PATH_LENGTH_MAX;
-    if (!scene_sky)
+    if (packed.a >= 0.5)
     {
-        optical_path = min(distance(packed.xyz, water_view), PATH_LENGTH_MAX);
+        // packed.xyz is the G-buffer's view-space position; its length is
+        // already the eye distance.
+        optical_path = min(length(packed.xyz), PATH_LENGTH_MAX);
     }
 
+    let to_view = rayDirection(uv);
+    if (to_view.y > 0.001)
+    {
+        let surface_path = max(level - globals.camera_position.y, 0.0)/to_view.y;
+        optical_path = min(optical_path, surface_path);
+    }
+    let scene_linear = sceneRadiance(scene.rgb);
+    let body = WaterBody(stage.eye_water.w, stage.eye_body.x, clamp(stage.eye_body.z, 0.0, 1.0)*(1.0 - stage.eye_water.w),
+                         smoothstepf(0.3, 0.9, stage.eye_body.y)*0.4);
+    let medium = waterMedium(body);
+    let transmittance = exp(-medium.sigma_t*optical_path);
+
+    // In-scattered sunlight. The eye is inside the medium, so the whole path is
+    // the water column — there is nothing above the shaded point to attenuate
+    // first, unlike the surface pass.
     let to_sun = normalize(-globals.sun_direction.xyz);
+    // rayDirection points from the eye toward the scene, so forward
+    // scattering peaks while looking toward the source.
+    let asymmetry = clamp(mix(0.8, stage.scatter.w, body.sea), -0.99, 0.99);
+    let cos_theta = dot(to_view, to_sun);
+    let phase = mix(henyeyGreenstein(cos_theta, asymmetry), phaseRayleigh(cos_theta), 0.5);
     let to_moon = normalize(-globals.moon_direction.xyz);
-    let above_water = smoothstepf(-0.08, 0.12, camera_position.y - in.world_position.y);
-
-    // --- The current and the surface ------------------------------------------
-    // A river's surface lives in its own frame, metres downstream and across,
-    // so its ripples and standing waves follow every bend. A lake has no frame
-    // and keeps world axes; its current only carries the ripples.
-    let velocity = in.velocity;
-    let speed = length(velocity);
-    let downstream = select(vec2<f32>(1.0, 0.0), velocity/max(speed, 1e-4), river && speed > 1e-4);
-    let cross_stream = vec2<f32>(-downstream.y, downstream.x);
-    let st = select(in.world_position.xz, vec2<f32>(along, in.side), river);
-    // Where a tributary's water becomes its parent's, its ripples, steps and
-    // foam cross-fade into those laid in the parent's own frame: two frames
-    // at an angle cannot be blended into one without squeezing the ripples
-    // between them. Two patterns mixed lose contrast, which `restore` puts
-    // back.
-    let joined_st = in.joined.xy;
-    let joining = select(0.0, clamp(in.joined.z, 0.0, 1.0), river);
-    let restore = inverseSqrt((1.0 - joining)*(1.0 - joining) + joining*joining);
-    let flow = select(velocity, vec2<f32>(speed, 0.0), river);
-    // The pixel's footprint along each axis of that frame: a grazing view
-    // stretches it along the view, not across the flow.
-    let footprint = vec2<f32>(max(abs(dot(pixel_dx.xz, downstream)), abs(dot(pixel_dy.xz, downstream))),
-                              max(abs(dot(pixel_dx.xz, cross_stream)), abs(dot(pixel_dy.xz, cross_stream))));
-    let roughness = clamp(turbulence*0.8 + smoothstepf(0.6, 3.0, speed)*0.25, 0.0, 1.0);
-    let riffle = select(0.0, smoothstepf(0.03, 0.2, turbulence)*smoothstepf(0.45, 1.2, speed), river);
-    var water_surface = riverSurface(st, flow, time, roughness, riffle, river, footprint);
-    if (joining > 0.001)
-    {
-        let other = riverSurface(joined_st, flow, time, roughness, riffle, river, footprint);
-        water_surface.slope = mix(water_surface.slope, other.slope, joining)*restore;
-        water_surface.variance = mix(water_surface.variance, other.variance, joining);
-        water_surface.crest = mix(water_surface.crest, other.crest, joining);
+    let scatter_position = globals.camera_position.xyz + to_view*optical_path*0.5;
+    var sun_visibility = 1.0;
+    if (globals.settings_a.x > 0.001) {
+        sun_visibility = underwaterCloudShadow(scatter_position, to_sun);
     }
-    let impacts = waterImpacts(in.world_position.xz, globals.storm.z, pixel_footprint,
-                               view_distance, precipitation.x, precipitation.y, precipitation.w);
-    let slope = downstream*water_surface.slope.x + cross_stream*water_surface.slope.y + impacts.slope;
-    var normal = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
-    // Seen from above, a facet tipped away from the eye is met edge-on, not
-    // from behind: bend it back just into view. From below, the surface is
-    // the other side of the same sheet.
-    let facing = dot(normal, to_view);
-    if (camera_position.y >= surface_level)
-    {
-        normal = normalize(normal + to_view*max(0.02 - facing, 0.0));
+    var moon_visibility = 1.0;
+    if (globals.atmosphere.y > 0.001) {
+        moon_visibility = underwaterCloudShadow(scatter_position, to_moon);
     }
-    else if (facing < 0.0)
-    {
-        normal = -normal;
-    }
+    let moon_phase = mix(henyeyGreenstein(dot(to_view, to_moon), asymmetry),
+                         phaseRayleigh(dot(to_view, to_moon)), 0.5);
+    let local_weather = weatherSeverity(scatter_position.xz);
+    let convective_core = weatherConvectiveCore(scatter_position);
+    let moon_radiance = vec3<f32>(0.63, 0.74, 1.0)*stage.medium_sun.w
+                        *weatherSunMultiplier(local_weather)
+                        *mix(1.0, 0.42, convective_core)*moon_visibility;
+    let ambient = skyAmbient(vec3<f32>(0.0, 1.0, 0.0), scatter_position)
+                  *(0.35/(4.0*PI));
+    // Light reaching the scattering point has crossed the water above it.
+    let overhead = exp(-medium.sigma_t*max(level - scatter_position.y, 0.0));
+    let scattered = medium.sigma_s*overhead*(stage.medium_sun.rgb*weatherSunMultiplier(local_weather)
+                             *mix(1.0, 0.11, convective_core)*phase*sun_visibility
+                             + moon_radiance*moon_phase + ambient)
+                   *(1.0 - transmittance)/medium.sigma_t;
 
-    // --- Light ------------------------------------------------------------------
-    // Trees shade the water as they shade its banks: by the sun's cascades
-    // by day, the moon's by night.
-    let plant_shadow = riverPlantShadow(in.world_position);
-    let sun_plants = select(1.0, plant_shadow, vegetation_shadows.light.w < 1.5);
-    let moon_plants = select(1.0, plant_shadow, vegetation_shadows.light.w > 1.5);
-    let severity = weatherSeverity(in.world_position.xz);
-    // Sunlight over the banks and crowns, for what the water mirrors of them.
-    let sun_open = globals.sun_colour.rgb*globals.settings_a.x*weatherSunMultiplier(severity)
-                   *mix(1.0, 0.11, precipitation.z)*cloudShadow(in.world_position, to_sun);
-    let sun_colour = sun_open*terrainShadow(in.world_position, normal, to_sun)*sun_plants;
-    let moon_colour = vec3<f32>(0.63, 0.74, 1.0)*globals.atmosphere.y
-                      *weatherSunMultiplier(severity)*mix(1.0, 0.42, precipitation.z)*moon_plants;
-    let sky_light = skyAmbient(vec3<f32>(0.0, 1.0, 0.0), in.world_position);
-
-    // --- Roughness ----------------------------------------------------------------
-    // Open sky over this very water, and the colour of the ground under it.
-    let here = riverCanopy(in.world_position.xz);
-    // Gusts cross open water as cat's paws: patches of capillary ripples too
-    // fine to see one by one that dull the mirror as they pass. Banks and
-    // crowns shelter a creek; a pond in a clearing takes the wind.
-    let wind_direction = vec2<f32>(cos(globals.storm.w), sin(globals.storm.w));
-    let gusts = smoothstepf(0.45, 0.8, valueNoise((in.world_position.xz - wind_direction*time*2.5)/24.0));
-    let wind_variance = (0.0008 + 0.006*gusts)*(0.35 + 0.65*precipitation.w)
-                      *here.a*mix(0.4, 1.0, stillness);
-    let base_roughness = mix(0.02, 0.10, roughness);
-    let alpha = clamp(sqrt(base_roughness*base_roughness + water_surface.variance + wind_variance
-                           + impacts.slope_variance), 0.02, 1.0);
-    let n_dot_v = max(dot(normal, to_view), 0.0);
-    let reflection_direction = reflect(-to_view, normal);
-    let surroundings = riverSurroundings(in.world_position.xz, surface_level, reflection_direction,
-                                         alpha, here, across, half_width, cross_stream, sun_open,
-                                         to_sun, in.world_position);
-
-    // --- Refraction and the body of the water ---------------------------------
-    let refracted_uv = clamp(uv + normal.xz*(0.35*clamp(optical_path, 0.0, 1.0)
-                             /max(view_distance, 1.0)), vec2<f32>(0.0), vec2<f32>(1.0));
-    let flat_background = textureSampleLevel(scene_texture, scene_sampler, uv, 0.0).rgb;
-    let refracted_background = textureSampleLevel(scene_texture, scene_sampler, refracted_uv, 0.0).rgb;
-    let refracted_packed = reflectionDepth(refracted_uv);
-    let accept_refraction = refracted_packed.a < 0.5 || refracted_packed.z <= water_view.z;
-    let scene_linear = sceneRadiance(select(flat_background, refracted_background, accept_refraction));
-
-    let extinction = mix(RIVER_EXTINCTION, LAKE_EXTINCTION, stillness);
-    let backscatter = mix(RIVER_SCATTER, LAKE_SCATTER, stillness);
-    // Whitewater gathers where the bed steps: over the ledges and boulders
-    // of a rapid, with dark glassy tongues of water running between them.
-    // The steps stay put as the water runs over them.
-    let step_noise = mix(valueNoise(vec2<f32>(along/RIVER_STEP_SPACING, across*1.7 + 3.1)),
-                         valueNoise(vec2<f32>(joined_st.x/RIVER_STEP_SPACING, across*1.7 + 3.1)), joining);
-    let steps = smoothstepf(0.25, 0.75, 0.5 + (step_noise - 0.5)*restore);
-    // Rapids turn milky below each step, where the water plunges and fills
-    // with bubbles, and run clear over the smooth tongues between.
-    let aeration = smoothstepf(0.3, 0.9, turbulence)*mix(0.15, 0.7, steps);
-    let sigma_t = extinction + vec3<f32>(BUBBLE_SCATTER*aeration);
-    let sigma_s = backscatter + vec3<f32>(0.5*BUBBLE_SCATTER*aeration);
-    // The eye's ray bends down into the water, so it crosses the column far
-    // more steeply than the straight line to the bed drawn behind it: at a
-    // glance from the bank a shallow bed still shows through.
-    let cos_refracted = sqrt(1.0 - (1.0 - to_view.y*to_view.y)/(1.333*1.333));
-    let bed_depth = min(optical_path, 8.0)*max(to_view.y, 0.0);
-    let water_path = select(optical_path, bed_depth/max(cos_refracted, 0.05),
-                            !scene_sky && camera_position.y >= surface_level);
-    let transmittance = exp(-sigma_t*water_path);
-    // The bed was lit as if in air: its light also crossed the water on the
-    // way down, a path of its depth over the sun's height.
-    let downwelling = exp(-sigma_t*bed_depth/max(to_sun.y, 0.25));
-    // Light scattered back out of the column, which is lit less the deeper
-    // it lies: each metre of the eye's path is also a metre further down.
-    let sigma_column = sigma_t*(1.0 + cos_refracted/max(to_sun.y, 0.25));
-    let source = sun_colour*0.08 + moon_colour*0.08 + sky_light*0.35*surroundings.sky_view;
-    let in_scatter = sigma_s*source*(1.0 - exp(-sigma_column*water_path))
-                   /max(sigma_column, vec3<f32>(1e-3));
-    var body = scene_linear*transmittance*downwelling + in_scatter;
-    // Toward the sea the water becomes the sea's, as fs_main shades it: the
-    // same green and the same light in it where the two meet.
-    if (sea > 0.0)
-    {
-        let sea_sigma_t = max(stage.extinction.xyz, vec3<f32>(1e-4));
-        let sea_sigma_s = min(sea_sigma_t, PARTICLE_SCATTER*stage.extinction.w*stage.scatter.xyz + RAYLEIGH);
-        let sea_transmittance = exp(-sea_sigma_t*optical_path);
-        let asymmetry = clamp(stage.scatter.w, -0.99, 0.99);
-        let sun_phase = mix(henyeyGreenstein(dot(to_view, -to_sun), asymmetry),
-                            phaseRayleigh(dot(to_view, -to_sun)), 0.5);
-        let moon_phase = mix(henyeyGreenstein(dot(to_view, -to_moon), asymmetry),
-                             phaseRayleigh(dot(to_view, -to_moon)), 0.5);
-        let sea_source = sun_colour*sun_phase + moon_colour*moon_phase + sky_light*(0.35/(4.0*PI));
-        let sea_body = scene_linear*sea_transmittance
-                     + sea_sigma_s*sea_source*(1.0 - sea_transmittance)/sea_sigma_t;
-        body = mix(body, sea_body, sea);
-    }
-
-    // --- Reflection and glitter -------------------------------------------
-    let reflected_sky = cloudSkyRadiance(reflection_direction)*mix(0.8, 0.68, precipitation.z);
-    // Where the screen cannot show the reflection, the banks and the crowns
-    // on them hide the sky below their horizon.
-    let unseen = mix(surroundings.occluder, reflected_sky, surroundings.sky);
-    let terrain_reflection = marchWaterReflection(in.world_position, normal,
-                                                  reflection_direction, alpha, surface_level);
-    let reflected = mix(unseen, terrain_reflection.rgb, terrain_reflection.a);
-    let specular = waterSpecular(normal, to_view, to_sun, alpha);
-    let moon_specular = waterSpecular(normal, to_view, to_moon, alpha);
-    let fresnel = clamp(godotFresnel(n_dot_v, stage.surface.x, stage.surface.y), 0.0, 1.0);
-    var lit = mix(body, reflected, fresnel) + specular*sun_colour + moon_specular*moon_colour;
-
-    // --- Whitewater and foam ------------------------------------------------
-    // Foam on a run is drawn out along the current; churned in a rapid it
-    // breaks into short ragged patches.
-    let foam_stretch = select(1.0, 1.0 + 2.5*smoothstepf(0.3, 1.5, speed)*(1.0 - 0.75*turbulence), river);
-    var pattern = riverFoamPattern(st, flow, foam_stretch, time, footprint);
-    if (joining > 0.001)
-    {
-        let other = riverFoamPattern(joined_st, flow, foam_stretch, time, footprint);
-        pattern = 0.5 + (mix(pattern, other, joining) - 0.5)*restore;
-    }
-    // Whitewater where the bed breaks the surface, below the steps.
-    let whitewater = smoothstepf(0.35, 0.85, turbulence)*mix(0.15, 0.8, steps);
-    // Flecks on the faces of a riffle's standing waves.
-    let flecks = water_surface.crest*riffle*0.5;
-    // Foam the whitewater upstream made drifts down as a thin lace, gathered
-    // into lines where the surface currents converge: the seams between the
-    // fast core and the slack water by the banks, a tongue down the current
-    // that wanders across the channel, and a scum in the slack edges of pools.
-    let wander = (mix(valueNoise(vec2<f32>(along/RIVER_TONGUE_WANDER, 5.3)),
-                      valueNoise(vec2<f32>(joined_st.x/RIVER_TONGUE_WANDER, 5.3)), joining) - 0.5)*0.8;
-    let off_tongue = (across - wander)*6.0;
-    let tongue = exp(-off_tongue*off_tongue);
-    let seam = smoothstepf(0.5, 0.75, abs(across))*(1.0 - smoothstepf(0.82, 0.97, abs(across)));
-    let slack = smoothstepf(0.8, 0.98, abs(across))*(1.0 - smoothstepf(0.25, 0.7, speed));
-    let drift = select(0.0, supply*(0.05 + 0.25*max(tongue, seam) + 0.2*slack), river);
-    // A creek's jet carries its foam out into the pond it feeds.
-    let mouth = select(smoothstepf(0.08, 0.5, speed)*0.3, 0.0, river);
-    let amount = clamp(max(max(whitewater, flecks), max(drift, mouth)), 0.0, 1.0);
-    // Far off the texture averages away; keep the share of water it covers.
-    let foam_resolved = 1.0 - smoothstepf(0.15, 0.5, max(footprint.x/foam_stretch, footprint.y)*2.1);
-    let foam = mix(smoothstepf(1.05 - amount, 1.3 - amount*0.6, 0.58),
-                   smoothstepf(1.05 - amount, 1.3 - amount*0.6, pattern), foam_resolved)*amount
-             + impacts.splash*0.2 + impacts.snow_fleck*0.06;
-    // Stream foam is cream with the same tannins that stain the water, and
-    // under the trees it sees only the sky the crowns leave.
-    let foam_colour = vec3<f32>(0.86, 0.84, 0.76)
-                    *((sun_colour*max(dot(normal, to_sun), 0.0)
-                       + moon_colour*max(dot(normal, to_moon), 0.0))*0.06
-                      + skyAmbient(normal, in.world_position)*0.8*surroundings.sky_view);
-    lit = mix(lit, foam_colour, clamp(foam, 0.0, 1.0)*above_water);
-    // Resolve the last centimetres into the bank instead of a hard edge.
-    lit = mix(scene_linear, lit, smoothstepf(0.0, 0.05, optical_path));
-
-    let fog = integrateAtmosphere(-to_view, view_distance);
-    lit = lit*fog.transmittance + fog.scattering;
-    return vec4<f32>(pow(acesFilm(lit*globals.params.z), vec3<f32>(1.0/2.2)), 1.0);
+    // Snell's window is the surface pass's: wherever a water surface lies
+    // over the eye it draws the sky refracted through it, and the medium here
+    // attenuates it on its way down to the eye like everything else.
+    let lit = scene_linear*transmittance + scattered;
+    let medium_result = pow(acesFilm(lit*globals.params.z), vec3<f32>(1.0/2.2));
+    return vec4<f32>(mix(scene.rgb, clamp(medium_result, vec3<f32>(0.0), vec3<f32>(1.0)), fade),
+                     1.0);
 }

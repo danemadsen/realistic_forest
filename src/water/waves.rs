@@ -13,21 +13,39 @@
 //! skirt. Unresolved components skip trigonometry and contribute slope variance
 //! to specular roughness. The band partition is retained for the GPU contract.
 //!
-//! DIVERGENCE: three constants tune the sea this port draws without touching
+//! DIVERGENCE: two constants tune the sea this port draws without touching
 //! the ported table. [`RIPPLE_GAIN`] and [`SWELL_GAIN`] scale the uploaded
 //! amplitude of everything shorter than [`RIPPLE_BAND_METRES`] and of
-//! everything at or above [`SWELL_BAND_METRES`]; [`DIRECTION_CONCENTRATION`]
-//! shapes the per-component direction draw. Aqua carries no equivalent of any
-//! of them. They are this port's look tuning, layered on top of the verbatim
+//! everything at or above [`SWELL_BAND_METRES`]. Aqua carries no equivalent of
+//! either. They are this port's look tuning, layered on top of the verbatim
 //! Crest power table rather than written into it, and each doc comment carries
 //! its own calibration.
 //!
-//! Together they are what makes the water a *lake*. Crest's table is a fully
-//! developed 150 kph wind sea: 82% of its wave height sits in the 16-64 m
-//! octaves and the largest single component is a 60 m, 6.2 s swell. The taper
-//! takes the swell out, the ripple gain takes the fine chop down, and the
-//! concentration organises what is left into a travelling train instead of an
-//! isotropic fan. See the constants below for the measured rungs.
+//! DIVERGENCE: the directions and phases are not Crest's. Crest gives each
+//! component one index that picks its wavelength within its octave, its
+//! direction stratum and its phase eighth all at once, and draws the phases
+//! from the same seed as the wavelengths. Every octave then repeats the same
+//! fan with the same phases, so the components fall into eight families of
+//! octave harmonics running the same way in phase: a regular egg-crate of
+//! dimples across the sea. Here the directions follow a measured directional
+//! spectrum ([`spreading_beta`], drawn by [`spread_angle`]) through strata
+//! shuffled independently in every octave, and the phases are uniform from a
+//! seed of their own. The wavelengths and amplitudes are still Crest's draw,
+//! bit for bit.
+//!
+//! Together they scale Crest's ocean to a coastal sea under a moderate
+//! breeze. Crest's table is a fully developed 150 kph wind sea: 82% of its
+//! wave height sits in the 16-64 m octaves and the largest single component is
+//! a 60 m, 6.2 s swell. The taper turns that swell down without taking it out,
+//! the ripple gain takes the fine chop down, and the directional spread makes
+//! the swell long-crested and the shorter waves short-crested about the wind.
+//! See the constants below for the measured rungs. Waves shorter than the 2 m
+//! this spectrum starts at are not Crest's: they are the wind sea every water
+//! body shares ([`wind_sea_components`], `windSea` in
+//! assets/shaders/water.wgsl), which on the open sea takes the whole of the
+//! wind over unlimited fetch. Lakes and ponds have only that wind sea, limited
+//! by their fetch and their shelter, and no swell at all, which is what keeps
+//! them calmer than the sea.
 
 use bevy::math::Vec2;
 
@@ -43,43 +61,62 @@ pub const COMPONENT_COUNT: usize = OCTAVE_COUNT * COMPONENTS_PER_OCTAVE;
 pub const WAVE_SLOTS: usize = 40;
 
 const SMALLEST_WAVELENGTH_POWER: i32 = -4;
-/// Half-width of the direction window, in degrees, that Crest's generator
-/// spreads components across. See [`DIRECTION_CONCENTRATION`] for the shape of
-/// the draw inside it.
-const DIRECTION_VARIANCE_DEGREES: f32 = 90.0;
 
-/// Exponent concentrating the direction draw toward the wind heading.
+/// The broadest a sea is ever spread about the wind: the floor of
+/// [`spreading_beta`], as the `beta` of a `sech^2(beta*theta)` spread.
 ///
-/// Crest's generator spreads one component per eighth of each octave evenly
-/// across the full `+/- DIRECTION_VARIANCE_DEGREES` window, so the 40 uploaded
-/// components fan out with no preferred heading: the sum is directionally
-/// random and reads as cross-hatched foil rather than as a wave train. A real
-/// wind sea is narrow — the fetch axis *is* the wind axis, and every off-axis
-/// wave is limited by a shorter cross-fetch — which a cosine power law
-/// reproduces. The draw maps the same uniform variate `u` in `[-1, 1]`
-/// through `u * |u|^(p-1)`, whose density peaks at the wind heading and whose
-/// extremes still reach the window edge, so `1.0` is the **exact identity**
-/// (bit-for-bit, `powf(x, 0.0) == 1.0`) and reproduces today's ship.
-///
-/// The number of LCG draws is unchanged — the exponent is applied to the value
-/// the existing draw already produced — so the wavelengths, the amplitudes, the
-/// sort order, the LOD partition and every other measured quantity are
-/// untouched. Only the along/cross split of the slope covariance moves.
-///
-/// Calibration, the directional concentration `lambda_max/trace` of the slope
-/// covariance `sum 0.5(ak)^2 dir dir^T` (0.5 is fully isotropic, 1.0 a perfect
-/// train; shipped tuning otherwise at [`SWELL_GAIN`] 0.20, [`RIPPLE_GAIN`]
-/// 0.5, `sea_state_amplitude` 0.28):
-///   1.0 -> 0.552, along-wind tilt 0.037 deg, cross-wind 0.034 (shipped)
-///   1.5 -> 0.690, along 0.042, cross 0.028
-///   2.0 -> 0.770, along 0.044, cross 0.024 (shipped value)
-///   2.5 -> 0.821, along 0.046, cross 0.021
-/// Total tilt and H_s do not move at any rung (they are direction-independent),
-/// and the breaking area moves by at most 0.11 points across the whole sweep:
-/// this is pure shape. 2.5 is the next step if a capture still reads as
-/// speckle; 1.5 if the surface reads as corduroy, which is the failure mode
-/// above about 0.85.
-const DIRECTION_CONCENTRATION: f32 = 2.0;
+/// Banner's fit for the short waves goes on widening the spread toward a
+/// uniform circle (beta 0.7 at three times the peak frequency, 0.5 at ten).
+/// Cox and Munk's sun-glitter photographs see more order than that in the
+/// short waves that carry the slope: the wind-dependent part of their mean
+/// square slope is 3.16e-3 per m/s upwind and 1.92e-3 crosswind, 1.65 to 1.
+/// A sech^2 spread gives its waves' slopes that ratio at beta 0.955, so no
+/// rung of either wave set is spread wider than that.
+pub const SPREAD_FLOOR: f32 = 0.955;
+
+/// The seeds of the swell's direction and phase draws. Each is a stream of
+/// its own, so neither repeats the wavelength and amplitude draw (seed 0,
+/// Crest's) nor the other. The direction seed was picked from the first two
+/// hundred for a draw that leaves fewer octave harmonics running together
+/// than chance does on average, heads within two degrees of the wind and
+/// has the slope ratio its spread gives (see the tests below).
+const DIRECTION_SEED: u32 = 112;
+const PHASE_SEED: u32 = 2;
+
+/// The wind sea's components, which the shader's `windSea` evaluates for
+/// every water body: [`WIND_RUNGS`] half-octave rungs of wavelength from
+/// [`WIND_SHORTEST_METRES`] up, [`WIND_PER_RUNG`] components to a rung.
+/// Mirrored by `WIND_RUNGS`, `WIND_PER_RUNG` and `WIND_SHORTEST` in
+/// assets/shaders/water.wgsl.
+pub const WIND_RUNGS: usize = 14;
+pub const WIND_PER_RUNG: usize = 4;
+pub const WIND_COMPONENTS: usize = WIND_RUNGS * WIND_PER_RUNG;
+pub const WIND_SHORTEST_METRES: f32 = 0.04;
+/// The period, metres, every wind wave repeats over: its wave vector is a
+/// whole number of cycles over it (see [`wind_sea_components`]). Mirrored by
+/// `WIND_PERIOD` in the shader.
+pub const WIND_PERIOD_METRES: f32 = 512.0;
+/// How far each rung of the wind sea turns its headings on from the rung
+/// before, as a share of the quarter of the spread each heading owns. A few
+/// rungs are resolved at once wherever the eye looks, and their headings must
+/// fill the spread between them rather than gather into two or three
+/// directions, which read as crossing families of crests. Three tenths of a
+/// quarter puts each rung's headings between its neighbour's, and an
+/// octave's (two rungs') four tenths away, so no wave runs with its own
+/// octave harmonic. A golden-ratio turn would interleave neighbours as well
+/// but bring each octave back within a quarter of a quarter of itself.
+const WIND_STRATUM_TURN: f32 = 0.3;
+/// How far a heading wanders within its place, as a share of a quarter of
+/// the spread: enough that no rung's four headings are mirrored about the
+/// wind (which an even spacing is at every half turn), too little to gather
+/// neighbouring rungs' headings together.
+const WIND_STRATUM_JITTER: f32 = 0.2;
+/// The wind sea's own seed, picked like the swell's: no rung holds a pair
+/// mirrored within four degrees of each other, any two or three neighbouring
+/// rungs leave no gap in the spread wider than twice an even share, no wave
+/// heads within eight degrees of its octave's, and the set heads with the
+/// wind at its spread's slope ratio.
+const WIND_SEED: u32 = 258;
 
 const WIND_SPEED_KPH: f32 = 150.0;
 const KPH_PER_MPS: f32 = 3.6;
@@ -95,11 +132,12 @@ const ANALYTIC_CHOP: f32 = 1.6;
 /// below pins that.
 ///
 /// The two octaves under it are where the surface's slope lives. At
-/// `sea_state_amplitude` 0.28 and the shipped tuning the 40 uploaded components
-/// give an RMS surface tilt of 2.037 degrees; the 2-8 m octaves carry 56.1% of
-/// that slope variance on 17.6% of the wave height, and the 16-64 m octaves
-/// only 6.2% of the slope on 51.6% of the height. The 2-8 m band is therefore
-/// both the near-field look and the band a strength change moves.
+/// `sea_state_amplitude` 0.28 with [`SWELL_GAIN`] at 0.20 the 40 uploaded
+/// components give an RMS surface tilt of 2.037 degrees; the 2-8 m octaves
+/// carry 56.1% of that slope variance on 17.6% of the wave height, and the
+/// 16-64 m octaves only 6.2% of the slope on 51.6% of the height. The 2-8 m
+/// band is therefore both the near-field look and the band a strength change
+/// moves.
 const RIPPLE_BAND_METRES: f32 = 8.0;
 
 /// Amplitude gain for everything shorter than [`RIPPLE_BAND_METRES`].
@@ -111,10 +149,10 @@ const RIPPLE_BAND_METRES: f32 = 8.0;
 /// octave instead of scaling a band.
 ///
 /// Calibration, measured against the exact float32 generator at
-/// `sea_state_amplitude` 0.28 with [`SWELL_GAIN`] at its shipped 0.20 and
-/// [`DIRECTION_CONCENTRATION`] at 2.0 (baseline, gain 1.0: RMS tilt 3.335
-/// degrees, H_s 0.3090 m, sum|a| 0.5835 m, far-field GGX alpha 0.06667, fold
-/// 0.6240, breaking area 14.27%):
+/// `sea_state_amplitude` 0.28 with [`SWELL_GAIN`] at 0.20 (baseline, gain 1.0:
+/// RMS tilt 3.335 degrees, H_s 0.3090 m, sum|a| 0.5835 m, far-field GGX alpha
+/// 0.06667, fold 0.6240, breaking area 14.31% with the directions drawn by
+/// [`spreading_beta`]; 14.27% with Crest's concentrated fan):
 ///   0.8 -> <8 m RMS slope -36.0%, tilt 2.789 deg, H_s -3.9%, alpha -12.3%
 ///   0.7 -> -51.0%, tilt 2.527 deg, H_s -5.6%, alpha -17.9%, fold 0.4950
 ///   0.6 -> -64.0%, tilt 2.275 deg, H_s -7.0%, alpha -23.1%
@@ -145,9 +183,9 @@ const SWELL_BAND_METRES: f32 = 16.0;
 /// inert across the uploaded spectrum (its amplitude factor is 0.998 at 64 m)
 /// and `POWER_LOG10` alone shapes the sea into 16-64 m swell: 79.6% of the wave
 /// height, with a single 60 m, 6.2 s component as the largest wave in the
-/// water. No lake with a kilometre of fetch can grow that, so the gain tapers
-/// it. Moving `WIND_SPEED_KPH` instead would drag the window's peak into the
-/// resolved band and invalidate every gain rung documented above; editing
+/// water. That is a storm sea's swell, so the gain tapers it. Moving
+/// `WIND_SPEED_KPH` instead would drag the window's peak into the resolved
+/// band and invalidate every gain rung documented above; editing
 /// `POWER_LOG10` would break the "Crest defaults ported verbatim" contract and
 /// smear across an octave through the interpolation in `spectrum_amplitude`.
 ///
@@ -155,31 +193,42 @@ const SWELL_BAND_METRES: f32 = 16.0;
 /// below about 0.25 the largest single component stops being the 60 m swell and
 /// becomes a 13.1 m, 2.90 s wave, which is the lake regime the shoreline
 /// surveys report (H_s 0.10-0.40 m, T_p 1.4-2.5 s summary / 1.7-3.6 s
-/// measured). At 0.35 the swell is still the largest wave and the sea still
-/// reads as an ocean with the amplitude turned down.
+/// measured). The sea was held there (0.20) while it was the only water with
+/// waves at all. Now that lakes raise their own fetch-limited waves, the sea
+/// is an ocean again: at 0.35 the swell is still the largest wave and the sea
+/// reads as an ocean with the amplitude turned down, H_s 0.41 m under the
+/// default breeze, rougher than any lake and calm enough for a shoreline.
 ///
 /// Calibration at `sea_state_amplitude` 0.28 with [`RIPPLE_GAIN`] at its
-/// shipped 0.5 and [`DIRECTION_CONCENTRATION`] at 2.0, columns sum|a| m / H_s m
-/// / RMS tilt deg / 2-8 m tilt deg / 16-64 m tilt deg / far-field alpha /
-/// fold / breaking area (Jacobian < 0.90) / largest component:
+/// shipped 0.5, columns sum|a| m / H_s m / RMS tilt deg / 2-8 m tilt deg /
+/// 16-64 m tilt deg / far-field alpha / fold (`ANALYTIC_CHOP * sum(ak)`) /
+/// breaking area (Jacobian < 0.90, over 2 km square) / slope up:across the
+/// wind / largest component:
 ///   1.00 -> 1.5204 / 1.0601 / 3.209 / 1.526 / 2.532 / 0.06475 / 0.6965 /
-///           13.32% / 60 m, 6.19 s
+///           13.26% / 2.39 / 60 m, 6.19 s
 ///   0.50 -> 0.8802 / 0.5555 / 2.344 / 1.526 / 1.267 / 0.05221 / 0.5168 /
-///            6.20% / 60 m, 6.19 s
+///            6.10% / 1.81 / 60 m, 6.19 s
 ///   0.35 -> 0.6882 / 0.4123 / 2.163 / 1.526 / 0.887 / 0.04977 / 0.4629 /
-///            4.70% / 60 m, 6.19 s
+///            4.64% / 1.65 / 60 m, 6.19 s (shipped value)
 ///   0.25 -> 0.5601 / 0.3237 / 2.072 / 1.526 / 0.633 / 0.04857 / 0.4270 /
-///            4.01% / 13 m, 2.90 s
+///            3.99% / 2.86 / 13 m, 2.90 s
 ///   0.20 -> 0.4961 / 0.2834 / 2.037 / 1.526 / 0.507 / 0.04812 / 0.4090 /
-///            3.73% / 13 m, 2.90 s (shipped value)
+///            3.73% / 2.87 / 13 m, 2.90 s (the lake regime)
 ///   0.14 -> 0.4193 / 0.2412 / 2.005 / 1.526 / 0.355 / 0.04770 / 0.3874 /
-///            3.48% / 13 m, 2.90 s
+///            3.49% / 2.89 / 13 m, 2.90 s
+/// Of these, only the breaking area and the slope ratio depend on where the
+/// waves head. The breaking area is within 0.1 point of what Crest's
+/// concentrated fan gave (13.32%, 6.20%, 4.70%, 4.01%, 3.73%, 3.48%), whose
+/// up:across was 2.7-3.3 at every rung. The spread follows the peak, so once
+/// the 13 m wave is the largest the 2-8 m waves lie nearer the peak and run
+/// closer to the wind.
 /// The 2-8 m tilt is 1.526 deg at every rung: the band edge is above it, so
-/// this lever and [`RIPPLE_GAIN`] are orthogonal by construction. H_s 0.2834 m
-/// is the middle of the surveyed lake band. The taper also *raises* the folding
-/// margin, from 1/sum(ak) 2.297 at 1.00 to 3.912 at 0.20, rather than spending
-/// it.
-const SWELL_GAIN: f32 = 0.20;
+/// this lever and [`RIPPLE_GAIN`] are orthogonal by construction. The taper
+/// also *raises* the folding margin, from 1/sum(ak) 2.297 at 1.00 to 3.912 at
+/// 0.20, rather than spending it; 0.35 still keeps it above 2. The far-field
+/// alpha column is the swell's alone: the wind sea under 2 m adds its own
+/// Cox-Munk roughness on top in the shader.
+const SWELL_GAIN: f32 = 0.35;
 
 const MIN_AMPLITUDE: f32 = 0.001;
 const TAU: f32 = std::f32::consts::TAU;
@@ -266,16 +315,14 @@ pub fn build(amplitude_multiplier: f32, wind_radians: f32) -> WaveSpectrum {
 }
 
 /// Crest's component distribution: per octave, one component per eighth of the
-/// octave's wavelength span, with the direction draw concentrated toward the
-/// wind heading by [`DIRECTION_CONCENTRATION`] instead of spread evenly across
-/// the wind's +/- 90 degree window.
+/// octave's wavelength span at Crest's amplitudes, heading round the wind as a
+/// measured sea does at that wavelength, at a random phase.
 fn generate_components(
     amplitude_multiplier: f32,
     wind_radians: f32,
 ) -> [WaveComponent; COMPONENT_COUNT] {
     let mut random = Random::new(0);
     let mut wavelengths = [0.0f32; COMPONENT_COUNT];
-    let mut angles = [0.0f32; COMPONENT_COUNT];
 
     for octave in 0..OCTAVE_COUNT {
         let base = 2.0f32.powi(SMALLEST_WAVELENGTH_POWER + octave as i32);
@@ -286,66 +333,63 @@ fn generate_components(
             let maximum =
                 (minimum + base / COMPONENTS_PER_OCTAVE as f32).min(2.0 * base);
             wavelengths[index] = minimum + random.next() * (maximum - minimum);
-
-            let direction_fraction =
-                (component as f32 + random.next()) / COMPONENTS_PER_OCTAVE as f32;
-            // The same draw as Crest, shaped rather than replaced: `u * |u|^(p-1)`
-            // leaves `p = 1.0` bit-for-bit identical to the uniform fan (see
-            // `DIRECTION_CONCENTRATION`) and consumes no extra LCG state, so the
-            // wavelengths and amplitudes below are unchanged at every `p`.
-            let direction = 2.0 * direction_fraction - 1.0;
-            angles[index] = direction
-                * direction.abs().powf(DIRECTION_CONCENTRATION - 1.0)
-                * DIRECTION_VARIANCE_DEGREES;
+            // Crest drew the component's direction here, from the same eighth
+            // of the circle as its wavelength's eighth of the octave. The draw
+            // is made and dropped, so the amplitudes below come out of the
+            // stream exactly as they did: the wave heights, the tilt, the
+            // folding margin, the live set and every gain calibration hold.
+            random.next();
         }
     }
 
+    let lowest = 0.5 * lod_max_wavelength(0);
+    let highest = lod_max_wavelength(super::WATER_LOD_COUNT - 1);
     let mut amplitudes = [0.0f32; COMPONENT_COUNT];
+    // The largest wave the sea draws, and its wavelength: the peak its
+    // directional spread is measured from. Judged before the sea state scales
+    // every wave alike, so it does not move with it.
+    let mut peak = (0.0f32, highest);
     for (amplitude, wavelength) in amplitudes.iter_mut().zip(wavelengths) {
         *amplitude = random.next() * spectrum_amplitude(wavelength);
         if *amplitude < MIN_AMPLITUDE {
             *amplitude = 0.0;
         }
-        *amplitude *= amplitude_multiplier;
-        // The two tapers. Applied after the multiplier and after the
-        // MIN_AMPLITUDE gate: they scale how much amplitude the sea carries,
-        // never which components exist. The live set is therefore identical to
-        // upstream's — a nonzero amplitude times 0.5 is still nonzero — so the
-        // WAVE_SLOTS assert and the LOD partition below are untouched.
-        //
-        // Two components of the uploaded band sit under the nominal floor and
-        // stay there: 3.33 m at 0.66 mm before the tapers, 0.33 mm after, and
-        // 9.55 m at 0.68 mm, which no taper touches. That is harmless: the
-        // constant is only a generation-time gate and nothing downstream treats
-        // it as a floor.
-        //
-        // `chop_amplitude` is derived from `amplitude` further down, so the
-        // displacement, the analytic normals and the crest pinch all fall
-        // together. That is the property a shader-side weight cut cannot have:
-        // scaling amplitude at the upload point keeps the drawn geometry and
-        // its shading the same surface.
-        if wavelength < RIPPLE_BAND_METRES {
-            *amplitude *= RIPPLE_GAIN;
+        let shape = *amplitude * band_gain(wavelength);
+        if (lowest..highest).contains(&wavelength) && shape > peak.0 {
+            peak = (shape, wavelength);
         }
-        // The swell taper. Same construction and the same reasoning as the
-        // ripple gain above: it scales how much amplitude the sea carries,
-        // never which components exist, because `MIN_AMPLITUDE` has already
-        // run. `SWELL_BAND_METRES` is octave 7's upper edge, so the taper
-        // covers whole octaves 8 and 9 and no LOD band is half-scaled.
-        if wavelength >= SWELL_BAND_METRES {
-            *amplitude *= SWELL_GAIN;
+        *amplitude *= amplitude_multiplier;
+        *amplitude *= band_gain(wavelength);
+    }
+
+    // Each octave's eight components take the eight strata of the spread one
+    // each, in an order shuffled afresh for every octave, so a wavelength's
+    // place in its octave says nothing of its heading and no two octaves
+    // repeat the same fan.
+    let peak_frequency = (GRAVITY * TAU / peak.1).sqrt();
+    let mut direction_random = Random::new(DIRECTION_SEED);
+    let mut angles = [0.0f32; COMPONENT_COUNT];
+    for octave in 0..OCTAVE_COUNT {
+        let mut strata: [usize; COMPONENTS_PER_OCTAVE] = std::array::from_fn(|stratum| stratum);
+        for last in (1..COMPONENTS_PER_OCTAVE).rev() {
+            let pick = ((direction_random.next() * (last + 1) as f32) as usize).min(last);
+            strata.swap(last, pick);
+        }
+        for (component, stratum) in strata.into_iter().enumerate() {
+            let index = octave * COMPONENTS_PER_OCTAVE + component;
+            let frequency = (GRAVITY * TAU / wavelengths[index]).sqrt();
+            let u = (stratum as f32 + direction_random.next()) / COMPONENTS_PER_OCTAVE as f32;
+            angles[index] = spread_angle(u, spreading_beta(frequency / peak_frequency));
         }
     }
 
-    let mut phase_random = Random::new(0);
+    let mut phase_random = Random::new(PHASE_SEED);
     std::array::from_fn(|index| {
         let wavelength = wavelengths[index];
-        let direction =
-            Vec2::from_angle(wind_radians + angles[index].to_radians());
+        let direction = Vec2::from_angle(wind_radians + angles[index]);
         let amplitude = amplitudes[index];
         let wave_number = TAU / wavelength;
-        let phase = TAU * ((index % COMPONENTS_PER_OCTAVE) as f32 + phase_random.next())
-            / COMPONENTS_PER_OCTAVE as f32;
+        let phase = TAU * phase_random.next();
         WaveComponent {
             direction: [direction.x, direction.y],
             amplitude,
@@ -356,6 +400,119 @@ fn generate_components(
             wavelength,
         }
     })
+}
+
+/// The two tapers, [`RIPPLE_GAIN`] under [`RIPPLE_BAND_METRES`] and
+/// [`SWELL_GAIN`] from [`SWELL_BAND_METRES`] up. They are applied after the
+/// multiplier and after the `MIN_AMPLITUDE` gate: they scale how much amplitude
+/// the sea carries, never which components exist. The live set is therefore
+/// identical to upstream's — a nonzero amplitude times 0.5 is still nonzero —
+/// so the `WAVE_SLOTS` assert and the LOD partition are untouched. Both band
+/// edges are octave boundaries, so the tapers cover whole octaves (5 and 6, 8
+/// and 9) and no LOD band is half-scaled.
+///
+/// Two components of the uploaded band sit under the nominal floor and stay
+/// there: 3.33 m at 0.66 mm before the tapers, 0.33 mm after, and 9.55 m at
+/// 0.68 mm, which no taper touches. That is harmless: the constant is only a
+/// generation-time gate and nothing downstream treats it as a floor.
+///
+/// `chop_amplitude` is derived from `amplitude` after the gain, so the
+/// displacement, the analytic normals and the crest pinch all fall together.
+/// That is the property a shader-side weight cut cannot have: scaling
+/// amplitude at the upload point keeps the drawn geometry and its shading the
+/// same surface.
+fn band_gain(wavelength: f32) -> f32 {
+    if wavelength < RIPPLE_BAND_METRES {
+        RIPPLE_GAIN
+    } else if wavelength >= SWELL_BAND_METRES {
+        SWELL_GAIN
+    } else {
+        1.0
+    }
+}
+
+/// How narrowly a wind sea's waves at `frequency_ratio` times its peak's
+/// angular frequency are spread about the wind, as the `beta` of a
+/// `sech^2(beta*theta)` spread.
+///
+/// Donelan, Hamilton and Hui (1985) measured it with a wave-staff array on
+/// Lake Ontario: narrowest just past the peak (beta 2.4), wider to either
+/// side, `2.61 r^1.3` below 0.95 times the peak frequency and `2.28 r^-0.65`
+/// above it. Their data stopped at 1.6, past which they held it at 1.24;
+/// Banner (1990) carried it on from stereo photographs of the shorter waves as
+/// `10^(-0.4 + 0.8393 exp(-0.567 ln r^2))`, which starts from that 1.24. The
+/// two fits step from 1.68 to 1.24 at 1.6; the step is eased over 1.6-2.0, so
+/// a ripple field whose peak moves with the gusts does not change its spread
+/// along a line. No wave is spread wider than [`SPREAD_FLOOR`].
+///
+/// Mirrored by `spreadingBeta` in assets/shaders/water.wgsl.
+pub fn spreading_beta(frequency_ratio: f32) -> f32 {
+    let r = frequency_ratio.max(1e-3);
+    let donelan = if r < 0.95 { 2.61 * r.powf(1.3) } else { 2.28 * r.powf(-0.65) };
+    let banner = 10.0f32.powf(-0.4 + 0.8393 * (-0.567 * (r * r).ln()).exp());
+    let t = ((r - 1.6) / 0.4).clamp(0.0, 1.0);
+    let eased = t * t * (3.0 - 2.0 * t);
+    (donelan + (banner - donelan) * eased).max(SPREAD_FLOOR)
+}
+
+/// The heading, radians off the wind, under which a fraction `u` of the waves
+/// of a `sech^2(beta*theta)` spread over the whole circle lie: the inverse of
+/// that spread's cumulative distribution, `tanh(beta*theta)/tanh(beta*pi)`
+/// mapped from `[-1, 1]` to `[0, 1]`.
+pub fn spread_angle(u: f32, beta: f32) -> f32 {
+    ((2.0 * u - 1.0) * (beta * std::f32::consts::PI).tanh()).atanh() / beta
+}
+
+/// The wind sea's components for a wind blowing toward `wind_radians`, as the
+/// shader reads them (`stage.wind_waves`): each one's wave vector as whole
+/// cycles over [`WIND_PERIOD_METRES`] along x and z, its phase in cycles, and
+/// its heading off the wind in radians.
+///
+/// The set depends on the wind's heading and on nothing else. The shader
+/// spreads a rung's slope over its components by weights that follow the
+/// local wind and fetch, but where a crest lies and where it heads come only
+/// from here: a gust, a shore further upwind or the camera's maps moving on
+/// can change how high the ripples run, never re-phase them from one frame to
+/// the next.
+///
+/// Every rung takes [`WIND_PER_RUNG`] headings, one from each equal share of
+/// the broadest spread ([`SPREAD_FLOOR`]), each wandering a little within its
+/// share so no rung pairs its waves mirrored about the wind to cross in a
+/// lattice. The shares turn on by [`WIND_STRATUM_TURN`] from rung to rung, so
+/// the few rungs a pixel resolves together fill the spread evenly between
+/// them. The wavelengths are spread across the rung's half octave and the
+/// phases are random, so the rungs do not lock to each other either. A wave
+/// vector is a whole number of
+/// cycles over the period so the shader can wrap the position into one period
+/// first and keep the phase exact far from the origin; snapping moves a
+/// heading by at most a third of a degree, and the period is far too long to
+/// see repeat.
+pub fn wind_sea_components(wind_radians: f32) -> [[f32; 4]; WIND_COMPONENTS] {
+    let mut random = Random::new(WIND_SEED);
+    let start = random.next();
+    let mut components = [[0.0f32; 4]; WIND_COMPONENTS];
+    for (index, component) in components.iter_mut().enumerate() {
+        let rung = index / WIND_PER_RUNG;
+        let stratum = index % WIND_PER_RUNG;
+        let jitter = WIND_STRATUM_JITTER * (random.next() - 0.5);
+        let stretch = random.next();
+        let phase = random.next();
+        let turn = (start + rung as f32 * WIND_STRATUM_TURN).fract();
+        let u = ((stratum as f32 + turn + jitter) / WIND_PER_RUNG as f32).rem_euclid(1.0);
+        let angle = spread_angle(u, SPREAD_FLOOR);
+        // Within a quarter octave either side of the rung's nominal length.
+        let wavelength = f64::from(WIND_SHORTEST_METRES)
+            * 2.0f64.powf(0.5 * rung as f64 + 0.5 * (f64::from(stretch) - 0.5));
+        let cycles = f64::from(WIND_PERIOD_METRES) / wavelength;
+        let heading = f64::from(wind_radians) + f64::from(angle);
+        *component = [
+            (heading.cos() * cycles).round() as f32,
+            (heading.sin() * cycles).round() as f32,
+            phase,
+            angle,
+        ];
+    }
+    components
 }
 
 /// Crest's spectral power for one wavelength: the octave power table
@@ -477,5 +634,266 @@ mod tests {
         assert!(spectrum.waves.iter().all(|wave| wave.amplitude.is_finite()));
         // The whole sea state should stay well inside the water plan's bounds.
         assert!(total > 0.05 && total < 12.0, "suspicious total amplitude {total}");
+    }
+
+    /// The heading off the wind, radians, of an uploaded swell component.
+    fn heading_off(direction: [f32; 2], wind: f32) -> f32 {
+        let turn = direction[1].atan2(direction[0]) - wind;
+        (turn + std::f32::consts::PI).rem_euclid(TAU) - std::f32::consts::PI
+    }
+
+    /// The weighted mean heading off the wind, degrees, and the ratio of the
+    /// mean square slope up the wind to across it, of waves at `(heading,
+    /// slope variance)`.
+    fn spread_of(waves: impl Iterator<Item = (f32, f32)>) -> (f32, f32) {
+        let (mut sine, mut cosine, mut up, mut across) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for (heading, variance) in waves {
+            sine += variance * heading.sin();
+            cosine += variance * heading.cos();
+            up += variance * heading.cos().powi(2);
+            across += variance * heading.sin().powi(2);
+        }
+        (sine.atan2(cosine).to_degrees(), up / across)
+    }
+
+    /// The share of a `sech^2(beta*theta)` spread under `theta`: what
+    /// [`spread_angle`] inverts.
+    fn spread_share(theta: f32, beta: f32) -> f32 {
+        0.5 + 0.5 * (beta * theta).tanh() / (beta * std::f32::consts::PI).tanh()
+    }
+
+    /// The directions and phases are drawn from their own streams, so the
+    /// wavelengths and amplitudes must still be Crest's draw exactly: the
+    /// wave heights and the largest wave documented on [`SWELL_GAIN`].
+    #[test]
+    fn the_wavelengths_and_amplitudes_are_crests_draw() {
+        let spectrum = build(0.28, 0.7);
+        let total: f32 = spectrum.waves.iter().map(|wave| wave.amplitude.abs()).sum();
+        let variance: f32 = spectrum.waves.iter().map(|wave| 0.5 * wave.amplitude * wave.amplitude).sum();
+        assert!((total - 0.6882).abs() < 1e-4, "sum|a| {total}");
+        assert!((4.0 * variance.sqrt() - 0.4123).abs() < 1e-4, "H_s {}", 4.0 * variance.sqrt());
+        let largest = spectrum.waves.iter().max_by(|a, b| a.amplitude.total_cmp(&b.amplitude)).unwrap();
+        assert!((59.0..61.0).contains(&largest.wavelength), "largest {}", largest.wavelength);
+    }
+
+    /// Two components an octave apart that run the same way are the first two
+    /// harmonics of one sharpened wave. Crest's generator gave a component its
+    /// heading by its place in its octave, so every octave repeated the same
+    /// fan and 32 such pairs ran across the sea as eight families of
+    /// egg-crate dimples. Drawn independently they pair by chance alone,
+    /// about eight times (the mean over two hundred seeds, deviation 2.4).
+    #[test]
+    fn the_swell_has_no_families_of_octave_harmonics() {
+        let spectrum = build(0.28, 0.7);
+        let waves = &spectrum.waves;
+        let mut pairs = 0;
+        for a in waves {
+            for b in waves {
+                let ratio = b.wavelength / a.wavelength;
+                let apart = heading_off(b.direction, 0.7) - heading_off(a.direction, 0.7);
+                if (ratio - 2.0).abs() < 0.15 && apart.abs().to_degrees() < 10.0 {
+                    pairs += 1;
+                }
+            }
+        }
+        assert!(pairs <= 10, "{pairs} octave-harmonic pairs run together");
+    }
+
+    /// The swell heads with the wind, spread as a measured sea is: the mean
+    /// heading close to the wind's and the slope steeper up the wind than
+    /// across it, as Cox and Munk's 1.65 to 1 for the short waves, less than a
+    /// swell train's single direction. Crest's concentrated fan gave 3.2.
+    #[test]
+    fn the_swell_runs_with_the_wind_at_a_measured_spread() {
+        for wind in [0.0f32, 0.7, 2.5] {
+            let spectrum = build(0.28, wind);
+            let (mean, ratio) = spread_of(spectrum.waves.iter().map(|wave| {
+                let slope = wave.amplitude * wave.wave_number;
+                (heading_off(wave.direction, wind), 0.5 * slope * slope)
+            }));
+            assert!(mean.abs() < 10.0, "wind {wind}: mean heading {mean} degrees off the wind");
+            assert!((1.1..2.5).contains(&ratio), "wind {wind}: up/cross {ratio}");
+        }
+    }
+
+    /// Crest drew each phase in the eighth of the circle its component's place
+    /// in the octave picked, from the same seed as the wavelengths, so every
+    /// octave started its waves at the same eight phases. Drawn uniformly from
+    /// a stream of their own, no octave's phases follow its components'
+    /// places.
+    #[test]
+    fn the_phases_are_not_tied_to_the_wavelengths() {
+        let components = generate_components(1.0, 0.0);
+        let tied = components
+            .chunks(COMPONENTS_PER_OCTAVE)
+            .filter(|octave| {
+                octave.iter().enumerate().all(|(place, wave)| {
+                    (wave.phase / TAU * COMPONENTS_PER_OCTAVE as f32) as usize == place
+                })
+            })
+            .count();
+        assert_eq!(tied, 0, "{tied} octaves start their waves at Crest's eight phases");
+    }
+
+    /// Cox and Munk measured the wind-dependent slope of the sea 3.16 up the
+    /// wind to 1.92 across it; the floor of the spread gives its waves that
+    /// ratio.
+    #[test]
+    fn the_spread_floor_gives_cox_and_munks_slope_ratio() {
+        let steps = 20_000;
+        let (mut up, mut across) = (0.0f64, 0.0f64);
+        for step in 0..steps {
+            let theta = std::f64::consts::PI * (2.0 * (step as f64 + 0.5) / steps as f64 - 1.0);
+            let density = 1.0 / (f64::from(SPREAD_FLOOR) * theta).cosh().powi(2);
+            up += density * theta.cos().powi(2);
+            across += density * theta.sin().powi(2);
+        }
+        assert!((up / across - 3.16 / 1.92).abs() < 0.01, "up/cross {}", up / across);
+    }
+
+    /// The spread is narrowest just past the peak, broadens to either side
+    /// down to the floor, and moves smoothly with the frequency, so a ripple
+    /// field whose peak drifts with the wind never changes its spread along a
+    /// line. Donelan's and Banner's fits step from 1.68 to 1.24 where they
+    /// meet.
+    #[test]
+    fn the_spread_is_narrowest_past_the_peak_and_moves_smoothly() {
+        assert!((spreading_beta(0.95 - 1e-4) - 2.44).abs() < 0.01);
+        assert!((spreading_beta(1.3) - 1.92).abs() < 0.01);
+        assert_eq!(spreading_beta(0.3), SPREAD_FLOOR);
+        assert_eq!(spreading_beta(4.0), SPREAD_FLOOR);
+        let mut previous = spreading_beta(0.2);
+        for step in 1..=10_000 {
+            let beta = spreading_beta(0.2 + step as f32 * 1e-3);
+            assert!(beta >= SPREAD_FLOOR);
+            assert!((beta - previous).abs() < 0.1, "a step of {} at {}", beta - previous, 0.2 + step as f32 * 1e-3);
+            previous = beta;
+        }
+    }
+
+    #[test]
+    fn spread_angle_inverts_the_spread() {
+        for beta in [SPREAD_FLOOR, 1.5, 2.4] {
+            assert!(spread_angle(0.5, beta).abs() < 1e-6);
+            for step in 1..100 {
+                let u = step as f32 / 100.0;
+                let theta = spread_angle(u, beta);
+                assert!(theta.abs() < std::f32::consts::PI);
+                assert!((spread_share(theta, beta) - u).abs() < 1e-4, "beta {beta}, u {u}: {theta}");
+                assert!((spread_angle(1.0 - u, beta) + theta).abs() < 1e-4);
+            }
+        }
+    }
+
+    /// Where a ripple's crests lie must not change from one frame to the next,
+    /// whatever the gusts, the fetch or the camera's maps do. The wind sea's
+    /// components are a function of the wind's heading alone: the same heading
+    /// gives the same set, bit for bit, and turning the wind turns every wave
+    /// vector with it and leaves every phase and every heading off the wind
+    /// as it was.
+    #[test]
+    fn the_wind_sea_depends_on_the_heading_alone() {
+        let wind = 0.733f32;
+        let set = wind_sea_components(wind);
+        assert_eq!(set, wind_sea_components(wind));
+        let turn = 1.1f32;
+        let turned = wind_sea_components(wind + turn);
+        for (component, after) in set.iter().zip(&turned) {
+            assert_eq!(component[2], after[2]);
+            assert_eq!(component[3], after[3]);
+            let rotated = Vec2::from_angle(turn).rotate(Vec2::new(component[0], component[1]));
+            let off = (rotated - Vec2::new(after[0], after[1])).abs().max_element();
+            assert!(off <= 1.25, "{component:?} turned is {rotated}, not {after:?}");
+            assert_eq!(after[0].fract(), 0.0);
+            assert_eq!(after[1].fract(), 0.0);
+        }
+    }
+
+    /// Two equal waves mirrored about the wind cross in a diamond lattice, the
+    /// basket weave the wind sea used to be woven of, two crossing components
+    /// a rung. No rung may hold such a pair.
+    #[test]
+    fn no_rung_of_the_wind_sea_holds_a_mirrored_pair() {
+        let set = wind_sea_components(0.733);
+        for (rung, components) in set.chunks(WIND_PER_RUNG).enumerate() {
+            for (index, a) in components.iter().enumerate() {
+                for b in &components[index + 1..] {
+                    let mirror = (a[3] + b[3]).to_degrees().abs();
+                    assert!(mirror >= 4.0, "rung {rung}: {} and {} degrees", a[3].to_degrees(), b[3].to_degrees());
+                }
+            }
+        }
+    }
+
+    /// The shares of the broadest spread under each of a rung's headings, in
+    /// order round the circle, and the gaps between them.
+    fn spread_gaps(components: &[[f32; 4]]) -> Vec<f32> {
+        let mut shares: Vec<f32> = components.iter().map(|component| spread_share(component[3], SPREAD_FLOOR)).collect();
+        shares.sort_by(f32::total_cmp);
+        let mut gaps: Vec<f32> = shares.windows(2).map(|pair| pair[1] - pair[0]).collect();
+        gaps.push(1.0 + shares[0] - shares[shares.len() - 1]);
+        gaps
+    }
+
+    /// Every rung takes one heading from each quarter of the spread, each
+    /// wandering a tenth of a quarter at most, and its wavelengths within a
+    /// quarter octave of its own.
+    #[test]
+    fn every_rung_of_the_wind_sea_spans_its_spread() {
+        let set = wind_sea_components(0.0);
+        for (rung, components) in set.chunks(WIND_PER_RUNG).enumerate() {
+            for gap in spread_gaps(components) {
+                assert!((0.2 - 1e-4..0.3 + 1e-4).contains(&gap), "rung {rung}: a gap of {gap} in the spread");
+            }
+            let nominal = WIND_SHORTEST_METRES * 2.0f32.powf(0.5 * rung as f32);
+            for component in components {
+                let wavelength = WIND_PERIOD_METRES / Vec2::new(component[0], component[1]).length();
+                let octaves = (wavelength / nominal).log2();
+                assert!(octaves.abs() < 0.26, "rung {rung}: {wavelength} m");
+            }
+        }
+    }
+
+    /// Wherever the eye looks it resolves a few neighbouring rungs at once,
+    /// and their headings must fill the spread between them: gathered into
+    /// two or three directions they read as crossing families of crests, the
+    /// cross this table replaced. Two or three neighbouring rungs leave no
+    /// gap in the spread more than twice an even share; headings drawn at
+    /// random within each rung's quarters leave gaps of three or more. Nor
+    /// may a wave run within eight degrees of one an octave from it, which
+    /// with it is one sharpened wave train in a single direction.
+    #[test]
+    fn neighbouring_rungs_of_the_wind_sea_fill_each_others_gaps() {
+        let set = wind_sea_components(0.733);
+        for span in [2, 3] {
+            for (first, window) in set.windows(span * WIND_PER_RUNG).step_by(WIND_PER_RUNG).enumerate() {
+                let widest = spread_gaps(window).into_iter().fold(0.0f32, f32::max) * window.len() as f32;
+                assert!(widest <= 2.0, "rungs {first} to {}: a gap {widest} times an even share", first + span - 1);
+            }
+        }
+        for rung in 0..WIND_RUNGS - 2 {
+            for a in &set[rung * WIND_PER_RUNG..(rung + 1) * WIND_PER_RUNG] {
+                for b in &set[(rung + 2) * WIND_PER_RUNG..(rung + 3) * WIND_PER_RUNG] {
+                    let apart = (a[3] - b[3]).to_degrees().abs();
+                    assert!(apart >= 8.0, "rungs {rung} and {}: {apart} degrees apart", rung + 2);
+                }
+            }
+        }
+    }
+
+    /// At the broadest spread every component of a rung carries the same
+    /// slope: the set alone must head with the wind at Cox and Munk's ratio,
+    /// a quarter or more of it within 20 degrees of the wind. The crossing
+    /// pairs put none of it there and as much across the wind as up it.
+    #[test]
+    fn the_wind_sea_runs_with_the_wind() {
+        let wind = 0.733f32;
+        let set = wind_sea_components(wind);
+        let headings: Vec<f32> = set.iter().map(|component| heading_off([component[0], component[1]], wind)).collect();
+        let (mean, ratio) = spread_of(headings.iter().map(|&heading| (heading, 1.0)));
+        assert!(mean.abs() < 10.0, "mean heading {mean} degrees off the wind");
+        assert!((1.1..2.5).contains(&ratio), "up/cross {ratio}");
+        let near = headings.iter().filter(|heading| heading.to_degrees().abs() < 20.0).count();
+        assert!(near * 4 >= headings.len(), "{near} of {} within 20 degrees", headings.len());
     }
 }

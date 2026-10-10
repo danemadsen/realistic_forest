@@ -455,9 +455,9 @@ pub struct ForestShaderHandles {
     pub ssao_blur: Handle<Shader>,
     pub composite: Handle<Shader>,
     pub fxaa: Handle<Shader>,
-    pub water_surface: Handle<Shader>,
-    pub water_underwater: Handle<Shader>,
-    pub water_blit: Handle<Shader>,
+    /// All the water: every surface, the copy under them and the submerged
+    /// medium (`assets/shaders/water.wgsl`).
+    pub water: Handle<Shader>,
     pub precipitation: Handle<Shader>,
     pub lightning: Handle<Shader>,
     pub cloud_probe: Handle<Shader>,
@@ -501,9 +501,7 @@ impl Plugin for ForestRenderPlugin {
                 ssao_blur: asset_server.load::<Shader>("shaders/ssao-blur.wgsl"),
                 composite: asset_server.load::<Shader>("shaders/composite.wgsl"),
                 fxaa: asset_server.load::<Shader>("shaders/fxaa.wgsl"),
-                water_surface: asset_server.load::<Shader>("shaders/water-surface.wgsl"),
-                water_underwater: asset_server.load::<Shader>("shaders/water-underwater.wgsl"),
-                water_blit: asset_server.load::<Shader>("shaders/water-blit.wgsl"),
+                water: asset_server.load::<Shader>("shaders/water.wgsl"),
                 precipitation: asset_server.load::<Shader>("shaders/precipitation.wgsl"),
                 lightning: asset_server.load::<Shader>("shaders/lightning.wgsl"),
                 cloud_probe: asset_server.load::<Shader>("shaders/cloud-probe.wgsl"),
@@ -858,8 +856,7 @@ mod tests {
         let common = include_str!("../../assets/shaders/atmosphere-functions.wgslinc").trim();
         for source in [
             include_str!("../../assets/shaders/composite.wgsl"),
-            include_str!("../../assets/shaders/water-surface.wgsl"),
-            include_str!("../../assets/shaders/water-underwater.wgsl"),
+            include_str!("../../assets/shaders/water.wgsl"),
         ] {
             assert!(source.contains(common), "visible and reflected sky helpers diverged");
         }
@@ -871,8 +868,7 @@ mod tests {
         for source in [
             include_str!("../../assets/shaders/composite.wgsl"),
             include_str!("../../assets/shaders/cloud-probe.wgsl"),
-            include_str!("../../assets/shaders/water-surface.wgsl"),
-            include_str!("../../assets/shaders/water-underwater.wgsl"),
+            include_str!("../../assets/shaders/water.wgsl"),
             include_str!("../../assets/shaders/cloud-shadow-map.wgsl"),
         ] {
             assert!(source.contains(common), "cloud shape or lighting differs between passes");
@@ -896,11 +892,10 @@ mod tests {
         let common = include_str!("../../assets/shaders/precipitation-functions.wgslinc").trim();
         for source in [
             include_str!("../../assets/shaders/composite.wgsl"),
-            include_str!("../../assets/shaders/water-surface.wgsl"),
+            include_str!("../../assets/shaders/water.wgsl"),
             include_str!("../../assets/shaders/precipitation.wgsl"),
             include_str!("../../assets/shaders/lightning.wgsl"),
             include_str!("../../assets/shaders/cloud-probe.wgsl"),
-            include_str!("../../assets/shaders/water-underwater.wgsl"),
             include_str!("../../assets/shaders/cloud-shadow-map.wgsl"),
         ] {
             assert!(source.contains(common), "precipitation field differs between passes");

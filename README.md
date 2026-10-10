@@ -36,8 +36,8 @@ by naga at runtime either way.
 | --- | --- |
 | Mouse | Look |
 | W/A/S/D | Move |
-| Space | Jump, or rise while flying |
-| Left Shift | Descend while flying |
+| Space | Jump, or rise while flying; swim up, or kick out of the water at its surface |
+| Left Shift | Descend while flying; dive while swimming |
 | Left Control | Movement boost |
 | V | Toggle flight |
 | 2 | Open or close the developer menu; release the cursor while open, capture it on close |
@@ -48,7 +48,8 @@ by naga at runtime either way.
 
 Movement is unbounded in both walking and flight modes. Walking is stopped by
 trees and lilacs (see [Colliding with trees](#colliding-with-trees)); flight
-passes through them, as it does the ground.
+passes through them, as it does the ground. Water too deep to stand in, the
+sea's, a lake's or a river's, is swum in (see [Wading and swimming](#wading-and-swimming)).
 
 The developer menu opens at the top left with 2 and leaves no launcher or
 overlay when closed. Its movement tools teleport to exact XYZ coordinates
@@ -141,7 +142,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | Flag | Effect |
 | --- | --- |
 | `--camera x,y,z,yawDeg,pitchDeg` | Pin the camera pose and fly, for reproducible shots; with `--shot`, mouse and keyboard input cannot move it |
-| `--shot path.png` | Render, save a screenshot, then exit; the log reports average, p95 and maximum frame time over the `--wait` window, split into frames while erosion tiles stream and settled frames |
+| `--shot path.png` | Render, save a screenshot, then exit; the log reports average, p95 and maximum frame time over the `--wait` window, split into frames while erosion tiles stream and settled frames. The water is drawn as a still of the game at 60 fps however long the frames take |
 | `--snow-trail x,z,x,z` | Seed one compressed snow segment between the two world XZ positions for reproducible screenshots |
 | `--wait n` | Frames to render before the screenshot, counted once the prewarmed erosion tiles, plants and grass are ready |
 | `--erosion-prewarm N` | Simulate the `N` nearest erosion tiles at full budget before streaming (default `4`, the quartet around the player); raise it so a capture shows erosion beyond the player's own lattice cell |
@@ -317,6 +318,10 @@ beyond the mesh's displacement fade and across the flat horizon skirt.
 Each wave filters against its projected pixel footprint; unresolved ripples
 broaden the sun reflection instead of shimmering. Crest compression drives
 whitecaps and subsurface light, with foam detail also filtered at distance.
+The sea is drawn by the same water shader as the rivers and lakes (see
+[The water](#the-water)): its swell is its own, and its shorter waves are the
+wind sea every water body shares, which on the open sea takes the whole of
+the wind.
 
 ## Imported grass
 
@@ -756,7 +761,11 @@ over it; its whitewater stays its own to the parent's waterline and becomes
 the parent's halfway in to its centre. Its surface does the same where they meet (see The water). A
 tributary standing under its parent where it reaches it (out of a lake at
 the foot of the parent's fall into it) keeps its own water, and lies just
-under the parent's ribbon wherever that reaches over it. A lake's water keeps its level:
+under the parent's ribbon wherever that reaches over it. A tributary
+running through a lake its parent also runs through ends in the lake, its
+water leaving by the lake's one outlet, rather than cutting the rim a
+second time beside it; none of its water becomes the parent's, so its
+inlet's cascade runs on into the lake as its own. A lake's water keeps its level:
 where a tributary leaves a pond too close above the confluence to fall at
 3 cm per metre, it runs down from the pond's level as one even rapid to where
 it meets its parent, rather than dropping off the pond's edge. Where water seems held
@@ -791,9 +800,19 @@ the rim it spills over (the fill sees each 4 m cell at its centre, so the rim
 is checked again metre by metre, and where it dips lower between centres the
 water stands no higher than that gap), every river that reaches it shares it (a basin
 holding a smaller lake drowns it), the reaches above it are backed up to its
-level, and the river leaves it at its outlet over a sill: for its first 25 m
-the water draws down gently from the lake's level and always stands a little
-under the ground beside it, so the outlet has banks from the start. Backed up
+level, and the river leaves it at its outlet over a sill. The lake's still
+water runs on at its level past its last 4 m cell, over its own basin and
+up the rim, to the rim's crest (within 8 m of the lake), and crosses it at
+the critical depth of a broad-crested weir, h_c = (q²/g)^(1/3) for the
+discharge per metre of the sill's width: some 16 cm for a square kilometre's
+outlet, the crest 1.5 h_c under the lake and the water over it half h_c
+under, as a smooth, glassy tongue running at the critical speed, its bed
+ramping up over the approach to the lip and back down to the rapid's own
+over two widths below it. So a lake is held by its lip, not drained through
+a trench in its rim, and never stands a metre over the pool a few metres
+past its edge. Below the sill, for 25 m, the water draws down gently from
+the sill's and always stands a little under the ground beside it, so the
+outlet has banks from the start. Backed up
 to the lake's level, the water stands over any ground below it along the
 reach above, however shallow that hollow seemed: the lake floods it too,
 rather than the river being held over it between dikes. A river
@@ -816,9 +835,16 @@ graded down to it along a smooth profile from its surface 120 m upstream of the 
 cutting a notch at most 3 m deep through the beach and the dune behind it;
 from where its water reaches the sea's level, the sea fills its channel out
 to the open water. Nothing holds the ground up beside a river's last stretch
-to the sea, or beside it where it runs into or out of a lake, so no levee
+to the sea, or beside it where its water is a lake's, backed up to within
+a few centimetres of the lake's level (as its water rises a hand or two
+over the lake, 0.05 to 0.3 m, its banks are held up again), so no levee
 raises a bar across its own mouth between its water and the still water it
-meets. An estuary's bed falls toward the sea and meets the seabed: at its
+meets; but a cascade running into a lake, or an outlet's rapid below its
+sill, has banks held up right down to the lake, as a delta's natural
+levees are, however near it, though never out of the lake's own water:
+where its water stands at or over the lake's, its levee comes back up the
+shore from just under the water (the lake's level, where its sheet's edge
+is drawn sunk lower), no steeper than 45 degrees. An estuary's bed falls toward the sea and meets the seabed: at its
 mouth it is no deeper than the highest ground its water still crosses to
 reach open water (a bar, or the shelving seabed), and up its flare nowhere
 deeper than downstream, so no pool lies behind the shore.
@@ -859,13 +885,18 @@ shoulders (an estuary's a little firmer, cut through the beach rather than
 scooping a bowl out of it, and shallowing as it widens), with submerged bed
 transitions into the pond or seabed. The
 current slows as its cross-section expands, and accelerates again below
-an outlet's sill. A mouth is the reach drowned in the still water, though: it
-opens fully only where the river's water stands within 0.3 m of the lake's
-or the sea's level, and not at all where it stands 1.2 m from it, so a
-cascade down into a lake or to the sea, or an outlet's rapid well below its
-sill, keeps its own channel, banks and whitewater until it meets the water,
-rather than spreading into a broad, glassy, low-banked sheet sliding down
-the hillside over its banks. The thalweg hugs the outside of every bend.
+an outlet's sill. A mouth is the reach drowned in the still water, though: a
+lake's opens fully only where the river's water stands within 5 cm of the
+lake's level, and not at all where it stands 0.3 m from it (the sea's,
+whose level rises and falls with its waves, within 0.3 m and 1.2 m), and it
+opens no faster along the river than a tenth of the channel's own half
+width a metre, about as fast as a jet spreads into still water. So a
+cascade down into a lake or to the sea, or an outlet's rapid below its sill,
+keeps its own channel, banks and whitewater until it meets the water, and
+its mouth opens over the drowned reach past its foot, under the lake's
+sheet, rather than spreading within a node into a broad, glassy,
+low-banked wedge splayed over the foot of the cascade. The thalweg hugs the
+outside of every bend.
 
 Submerged transitions follow the routed course and taper to zero within
 10 m, or less than half a pond crossing. Their footprint is checked against
@@ -887,7 +918,9 @@ water (rivers darting out of a lake and back, how far outlets fall below
 their lakes, river mouths cut off from the open sea, how far sheets dip
 under a river where they meet), how the ribbons sit (how often one stands in
 the air over dry ground beside its banks, or one river's water shows under
-another's), how smoothly the water meets at each confluence (steps, sampled
+another's, and whether any ribbon's edge stands over the ground beside it),
+how often the ground just past a waterline lies under the channel's water
+and where most, how smoothly the water meets at each confluence (steps, sampled
 every quarter metre around it, in the height, current, whitewater and ripple
 frame of the water drawn on top and in the whitewater, speed and level of the
 bed the terrain paints under it), and the rivers and lakes nearest
@@ -896,8 +929,12 @@ to 8 km here. The spawn region holds some 160 rivers, 86 km of channel and
 170 lakes and ponds covering 290 ha; on gentle reaches the water stands about
 1.0 m under the natural ground on average (half of it under 0.71 m), under
 1 % of their length is trenched more than 3 m into it, one of 127 river
-mouths does not reach open sea (a creek down a sea cliff), and fewer than one
-in a thousand samples across the ribbons stands over dry ground past a bank.
+mouths does not reach open sea (a creek down a sea cliff), fewer than one in
+five thousand samples across the ribbons stands over dry ground past a bank,
+under one in a hundred samples of ground just past a waterline lies more
+than 10 cm under the channel's water, and no ribbon edge stands more than a
+few centimetres over the ground beside it (only on the shelf a confluence's
+rounded banks open, where the tributary's water follows its parent's).
 
 ### How they shape the ground
 
@@ -940,7 +977,8 @@ first segment, and its first out of a lake, starts flat.
 Gentle junction banks spread their shoulders over up to twice the ordinary
 bank run. Both carve bounds relax smoothly before the lookup's support ends,
 so a cut into high ground cannot stop in a vertical wall at that boundary.
-Levees also retreat continuously as the channel approaches still water.
+Levees also retreat continuously as the channel's water comes down to the
+still water's level.
 Intersecting banks at river confluences are rounded once against their
 original shapes. The rounding continues through the waterline, opening a
 shallow shelf no more than 0.6 m outside either channel. It fades into the
@@ -1035,7 +1073,29 @@ forest's shade.
 
 Each river's surface is a ribbon across its channel at the water level,
 reaching under both banks so the waterline is wherever the carved bank rises
-through the water. A lake is a flat sheet at its level over its basin, in
+through the water. No water edge ever ends in the air: wherever the ground
+beside a channel lies lower than its water, or a lake's sheet does where a
+cascade reaches out over the lake it runs into, the ribbon's outer strip
+(from about half its width out, and the whole of a narrow creek's half)
+rounds down onto it, level where it leaves the open water and steepening
+to end just under the ground at its edge, as the front of water running
+over dry ground does where the bed's friction holds it back (its depth
+falling as the square root of the distance behind the front, Whitham
+1955): a thin wet film over the ground rather than a slab standing in the
+air. Over dry land the strip always curves down at least 0.12 to 0.3 m (6%
+of its half width) under the water at its edge, whatever the ground
+measured there, so a bank only a little under the water, from the erosion
+or between the ground's samples, never holds a flat edge in the air; where
+the bank stands higher the curve lies inside it, out of sight. A cascade's
+foot curves down the same way over its first 2 m inside the lake's sheet
+and its last 2 m before the lake's first
+node, to end just under the lake's level (or its sheet, where that is
+drawn sunk lower) whether or not the sheet is drawn over it, its rows laid
+half a metre apart there, so the rapid meets the pond without a lip. The strip is
+rounded by the ground as the rivers carve it, and again
+in the shader by the camera's one-metre map of the ground as the erosion
+has worn it since, wherever its edge lies on dry land; never where a
+tributary's water is becoming its parent's, whose surface it follows. A lake is a flat sheet at its level over its basin, in
 4 m cells: over the basin, every metre of ground below its level joined to
 it that the cell-by-cell fill stepped past, the closed hollows beside it
 (which fill to its level, as a waterlogged hollow by a pond does) and a few
@@ -1044,7 +1104,12 @@ meets the water. It never reaches past its outlet or over a narrow rim,
 where the ground falls away below its level (nor along an outlet's banks
 below the sill), nor over a river's channel, and wherever the ground under
 its outer edge still lies lower than the water, that edge sinks just under
-the ground, so the sheet never ends in the air. Where a river meets a
+the ground, so the sheet never ends in the air. Each corner of its outer
+edge sinks only as far as the edges meeting there must (the corner nearer
+whatever lies low under the edge goes down, and the far one keeps the
+lake's level), so a channel crossing one stretch of the edge sinks the
+corner beside it alone and the open water beside an outlet stays level.
+Where a river meets a
 lake, coming in or going out, the two surfaces cross inside the sheet's last
 cell: the sheet's edge slips just under the river's water, and the river's
 ribbon runs on just under the sheet, a little deeper the further in, until it
@@ -1077,42 +1142,123 @@ at an angle cannot be blended into one without squeezing the ripples
 between them. Wherever one surface shows beside the other they carry the
 same water, so no line crosses the junction.
 
-The river shader (`vs_river`/`fs_river` in `water-surface.wgsl`) shades the
-water with the sea's own optics, sky and screen-space reflections, sun
-glitter, refraction, rain rings and fog, and the plants' shadow cascades. Sun
-and moon glints are a normalised GGX lobe weighted by the water's own Fresnel
-at each facet (the sea's glints use the same), so water mirrors the sun only
-where its facets line up, as sparkles and a soft path, never as a white
-sheet. On top of that:
+All the water, the sea, rivers and creeks, ponds and lakes, is one shader
+(`assets/shaders/water.wgsl`). The sea's tiles (`vs_sea`) and the rivers'
+ribbons and lakes' sheets (`vs_inland`) feed the same `fs_water`, which is
+told what the water is rather than which kind it is: how much of it is the
+open sea's, how still it is, its level, its current, its whitewater and the
+foam drifting on it. Everything else follows from those, so a river's last
+reach turns to the sea's water as it meets it, and a stream leaving a tarn
+carries the tarn's colour down. Every surface has the same optics, sky and
+screen-space reflections, sun glitter, refraction, rain rings and fog, the
+plants' shadow cascades and the same underside. Sun and moon glints are a
+normalised GGX lobe weighted by the water's own Fresnel at each facet, so
+water mirrors the sun only where its facets line up, as sparkles and a soft
+path, never as a white sheet. Where the surface turns faster across a pixel
+than a glint is wide, the lobe is widened by the spread of the normals the
+pixel spans (geometric specular antialiasing), so a glint too fine to draw
+spreads dimly over its pixel instead of flickering as the camera moves; a
+glint two pixels across or more barely changes. What differs from one water
+to the next:
 
-- **Brown, tannin-stained water.** The forest's dissolved organic matter
-  absorbs blue most, so a riffle shows a golden bed, a pool an amber one and
-  deep water goes dark brown; lakes are darker still, and rapids are milky
-  with bubbles. The eye's path is bent down into the water and the light
-  scattered back out of it is dimmed with depth, so depth reads.
+- **Its colour.** The sea's is its optics preset. Forest water is stained
+  like tea by the tannins the rain leaches from the forest floor: dissolved
+  organic matter absorbs blue most, so a riffle shows a golden bed, a pool an
+  amber one and deep water goes dark brown; ponds are darker still, and
+  rapids are milky with bubbles. Above the forest nothing stains it: a
+  mountain lake or stream is clear snowmelt over rock with a little rock
+  flour in it, glass over the stones of its shallows, turquoise a few metres
+  down and a deep blue-cyan over its depths. Which a lake is follows from
+  where it lies and how big it is: above the treeline (95-115 m) every tarn
+  is clear; among the thinning trees below it (from about 55 m) a lake large
+  enough to hold its snowmelt clear (over a hectare or so) is too, where a
+  pond the same height stays brown. A stream is clear above the forest, and
+  one leaving a clear lake carries its clarity down into the forest for a
+  kilometre or two before the stain takes over. The eye's path is bent down
+  into the water and the light scattered back out of it is dimmed with
+  depth, so depth reads. A bed shows through as much water as lies over it,
+  however low the glance: deep water seen across a tarn is no clearer than
+  seen from above it, and a bed deeper than about 29 m, from which not even
+  a tarn's light comes back, looks the same as none.
+- **How rough it is.** Every water body feels the same wind (10 m up, about a
+  third of the wind the clouds ride on) and raises the same kind of waves
+  from it: a spectrum of short waves whose slope follows Cox and Munk's
+  measurements of the sea surface, peaked where JONSWAP puts the peak of a
+  sea the wind has blown over that far, moving with the capillary-gravity
+  dispersion. The waves head round the wind as a measured sea's do, a
+  short-crested field rather than a weave: narrowly just past the peak and
+  more broadly for the shorter waves (Donelan, Hamilton and Hui; Banner),
+  never more broadly than Cox and Munk saw the short waves, whose slope runs
+  1.65 times as steep up the wind as across it. Each half octave of
+  wavelength holds four waves whose headings, lengths and phases are fixed
+  for the wind's heading, drawn so that no two of them cross mirrored about
+  the wind and the neighbouring half octaves the eye sees together fill the
+  spread between them; the local wind only shares the slope out between
+  them, so a gust
+  or a nearer shore changes how high the ripples run and never where their
+  crests lie. The sea's swell spreads the same way about the wind, its long
+  waves long-crested, and its components no longer run as families of
+  octave harmonics in step. What differs is how much wind the water feels
+  and over what fetch. The open sea takes all of it over unlimited fetch,
+  with whitecaps from a fresh breeze, and adds its swell and its surf. A
+  lake's waves grow from its upwind shore across it, calm in the lee of the
+  trees there and rougher toward its far shore. A pond ringed by forest, or
+  a creek in its cut under the crowns, lies sheltered and nearly glassy but
+  for the cat's paws gusts send across it, patches drawn out three times as
+  long down the wind as across it. A river adds what its current does to
+  it. The
+  crowns are read from the grass's 512-metre capture, placed by the window
+  the capture itself records as it is taken, so in the frame the camera
+  crosses into the next window the forest the water sees does not jump.
 - **What the water mirrors.** Where the screen cannot show a reflection, the
   shader walks out along the reflected ray's bearing over the ground and the
   canopy (the shore map near the camera, the lighting map beyond, and the
   share of open sky the tree crowns leave) and finds the horizon the banks
   and crowns raise: below it the water mirrors dark banks and foliage, above
   it the sky. A creek in its cut under the trees is dark but for a strip of
-  sky down its corridor; a pond in a clearing keeps its sky.
-- **The stream's own frame.** Ripples live in metres down and across the
-  channel, so they follow every bend, and cross-fade into a parent's
-  where a tributary joins it. Two advected phases stream at the
-  water's own speed, drawn out along fast water; standing waves stand still
-  over riffles, fixed to the bed, while ripples and foam stream through
-  them; boils swell glassy on runs and pools; gusts dull open water in cat's
-  paws. What a pixel cannot resolve becomes roughness by its true slope
-  variance, per axis of the flow, so distant water does not turn white.
-- **Foam that follows the flow.** Rapids churn white over the steps and
-  boulders of their bed, with dark glassy tongues of water between; foam they make drifts
-  downstream for some fifteen seconds as lace gathered on the seams by the
-  banks, on a tongue down the current and as scum in slack water, and an
-  inlet carries it out into the pond. It is cream, stained like the water,
-  and in the shade of the crowns it is lit only by the sky they leave.
+  sky down its corridor; a pond in a clearing keeps its sky; the sea mirrors
+  its wooded headlands near the shore.
+- **The current.** A river's ripples live in metres down and across its
+  channel, so they follow every bend, and cross-fade into a parent's where a
+  tributary joins it. The current carries them downstream at the water's own
+  speed, drawn out along fast water, each scale on its own cycle, its two
+  layers handed over with their contrast held so the water never pulses.
+  Standing waves stand still over riffles, fixed to the bed, while ripples
+  and foam stream through them; they swell and ebb in place rather than in a
+  travelling pulse, which used to read as the water running upstream. Boils
+  swell glassy on runs and pools, and the wind's waves ride the current. A
+  texture the current carries further in one frame than a third of its own
+  size would strobe and seem to run backwards; it becomes roughness instead,
+  as what a pixel cannot resolve does, by its true slope variance. The frame
+  is the one the eye has settled into, the frame time averaged over three
+  quarters of a second: a single slow frame hardly moves it, so a hitch
+  neither strips the ripples for a frame nor flashes the glints.
+- **Foam.** On the sea, breaking crests and the shore's wash; on any water, a
+  strong wind's whitecaps. Rapids churn white over the steps and boulders of
+  their bed, with dark glassy tongues of water between. Far off, where a
+  pixel spans several boulders, it shows them as it would average them,
+  each third of the pixel at its own share of white, so a distant rapid is
+  as white as a near one without crawling; foam they make
+  drifts downstream for some fifteen seconds as lace gathered on the seams by
+  the banks, on a tongue down the current and as scum in slack water, and an
+  inlet carries it out into the pond. Stream foam is cream, stained like the
+  water, and in the shade of the crowns it is lit only by the sky they leave.
+- **Seen from below.** Every surface is seen from the side of the water the
+  eye is on, not by how high it stands. From the air the eye sees every
+  surface from above, with its glints, its reflection and its whitewater,
+  even one standing over it: a rapid climbing away up its channel, a river
+  upstream of a swimmer or a swell's crest over a swimmer's head. From under
+  the water every surface is Snell's window: the sky and banks refracted
+  through it inside the critical angle, and outside it a mirror of the
+  water's own glow. Only while the eye crosses its own water's surface does
+  it see each surface from the side of that surface's own plane it is on, a
+  sheet's level or a wave's face. Seen from above, the water under a
+  surface is measured across the surface's own plane: a rapid climbing away
+  above the eye still shows the depth of its water. The medium the eye is
+  in is that water's: the sea's preset, a pond's dark tea or a tarn's clear
+  cyan.
 
-### Wading
+### Wading and swimming
 
 Flowing water pushes the player. The current's drag on the submerged body,
 ½ρC_dAu² over the legs and then the torso as the water deepens, is set
@@ -1120,15 +1266,25 @@ against the friction the feet can hold with, which buoyancy and a whitewater
 bed reduce. Knee-deep water slows a wade, more so walking upstream; a gentle
 current is stood against; a strong one carries the body along more and more,
 and once its drag outweighs the footing it sweeps the player off their feet
-and away downstream, down any rapids coming. Water too deep to stand in
-floats the player with the current; a lake's still water only floats them.
-Space kicks a swimmer up out of the water as it jumps a walker off the
+and away downstream, down any rapids coming. Water too deep to stand in, the
+sea's, a lake's or a river's, is swum in: the body floats head out, carried
+by any current, until the player dives. Left Shift dives and Space swims
+back up; swimming forward while looking well down or up follows the eye; a
+swimmer left alone drifts back up and floats, and a diver reaching water too
+shallow to float in stands up out of it, with the bed as it rises and on out
+onto the bank. A fall into deep water plunges the same depth whatever the
+frame rate. The bed is solid, a bank too high to step onto is as solid to a
+swimmer as to a walker, and from the
+surface Space kicks a swimmer up out of the water as it jumps a walker off the
 ground, onto a bank or over a ledge; a body in the air over the water keeps
 the motion it left the water with, so a hop neither shakes off the current
-nor stops a body it was carrying dead.
-The F1 panel's **Rivers** section
+nor stops a body it was carrying dead. Once the eye is under, the view is
+the medium of the water drawn over it, whichever water it is: a river's last
+reach is partly the sea's, as its surface is, and a stream out of a clear lake
+is as clear under the surface as it looks from above.
+The developer menu's **Rivers** section
 reports the network, the nearest channel and the current the player stands
-in, and can hide the water surfaces.
+in, and can hide the river and lake surfaces.
 
 ## Day/night lighting and atmosphere
 
@@ -1241,7 +1397,7 @@ outside the current view, and the cloud shadow map supplies sunlight
 occlusion for fog in the atmosphere and water passes.
 The water surface then samples the opaque scene for refraction and raymarched
 reflections, followed by underwater effects where applicable. The sea and the
-rivers depth-test against the G-buffer's own depth buffer in hardware, ahead
+rivers and lakes depth-test against the G-buffer's own depth buffer in hardware, ahead
 of their shaders, so water hidden behind terrain or plants is never shaded;
 they write that depth too, so a river never paints over a nearer wave. FXAA smooths the
 completed scene, and the diagnostics panel draws on top. The G-buffer, AO and
