@@ -1207,10 +1207,15 @@ to the next:
   and over what fetch. The open sea takes all of it over unlimited fetch,
   with whitecaps from a fresh breeze, and adds its swell and its surf. A
   lake's waves grow from its upwind shore across it, calm in the lee of the
-  trees there and rougher toward its far shore. A pond ringed by forest, or
-  a creek in its cut under the crowns, lies sheltered and nearly glassy but
-  for the cat's paws gusts send across it, patches drawn out three times as
-  long down the wind as across it. A river adds what its current does to
+  trees there and rougher toward its far shore. The shelter is the steepest
+  bank or stand upwind, its crowns averaged over a belt as wide as half its
+  distance, so the lee fades out over tens of metres instead of in stripes.
+  A pond ringed by forest, or a creek in its cut under the crowns, lies
+  calmer but never glassy: the mean wind drops faster in a lee than its
+  gusts, so cat's paws still cross it, patches drawn out three times as
+  long down the wind as across it. A creek's own cut stands in for banks the
+  one-metre map cannot see, but never on an outlet whose water is still the
+  pond's. A river adds what its current does to
   it. The
   crowns are read from the grass's 512-metre capture, placed by the window
   the capture itself records as it is taken, so in the frame the camera
@@ -1368,7 +1373,11 @@ existing quality presets, sample budgets, scene resolution, half-resolution
 fog/cloud target and reflection probe resolution.
 
 Water traces reflected rays against the terrain view-position buffer, refines
-depth crossings, and samples the lit scene at each valid hit. This adds visible
+depth crossings, and samples the lit scene at each valid hit. Each pixel starts
+its steps at its own fraction of a step, and a hit's depth tolerance grows with
+the step it was found in, so distant reflections are not cut into contours. The
+water's output carries a one-step triangular dither, so smooth water does not
+break into 8-bit plateaus. This adds visible
 coastlines and mountains to the wave-distorted reflections. Invalid hits and
 screen edges fade into the shared day/night sky with clouds. A separate
 `256×128` all-direction sky probe raymarches the same cloud volume each frame,

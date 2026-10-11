@@ -1276,12 +1276,23 @@ fn reflectionDepth(uv: vec2<f32>) -> vec4<f32>
                         vec2<i32>(0), size - vec2<i32>(1)), 0);
 }
 
+// Interleaved gradient noise (Jimenez 2014): a fixed per-pixel value in
+// [0, 1) whose neighbours differ by about half its range, so anything offset
+// by it dithers between pixels instead of lining up into contours.
+fn screenNoise(pixel: vec2<f32>) -> f32
+{
+    return fract(52.9829189*fract(dot(floor(pixel), vec2<f32>(0.06711056, 0.00583715))));
+}
+
 // RGB is incident radiance and A confidence. A miss never stretches an edge
 // texel across the sea: it leaves the analytic sky visible instead. Exponential
 // world-distance steps retain nearby detail while reaching distant headlands.
+// Every pixel starts its steps at its own fraction of a step (`frag`), so where
+// a hit falls between two steps varies from pixel to pixel instead of along
+// lines of equal distance, which would cut the reflection into contours.
 fn marchWaterReflection(world_origin: vec3<f32>, world_normal: vec3<f32>,
                          direction: vec3<f32>, roughness: f32, surface_level: f32,
-                         from_below: bool) -> vec4<f32>
+                         from_below: bool, frag: vec2<f32>) -> vec4<f32>
 {
     if (globals.raymarch.z < 0.5)
     {
@@ -1307,11 +1318,12 @@ fn marchWaterReflection(world_origin: vec3<f32>, world_normal: vec3<f32>,
     let logarithmic_range = log(1.0 + max_distance/near_step);
     var previous_distance = 0.0;
     var previous_front = true;
+    let jitter = screenNoise(frag);
 
     for (var step = 0u; step < 64u; step += 1u)
     {
         if (step >= steps) { break; }
-        let progress = f32(step + 1u)/f32(steps);
+        let progress = (f32(step) + 1.0 - jitter)/f32(steps);
         let distance = near_step*(exp(logarithmic_range*progress) - 1.0);
         let sample_position = origin + ray*distance;
         let uv = projectView(sample_position);
@@ -1343,7 +1355,12 @@ fn marchWaterReflection(world_origin: vec3<f32>, world_normal: vec3<f32>,
             let hit_position = origin + ray*high;
             let hit_uv = projectView(hit_position);
             let hit = reflectionDepth(hit_uv);
-            let thickness = clamp(0.4 - hit.z*0.0015, 0.4, 4.0);
+            // A true crossing leaves the ray behind the surface by no more
+            // than the refined step it was found in, however long the coarse
+            // step was; a ray passing far behind a thin edge does not. An
+            // absolute thickness instead accepts or fades whole rings of
+            // hits at once wherever the step grows past it.
+            let thickness = max(clamp(0.4 - hit.z*0.0015, 0.4, 4.0), 2.0*(high - low));
             let depth_error = hit.z - hit_position.z;
             // Reject self hits, depth discontinuities and submerged geometry
             // seen through the water's reflective side. Seen from above
@@ -1946,46 +1963,72 @@ struct WindExposure
     shelter: f32,
 };
 
-fn windExposure(xz: vec2<f32>, level: f32, upwind: vec2<f32>, open_sky: f32, sea: f32,
-                across: f32, half_width: f32, cross_stream: vec2<f32>) -> WindExposure
+// The share of the open wind a lee keeps at worst: gusts still find their
+// way down into it, so even a pond ringed by trees feels some of the wind.
+const LEE_WIND: f32 = 0.3;
+
+// Crown cover over a stand about `width` across around `p`: a forest edge
+// shelters as a porous belt, not as the one crown or gap a single point
+// lands on.
+fn standCover(p: vec2<f32>, upwind: vec2<f32>, width: f32) -> f32
 {
+    let side = vec2<f32>(-upwind.y, upwind.x)*width*0.5;
+    let along = upwind*width*0.5;
+    let open = riverCanopy(p).a + riverCanopy(p + side).a + riverCanopy(p - side).a
+             + riverCanopy(p + along).a + riverCanopy(p - along).a;
+    return 1.0 - open*0.2;
+}
+
+fn windExposure(xz: vec2<f32>, level: f32, upwind: vec2<f32>, open_sky: f32, sea: f32,
+                across: f32, half_width: f32, cross_stream: vec2<f32>, still: f32) -> WindExposure
+{
+    // Walk upwind and keep the steepest obstacle seen, as the tangent of its
+    // top over the water (the upwind horizon). A wake spreads as it runs
+    // downwind, so each step looks at the crowns over a stand half as wide as
+    // it is far. Water ends softly at its first bank, and land beyond, even
+    // below the level, is not more water. Every term is continuous in the
+    // water's position, so shelter and fetch change in gradients, not steps.
+    var wet = 1.0;
+    var fetch = 0.0;
+    var previous = 0.0;
+    var horizon = 0.0;
+    for (var i = 0u; i < 10u; i += 1u)
+    {
+        // 2 m out to 290 m.
+        let distance = 2.0*exp2(f32(i)*0.8);
+        let p = xz + upwind*distance;
+        let rise = riverGround(p).x - level;
+        let dry = smoothstepf(-0.15, 0.25, rise);
+        let top = max(rise, 0.0) + standCover(p, upwind, 0.5*distance)*CANOPY_HEIGHT*dry;
+        horizon = max(horizon, top/distance);
+        fetch += (distance - previous)*wet*(1.0 - 0.5*dry);
+        wet *= 1.0 - dry;
+        previous = distance;
+    }
     // No shore within reach: the open sea, whose wind sea is fully developed
     // a hundred kilometres out, or a lake wider than the walk, which in this
     // landscape is a few hundred metres at most.
-    var fetch = mix(400.0, 1.0e5, sea);
-    var obstacle = 0.0;
-    var previous = 0.0;
-    for (var i = 0u; i < 8u; i += 1u)
-    {
-        // 3 m out to 235 m.
-        let distance = 3.0*exp2(f32(i)*0.9);
-        let p = xz + upwind*distance;
-        let ground = riverGround(p).x;
-        if (ground > level + 0.05)
-        {
-            fetch = 0.5*(previous + distance);
-            let canopy = riverCanopy(p);
-            obstacle = ground - level + (1.0 - canopy.a)*CANOPY_HEIGHT;
-            break;
-        }
-        previous = distance;
-    }
-    if (half_width > 0.01)
+    let open_fetch = mix(400.0, 1.0e5, sea);
+    fetch = min(fetch + wet*max(open_fetch - previous, 0.0), open_fetch);
+    // A channel's own cut stands in for its banks only where the one-metre
+    // map cannot show them, and never where the channel's water has already
+    // become a lake's or the sea's: an outlet beside an open pond feels the
+    // pond's wind, not a creek's.
+    let stand_in = (1.0 - riverGround(xz).y)*(1.0 - max(still, sea));
+    if (half_width > 0.01 && stand_in > 0.0)
     {
         let sideways = dot(upwind, cross_stream);
         let to_bank = half_width*(1.0 - across*sign(sideways))/max(abs(sideways), 0.05);
         let bank_fetch = min(max(to_bank, 0.5), 40.0*half_width);
-        if (bank_fetch < fetch)
-        {
-            fetch = bank_fetch;
-            let canopy = riverCanopy(xz + upwind*(bank_fetch + 2.0));
-            obstacle = max(obstacle, 0.6 + 0.15*half_width + (1.0 - canopy.a)*CANOPY_HEIGHT);
-        }
+        let bank = 0.6 + 0.15*half_width
+                 + standCover(xz + upwind*(bank_fetch + 2.0), upwind, 0.5*bank_fetch + 4.0)*CANOPY_HEIGHT;
+        fetch = mix(fetch, min(fetch, bank_fetch), stand_in);
+        horizon = max(horizon, stand_in*bank/(bank_fetch + 2.0));
     }
-    // Gusts still find their way down into the lee, so even a pond ringed by
-    // trees feels a little of the wind.
-    let shadow = max(smoothstepf(3.0*obstacle, 14.0*obstacle + 2.0, fetch), 0.15);
-    return WindExposure(fetch, shadow*mix(0.25, 1.0, open_sky));
+    // The wind comes back down to the water some three to thirty obstacle
+    // heights downwind.
+    let shelter = mix(LEE_WIND, 1.0, smoothstepf(3.0, 30.0, 1.0/max(horizon, 1e-3)));
+    return WindExposure(fetch, shelter*mix(0.25, 1.0, open_sky));
 }
 
 // ---------------------------------------------------------------------------
@@ -2841,10 +2884,14 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     // The wind sea, as much as the wind and the fetch allow.
     let wind_direction = vec2<f32>(cos(stage.flags.z), sin(stage.flags.z));
     let here = riverCanopy(xz);
-    let exposure = windExposure(xz, level, -wind_direction, here.a, sea, across, half_width, cross_stream);
+    let exposure = windExposure(xz, level, -wind_direction, here.a, sea, across, half_width, cross_stream,
+                                stillness);
     let gust = windGust(xz, wind_direction, stage.wind.x, time);
-    let gust_factor = 1.0 + stage.wind.y*(gust - 0.5)*1.6;
-    let local_wind = stage.wind.x*exposure.shelter*max(gust_factor, 0.0)*(1.0 + 0.31*precipitation.w);
+    // The mean wind falls faster in a lee than its gusts do (turbulence
+    // intensity grows about as the shelter's inverse square root), so cat's
+    // paws still cross a sheltered pond.
+    let gust_swing = stage.wind.y*(gust - 0.5)*1.6*sqrt(exposure.shelter);
+    let local_wind = stage.wind.x*max(exposure.shelter + gust_swing, 0.0)*(1.0 + 0.31*precipitation.w);
     // On the sea the wind sea stops where the swell's spectrum begins.
     let longest = mix(3.7, 2.0, sea);
     var wind_sea = WindSea(vec2<f32>(0.0), 0.0, 0.0, 0.0);
@@ -3039,7 +3086,8 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     // on them hide the sky below their horizon.
     let unseen = mix(seen.occluder, reflected_sky, seen.sky);
     let terrain_reflection = marchWaterReflection(in.world_position, normal,
-                                                  reflection_direction, alpha, level, underside);
+                                                  reflection_direction, alpha, level, underside,
+                                                  in.clip_position.xy);
     let reflected = mix(unseen, terrain_reflection.rgb, terrain_reflection.a);
     // Fresnel-weighted and normalised (waterSpecular): a low sun's glitter
     // path keeps its clipped core and loses only its halo.
@@ -3222,7 +3270,10 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     // sunset shafts and the volumetric switch agree with the terrain pass.
     let fog = integrateAtmosphere(-to_view, view_distance);
     lit = lit*fog.transmittance + fog.scattering;
-    return vec4<f32>(pow(acesFilm(lit*globals.params.z), vec3<f32>(1.0/2.2)), 1.0);
+    // A triangular dither of one 8-bit step before the store quantises it, so
+    // the smooth gradients of open water do not break into flat plateaus.
+    let dither = screenNoise(in.clip_position.xy) + screenNoise(in.clip_position.xy + vec2<f32>(37.0, 113.0)) - 1.0;
+    return vec4<f32>(pow(acesFilm(lit*globals.params.z), vec3<f32>(1.0/2.2)) + vec3<f32>(dither/255.0), 1.0);
 }
 
 // ---------------------------------------------------------------------------
