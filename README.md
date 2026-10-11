@@ -1257,7 +1257,11 @@ to the next:
   as white as a near one without crawling; foam they make
   drifts downstream for some fifteen seconds as lace gathered on the seams by
   the banks, on a tongue down the current and as scum in slack water, and an
-  inlet carries it out into the pond. Stream foam is cream, stained like the
+  inlet carries it out into the pond. Where a rapid falls into a lake, the
+  roller at its foot keeps the toe's whitewater on the lake's water for a
+  couple of channel widths, and its foam drifts on out with the inflow's
+  plume, thinning over its lifetime, so the rapid meets the lake with no
+  line where the white ends. Stream foam is cream, stained like the
   water, and in the shade of the crowns it is lit only by the sky they leave.
 - **Seen from below.** Every surface is seen from the side of the water the
   eye is on, not by how high it stands. From the air the eye sees every

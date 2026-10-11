@@ -3013,16 +3013,21 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     // The steps stay put as the water runs over them. A ledge throws its
     // white water out in a train downstream of it, and the boulders between
     // break it up, so the steps are drawn out along the flow and broken by a
-    // finer scale, not laid as round patches.
-    let step_footprint = vec2<f32>(footprint.x, footprint.y/max(half_width, 0.01));
-    let own_steps = riverSteps(along, across, step_footprint);
+    // finer scale, not laid as round patches. A lake's sheet has no channel
+    // frame: where an inflow's fall churns it, its roller is laid on world
+    // axes in metres, two to a half width, so no pixel's own direction or
+    // stretch ever sets it.
+    let step_frame = select(vec2<f32>(xz.x, xz.y*0.5), vec2<f32>(along, across), river);
+    let step_footprint = vec2<f32>(footprint.x, footprint.y/select(2.0, max(half_width, 0.01), river));
+    let own_steps = riverSteps(step_frame.x, step_frame.y, step_footprint);
     let joined_steps = riverSteps(joined_st.x, across, step_footprint);
     let step_noise = mix(own_steps.x, joined_steps.x, joining);
     let step_shares = riverStepShares(0.5 + (step_noise - 0.5)*restore, own_steps.y);
     let steps = (step_shares.x + step_shares.y + step_shares.z)/3.0;
     // Rapids turn milky below each step, where the water plunges and fills
-    // with bubbles, and run clear over the smooth tongues between.
-    let aeration = select(0.0, smoothstepf(0.3, 0.9, turbulence)*mix(0.15, 0.7, steps), river);
+    // with bubbles, and run clear over the smooth tongues between; so does
+    // the roller at the foot of a fall into still water.
+    let aeration = smoothstepf(0.3, 0.9, turbulence)*mix(0.15, 0.7, steps);
     let body = WaterBody(sea, stillness, clamp(in.clarity, 0.0, 1.0)*(1.0 - sea), aeration);
 
     let rise = viewRise(to_view, facet, underside);
@@ -3206,7 +3211,7 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
         let unresolved = smoothstepf(0.5, 2.0, pixel_footprint*4.0);
         foam = max(foam, mix(breaking, coverage, unresolved)*0.8);
     }
-    if (river || speed > 0.02)
+    if (river || speed > 0.02 || turbulence > 0.0 || supply > 0.0)
     {
         // Foam on a run is drawn out along the current; churned in a rapid it
         // breaks into short ragged patches.
@@ -3237,7 +3242,8 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
         let tongue = exp(-off_tongue*off_tongue)*(1.0/6.0)/tongue_width;
         let seam = smoothstepf(0.5, 0.75, abs(across))*(1.0 - smoothstepf(0.82, 0.97, abs(across)));
         let slack = smoothstepf(0.8, 0.98, abs(across))*(1.0 - smoothstepf(0.25, 0.7, speed));
-        let drift = select(0.0, supply*(0.05 + 0.25*max(tongue, seam) + 0.2*slack), river);
+        // Out on a lake, below the fall that made it, it spreads as one lace.
+        let drift = select(supply*0.25, supply*(0.05 + 0.25*max(tongue, seam) + 0.2*slack), river);
         // A creek's jet carries its foam out into the pond it feeds.
         let mouth = select(smoothstepf(0.08, 0.5, speed)*0.3, 0.0, river)*(1.0 - sea);
         // Far off the texture averages away; keep the share of water it covers.

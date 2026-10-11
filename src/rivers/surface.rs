@@ -120,6 +120,11 @@ const PLUME_FLUSH: f32 = 3.0;
 const PLUME_SPREAD: f32 = 0.12;
 const PLUME_EDGE: f32 = LAKE_CELL;
 const PLUME_CONFINE: f32 = 0.2;
+/// Where a fall plunges into still water, the roller at its foot churns the
+/// pool over a couple of the channel's widths, and at least a few metres,
+/// before the water calms again (`paint_plume`).
+const ROLLER_WIDTHS: f32 = 2.0;
+const ROLLER_MIN: f32 = 4.0;
 
 /// How clear a lake's water is, 0..1: the forest's dissolved organic matter
 /// stains its streams and ponds like tea wherever there is forest to drain,
@@ -301,6 +306,9 @@ struct Sheets {
     /// (`lake_clarity`), and its inflows' where they run into it
     /// (`paint_plume`).
     clarity: Vec<HashMap<[i32; 2], f32>>,
+    /// Each lake's whitewater and foam at the corners of its sheet where an
+    /// inflow runs into it (`paint_plume`); none elsewhere.
+    stir: Vec<HashMap<[i32; 2], [f32; 2]>>,
 }
 
 impl Sheets {
@@ -329,7 +337,8 @@ impl Sheets {
             }
             clarity.push(own);
         }
-        Sheets { cells, corners, owner, clarity }
+        let stir = vec![HashMap::new(); lakes.len()];
+        Sheets { cells, corners, owner, clarity, stir }
     }
 
     /// The clarity of the highest sheet over `p`, if one lies there,
@@ -799,8 +808,8 @@ pub fn build(rivers: &[River], lakes: &[Lake], dry_ground: &dyn Fn([f32; 2]) -> 
         }
     }
 
-    for (lake, clarity) in lakes.iter().zip(&sheets.clarity) {
-        add_lake(&mut vertices, &mut chunk_triangles, lake, clarity);
+    for ((lake, clarity), stir) in lakes.iter().zip(&sheets.clarity).zip(&sheets.stir) {
+        add_lake(&mut vertices, &mut chunk_triangles, lake, clarity, stir);
     }
 
     let mut indices = Vec::new();
@@ -898,17 +907,31 @@ fn resolve_clarity(rivers: &[River], lakes: &[Lake], sheets: &mut Sheets) -> Vec
         }
         let own = lake_clarity(lakes[lake].level, lakes[lake].cells.len() as f32 * LAKE_CELL * LAKE_CELL);
         let breadth = (lakes[lake].cells.len() as f32).sqrt() * LAKE_CELL;
+        // Foam drifts out on the sheet's current, as far as it carries it
+        // in its lifetime, and no shorter than on slack water.
+        let current: HashMap<[i32; 2], [f32; 2]> = lakes[lake].current.iter().copied().collect();
+        let drift = |corner: [i32; 2]| FOAM_LIFETIME * current.get(&corner).map_or(0.0, |v| v[0].hypot(v[1])).max(0.3);
         // Each corner's share of inflowing water, and of its clarity over
-        // the lake's own.
+        // the lake's own; and the whitewater and foam the inflows carry
+        // out from the toes of their falls, the most any one brings.
         let mut mixed: HashMap<[i32; 2], (f32, f32)> = HashMap::new();
+        let mut stir: HashMap<[i32; 2], [f32; 2]> = HashMap::new();
         for &(index, origin, first, run_end) in &inlets[lake] {
+            let nodes = &rivers[index].nodes;
             let inflow = river_clarity(&rivers[index], sheets)[origin.min(first - 1)];
-            paint_plume(&rivers[index].nodes, origin, run_end, breadth, &sheets.clarity[lake], &mut |corner, share| {
+            let toe = [nodes[origin].turbulence, drifting_foam(nodes, origin)[origin]];
+            paint_plume(nodes, origin, run_end, breadth, &sheets.clarity[lake], &drift, &mut |corner, plume| {
                 let entry = mixed.entry(corner).or_insert((0.0, 0.0));
-                entry.0 += share;
-                entry.1 += share * (inflow - own);
+                entry.0 += plume.water;
+                entry.1 += plume.water * (inflow - own);
+                let churned = [toe[0] * plume.roller, toe[1] * plume.foam];
+                if churned[0] > 0.0 || churned[1] > 0.0 {
+                    let entry = stir.entry(corner).or_insert([0.0; 2]);
+                    *entry = [entry[0].max(churned[0]), entry[1].max(churned[1])];
+                }
             });
         }
+        sheets.stir[lake] = stir;
         // Clarity mixes as the volumes of the waters do: the optical
         // properties drawn are linear in it (`inlandMedium` in water.wgsl).
         for (corner, (share, excess)) in mixed {
@@ -932,15 +955,23 @@ fn resolve_clarity(rivers: &[River], lakes: &[Lake], sheets: &mut Sheets) -> Vec
 /// the share stays whole for a couple of cells, so wherever the ribbon
 /// gives way to the sheet the two carry the same water. `breadth` is the
 /// lake's, metres.
+///
+/// With it, how much of the toe's whitewater and foam reach each corner.
+/// Where a fall plunges into still water it churns a roller at its foot,
+/// which dies out within a couple of channel widths (`ROLLER_WIDTHS`), over
+/// the plume's width; the foam it makes drifts on out with the plume's
+/// water and thins over its lifetime, `drift` metres at a corner.
 fn paint_plume(
     nodes: &[RiverNode],
     origin: usize,
     run_end: usize,
     breadth: f32,
     corners: &HashMap<[i32; 2], f32>,
-    paint: &mut dyn FnMut([i32; 2], f32),
+    drift: &dyn Fn([i32; 2]) -> f32,
+    paint: &mut dyn FnMut([i32; 2], Plume),
 ) {
     let channel = (2.0 * nodes[origin.saturating_sub(1)].half_width).max(1.0);
+    let roller = (ROLLER_WIDTHS * channel).max(ROLLER_MIN);
     let mouth = 1.15 * nodes[origin].half_width + JUNCTION_RIBBON_MARGIN;
     let core_length = (PLUME_CORE * channel).min(PLUME_CONFINE * breadth).max(1.0);
     let flush = (PLUME_FLUSH * channel).min(PLUME_CONFINE * breadth).max(1.0);
@@ -972,7 +1003,8 @@ fn paint_plume(
                 continue;
             }
             let q = [x as f32 * LAKE_CELL, z as f32 * LAKE_CELL];
-            let mut share = 0.0f32;
+            let drift = drift([x, z]);
+            let mut plume = Plume::default();
             for (j, pair) in path.windows(2).enumerate() {
                 let (a, b) = (pair[0].position, pair[1].position);
                 let d = [b[0] - a[0], b[1] - a[1]];
@@ -991,13 +1023,44 @@ fn paint_plume(
                 let edge = PLUME_EDGE + PLUME_SPREAD * s;
                 let centre = if s <= core_length { 1.0 } else { (core_length / s).sqrt() * (-(s - core_length) / flush).exp() };
                 let out = (off - core).max(0.0) / edge;
-                share = share.max(behind * centre * (-std::f32::consts::LN_2 * out * out).exp());
+                let across = behind * (-std::f32::consts::LN_2 * out * out).exp();
+                plume.water = plume.water.max(centre * across);
+                plume.roller = plume.roller.max(across * (-s / roller).exp());
+                plume.foam = plume.foam.max(centre * across * (-s / drift).exp());
             }
-            if share > 0.0 {
-                paint([x, z], share);
+            if plume.water > 0.0 {
+                paint([x, z], plume);
             }
         }
     }
+}
+
+/// What an inflow's plume brings to a corner of its lake's sheet
+/// (`paint_plume`), each 0..1: its share of the inflow's water, of the
+/// whitewater at the toe of its fall and of the foam there.
+#[derive(Clone, Copy, Default)]
+struct Plume {
+    water: f32,
+    roller: f32,
+    foam: f32,
+}
+
+/// Foam the whitewater makes drifts on downstream and thins as it goes: a
+/// reach carries its own whitewater's or what is left of the foam made
+/// above it, which draws foam lines down the pool below every riffle and
+/// rapid. Down the river's nodes to `end`.
+fn drifting_foam(nodes: &[RiverNode], end: usize) -> Vec<f32> {
+    let mut foam = vec![0.0f32; end + 1];
+    let mut carried = 0.0f32;
+    for i in 0..=end {
+        if i > 0 {
+            let step = (nodes[i].along - nodes[i - 1].along).max(0.0);
+            carried *= (-step / (FOAM_LIFETIME * nodes[i - 1].speed.max(0.3))).exp();
+        }
+        carried = carried.max(nodes[i].turbulence);
+        foam[i] = carried;
+    }
+    foam
 }
 
 /// A row of a ribbon before it is laid: its vertices as the river alone
@@ -1174,20 +1237,7 @@ fn ribbon(
             *near = near.min(at - node.along);
         }
     }
-    // Foam the whitewater makes drifts on downstream and thins as it
-    // goes: a reach carries its own whitewater's or what is left of the
-    // foam made above it, which draws foam lines down the pool below
-    // every riffle and rapid.
-    let mut foam = vec![0.0f32; end + 1];
-    let mut carried = 0.0f32;
-    for i in 0..=end {
-        if i > 0 {
-            let step = (nodes[i].along - nodes[i - 1].along).max(0.0);
-            carried *= (-step / (FOAM_LIFETIME * nodes[i - 1].speed.max(0.3))).exp();
-        }
-        carried = carried.max(nodes[i].turbulence);
-        foam[i] = carried;
-    }
+    let foam = drifting_foam(nodes, end);
     // A row as the river alone would have it, its columns `offsets`.
     let draft = |i: usize, offsets: &[f32]| -> Draft {
         let node = &nodes[i];
@@ -1518,6 +1568,7 @@ fn add_lake(
     chunk_triangles: &mut std::collections::BTreeMap<(i32, i32), Vec<u32>>,
     lake: &Lake,
     clarity: &HashMap<[i32; 2], f32>,
+    stir: &HashMap<[i32; 2], [f32; 2]>,
 ) {
     let sunk: HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
     let current: HashMap<[i32; 2], [f32; 2]> = lake.current.iter().copied().collect();
@@ -1525,17 +1576,20 @@ fn add_lake(
     let mut corner = |vertices: &mut Vec<SurfaceVertex>, x: i32, z: i32| -> u32 {
         let push_vertex = || {
             let height = sunk.get(&[x, z]).map_or(lake.level, |&h| h.min(lake.level));
+            // Still water is calm and clear of foam but where an inflow's
+            // fall churns it (`paint_plume`).
+            let [turbulence, foam] = stir.get(&[x, z]).copied().unwrap_or([0.0; 2]);
             vertices.push(SurfaceVertex {
                 position: [x as f32 * LAKE_CELL, height, z as f32 * LAKE_CELL],
                 // A river's current runs on a little way into the lake at its
                 // mouth (network::sheet_current).
                 velocity: current.get(&[x, z]).copied().unwrap_or([0.0, 0.0]),
                 across: 0.0,
-                turbulence: 0.0,
+                turbulence,
                 still: 1.0,
                 along: 0.0,
                 half_width: 0.0,
-                foam: 0.0,
+                foam,
                 sea: 0.0,
                 side: 0.0,
                 joined: [0.0; 3],
@@ -2111,7 +2165,8 @@ mod tests {
     /// plume of its own water, which fades into the pond's: no step where
     /// the stream's ribbon gives way to the pond's sheet, the stream's own
     /// colour at the mouth, the pond's own beyond the plume, and the pond's
-    /// own water out of its outlet.
+    /// own water out of its outlet. The whitewater and foam at the foot of
+    /// the rapid run on out into the pond the same way, and die out in it.
     #[test]
     fn a_clear_stream_runs_into_a_stained_pond_as_a_plume() {
         // A clear lake at 120 m over x -80..-40 m, and a 120 m pond at 60 m
@@ -2137,6 +2192,8 @@ mod tests {
                 depth: 0.5,
                 speed: 1.0,
                 along: x + 70.0,
+                // White down the rapid, to its toe at the pond's level.
+                turbulence: if (-40.0..=0.0).contains(&x) { 0.6 } else { 0.0 },
                 lake: x < -40.0 || (0.0..120.0).contains(&x),
                 ..Default::default()
             }
@@ -2155,13 +2212,28 @@ mod tests {
             for (k, pair) in samples.windows(2).enumerate() {
                 assert!((pair[1] - pair[0]).abs() < 0.08, "{z}: step at {}: {samples:?}", -10.0 + 0.5 * k as f32);
             }
+            // And so do its whitewater and foam.
+            let stirred: Vec<[f32; 2]> = (0..=140)
+                .map(|k| mesh.drawn_at([-10.0 + 0.5 * k as f32, z]).unwrap())
+                .map(|v| [v.turbulence, v.foam])
+                .collect();
+            for (k, pair) in stirred.windows(2).enumerate() {
+                let step = (pair[1][0] - pair[0][0]).abs().max((pair[1][1] - pair[0][1]).abs());
+                assert!(step < 0.1, "{z}: step at {}: {stirred:?}", -10.0 + 0.5 * k as f32);
+            }
         }
+        let stir = |x: f32, z: f32| mesh.drawn_at([x, z]).map(|v| [v.turbulence, v.foam]).unwrap();
+        assert!(stir(-5.0, 0.0)[0] > 0.55 && stir(1.0, 0.0)[0] > 0.5, "{:?} {:?}", stir(-5.0, 0.0), stir(1.0, 0.0));
+        assert!(stir(1.0, 0.0)[1] > 0.5 && stir(6.0, 0.0)[1] > 0.1, "the foam drifts on out: {:?}", stir(6.0, 0.0));
         assert!((drawn(1.0, 0.0) - inflow).abs() < 0.02, "{}", drawn(1.0, 0.0));
         assert!(drawn(20.0, 0.0) > own + 0.2, "the plume reaches into the pond");
         // Beyond the plume, along it and to either side, the pond's own.
         for [x, z] in [[80.0, 0.0], [110.0, 0.0], [10.0, 24.0], [10.0, -24.0], [40.0, 30.0]] {
             assert!((drawn(x, z) - own).abs() < 0.02, "{x} {z}: {}", drawn(x, z));
+            assert!(stir(x, z)[0] < 1e-3 && stir(x, z)[1] < 1e-3, "{x} {z}: the pond is calm: {:?}", stir(x, z));
         }
+        // Still water no fall runs into stays calm and clear of foam.
+        assert_eq!(stir(-60.0, 15.0), [0.0, 0.0]);
         // Out of the outlet runs the pond's own water.
         assert!((ribbon_at(130.0) - own).abs() < 0.02, "{}", ribbon_at(130.0));
     }
