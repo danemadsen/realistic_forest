@@ -1638,7 +1638,10 @@ fn waterImpacts(world_xz: vec2<f32>, time: f32, footprint: f32,
 // a lake large enough to hold its snowmelt clear is too, where a pond the
 // same height stays humic; a stream is clear above the forest and carries
 // the clarity of the lake it leaves down into the forest, where the stain
-// takes over again.
+// takes over again. Where a stream runs into a lake of other water its
+// clarity runs on into the lake's sheet as the plume of a jet, fading into
+// the lake's own; the optics below are linear in clarity, so that blend is
+// the two waters mixed by volume.
 const RIVER_EXTINCTION: vec3<f32> = vec3<f32>(0.40, 0.38, 1.05);
 const RIVER_SCATTER: vec3<f32> = vec3<f32>(0.012, 0.012, 0.010);
 const POND_EXTINCTION: vec3<f32> = vec3<f32>(0.55, 0.58, 1.60);

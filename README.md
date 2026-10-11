@@ -1174,7 +1174,12 @@ to the next:
   enough to hold its snowmelt clear (over a hectare or so) is too, where a
   pond the same height stays brown. A stream is clear above the forest, and
   one leaving a clear lake carries its clarity down into the forest for a
-  kilometre or two before the stain takes over. The eye's path is bent down
+  kilometre or two before the stain takes over. Where a stream runs into a
+  lake of other water it enters as a jet of its own water, unmixed across
+  its width for a few channel widths and then diluting into the lake's over
+  a few more, so a clear rapid runs on into a brown pond as a pale tongue
+  that fades into the tea rather than ending at a line; beyond it the pond
+  keeps its own colour. The eye's path is bent down
   into the water and the light scattered back out of it is dimmed with
   depth, so depth reads. A bed shows through as much water as lies over it,
   however low the glance: deep water seen across a tarn is no clearer than
