@@ -194,9 +194,13 @@ pub struct Envelope {
 /// its water, for a shore's typical slope; how near the shore a point is,
 /// in the same terms as a river's bank distance.
 pub const LAKE_SHORE_RUN: f32 = 6.0;
-/// The steepest face, rise over run, a levee meets a lake's water in: about
-/// the angle of repose of loose wet soil, 45 degrees.
-pub const LEVEE_LAKE_FACE: f32 = 1.0;
+/// How many metres a levee's face rises from a lake's water for each metre
+/// the natural ground under it rises (`Envelope::held`). The face is
+/// reckoned from the ground's own height, so it draws every hollow and rise
+/// of that ground, an erosion gully's walls among them, this many times as
+/// steep: twice, a face of one in three on a typical shore
+/// (`LAKE_SHORE_RUN`), a delta's levee sloping gently down into its lake.
+pub const LEVEE_LAKE_RISE: f32 = 2.0;
 /// How far a river's water stands over a lake's where it stops being the
 /// lake's own: within the lower it is the lake's water backed up its mouth,
 /// past the higher (a hand or two, as high as a creek's banks stand over its
@@ -259,10 +263,12 @@ impl Envelope {
     /// where its sheet's edge is drawn sunk lower), which heaped a dyke
     /// into the lake beside a cascade and, behind the head of an outlet's
     /// rapid, a mound into the open water by its sill. Up the shore it comes
-    /// back in a face no steeper than `LEVEE_LAKE_FACE` over the distance
-    /// from the waterline ground that high stands at (`LAKE_SHORE_RUN`
-    /// metres per metre), its foot `CARVE_ROUNDING` under the water so the
-    /// rounded crease never lifts the lake's bed either. A channel running
+    /// back in a face rising `LEVEE_LAKE_RISE` metres for each metre the
+    /// ground under it rises, its foot `CARVE_ROUNDING` under the water so
+    /// the rounded crease never lifts the lake's bed either. The face is
+    /// measured from the very ground it holds up, so a steeper face would
+    /// draw that ground's every hollow as a steep-walled pit, dark in the
+    /// sun. A channel running
     /// away below its lake's level (an outlet below its sill, beyond the
     /// rim) keeps its levees. Mirrored by `riverHeld` in
     /// river-functions.wgslinc.
@@ -271,7 +277,7 @@ impl Envelope {
             return self.lower;
         }
         let lake = self.lake.max(self.still);
-        let face = lake - CARVE_ROUNDING + (height - lake) * LAKE_SHORE_RUN * LEVEE_LAKE_FACE;
+        let face = lake - CARVE_ROUNDING + (height - lake) * LEVEE_LAKE_RISE;
         self.lower - self.perched * (self.lower - face).max(0.0)
     }
 
@@ -1296,6 +1302,40 @@ mod tests {
         let offset = words[GRID_HEADER_WORDS + cell * GRID_CELL_WORDS] as usize;
         let count = words[GRID_HEADER_WORDS + cell * GRID_CELL_WORDS + 1] as usize;
         assert_eq!(&words[offset..offset + count], &grid.indices[grid.cells[cell][0] as usize..][..count]);
+    }
+    /// Reported: a dark pit on a lake's shore beside its outlet, where an
+    /// outlet head's levee stood over the carve's terrace (lower over upper)
+    /// and the face down to the lake drew the ground several times as steep
+    /// as it lies. Swept from the lake's water up past the terrace, the held
+    /// ground only ever rises with the natural ground, never sinks under it
+    /// by more than the rounded crease, and never climbs faster than the
+    /// face does.
+    #[test]
+    fn a_perched_levees_face_follows_the_ground() {
+        let envelope = Envelope {
+            upper: 99.3,
+            lower: 100.5,
+            bank_distance: 3.0,
+            water: 98.8,
+            lake: 98.75,
+            perched: 1.0,
+            still: 98.75,
+            ..Envelope::NONE
+        };
+        let step = 0.001;
+        let mut previous = envelope.clamp(envelope.lake);
+        let mut height = envelope.lake;
+        while height < envelope.upper + 0.5 {
+            height += step;
+            let held = envelope.clamp(height);
+            let slope = (held - previous) / step;
+            assert!(slope >= 0.0, "the ground falls at {height}: {previous} to {held}");
+            assert!(slope <= LEVEE_LAKE_RISE + 0.01, "the face climbs {slope} times as fast as the ground at {height}");
+            if height <= envelope.upper {
+                assert!(held >= height - CARVE_ROUNDING, "ground at {height} held at {held}");
+            }
+            previous = held;
+        }
     }
 }
 

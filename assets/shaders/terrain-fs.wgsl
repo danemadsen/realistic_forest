@@ -694,10 +694,11 @@ const RIVER_LAKE_DEPTH_UNIT: f32 = 0.002;
 const RIVER_LAKE_NO_CORNER: u32 = 0xffffu;
 // Metres of shore per metre of rise above a lake's water.
 const RIVER_LAKE_SHORE_RUN: f32 = 6.0;
-// The steepest face, rise over run, a levee meets a lake's water in
-// (LEVEE_LAKE_FACE), and how far under a lake's level a river's water may
-// stand and still be the lake's own, and is for certain (UNDER_LAKE).
-const RIVER_LEVEE_LAKE_FACE: f32 = 1.0;
+// How many metres a levee's face rises from a lake's water for each metre
+// the ground under it rises (LEVEE_LAKE_RISE), and how far under a lake's
+// level a river's water may stand and still be the lake's own, and is for
+// certain (UNDER_LAKE).
+const RIVER_LEVEE_LAKE_RISE: f32 = 2.0;
 const RIVER_UNDER_LAKE: vec2<f32> = vec2<f32>(0.2, 0.05);
 const RIVER_BANK_REACH: f32 = 12.0;
 const RIVER_BANK_CURVE: f32 = 0.16;
@@ -1096,14 +1097,14 @@ fn riverSmoothMax(a: f32, b: f32, k: f32) -> f32
 // How high the levees hold up ground standing at `height` (Envelope::held):
 // a channel whose water stands at or over its lake's never builds ground out
 // of the lake's water (its surface, or its level where the sheet's edge is
-// drawn sunk lower), and its levee comes back up the shore in a face no
-// steeper than RIVER_LEVEE_LAKE_FACE over the run from the waterline.
+// drawn sunk lower), and its levee comes back up the shore in a face rising
+// RIVER_LEVEE_LAKE_RISE times as fast as the ground it holds up, so it never
+// draws that ground's hollows as steep-walled pits.
 fn riverHeld(envelope: RiverEnvelope, height: f32) -> f32
 {
     if (envelope.lake <= RIVER_NO_LAKE || envelope.perched <= 0.0) { return envelope.lower; }
     let lake = max(envelope.lake, envelope.still);
-    let face = lake - RIVER_CARVE_ROUNDING
-             + (height - lake)*RIVER_LAKE_SHORE_RUN*RIVER_LEVEE_LAKE_FACE;
+    let face = lake - RIVER_CARVE_ROUNDING + (height - lake)*RIVER_LEVEE_LAKE_RISE;
     return envelope.lower - envelope.perched*max(envelope.lower - face, 0.0);
 }
 

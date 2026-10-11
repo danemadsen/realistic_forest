@@ -844,7 +844,9 @@ sill, has banks held up right down to the lake, as a delta's natural
 levees are, however near it, though never out of the lake's own water:
 where its water stands at or over the lake's, its levee comes back up the
 shore from just under the water (the lake's level, where its sheet's edge
-is drawn sunk lower), no steeper than 45 degrees. An estuary's bed falls toward the sea and meets the seabed: at its
+is drawn sunk lower), rising twice as fast as the ground it holds up (one
+in three on a typical shore), so it never draws that ground's hollows as
+steep-walled pits. An estuary's bed falls toward the sea and meets the seabed: at its
 mouth it is no deeper than the highest ground its water still crosses to
 reach open water (a bar, or the shelving seabed), and up its flare nowhere
 deeper than downstream, so no pool lies behind the shore.
