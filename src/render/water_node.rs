@@ -2244,6 +2244,62 @@ mod shading_tests {
         assert!(along > across + 0.3, "{lag} m down the wind {along}, across it {across}");
     }
 
+    /// A river's ripples and foam are drawn out along its current by as much
+    /// as the current is fast, but how closely their crests follow one
+    /// another down the river must depend only on the current there, not on
+    /// how far the river has run from its head. Here the current quickens
+    /// down a 40 m reach, so the stretch changes along it, and the same reach
+    /// is drawn near the head and 600 m below it.
+    #[test]
+    fn ripple_and_foam_crests_are_as_close_far_down_a_river_as_near_its_head() {
+        let heads = [
+            "const PI:", "fn smoothstepf(", "fn hash21(", "fn valueNoise(", "fn riverNoise(",
+            "const RIVER_NOISE_SLOPE_VARIANCE:", "struct FlowLayer", "fn flowLayer(", "struct FlowSurface",
+            "fn flowSurface(", "fn riverFoamPattern(",
+        ];
+        let body = "
+            let flow = vec2<f32>(input.z, 0.0);
+            let st = input.xy;
+            let ripples = flowSurface(st, flow, 3.7, 0.0, 0.0, true, vec2<f32>(0.001), 0.0);
+            let foam_stretch = 1.0 + 2.5*smoothstepf(0.3, 1.5, input.z);
+            let foam = riverFoamPattern(st, flow, foam_stretch, 3.7, vec2<f32>(0.001), 0.0);
+            samples[id.x] = vec4<f32>(ripples.slope.x, foam, 0.0, 0.0);";
+        let step = 0.01f32;
+        let reach = 40.0f32;
+        let points: Vec<[f32; 2]> = (0..4000)
+            .flat_map(|i| [-0.6f32, -0.2, 0.2, 0.6].map(|across| [i as f32 * step, across]))
+            .collect();
+        let mut inputs = Vec::new();
+        for base in [0.0f32, 600.0] {
+            for offset in [0.0, step] {
+                inputs.extend(points.iter().map(|p| {
+                    let local = p[0] + offset;
+                    [base + local, p[1], 0.4 + 1.2 * local / reach, 0.0]
+                }));
+            }
+        }
+        let Some(values) = evaluate(&heads, body, &inputs) else {
+            return;
+        };
+        let n = points.len();
+        // Crests per metre: how fast the pattern changes down the river over
+        // how much it varies.
+        let frequency = |base: usize, k: usize| {
+            let (here, next) = values[base * 2 * n..(base + 1) * 2 * n].split_at(n);
+            let mean = here.iter().map(|v| v[k]).sum::<f32>() / n as f32;
+            let spread: f32 = here.iter().map(|v| (v[k] - mean).powi(2)).sum();
+            let change: f32 = here.iter().zip(next).map(|(a, b)| (b[k] - a[k]).powi(2)).sum();
+            (change / spread).sqrt() / step
+        };
+        for (k, name) in [(0, "ripples"), (1, "foam")] {
+            let (head, below) = (frequency(0, k), frequency(1, k));
+            assert!(
+                (below / head - 1.0).abs() < 0.2,
+                "{name}: {head} crests per metre near the head, {below} 600 m below"
+            );
+        }
+    }
+
     /// The stage block is mirrored by hand on both sides; a field added to one
     /// alone would shift everything after it.
     #[test]

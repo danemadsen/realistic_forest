@@ -2169,31 +2169,53 @@ fn flowSurface(st: vec2<f32>, flow: vec2<f32>, time: f32, roughness: f32, riffle
         stir = 1.0 - 0.75*dome*boils + 0.6*rim*boils;
     }
 
+    // The stretch changes from pixel to pixel with the current, but the
+    // channel's frame runs hundreds of metres from the river's head: divided
+    // by the stretch there, the frame's own length would set the crests
+    // (they would follow lines of equal speed, closing into rings that
+    // shrink to a point and sparkle by the banks). So the ripples are drawn
+    // at fixed stretches a half octave apart, 1, 1.41, 2, 2.83, and the
+    // stretch the current asks for is a blend of the two that bracket it.
+    // Each fixed stretch keeps its own pattern wherever it is drawn, so the
+    // blend has no seams, and two patterns blended keep the slope of one.
+    let rungs = 2.0*log2(stretch);
+    let low_rung = floor(rungs);
+    let high_share = rungs - low_rung;
+    let keep_slope = inverseSqrt((1.0 - high_share)*(1.0 - high_share) + high_share*high_share);
     for (var octave = 0u; octave < 3u; octave += 1u)
     {
         let wavelength = select(select(0.85, 0.32, octave == 1u), 0.12, octave == 2u);
         let period = select(select(2.3, 1.45, octave == 1u), 0.95, octave == 2u);
         let c = steepness*stir*select(1.0, 0.8, octave == 2u);
-        let along_scale = wavelength*stretch;
-        let resolved = (1.0 - smoothstepf(0.18, 0.6, footprint.x/along_scale))
-                     * (1.0 - smoothstepf(0.18, 0.6, footprint.y/wavelength))
-                     * (1.0 - smoothstepf(0.22, 0.4, travel/along_scale));
+        var resolved_mean = 0.0;
+        for (var k = 0u; k < 2u; k += 1u)
+        {
+            let rung = low_rung + f32(k);
+            let share = select(1.0 - high_share, high_share, k == 1u);
+            let rung_stretch = exp2(rung*0.5);
+            let along_scale = wavelength*rung_stretch;
+            let resolved = (1.0 - smoothstepf(0.18, 0.6, footprint.x/along_scale))
+                         * (1.0 - smoothstepf(0.18, 0.6, footprint.y/wavelength))
+                         * (1.0 - smoothstepf(0.22, 0.4, travel/along_scale));
+            resolved_mean += resolved*share;
+            if (resolved*share <= 0.0)
+            {
+                continue;
+            }
+            let seed = vec2<f32>(rung*13.7, rung*7.1) + vec2<f32>(f32(octave)*7.7);
+            for (var layer = 0u; layer < 2u; layer += 1u)
+            {
+                let cycle = flowLayer(time, period, layer, f32(octave)*0.37, flow);
+                let advected = st - cycle.offset;
+                let q = vec2<f32>(advected.x/along_scale, advected.y/wavelength) + cycle.jitter + seed;
+                let noise = riverNoise(q);
+                // Height c*wavelength*noise: d/ds = c*noise.y/rung_stretch, d/dt = c*noise.z.
+                result.slope += vec2<f32>(noise.y/rung_stretch, noise.z)
+                              * (c*cycle.weight*resolved*share*keep_slope);
+            }
+        }
         result.variance += c*c*RIVER_NOISE_SLOPE_VARIANCE*(1.0/(stretch*stretch) + 1.0)
-                         *(1.0 - resolved*resolved);
-        if (resolved <= 0.0)
-        {
-            continue;
-        }
-        for (var layer = 0u; layer < 2u; layer += 1u)
-        {
-            let cycle = flowLayer(time, period, layer, f32(octave)*0.37, flow);
-            let advected = st - cycle.offset;
-            let q = vec2<f32>(advected.x/along_scale, advected.y/wavelength)
-                  + cycle.jitter + vec2<f32>(f32(octave)*7.7);
-            let noise = riverNoise(q);
-            // Height c*wavelength*noise: d/ds = c*noise.y/stretch, d/dt = c*noise.z.
-            result.slope += vec2<f32>(noise.y/stretch, noise.z)*(c*cycle.weight*resolved);
-        }
+                         *(1.0 - resolved_mean*resolved_mean);
     }
     if (riffle > 0.001)
     {
@@ -2230,23 +2252,40 @@ fn flowSurface(st: vec2<f32>, flow: vec2<f32>, time: f32, roughness: f32, riffle
 // along the current, 0..1 about a mean of 0.5. Its two layers hand over as
 // the ripples' do, so the foam keeps its contrast through the hand-over, and
 // its fine bubbles average away once the current carries them too far a
-// frame to follow.
+// frame to follow. Like the ripples (flowSurface) it is drawn at fixed
+// stretches a half octave apart and blended between the two that bracket
+// `stretch`, so the length of the frame never sets its streaks.
 fn riverFoamPattern(st: vec2<f32>, flow: vec2<f32>, stretch: f32, time: f32,
                     footprint: vec2<f32>, frame_seconds: f32) -> f32
 {
-    let squeeze = vec2<f32>(1.0/stretch, 1.0);
-    let extent = max(footprint.x/stretch, footprint.y);
-    let travel = length(flow)*frame_seconds/stretch;
-    let coarse_blur = max(smoothstepf(0.25, 0.75, extent*2.1), smoothstepf(0.1, 0.2, travel*2.1));
-    let fine_blur = max(smoothstepf(0.25, 0.75, extent*7.3), smoothstepf(0.1, 0.2, travel*7.3));
+    let rungs = 2.0*log2(max(stretch, 1.0));
+    let low_rung = floor(rungs);
+    let high_share = rungs - low_rung;
+    let keep_contrast = inverseSqrt((1.0 - high_share)*(1.0 - high_share) + high_share*high_share);
     var pattern = 0.5;
-    for (var layer = 0u; layer < 2u; layer += 1u)
+    for (var k = 0u; k < 2u; k += 1u)
     {
-        let cycle = flowLayer(time, 2.2, layer, 0.13, flow);
-        let q = (st - cycle.offset)*squeeze + cycle.jitter*0.74;
-        let coarse = mix(valueNoise(q*2.1), 0.5, coarse_blur);
-        let bubbles = mix(valueNoise(q*7.3 + vec2<f32>(13.1, 4.7)), 0.5, fine_blur);
-        pattern += (coarse*0.62 + bubbles*0.38 - 0.5)*cycle.weight;
+        let rung = low_rung + f32(k);
+        let share = select(1.0 - high_share, high_share, k == 1u);
+        if (share <= 0.0)
+        {
+            continue;
+        }
+        let rung_stretch = exp2(rung*0.5);
+        let squeeze = vec2<f32>(1.0/rung_stretch, 1.0);
+        let extent = max(footprint.x/rung_stretch, footprint.y);
+        let travel = length(flow)*frame_seconds/rung_stretch;
+        let coarse_blur = max(smoothstepf(0.25, 0.75, extent*2.1), smoothstepf(0.1, 0.2, travel*2.1));
+        let fine_blur = max(smoothstepf(0.25, 0.75, extent*7.3), smoothstepf(0.1, 0.2, travel*7.3));
+        let seed = vec2<f32>(rung*13.7, rung*7.1);
+        for (var layer = 0u; layer < 2u; layer += 1u)
+        {
+            let cycle = flowLayer(time, 2.2, layer, 0.13, flow);
+            let q = (st - cycle.offset)*squeeze + cycle.jitter*0.74 + seed;
+            let coarse = mix(valueNoise(q*2.1), 0.5, coarse_blur);
+            let bubbles = mix(valueNoise(q*7.3 + vec2<f32>(13.1, 4.7)), 0.5, fine_blur);
+            pattern += (coarse*0.62 + bubbles*0.38 - 0.5)*cycle.weight*share*keep_contrast;
+        }
     }
     return clamp(pattern, 0.0, 1.0);
 }

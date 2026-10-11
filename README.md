@@ -1223,6 +1223,10 @@ to the next:
   tributary joins it. The current carries them downstream at the water's own
   speed, drawn out along fast water, each scale on its own cycle, its two
   layers handed over with their contrast held so the water never pulses.
+  Ripples and foam are drawn out by blending fixed stretches half an octave
+  apart, never by dividing the distance down the channel by a stretch that
+  changes with the current, which closed their crests into rings that
+  shrank to a point.
   Standing waves stand still over riffles, fixed to the bed, while ripples
   and foam stream through them; they swell and ebb in place rather than in a
   travelling pulse, which used to read as the water running upstream. Boils
