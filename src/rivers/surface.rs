@@ -3,10 +3,14 @@
 //!
 //! A ribbon's cross-sections sit at the river's nodes and reach a little
 //! past each bank, so the waterline is wherever the carved bank rises through
-//! the water and never a mesh edge. Every vertex carries the flow there (the
-//! current is fastest over the thalweg and stalls at the banks), where across
-//! the channel it lies and its whitewater, which is what the water shader
-//! animates and foams.
+//! the water and never a mesh edge. Where the ground beside the channel lies
+//! lower than its water, or a lake's sheet does where a cascade runs into it,
+//! the ribbon's outer strip rounds down onto it (`round_edge`), here by the
+//! ground as carved and again in the shader by the ground as the erosion
+//! leaves it, so no water edge ever ends in the air. Every vertex carries
+//! the flow there (the current is fastest over the thalweg and stalls at the
+//! banks), where across the channel it lies and its whitewater, which is
+//! what the water shader animates and foams.
 //!
 //! A lake is a flat sheet at its level over its basin and the shore cells
 //! around it, so the shoreline is wherever the ground rises through it, but
@@ -22,12 +26,12 @@
 //! The mesh is cut into 256 m chunks with their bounds, so the renderer only
 //! draws what the camera can see.
 
-use super::network::{FLOW_CELL, Lake, River, RiverEnd};
+use super::network::{FLOW_CELL, Lake, River, RiverEnd, RiverNode};
 use crate::constants::SEA_LEVEL;
 use std::collections::HashMap;
 
-/// One water-surface vertex: 64 bytes, mirrored by the river vertex inputs
-/// in water-surface.wgsl.
+/// One water-surface vertex: 68 bytes, mirrored by `vs_inland`'s inputs in
+/// water.wgsl.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SurfaceVertex {
@@ -70,9 +74,71 @@ pub struct SurfaceVertex {
     /// them, so the shader draws them in both and cross-fades. Elsewhere the
     /// ribbon's own frame and 0.
     pub joined: [f32; 3],
+    /// How clear the water is: 0 stained like tea by the forest it drains,
+    /// 1 clear mountain water (`lake_clarity`, `stream_clarity`). The shader
+    /// colours the water by it.
+    pub clarity: f32,
+    /// Where a ribbon's outer strip rounds down onto lower ground beside its
+    /// channel (`round_edge`): the world XZ of the strip's edge on this
+    /// vertex's side, how far across the strip the vertex lies (0 at its
+    /// inner end, 1 at its edge), and the row's water before the strip was
+    /// rounded. The shader rounds the strip down again wherever the ground
+    /// at the edge, as the erosion has worn it since, lies lower still. The
+    /// third is 0 off the strip, on a lake's sheet, wherever a tributary's
+    /// water is becoming its parent's, and wherever the edge lies over water
+    /// rather than dry land, none of which the shader rounds.
+    pub rim: [f32; 4],
 }
 
-const _: () = assert!(std::mem::size_of::<SurfaceVertex>() == 64);
+const _: () = assert!(std::mem::size_of::<SurfaceVertex>() == 84);
+
+/// Altitudes over which the forest gives way to bare rock: the treeline is
+/// 96 m, give or take 15 (src/vegetation/ecology.rs). Above it nothing
+/// stains the water.
+const ABOVE_FOREST: [f32; 2] = [95.0, 115.0];
+/// Altitudes over which the forest thins out toward the treeline: a lake
+/// large and deep enough here is fed by snowmelt and springs and holds them
+/// clear, where a pond the same height in the trees stays humic.
+const MONTANE: [f32; 2] = [55.0, 85.0];
+/// Lake areas, square metres, over which a montane lake turns clear.
+const LARGE_LAKE: [f32; 2] = [10_000.0, 30_000.0];
+/// Metres down a river over which the clearness of the lake it leaves fades
+/// into the stain of the forest it runs through.
+const CLEAR_FADE: f32 = 1500.0;
+/// A river running into still water enters it as a turbulent plane jet
+/// (Rajaratnam 1976): it holds an unmixed core of its own water for a few
+/// channel widths (`PLUME_CORE`), then dilutes as the square root of the
+/// distance as it draws the lake's water in, and is spent within a few more
+/// (`PLUME_FLUSH`, the e-folding length past the core). Its edges, where it
+/// shears against the still water, widen by `PLUME_SPREAD` metres a metre
+/// from at least `PLUME_EDGE`, a sheet cell, so the sheet's triangles never
+/// show in them. In a basin not much larger than the jet it draws its own
+/// mixed water back in, which shortens it: neither length passes
+/// `PLUME_CONFINE` of the basin's breadth.
+const PLUME_CORE: f32 = 3.0;
+const PLUME_FLUSH: f32 = 3.0;
+const PLUME_SPREAD: f32 = 0.12;
+const PLUME_EDGE: f32 = LAKE_CELL;
+const PLUME_CONFINE: f32 = 0.2;
+/// Where a fall plunges into still water, the roller at its foot churns the
+/// pool over a couple of the channel's widths, and at least a few metres,
+/// before the water calms again (`paint_plume`).
+const ROLLER_WIDTHS: f32 = 2.0;
+const ROLLER_MIN: f32 = 4.0;
+
+/// How clear a lake's water is, 0..1: the forest's dissolved organic matter
+/// stains its streams and ponds like tea wherever there is forest to drain,
+/// but above the treeline a tarn is clear snowmelt over rock, whatever its
+/// size, and a large lake among the thinning trees below it is too.
+pub fn lake_clarity(level: f32, area: f32) -> f32 {
+    let montane = smoothstep(MONTANE[0], MONTANE[1], level) * smoothstep(LARGE_LAKE[0], LARGE_LAKE[1], area);
+    stream_clarity(level).max(montane)
+}
+
+/// How clear a stream's own water is: clear above the forest, stained in it.
+pub fn stream_clarity(level: f32) -> f32 {
+    smoothstep(ABOVE_FOREST[0], ABOVE_FOREST[1], level)
+}
 
 /// How far the ripples drawn change between two points of the water: the
 /// change of each frame they are laid in, by its share of the cross-fade
@@ -156,6 +222,68 @@ const MERGE_STEP: f32 = 0.5;
 /// How far a tributary's water may stand under its parent's where it reaches
 /// it and still run into it.
 const JOIN_STEP: f32 = 0.15;
+/// A ribbon's columns across its channel, in half widths: a little past
+/// each waterline, under the banks, and through its outer strips (from
+/// `WIDE_STRIP` or `NARROW_STRIP` out) closely enough for the strip to round
+/// down onto lower ground beside the channel (`round_edge`). A channel
+/// wider than `WIDE_RIBBON` metres either side takes the wide set.
+const WIDE_COLUMNS: [f32; 9] = [-1.12, -0.97, -0.8, -0.55, 0.0, 0.55, 0.8, 0.97, 1.12];
+const NARROW_COLUMNS: [f32; 5] = [-1.15, -0.75, 0.0, 0.75, 1.15];
+const WIDE_STRIP: f32 = 0.55;
+const NARROW_STRIP: f32 = 0.0;
+const WIDE_RIBBON: f32 = 1.6;
+/// How far under the ground at its edge a ribbon's rounded strip ends:
+/// enough that the terrain's triangles, which stand within a few
+/// centimetres of the metre-spaced ground the strip is rounded by, never
+/// bare it. Mirrored by `EDGE_TUCK` in water.wgsl.
+pub const EDGE_TUCK: f32 = 0.05;
+/// How far under its water a ribbon's edge always ends, whatever the ground
+/// measured beside it: a share of its half width, at least `EDGE_DROP[0]`
+/// and at most `EDGE_DROP[1]` metres. The ground the strip is rounded by is
+/// only ever an estimate of the ground drawn: the terrain's triangles
+/// stand a few centimetres off the metre-spaced map between its samples,
+/// the erosion wears banks down by decimetres after the ribbon is built, and
+/// far from the coast the shader has no map of the ground to round the strip
+/// by again. A bank a hand under its water there would leave the strip
+/// standing over it in a flat glassy edge. Curving every edge down by about
+/// a hand or two keeps a bank that low under the water's front; where the
+/// bank stands higher the curve lies inside it, out of sight. A wider river
+/// stands deeper in its channel and its banks wear further, so the share
+/// grows with it, while at the waterline, a quarter ellipse being level
+/// where it starts, the water lowers by only a few centimetres.
+pub const EDGE_DROP: [f32; 2] = [0.12, 0.3];
+pub const EDGE_DROP_SHARE: f32 = 0.06;
+/// Metres inside a lake's sheet, and before the lake's first node along
+/// the river, over which a ribbon still standing over the lake's level (a
+/// cascade's foot) curves down under it, as its outer strips do onto the
+/// ground (`round_edge`): about the run over which
+/// a shallow rapid's water plunges under the still water it meets, so the
+/// rapid ends in the pond rather than in a straight raised edge over it.
+const TOE_RUN: f32 = 2.0;
+
+/// The least depth under its water a ribbon `half_width` metres either side
+/// ends at (`EDGE_DROP`).
+pub fn edge_drop(half_width: f32) -> f32 {
+    (EDGE_DROP_SHARE * half_width).clamp(EDGE_DROP[0], EDGE_DROP[1])
+}
+
+/// The height of a ribbon's outer strip `t` of the way across it (0 where it
+/// leaves the channel's open water, 1 at its edge), where the row's water
+/// stands at `level` and its edge must end under `cover`: the ground there,
+/// less `EDGE_TUCK`, or a lake's sheet. Where the cover stands over the water
+/// the strip stays level. Where it lies under it, the channel's banks fail to
+/// hold the water, which spreads over the lower ground as a thin sheet: the
+/// strip rounds down onto it as the front of water running over dry ground
+/// does, its depth over the ground falling as the square root of the
+/// distance behind the front where the bed's friction holds it back
+/// (Whitham 1955, the tip of a dam-break flood), a quarter ellipse, level
+/// where it leaves the channel and steepening to meet the ground at its
+/// edge. So no edge ever ends in the air: it meets the bank, slips under the
+/// still water, or rounds down onto the ground.
+pub fn round_edge(level: f32, cover: f32, t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    level - (level - cover).max(0.0) * (1.0 - (1.0 - t * t).sqrt())
+}
 
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
@@ -172,25 +300,70 @@ fn under_sheet(depth: f32) -> f32 {
 struct Sheets {
     cells: HashMap<[i32; 2], f32>,
     corners: HashMap<[i32; 2], f32>,
+    /// The highest lake over each cell, and its level.
+    owner: HashMap<[i32; 2], (usize, f32)>,
+    /// Each lake's clarity at the corners of its sheet: its own water's
+    /// (`lake_clarity`), and its inflows' where they run into it
+    /// (`paint_plume`).
+    clarity: Vec<HashMap<[i32; 2], f32>>,
+    /// Each lake's whitewater and foam at the corners of its sheet where an
+    /// inflow runs into it (`paint_plume`); none elsewhere.
+    stir: Vec<HashMap<[i32; 2], [f32; 2]>>,
 }
 
 impl Sheets {
     fn new(lakes: &[Lake]) -> Self {
         let mut cells: HashMap<[i32; 2], f32> = HashMap::new();
         let mut corners: HashMap<[i32; 2], f32> = HashMap::new();
-        for lake in lakes {
+        let mut owner: HashMap<[i32; 2], (usize, f32)> = HashMap::new();
+        let mut clarity = Vec::with_capacity(lakes.len());
+        for (index, lake) in lakes.iter().enumerate() {
             let sunk: HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
+            let clear = lake_clarity(lake.level, lake.cells.len() as f32 * LAKE_CELL * LAKE_CELL);
+            let mut own = HashMap::new();
             for &cell in lake.cells.iter().chain(&lake.shore) {
+                let entry = owner.entry(cell).or_insert((index, lake.level));
+                if lake.level > entry.1 {
+                    *entry = (index, lake.level);
+                }
                 let level = cells.entry(cell).or_insert(lake.level);
                 *level = level.max(lake.level);
                 for corner in [cell, [cell[0] + 1, cell[1]], [cell[0], cell[1] + 1], [cell[0] + 1, cell[1] + 1]] {
+                    own.insert(corner, clear);
                     let height = sunk.get(&corner).map_or(lake.level, |&h| h.min(lake.level));
                     let entry = corners.entry(corner).or_insert(height);
                     *entry = entry.max(height);
                 }
             }
+            clarity.push(own);
         }
-        Sheets { cells, corners }
+        let stir = vec![HashMap::new(); lakes.len()];
+        Sheets { cells, corners, owner, clarity, stir }
+    }
+
+    /// The clarity of the highest sheet over `p`, if one lies there,
+    /// interpolated over the two triangles its cell is drawn as, as the GPU
+    /// draws it.
+    fn clarity_at(&self, p: [f32; 2]) -> Option<f32> {
+        let cell = Self::cell_of(p);
+        let &(lake, _) = self.owner.get(&cell)?;
+        let corners = &self.clarity[lake];
+        let corner = |dx: i32, dz: i32| corners.get(&[cell[0] + dx, cell[1] + dz]).copied();
+        let (u, v) = (p[0] / LAKE_CELL - cell[0] as f32, p[1] / LAKE_CELL - cell[1] as f32);
+        let (c00, c11) = (corner(0, 0)?, corner(1, 1)?);
+        Some(if v >= u {
+            let c01 = corner(0, 1)?;
+            c00 + (c11 - c01) * u + (c01 - c00) * v
+        } else {
+            let c10 = corner(1, 0)?;
+            c00 + (c10 - c00) * u + (c11 - c10) * v
+        })
+    }
+
+    /// The lake whose sheet lies over `p`, if water at `water` is its.
+    fn lake_at(&self, p: [f32; 2], water: f32) -> Option<usize> {
+        let &(lake, level) = self.owner.get(&Self::cell_of(p))?;
+        ((level - water).abs() <= SHEET_BAND).then_some(lake)
     }
 
     /// The drawn sheet's height over `p`, over the two triangles each cell
@@ -255,6 +428,47 @@ pub struct SurfaceMesh {
     pub vertices: Vec<SurfaceVertex>,
     pub indices: Vec<u32>,
     pub chunks: Vec<SurfaceChunk>,
+}
+
+impl SurfaceMesh {
+    /// The surface drawn on top over `p` (the highest ribbon or lake sheet
+    /// there), its attributes interpolated as the GPU interpolates them, or
+    /// `None` where no river or lake is drawn. Only the chunks whose bounds
+    /// hold `p` are searched.
+    ///
+    /// The water around a submerged eye is read from here, so the medium it
+    /// sees is the water drawn over it: its clarity carried down from a lake,
+    /// its blend into the sea toward a mouth and into still water toward a
+    /// lake, exactly as the surface overhead has them.
+    pub fn drawn_at(&self, p: [f32; 2]) -> Option<SurfaceVertex> {
+        let cross = |a: [f32; 2], b: [f32; 2]| a[0] * b[1] - a[1] * b[0];
+        let mut top: Option<SurfaceVertex> = None;
+        let holds = |chunk: &&SurfaceChunk| {
+            (chunk.minimum[0]..=chunk.maximum[0]).contains(&p[0]) && (chunk.minimum[2]..=chunk.maximum[2]).contains(&p[1])
+        };
+        for chunk in self.chunks.iter().filter(holds) {
+            let first = chunk.first_index as usize;
+            let triangles = &self.indices[first..first + chunk.index_count as usize];
+            for triangle in triangles.chunks_exact(3) {
+                let [a, b, c] = [0, 1, 2].map(|k| self.vertices[triangle[k] as usize]);
+                let flat = |v: &SurfaceVertex| [v.position[0] - p[0], v.position[2] - p[1]];
+                let (pa, pb, pc) = (flat(&a), flat(&b), flat(&c));
+                let det = cross([pb[0] - pa[0], pb[1] - pa[1]], [pc[0] - pa[0], pc[1] - pa[1]]);
+                if det.abs() < 1e-9 {
+                    continue;
+                }
+                let (wa, wb, wc) = (cross(pb, pc) / det, cross(pc, pa) / det, cross(pa, pb) / det);
+                if wa < -1e-5 || wb < -1e-5 || wc < -1e-5 {
+                    continue;
+                }
+                let here = weigh(&[(a, wa), (b, wb), (c, wc)]);
+                if top.is_none_or(|t| here.position[1] > t.position[1]) {
+                    top = Some(here);
+                }
+            }
+        }
+        top
+    }
 }
 
 fn normalize(v: [f32; 2]) -> [f32; 2] {
@@ -338,9 +552,9 @@ fn join_rows(a: Row, b: Row, out: &mut Vec<u32>) {
 
 /// Vertices weighed together, every attribute alike.
 fn weigh(parts: &[(SurfaceVertex, f32)]) -> SurfaceVertex {
-    let mut sum = [0.0f32; 16];
+    let mut sum = [0.0f32; 21];
     for &(vertex, weight) in parts {
-        let fields: [f32; 16] = bytemuck::cast(vertex);
+        let fields: [f32; 21] = bytemuck::cast(vertex);
         for (total, field) in sum.iter_mut().zip(fields) {
             *total += field * weight;
         }
@@ -518,8 +732,14 @@ fn parents_first(rivers: &[River]) -> Vec<usize> {
     order
 }
 
-pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
-    let sheets = Sheets::new(lakes);
+/// The water surfaces of `rivers` and `lakes`, the ribbons' outer strips
+/// rounded down onto the ground beside their channels wherever it lies
+/// lower than their water: `dry_ground` is the ground at a point as the
+/// rivers carve it where it is dry land, or `None` where water stands over
+/// it (a channel, a lake's basin, the sea) or nothing is known of it.
+pub fn build(rivers: &[River], lakes: &[Lake], dry_ground: &dyn Fn([f32; 2]) -> Option<f32>) -> SurfaceMesh {
+    let mut sheets = Sheets::new(lakes);
+    let clarity = resolve_clarity(rivers, lakes, &mut sheets);
     let seas = sea_blends(rivers);
     let mut junctions = vec![Vec::new(); rivers.len()];
     for (index, river) in rivers.iter().enumerate() {
@@ -560,7 +780,7 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
             }),
             _ => None,
         };
-        if let Some(ribbon) = ribbon(river, &junctions[index], &sheets, seas[index], parent) {
+        if let Some(ribbon) = ribbon(river, &junctions[index], &sheets, &clarity[index], seas[index], parent, dry_ground) {
             let _ = ribbons[index].set(ribbon);
         }
     }
@@ -588,8 +808,8 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
         }
     }
 
-    for lake in lakes {
-        add_lake(&mut vertices, &mut chunk_triangles, lake);
+    for ((lake, clarity), stir) in lakes.iter().zip(&sheets.clarity).zip(&sheets.stir) {
+        add_lake(&mut vertices, &mut chunk_triangles, lake, clarity, stir);
     }
 
     let mut indices = Vec::new();
@@ -620,6 +840,229 @@ pub fn build(rivers: &[River], lakes: &[Lake]) -> SurfaceMesh {
     }
 }
 
+/// A river's clarity at each node: its own, clear above the forest, or the
+/// clarity of the lake water it last ran through, which fades into the
+/// forest's stain as it runs on down. A stream through a brown pond comes
+/// out brown; one out of a clear mountain lake stays clear for a while.
+/// Under a lake it is the sheet's water over it as drawn, so a ribbon
+/// running into a lake's inflow plume, on through the lake or out of it
+/// carries the colour drawn over it and the two never meet in a step.
+fn river_clarity(river: &River, sheets: &Sheets) -> Vec<f32> {
+    let nodes = &river.nodes;
+    let mut clarity = vec![0.0f32; nodes.len()];
+    let mut carried = 0.0f32;
+    for i in 0..nodes.len() {
+        if i > 0 {
+            let step = (nodes[i].along - nodes[i - 1].along).max(0.0);
+            carried *= (-step / CLEAR_FADE).exp();
+        }
+        if nodes[i].lake
+            && let Some(lake) = sheets.clarity_at(nodes[i].position)
+        {
+            carried = lake;
+        }
+        clarity[i] = carried.max(stream_clarity(nodes[i].water));
+    }
+    clarity
+}
+
+/// Every lake's clarity at its sheet's corners, each inflow painted in as
+/// its plume (`paint_plume`), and then every river's clarity down its nodes
+/// (`river_clarity`). Water only runs down, so the lakes are painted from
+/// the highest down: whatever runs into a lake has already taken its colour
+/// from every lake above it.
+fn resolve_clarity(rivers: &[River], lakes: &[Lake], sheets: &mut Sheets) -> Vec<Vec<f32>> {
+    // Each inflow: the river, the node it reaches the lake's level at, the
+    // node its run into the lake begins at and the run's last node.
+    let mut inlets: Vec<Vec<(usize, usize, usize, usize)>> = vec![Vec::new(); lakes.len()];
+    for (index, river) in rivers.iter().enumerate() {
+        let nodes = &river.nodes;
+        // A run that starts at the river's head is the lake it rises in.
+        let mut k = 1;
+        while k < nodes.len() {
+            if !nodes[k].lake || nodes[k - 1].lake {
+                k += 1;
+                continue;
+            }
+            let mut run_end = k;
+            while run_end + 1 < nodes.len() && nodes[run_end + 1].lake {
+                run_end += 1;
+            }
+            if let Some(lake) = sheets.lake_at(nodes[k].position, nodes[k].water) {
+                let level = lakes[lake].level;
+                let mut origin = k;
+                while origin > 0 && nodes[origin - 1].water <= level + LEVEL_TIE {
+                    origin -= 1;
+                }
+                inlets[lake].push((index, origin, k, run_end));
+            }
+            k = run_end + 1;
+        }
+    }
+    let mut order: Vec<usize> = (0..lakes.len()).collect();
+    order.sort_by(|&a, &b| lakes[b].level.total_cmp(&lakes[a].level));
+    for lake in order {
+        if inlets[lake].is_empty() {
+            continue;
+        }
+        let own = lake_clarity(lakes[lake].level, lakes[lake].cells.len() as f32 * LAKE_CELL * LAKE_CELL);
+        let breadth = (lakes[lake].cells.len() as f32).sqrt() * LAKE_CELL;
+        // Foam drifts out on the sheet's current, as far as it carries it
+        // in its lifetime, and no shorter than on slack water.
+        let current: HashMap<[i32; 2], [f32; 2]> = lakes[lake].current.iter().copied().collect();
+        let drift = |corner: [i32; 2]| FOAM_LIFETIME * current.get(&corner).map_or(0.0, |v| v[0].hypot(v[1])).max(0.3);
+        // Each corner's share of inflowing water, and of its clarity over
+        // the lake's own; and the whitewater and foam the inflows carry
+        // out from the toes of their falls, the most any one brings.
+        let mut mixed: HashMap<[i32; 2], (f32, f32)> = HashMap::new();
+        let mut stir: HashMap<[i32; 2], [f32; 2]> = HashMap::new();
+        for &(index, origin, first, run_end) in &inlets[lake] {
+            let nodes = &rivers[index].nodes;
+            let inflow = river_clarity(&rivers[index], sheets)[origin.min(first - 1)];
+            let toe = [nodes[origin].turbulence, drifting_foam(nodes, origin)[origin]];
+            paint_plume(nodes, origin, run_end, breadth, &sheets.clarity[lake], &drift, &mut |corner, plume| {
+                let entry = mixed.entry(corner).or_insert((0.0, 0.0));
+                entry.0 += plume.water;
+                entry.1 += plume.water * (inflow - own);
+                let churned = [toe[0] * plume.roller, toe[1] * plume.foam];
+                if churned[0] > 0.0 || churned[1] > 0.0 {
+                    let entry = stir.entry(corner).or_insert([0.0; 2]);
+                    *entry = [entry[0].max(churned[0]), entry[1].max(churned[1])];
+                }
+            });
+        }
+        sheets.stir[lake] = stir;
+        // Clarity mixes as the volumes of the waters do: the optical
+        // properties drawn are linear in it (`inlandMedium` in water.wgsl).
+        for (corner, (share, excess)) in mixed {
+            if share >= 0.005
+                && let Some(clarity) = sheets.clarity[lake].get_mut(&corner)
+            {
+                *clarity = own + excess / share.max(1.0);
+            }
+        }
+    }
+    rivers.iter().map(|river| river_clarity(river, sheets)).collect()
+}
+
+/// The share of a river's own water at each corner of a lake's sheet
+/// (`corners`) where it runs in as a plane jet (`PLUME_CORE`), along its own
+/// path through the lake from the node `origin` where it reaches the lake's
+/// level to its last node in it, `run_end`: the whole of it across the
+/// channel's width out along the core, which narrows as the jet draws the
+/// lake's water in, diluting past it, and fading out across edges that
+/// widen as it goes. Upstream of the mouth, under the river's own ribbon,
+/// the share stays whole for a couple of cells, so wherever the ribbon
+/// gives way to the sheet the two carry the same water. `breadth` is the
+/// lake's, metres.
+///
+/// With it, how much of the toe's whitewater and foam reach each corner.
+/// Where a fall plunges into still water it churns a roller at its foot,
+/// which dies out within a couple of channel widths (`ROLLER_WIDTHS`), over
+/// the plume's width; the foam it makes drifts on out with the plume's
+/// water and thins over its lifetime, `drift` metres at a corner.
+fn paint_plume(
+    nodes: &[RiverNode],
+    origin: usize,
+    run_end: usize,
+    breadth: f32,
+    corners: &HashMap<[i32; 2], f32>,
+    drift: &dyn Fn([i32; 2]) -> f32,
+    paint: &mut dyn FnMut([i32; 2], Plume),
+) {
+    let channel = (2.0 * nodes[origin.saturating_sub(1)].half_width).max(1.0);
+    let roller = (ROLLER_WIDTHS * channel).max(ROLLER_MIN);
+    let mouth = 1.15 * nodes[origin].half_width + JUNCTION_RIBBON_MARGIN;
+    let core_length = (PLUME_CORE * channel).min(PLUME_CONFINE * breadth).max(1.0);
+    let flush = (PLUME_FLUSH * channel).min(PLUME_CONFINE * breadth).max(1.0);
+    // Past this the jet is spent (its share under 0.005), and three of its
+    // edges out from the core it has faded.
+    let reach = core_length + 6.0 * flush;
+    let widest = mouth + 3.0 * (PLUME_EDGE + PLUME_SPREAD * reach);
+    let start = origin.saturating_sub(2);
+    let base = nodes[origin].along;
+    let mut last = run_end;
+    while last > start + 1 && nodes[last - 1].along - base > reach {
+        last -= 1;
+    }
+    if last <= start {
+        return;
+    }
+    let path = &nodes[start..=last];
+    let (mut low, mut high) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+    for node in path {
+        for axis in 0..2 {
+            low[axis] = low[axis].min(node.position[axis] - widest - 4.0 * LAKE_CELL);
+            high[axis] = high[axis].max(node.position[axis] + widest + 4.0 * LAKE_CELL);
+        }
+    }
+    let cell = |v: f32| (v / LAKE_CELL).floor() as i32;
+    for z in cell(low[1])..=cell(high[1]) + 1 {
+        for x in cell(low[0])..=cell(high[0]) + 1 {
+            if !corners.contains_key(&[x, z]) {
+                continue;
+            }
+            let q = [x as f32 * LAKE_CELL, z as f32 * LAKE_CELL];
+            let drift = drift([x, z]);
+            let mut plume = Plume::default();
+            for (j, pair) in path.windows(2).enumerate() {
+                let (a, b) = (pair[0].position, pair[1].position);
+                let d = [b[0] - a[0], b[1] - a[1]];
+                let length = d[0] * d[0] + d[1] * d[1];
+                if length < 1e-6 {
+                    continue;
+                }
+                // The first reach runs on upstream, under the ribbon.
+                let t = ((q[0] - a[0]) * d[0] + (q[1] - a[1]) * d[1]) / length;
+                let t = if j == 0 { t.min(1.0) } else { t.clamp(0.0, 1.0) };
+                let off = (q[0] - a[0] - d[0] * t).hypot(q[1] - a[1] - d[1] * t);
+                let s = pair[0].along + (pair[1].along - pair[0].along) * t - base;
+                let behind = if s < 0.0 { 1.0 - smoothstep(2.0 * LAKE_CELL, 4.0 * LAKE_CELL, -s) } else { 1.0 };
+                let s = s.max(0.0);
+                let core = mouth * (1.0 - s / core_length).max(0.0);
+                let edge = PLUME_EDGE + PLUME_SPREAD * s;
+                let centre = if s <= core_length { 1.0 } else { (core_length / s).sqrt() * (-(s - core_length) / flush).exp() };
+                let out = (off - core).max(0.0) / edge;
+                let across = behind * (-std::f32::consts::LN_2 * out * out).exp();
+                plume.water = plume.water.max(centre * across);
+                plume.roller = plume.roller.max(across * (-s / roller).exp());
+                plume.foam = plume.foam.max(centre * across * (-s / drift).exp());
+            }
+            if plume.water > 0.0 {
+                paint([x, z], plume);
+            }
+        }
+    }
+}
+
+/// What an inflow's plume brings to a corner of its lake's sheet
+/// (`paint_plume`), each 0..1: its share of the inflow's water, of the
+/// whitewater at the toe of its fall and of the foam there.
+#[derive(Clone, Copy, Default)]
+struct Plume {
+    water: f32,
+    roller: f32,
+    foam: f32,
+}
+
+/// Foam the whitewater makes drifts on downstream and thins as it goes: a
+/// reach carries its own whitewater's or what is left of the foam made
+/// above it, which draws foam lines down the pool below every riffle and
+/// rapid. Down the river's nodes to `end`.
+fn drifting_foam(nodes: &[RiverNode], end: usize) -> Vec<f32> {
+    let mut foam = vec![0.0f32; end + 1];
+    let mut carried = 0.0f32;
+    for i in 0..=end {
+        if i > 0 {
+            let step = (nodes[i].along - nodes[i - 1].along).max(0.0);
+            carried *= (-step / (FOAM_LIFETIME * nodes[i - 1].speed.max(0.3))).exp();
+        }
+        carried = carried.max(nodes[i].turbulence);
+        foam[i] = carried;
+    }
+    foam
+}
+
 /// A row of a ribbon before it is laid: its vertices as the river alone
 /// would have them, the water the row stands at, how far its water has
 /// become its parent's and how far it lies from the ribbon's end.
@@ -634,6 +1077,10 @@ struct Draft {
     side: Vec<f32>,
     reached: bool,
     past_coast: bool,
+    /// Where the row runs down into a lake (its next node, or its own, is a
+    /// lake's): the lake's level and how far along the river the lake's
+    /// node lies ahead (`TOE_RUN`).
+    toe: Option<(f32, f32)>,
 }
 
 impl Draft {
@@ -647,6 +1094,7 @@ impl Draft {
             side: self.side.iter().zip(&other.side).map(|(&a, &b)| lerp(a, b)).collect(),
             reached: self.reached && other.reached,
             past_coast: self.past_coast && other.past_coast,
+            toe: self.toe.zip(other.toe).map(|(a, b)| (lerp(a.0, b.0), lerp(a.1, b.1))),
         }
     }
 }
@@ -656,8 +1104,10 @@ fn ribbon(
     river: &River,
     junctions: &[[f32; 2]],
     sheets: &Sheets,
+    clarity: &[f32],
     (sea_share, sea_along, sea_ramp): (f32, f32, f32),
     parent: Option<(&River, &Drawn)>,
+    dry_ground: &dyn Fn([f32; 2]) -> Option<f32>,
 ) -> Option<Ribbon> {
     let nodes = &river.nodes;
     // A river's surface runs on past where its own water ends, sunk
@@ -678,11 +1128,8 @@ fn ribbon(
         return None;
     }
     let widest = nodes[..=end].iter().map(|n| n.half_width).fold(0.0f32, f32::max);
-    let offsets: &[f32] = if widest > 1.6 {
-        &[-1.12, -0.55, 0.0, 0.55, 1.12]
-    } else {
-        &[-1.15, 0.0, 1.15]
-    };
+    let (offsets, strip): (&[f32], f32) =
+        if widest > WIDE_RIBBON { (&WIDE_COLUMNS, WIDE_STRIP) } else { (&NARROW_COLUMNS, NARROW_STRIP) };
     // Direction of the reach through each node.
     let direction = |i: usize| -> [f32; 2] {
         let pick = |a: usize, b: usize| {
@@ -790,20 +1237,7 @@ fn ribbon(
             *near = near.min(at - node.along);
         }
     }
-    // Foam the whitewater makes drifts on downstream and thins as it
-    // goes: a reach carries its own whitewater's or what is left of the
-    // foam made above it, which draws foam lines down the pool below
-    // every riffle and rapid.
-    let mut foam = vec![0.0f32; end + 1];
-    let mut carried = 0.0f32;
-    for i in 0..=end {
-        if i > 0 {
-            let step = (nodes[i].along - nodes[i - 1].along).max(0.0);
-            carried *= (-step / (FOAM_LIFETIME * nodes[i - 1].speed.max(0.3))).exp();
-        }
-        carried = carried.max(nodes[i].turbulence);
-        foam[i] = carried;
-    }
+    let foam = drifting_foam(nodes, end);
     // A row as the river alone would have it, its columns `offsets`.
     let draft = |i: usize, offsets: &[f32]| -> Draft {
         let node = &nodes[i];
@@ -821,12 +1255,42 @@ fn ribbon(
         }
         let sea = sea_share * (1.0 - smoothstep(0.0, sea_ramp, sea_along - node.along));
         let still = 1.0 - smoothstep(0.0, LIFT_FADE, from_still[i]);
+        // Each side's outer strip, from where it leaves the open water to
+        // its edge, which lies past the waterline under the bank.
+        let half_width = ribbon_half_width(i);
+        let last = offsets.len() - 1;
+        let edges = [(place(i, offsets[0]), -offsets[0]), (place(i, offsets[last]), offsets[last])];
+        let strip_start = strip * half_width;
+        // The current across the channel, and how far out under the banks
+        // toward the side edge each column lies (`merge_into`: out past the
+        // waterline over the last metre to the side edges). The strip's
+        // inner columns are there only for it to curve: across it the water
+        // carries what its two ends give it, as it did before they were
+        // added, so where a tributary runs into its parent nothing changes
+        // more steeply across the strip than at the metre the confluence is
+        // measured over.
+        let flow = |offset: f32| -> (f32, f32) {
+            let edge = if offset < 0.0 { -offsets[0] } else { offsets[last] };
+            let reach = (edge - half_width).clamp(1e-3, SIDE_MIX);
+            (node.speed * lateral(offset / half_width), 1.0 - smoothstep(0.0, reach, edge - offset.abs()))
+        };
+        let across_strip = |offset: f32| -> (f32, f32) {
+            let edge = if offset < 0.0 { -offsets[0] } else { offsets[last] };
+            if offset.abs() <= strip_start || offset.abs() >= edge {
+                return flow(offset);
+            }
+            let out = (offset.abs() - strip_start) / (edge - strip_start);
+            let (inner, outer) = (flow(strip_start * offset.signum()), flow(edge * offset.signum()));
+            (inner.0 + (outer.0 - inner.0) * out, inner.1 + (outer.1 - inner.1) * out)
+        };
         let vertices = offsets
             .iter()
             .map(|&offset| {
                 let p = place(i, offset);
-                let across = offset / ribbon_half_width(i);
-                let speed = node.speed * lateral(across);
+                let across = offset / half_width;
+                let (speed, _) = across_strip(offset);
+                let (edge, reach) = edges[usize::from(offset > 0.0)];
+                let out = ((offset.abs() - strip_start) / (reach - strip_start).max(1e-3)).clamp(0.0, 1.0);
                 SurfaceVertex {
                     position: [p[0], water, p[1]],
                     velocity: [tangent[0] * speed, tangent[1] * speed],
@@ -839,20 +1303,19 @@ fn ribbon(
                     sea,
                     side: offset + side_offset,
                     joined: [node.along + along_offset, offset + side_offset, 0.0],
+                    clarity: clarity[i],
+                    rim: [edge[0], edge[1], out, water],
                 }
             })
             .collect();
-        // Out past the waterline over the last metre to the side edges.
-        let half_width = ribbon_half_width(i);
-        let side = offsets
-            .iter()
-            .map(|&offset| {
-                let edge = if offset < 0.0 { -offsets[0] } else { offsets[offsets.len() - 1] };
-                let reach = (edge - half_width).clamp(1e-3, SIDE_MIX);
-                1.0 - smoothstep(0.0, reach, edge - offset.abs())
-            })
-            .collect();
-        Draft { vertices, water, merge: merge[i], to_end: nodes[end].along - node.along, side, reached: i >= contact, past_coast }
+        let side = offsets.iter().map(|&offset| across_strip(offset).1).collect();
+        // The lake it runs into from here: its own node's, or the next's.
+        let toe = if node.lake {
+            Some((node.water, 0.0))
+        } else {
+            nodes[..=end].get(i + 1).filter(|next| next.lake).map(|next| (next.water, next.along - node.along))
+        };
+        Draft { vertices, water, merge: merge[i], to_end: nodes[end].along - node.along, side, reached: i >= contact, past_coast, toe }
     };
     let mut ribbon = Ribbon::default();
     let mut lay = |draft: &Draft| {
@@ -887,6 +1350,67 @@ fn ribbon(
                 hidden &= depth >= HIDDEN_DEPTH;
             } else {
                 hidden = false;
+                // Standing over a lake's sheet, a cascade's foot curves
+                // down under it over `TOE_RUN` metres inside its edge, as
+                // its outer strips do onto the ground, wherever that edge
+                // crosses it.
+                if let Some((lake, depth)) = sheets.under(p)
+                    && water > lake + LEVEL_TIE
+                    && draft.merge <= 0.0
+                {
+                    let sheet = sheets.height(p).unwrap_or(lake).min(lake) - UNDER_SHEET;
+                    vertex.position[1] = vertex.position[1].min(round_edge(water, sheet, depth / TOE_RUN));
+                }
+            }
+            // Along the river it curves down the same way over the last
+            // `TOE_RUN` metres before the lake's first node, to end just
+            // under the lake's level there (or under its sheet,
+            // where that is drawn sunk lower at its edge), as its outer
+            // strips do onto the ground, whether or not the sheet is drawn
+            // over it: the rapid plunges into the pond rather than ending
+            // over it in a straight raised edge.
+            if let Some((level, ahead)) = draft.toe
+                && water > level + LEVEL_TIE
+                && draft.merge <= 0.0
+            {
+                let sheet = match sheets.under(p) {
+                    Some((lake, _)) if (lake - level).abs() <= LEVEL_TIE => sheets.height(p).unwrap_or(level).min(level),
+                    _ => level,
+                };
+                let toe = round_edge(water, sheet - UNDER_SHEET, 1.0 - ahead / TOE_RUN);
+                vertex.position[1] = vertex.position[1].min(toe);
+            }
+            // Its outer strips round down onto whatever lies lower than its
+            // water at their edges (`round_edge`): the dry ground beside the
+            // channel, or a lake's sheet whatever the row's water, where a
+            // cascade's edge reaches out over the lake it runs into. Over
+            // dry land always at least `edge_drop` under its water, so a
+            // bank standing a little under the water whatever the reason
+            // never holds a flat edge in the air; a sheet is drawn just as
+            // it is measured. Never where its edge lies in another
+            // channel's water, which it runs on into, nor where
+            // its water is becoming its parent's, whose surface it follows,
+            // nor past the coast, under the sea.
+            let out = vertex.rim[2];
+            let mut on_ground = false;
+            if out > 0.0 && draft.merge <= 0.0 && vertex.joined[2] <= 0.0 && !draft.past_coast {
+                let edge = [vertex.rim[0], vertex.rim[1]];
+                let ground = dry_ground(edge).map(|g| g - EDGE_TUCK);
+                let sheet = sheets.height(edge).zip(sheets.level(edge)).map(|(h, level)| h.min(level) - UNDER_SHEET);
+                let cover = match (ground, sheet) {
+                    (Some(g), Some(s)) => Some(g.max(s)),
+                    (g, s) => g.or(s),
+                };
+                on_ground = ground.is_some_and(|g| sheet.is_none_or(|s| s <= g));
+                if let Some(cover) = cover {
+                    let least = if on_ground { vertex.rim[3] - edge_drop(vertex.half_width) } else { cover };
+                    vertex.position[1] = vertex.position[1].min(round_edge(vertex.rim[3], cover.min(least), out));
+                }
+            }
+            // The shader rounds it again where the erosion has since worn
+            // the ground at its edge lower, only where that edge is dry land.
+            if !on_ground {
+                vertex.rim[2] = 0.0;
             }
             ribbon.vertices.push(vertex);
         }
@@ -918,10 +1442,35 @@ fn ribbon(
         side.extend(row.side.last());
         Draft { vertices, side, ..row }
     };
+    // Where a cascade runs down into a lake, its rows between its last
+    // node over the lake's level and the lake's first are laid closely, so
+    // its foot curves down into the lake (`TOE_RUN`) rather than crossing
+    // the lake's water in one straight quad.
+    let runs_into_lake = |before: &Draft, here: &Draft| {
+        here.toe.is_some_and(|(level, ahead)| ahead <= 0.0 && before.water > level + LEVEL_TIE)
+    };
+    let mut plain: Option<Draft> = None;
     let mut previous: Option<Draft> = None;
     for (i, offsets) in base_offsets.iter().enumerate() {
         if i < merging {
-            lay(&draft(i, offsets));
+            let here = draft(i, offsets);
+            if let Some(before) = plain.as_ref()
+                && before.vertices.len() == here.vertices.len()
+                && runs_into_lake(before, &here)
+            {
+                let reach = before
+                    .vertices
+                    .iter()
+                    .zip(&here.vertices)
+                    .map(|(a, b)| (a.position[0] - b.position[0]).hypot(a.position[2] - b.position[2]))
+                    .fold(0.0f32, f32::max);
+                let steps = ((reach / MERGE_STEP).ceil() as usize).clamp(1, 16);
+                for s in 1..steps {
+                    lay(&before.mix(&here, s as f32 / steps as f32));
+                }
+            }
+            lay(&here);
+            plain = Some(here);
             continue;
         }
         let here = dense(draft(i, offsets));
@@ -1018,6 +1567,8 @@ fn add_lake(
     vertices: &mut Vec<SurfaceVertex>,
     chunk_triangles: &mut std::collections::BTreeMap<(i32, i32), Vec<u32>>,
     lake: &Lake,
+    clarity: &HashMap<[i32; 2], f32>,
+    stir: &HashMap<[i32; 2], [f32; 2]>,
 ) {
     let sunk: HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
     let current: HashMap<[i32; 2], [f32; 2]> = lake.current.iter().copied().collect();
@@ -1025,20 +1576,25 @@ fn add_lake(
     let mut corner = |vertices: &mut Vec<SurfaceVertex>, x: i32, z: i32| -> u32 {
         let push_vertex = || {
             let height = sunk.get(&[x, z]).map_or(lake.level, |&h| h.min(lake.level));
+            // Still water is calm and clear of foam but where an inflow's
+            // fall churns it (`paint_plume`).
+            let [turbulence, foam] = stir.get(&[x, z]).copied().unwrap_or([0.0; 2]);
             vertices.push(SurfaceVertex {
                 position: [x as f32 * LAKE_CELL, height, z as f32 * LAKE_CELL],
                 // A river's current runs on a little way into the lake at its
                 // mouth (network::sheet_current).
                 velocity: current.get(&[x, z]).copied().unwrap_or([0.0, 0.0]),
                 across: 0.0,
-                turbulence: 0.0,
+                turbulence,
                 still: 1.0,
                 along: 0.0,
                 half_width: 0.0,
-                foam: 0.0,
+                foam,
                 sea: 0.0,
                 side: 0.0,
                 joined: [0.0; 3],
+                clarity: clarity[&[x, z]],
+                rim: [0.0; 4],
             });
             vertices.len() as u32 - 1
         };
@@ -1063,7 +1619,13 @@ fn add_lake(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rivers::network::RiverNode;
+
+
+    /// No ground known anywhere: nothing for the ribbons' strips to round
+    /// down onto.
+    fn no_ground(_: [f32; 2]) -> Option<f32> {
+        None
+    }
 
     #[test]
     fn confluence_ribbons_cover_the_rounded_shore_and_fade_back_to_normal_width() {
@@ -1089,12 +1651,13 @@ mod tests {
             surface_end: 1,
         };
         let rivers = [trunk, tributary];
-        let mesh = build(&rivers, &[]);
+        let mesh = build(&rivers, &[], &no_ground);
 
-        let junction_row = &mesh.vertices[5..10];
+        let columns = WIDE_COLUMNS.len();
+        let junction_row = &mesh.vertices[columns..2 * columns];
         assert!(junction_row[0].position[2].abs() > 2.6);
-        assert!(junction_row[4].position[2].abs() > 2.6);
-        let far_row = &mesh.vertices[15..20];
+        assert!(junction_row[columns - 1].position[2].abs() > 2.6);
+        let far_row = &mesh.vertices[3 * columns..4 * columns];
         assert!((far_row[0].position[2].abs() - 2.24).abs() < 1e-5);
         for vertex in junction_row {
             let actual_across = vertex.position[2] / vertex.half_width;
@@ -1122,26 +1685,7 @@ mod tests {
     /// The surface drawn on top over `p`, the highest there, its attributes
     /// interpolated as the GPU interpolates them.
     fn top(mesh: &SurfaceMesh, p: [f32; 2]) -> Option<SurfaceVertex> {
-        let cross = |a: [f32; 2], b: [f32; 2]| a[0] * b[1] - a[1] * b[0];
-        let mut top: Option<SurfaceVertex> = None;
-        for triangle in mesh.indices.chunks_exact(3) {
-            let [a, b, c] = [0, 1, 2].map(|k| mesh.vertices[triangle[k] as usize]);
-            let flat = |v: &SurfaceVertex| [v.position[0] - p[0], v.position[2] - p[1]];
-            let (pa, pb, pc) = (flat(&a), flat(&b), flat(&c));
-            let det = cross([pb[0] - pa[0], pb[1] - pa[1]], [pc[0] - pa[0], pc[1] - pa[1]]);
-            if det.abs() < 1e-9 {
-                continue;
-            }
-            let (wa, wb, wc) = (cross(pb, pc) / det, cross(pc, pa) / det, cross(pa, pb) / det);
-            if wa < -1e-5 || wb < -1e-5 || wc < -1e-5 {
-                continue;
-            }
-            let here = weigh(&[(a, wa), (b, wb), (c, wc)]);
-            if top.is_none_or(|t| here.position[1] > t.position[1]) {
-                top = Some(here);
-            }
-        }
-        top
+        mesh.drawn_at(p)
     }
 
     /// A creek runs in at an angle down the side of a steep, white river.
@@ -1185,7 +1729,7 @@ mod tests {
             }
         };
         let tributary = River { nodes: (0..=12).map(tributary_node).collect(), end: RiverEnd::Confluence(0, 0), surface_end: 11 };
-        let mesh = build(&[trunk, tributary], &[]);
+        let mesh = build(&[trunk, tributary], &[], &no_ground);
 
         // In its mouth, past the trunk's waterline, the creek's own water is
         // drawn, over the trunk's ribbon.
@@ -1262,18 +1806,19 @@ mod tests {
         };
         let nodes: Vec<RiverNode> = (0..=40).map(river_node).collect();
         let river = River { nodes, end: RiverEnd::Edge, surface_end: 40 };
-        let mesh = build(&[river], &[lake]);
-        // The ribbon's 41 rows of three vertices come first, then the sheet.
-        let ribbon = 41 * 3;
+        let mesh = build(&[river], &[lake], &no_ground);
+        // The ribbon's 41 rows of narrow columns come first, then the sheet.
+        let columns = NARROW_COLUMNS.len();
+        let ribbon = 41 * columns;
         let depth = |p: [f32; 3]| -> Option<f32> {
             let inside = (0.0..48.0).contains(&p[0]) && (-16.0..16.0).contains(&p[2]);
             inside.then(|| p[0].min(48.0 - p[0]).min(16.0 - p[2]).min(p[2] + 16.0))
         };
         // The first row is the spring's, tucked under the ground at a point.
-        let spring = &mesh.vertices[..3];
+        let spring = &mesh.vertices[..columns];
         assert!(spring.iter().all(|v| (v.position[1] - (water_at(-20.0) - SPRING_SINK)).abs() < 1e-4), "{spring:?}");
-        assert!((spring[0].position[2] - spring[2].position[2]).abs() < 0.3, "{spring:?}");
-        for v in &mesh.vertices[3..ribbon] {
+        assert!((spring[0].position[2] - spring[columns - 1].position[2]).abs() < 0.3, "{spring:?}");
+        for v in &mesh.vertices[columns..ribbon] {
             match depth(v.position) {
                 Some(d) => {
                     let under = level - v.position[1];
@@ -1288,10 +1833,174 @@ mod tests {
         }
         assert_eq!(mesh.vertices[ribbon - 1].still, 0.0);
         let triangles: Vec<&[u32]> = mesh.indices.chunks(3).filter(|t| t.iter().all(|&i| (i as usize) < ribbon)).collect();
-        assert!(triangles.len() < 40 * 4, "nothing left out under the lake");
+        assert!(triangles.len() < 40 * 2 * (columns - 1), "nothing left out under the lake");
         for triangle in triangles {
             assert!(triangle.iter().any(|&i| depth(mesh.vertices[i as usize].position).is_none_or(|d| d < HIDDEN_DEPTH)));
         }
+    }
+
+    /// Where the ground beside a channel lies lower than its water, the
+    /// ribbon's outer strip rounds down onto it, level where it leaves the
+    /// open water and steepening to end just under the ground at its edge,
+    /// instead of ending in the air over it; where the bank stands over the
+    /// water the strip still curves down into it by the least depth, out of
+    /// sight. Both strips, over dry land, are left for the shader to round
+    /// again by the ground as the erosion leaves it.
+    #[test]
+    fn a_ribbons_edge_rounds_down_onto_ground_lower_than_its_water() {
+        let level = 5.0;
+        let node = |k: i32| RiverNode {
+            position: [2.5 * k as f32, 0.0],
+            water: level,
+            half_width: 2.0,
+            depth: 0.6,
+            speed: 1.0,
+            along: 2.5 * k as f32,
+            ..Default::default()
+        };
+        let river = River { nodes: (0..=8).map(node).collect(), end: RiverEnd::Edge, surface_end: 8 };
+        // Past the waterlines, a low bank on the left of the flow (+z) and a
+        // high one on the right.
+        let ground = |p: [f32; 2]| (p[1].abs() > 2.0).then_some(if p[1] > 0.0 { 4.0 } else { 5.6 });
+        let mesh = build(&[river], &[], &ground);
+        let columns = WIDE_COLUMNS.len();
+        let row = &mesh.vertices[4 * columns..5 * columns];
+        for (v, across) in row.iter().zip(WIDE_COLUMNS) {
+            let out = ((across.abs() - WIDE_STRIP) / (WIDE_COLUMNS[columns - 1] - WIDE_STRIP)).clamp(0.0, 1.0);
+            // Even into the high bank, by the least depth.
+            let cover = if across > 0.0 { 4.0 - EDGE_TUCK } else { level - edge_drop(2.0) };
+            let expected = round_edge(level, cover, out);
+            assert!((v.position[1] - expected).abs() < 1e-4, "{across}: {v:?}");
+            assert_eq!(v.rim[2] > 0.0, out > 0.0, "{across}: {v:?}");
+        }
+        assert!((row[columns - 1].position[1] - (4.0 - EDGE_TUCK)).abs() < 1e-4);
+        assert!(row[columns / 2..].windows(2).all(|pair| pair[1].position[1] <= pair[0].position[1]));
+        // Level where it leaves the open water: the drop to the first strip
+        // column is a small share of the one to the edge.
+        let drop = |k: usize| level - row[k].position[1];
+        assert!(drop(columns / 2 + 2) < 0.15 * drop(columns - 1), "{row:?}");
+    }
+
+    /// Reported: a ribbon's edge over a bank only a little under its water
+    /// stood over it in a flat glassy edge. Over ground 2 to 10 cm under the
+    /// water the outer strip still curves down, a quarter ellipse, to end
+    /// under the ground, by at least the least depth.
+    #[test]
+    fn a_ribbons_edge_over_ground_just_under_its_water_still_curves_under_it() {
+        let level = 5.0;
+        for under in [0.02, 0.05, 0.1] {
+            let node = |k: i32| RiverNode {
+                position: [2.5 * k as f32, 0.0],
+                water: level,
+                half_width: 2.0,
+                depth: 0.6,
+                speed: 1.0,
+                along: 2.5 * k as f32,
+                ..Default::default()
+            };
+            let river = River { nodes: (0..=8).map(node).collect(), end: RiverEnd::Edge, surface_end: 8 };
+            let ground = move |p: [f32; 2]| (p[1].abs() > 2.0).then_some(level - under);
+            let mesh = build(&[river], &[], &ground);
+            let columns = WIDE_COLUMNS.len();
+            let row = &mesh.vertices[4 * columns..5 * columns];
+            for side in [&row[..=columns / 2], &row[columns / 2..]] {
+                let edge = if side[0].across < 0.0 { side[0] } else { side[side.len() - 1] };
+                assert!(edge.position[1] < level - under - EDGE_TUCK + 1e-4, "{under}: {edge:?}");
+                assert!(edge.position[1] <= level - edge_drop(2.0) + 1e-4, "{under}: {edge:?}");
+            }
+            // Curved: level where it leaves the open water, steepening to
+            // the edge, each step down larger than the one before.
+            let half = &row[columns / 2..];
+            let drops: Vec<f32> = half.windows(2).map(|pair| pair[0].position[1] - pair[1].position[1]).collect();
+            assert!(drops[0].abs() < 1e-5, "{under}: {drops:?}");
+            assert!(drops[1..].windows(2).all(|pair| pair[1] > pair[0]), "{under}: {drops:?}");
+        }
+    }
+
+    /// Reported: where a cascade ran down into a pond, its foot stood over
+    /// the pond in a straight raised edge. Its rows are laid closely down to
+    /// the lake's first node, and over the last `TOE_RUN` metres its water
+    /// curves down under the straight run of the rapid to end under the
+    /// lake's level there, whether or not the lake's sheet is drawn over it,
+    /// and never rises again.
+    #[test]
+    fn a_cascades_foot_curves_down_under_the_lake_it_runs_into() {
+        let level = 5.0;
+        // The sheet covers x 20..60 m, z -16..16 m; the lake's first node
+        // lies at x 22.5 m, the rapid's last at x 20 m.
+        let cells: Vec<[i32; 2]> = (5..15).flat_map(|x| (-4..4).map(move |z| [x, z])).collect();
+        let lake = Lake { level, cells, shore: Vec::new(), edge: Vec::new(), current: Vec::new() };
+        let water_at = |x: f32| if x < 22.5 { level + 0.1 * (22.5 - x) + 0.1 } else { level };
+        let node = |k: i32| RiverNode {
+            position: [2.5 * k as f32, 0.0],
+            water: water_at(2.5 * k as f32),
+            half_width: 1.0,
+            depth: 0.3,
+            speed: 1.0,
+            along: 2.5 * k as f32,
+            lake: 2.5 * k as f32 >= 22.5,
+            ..Default::default()
+        };
+        let river = River { nodes: (0..=16).map(node).collect(), end: RiverEnd::Edge, surface_end: 16 };
+        for lakes in [vec![lake], Vec::new()] {
+            let sheet = !lakes.is_empty();
+            let mesh = build(std::slice::from_ref(&river), &lakes, &no_ground);
+            let ribbon: Vec<&SurfaceVertex> = mesh.vertices.iter().filter(|v| v.half_width > 0.5).collect();
+            // More rows than nodes: the step from the rapid's last node into
+            // the lake is laid closely.
+            assert!(ribbon.len() > 17 * NARROW_COLUMNS.len(), "{sheet}: {}", ribbon.len());
+            let mut centre: Vec<[f32; 2]> =
+                ribbon.iter().filter(|v| v.position[2].abs() < 1e-3 && v.position[0] >= 15.0).map(|v| [v.position[0], v.position[1]]).collect();
+            centre.sort_by(|a, b| a[0].total_cmp(&b[0]));
+            assert!(centre.windows(2).all(|pair| pair[1][1] <= pair[0][1] + 1e-5), "{sheet}: {centre:?}");
+            let foot = water_at(20.0);
+            let mut curved = 0;
+            for &[x, y] in &centre {
+                if x >= 22.5 {
+                    // No lip: at the lake's first node and past it, at or
+                    // under the lake's level.
+                    assert!(y <= level + 1e-4, "{sheet}: {centre:?}");
+                } else if x > 20.0 + 1e-3 {
+                    // Under the rapid's straight run down to the lake.
+                    let straight = foot + (level - foot) * (x - 20.0) / 2.5;
+                    assert!(y <= straight + 1e-4, "{sheet}: {centre:?}");
+                    curved += usize::from(x >= 22.5 - TOE_RUN && y < straight - 0.01);
+                }
+            }
+            assert!(curved >= 2, "{sheet}: {centre:?}");
+        }
+    }
+
+    /// A cascade's edge reaching out over the lake it runs into rounds down
+    /// under the lake's sheet, whatever its water, so its water curves down
+    /// into the lake's rather than standing over it in a straight edge. The
+    /// shader, which knows only the ground, leaves it alone.
+    #[test]
+    fn a_cascades_edge_rounds_down_under_the_lake_it_runs_into() {
+        let level = 5.0;
+        // The sheet covers x 0..40 m, z 0..16 m: the cascade's left strip,
+        // not its centre, a metre on the other side of z = 0.
+        let cells: Vec<[i32; 2]> = (0..10).flat_map(|x| (0..4).map(move |z| [x, z])).collect();
+        let lake = Lake { level, cells, shore: Vec::new(), edge: Vec::new(), current: Vec::new() };
+        let node = |k: i32| RiverNode {
+            position: [2.5 * k as f32, -1.0],
+            water: level + 0.3,
+            half_width: 2.0,
+            depth: 0.6,
+            speed: 1.0,
+            along: 2.5 * k as f32,
+            ..Default::default()
+        };
+        let river = River { nodes: (0..=8).map(node).collect(), end: RiverEnd::Edge, surface_end: 8 };
+        let mesh = build(&[river], &[lake], &no_ground);
+        let columns = WIDE_COLUMNS.len();
+        // The row at the fifth node, 10 m along (rows between are laid closely
+        // where it stands over the sheet).
+        let first = mesh.vertices.iter().position(|v| (v.along - 10.0).abs() < 1e-4).unwrap();
+        let row = &mesh.vertices[first..first + columns];
+        assert!((row[columns - 1].position[1] - (level - UNDER_SHEET)).abs() < 1e-4, "{row:?}");
+        assert!((row[0].position[1] - (level + 0.3)).abs() < 1e-4, "{row:?}");
+        assert!(row.iter().all(|v| v.rim[2] == 0.0), "{row:?}");
     }
 
     /// Foam made at a rapid drifts on downstream, thinning as it goes, and
@@ -1312,9 +2021,9 @@ mod tests {
         let river = River { nodes, end: RiverEnd::Edge, surface_end: 20 };
         let cells: Vec<[i32; 2]> = vec![[100, 100]];
         let lake = Lake { level: 3.0, cells, shore: Vec::new(), edge: Vec::new(), current: Vec::new() };
-        let mesh = build(&[river], &[lake]);
-        // Half widths over 1.6 m give five columns.
-        let row = |r: usize| &mesh.vertices[r * 5];
+        let mesh = build(&[river], &[lake], &no_ground);
+        // Half widths over 1.6 m take the wide set of columns.
+        let row = |r: usize| &mesh.vertices[r * WIDE_COLUMNS.len()];
         assert_eq!(row(4).foam, 0.0);
         assert_eq!(row(5).foam, 0.8);
         for r in 6..=20 {
@@ -1325,6 +2034,208 @@ mod tests {
         assert_eq!(row(7).half_width, 2.0);
         let sheet = mesh.vertices.last().unwrap();
         assert_eq!((sheet.along, sheet.half_width, sheet.foam), (0.0, 0.0, 0.0));
+    }
+
+    /// Over a real region, the frame each ribbon lays its ripples in runs
+    /// downstream wherever the water is drawn: the shader carries the
+    /// ripples along the frame's downstream axis, so a ribbon whose frame ran
+    /// against its current would draw its water running backwards. Where it
+    /// becomes its parent's water the frame cross-fades into the parent's, so
+    /// a tributary's mouth is left out, as is the hidden ribbon under the
+    /// banks past either waterline. And the water itself never rises
+    /// downstream.
+    #[test]
+    fn ribbons_carry_their_current_downstream() {
+        let noise = crate::noise::NoiseField::new();
+        let network = crate::rivers::network::generate(&noise, [0, 0]);
+        let mesh = &network.surface;
+        let (mut total, mut reversed, mut askew) = (0.0f64, 0.0f64, 0.0f64);
+        for triangle in mesh.indices.chunks_exact(3) {
+            let [a, b, c] = [0, 1, 2].map(|k| mesh.vertices[triangle[k] as usize]);
+            let ribbon = [a, b, c].iter().all(|v| v.half_width > 0.0 && v.joined[2] == 0.0);
+            let open = [a, b, c].iter().any(|v| v.across.abs() < 1.0);
+            if !ribbon || !open {
+                continue;
+            }
+            let flat = |v: &SurfaceVertex| [v.position[0], v.position[2]];
+            let (pa, pb, pc) = (flat(&a), flat(&b), flat(&c));
+            let e1 = [pb[0] - pa[0], pb[1] - pa[1]];
+            let e2 = [pc[0] - pa[0], pc[1] - pa[1]];
+            let det = e1[0] * e2[1] - e1[1] * e2[0];
+            if det.abs() < 1e-6 {
+                continue;
+            }
+            // The gradient of `along` over the triangle: the frame's
+            // downstream axis in the world.
+            let (d1, d2) = (b.along - a.along, c.along - a.along);
+            let downstream = [(d1 * e2[1] - d2 * e1[1]) / det, (e1[0] * d2 - e2[0] * d1) / det];
+            let v = [a.velocity[0] + b.velocity[0] + c.velocity[0], a.velocity[1] + b.velocity[1] + c.velocity[1]];
+            let (speed, length) = (v[0].hypot(v[1]), downstream[0].hypot(downstream[1]));
+            if speed < 0.15 || length < 1e-6 {
+                continue;
+            }
+            let cos = (downstream[0] * v[0] + downstream[1] * v[1]) / (speed * length);
+            let area = f64::from(det.abs()) * 0.5;
+            total += area;
+            if cos < 0.0 {
+                reversed += area;
+            }
+            if cos < std::f32::consts::FRAC_1_SQRT_2 {
+                askew += area;
+            }
+        }
+        assert!(total > 1.0e5, "the region has rivers: {total} m²");
+        assert!(reversed / total < 1e-4, "{reversed:.1} m² of {total:.0} m² runs against its current");
+        assert!(askew / total < 2e-3, "{askew:.1} m² of {total:.0} m² runs over 45 degrees off its current");
+        for river in &network.rivers {
+            let drawn = &river.nodes[..=river.surface_end.min(river.nodes.len() - 1)];
+            for pair in drawn.windows(2) {
+                assert!(pair[1].water <= pair[0].water + 0.005, "water rising downstream: {pair:?}");
+            }
+        }
+    }
+
+    /// Forest ponds stay stained however high they lie below the treeline,
+    /// a large lake among the thinning trees runs clear, every tarn above
+    /// the treeline is clear and the lowland lakes keep the forest's tea.
+    #[test]
+    fn mountain_lakes_run_clear_and_forest_ponds_stay_stained() {
+        let area = |cells: f32| cells * LAKE_CELL * LAKE_CELL;
+        // A 60 m pond at 89 m, and a 200 m lake at 99 m, 10 m above it.
+        assert!(lake_clarity(89.1, area(227.0)) < 0.05);
+        assert!(lake_clarity(98.7, area(2256.0)) > 0.95);
+        // A small tarn above the treeline.
+        assert!(lake_clarity(112.0, area(763.0)) > 0.9);
+        // A broad lowland lake.
+        assert!(lake_clarity(18.3, area(5758.0)) < 0.01);
+        assert_eq!(stream_clarity(40.0), 0.0);
+        assert_eq!(stream_clarity(130.0), 1.0);
+    }
+
+    /// A stream out of a clear lake carries the lake's clarity down into the
+    /// forest, fading as it goes; out of a stained pond it is stained.
+    #[test]
+    fn a_stream_carries_its_lakes_clarity_downstream() {
+        let level = 90.0;
+        let cells: Vec<[i32; 2]> = (0..80).flat_map(|x| (-40..40).map(move |z| [x, z])).collect();
+        let clear = Lake { level, cells: cells.clone(), shore: Vec::new(), edge: Vec::new(), current: Vec::new() };
+        let pond = Lake { level, cells: cells[..40].to_vec(), shore: Vec::new(), edge: Vec::new(), current: Vec::new() };
+        let river = |out_of_lake: bool| {
+            let node = |k: i32| {
+                let x = 20.0 * k as f32;
+                RiverNode {
+                    position: [x, 2.0],
+                    water: level - 0.01 * (x - 320.0).max(0.0),
+                    half_width: 2.0,
+                    depth: 0.5,
+                    speed: 1.0,
+                    along: x,
+                    lake: out_of_lake && x < 320.0,
+                    ..Default::default()
+                }
+            };
+            River { nodes: (0..=200).map(node).collect(), end: RiverEnd::Edge, surface_end: 200 }
+        };
+        for (lake, expected) in [(clear, 1.0), (pond, 0.0)] {
+            let lake_clear = lake_clarity(lake.level, lake.cells.len() as f32 * LAKE_CELL * LAKE_CELL);
+            assert!((lake_clear - expected).abs() < 0.05, "{lake_clear}");
+            let mesh = build(&[river(true)], std::slice::from_ref(&lake), &no_ground);
+            let at = |x: f32| mesh.vertices.iter().find(|v| v.half_width > 0.0 && (v.position[0] - x).abs() < 1.0).unwrap().clarity;
+            // An eye under the water reads the same water as drawn over it:
+            // the lake's sheet over the lake (both lakes cover this point,
+            // well off the ribbon), the ribbon's carried clarity down the
+            // outlet.
+            let sheet = mesh.drawn_at([2.0, -80.0]).unwrap();
+            assert!((sheet.clarity - lake_clear).abs() < 1e-5 && sheet.still == 1.0 && sheet.half_width == 0.0, "{sheet:?}");
+            for x in [800.0, 1800.0, 3800.0] {
+                let drawn = mesh.drawn_at([x, 2.0]).unwrap();
+                assert!((drawn.clarity - at(x)).abs() < 1e-4, "{x}: {drawn:?}");
+            }
+            assert!(mesh.drawn_at([800.0, 40.0]).is_none(), "nothing is drawn off the water");
+            assert!((at(200.0) - lake_clear).abs() < 1e-5, "in the lake it is the lake's water");
+            assert!(at(1800.0) < at(800.0) || lake_clear == 0.0, "the clarity fades downstream");
+            assert!(at(800.0) <= lake_clear + 1e-5);
+            if expected > 0.5 {
+                assert!(at(800.0) > 0.6 && at(3800.0) < 0.2, "{} {}", at(800.0), at(3800.0));
+            }
+        }
+    }
+
+    /// A clear stream falling into a stained pond runs on into it as a
+    /// plume of its own water, which fades into the pond's: no step where
+    /// the stream's ribbon gives way to the pond's sheet, the stream's own
+    /// colour at the mouth, the pond's own beyond the plume, and the pond's
+    /// own water out of its outlet. The whitewater and foam at the foot of
+    /// the rapid run on out into the pond the same way, and die out in it.
+    #[test]
+    fn a_clear_stream_runs_into_a_stained_pond_as_a_plume() {
+        // A clear lake at 120 m over x -80..-40 m, and a 120 m pond at 60 m
+        // over x 0..120 m, z -60..60 m, joined by a rapid.
+        let block = |x: std::ops::Range<i32>, z: std::ops::Range<i32>| -> Vec<[i32; 2]> {
+            x.flat_map(|x| z.clone().map(move |z| [x, z])).collect()
+        };
+        let lake = |level: f32, cells| Lake { level, cells, shore: Vec::new(), edge: Vec::new(), current: Vec::new() };
+        let clear = lake(120.0, block(-20..-10, -5..5));
+        let pond = lake(60.0, block(0..30, -15..15));
+        let water_at = |x: f32| match x {
+            x if x < -40.0 => 120.0,
+            x if x < 0.0 => 120.0 - 1.5 * (x + 40.0),
+            x if x < 120.0 => 60.0,
+            x => 60.0 - 0.02 * (x - 120.0),
+        };
+        let node = |k: i32| {
+            let x = -70.0 + 2.5 * k as f32;
+            RiverNode {
+                position: [x, 0.0],
+                water: water_at(x),
+                half_width: 2.0,
+                depth: 0.5,
+                speed: 1.0,
+                along: x + 70.0,
+                // White down the rapid, to its toe at the pond's level.
+                turbulence: if (-40.0..=0.0).contains(&x) { 0.6 } else { 0.0 },
+                lake: x < -40.0 || (0.0..120.0).contains(&x),
+                ..Default::default()
+            }
+        };
+        let river = River { nodes: (0..=92).map(node).collect(), end: RiverEnd::Edge, surface_end: 92 };
+        let mesh = build(&[river], &[clear, pond], &no_ground);
+        let own = lake_clarity(60.0, 900.0 * LAKE_CELL * LAKE_CELL);
+        let ribbon_at = |x: f32| mesh.vertices.iter().find(|v| v.half_width > 0.0 && (v.position[0] - x).abs() < 1e-3).unwrap().clarity;
+        let drawn = |x: f32, z: f32| mesh.drawn_at([x, z]).unwrap().clarity;
+        let inflow = ribbon_at(-2.5);
+        assert!(inflow > 0.9 && own < 0.05, "{inflow} {own}");
+        // From the rapid out into the pond the drawn water changes
+        // smoothly, wherever the sheet takes over from the ribbon.
+        for z in [0.0, 1.5] {
+            let samples: Vec<f32> = (0..=140).map(|k| drawn(-10.0 + 0.5 * k as f32, z)).collect();
+            for (k, pair) in samples.windows(2).enumerate() {
+                assert!((pair[1] - pair[0]).abs() < 0.08, "{z}: step at {}: {samples:?}", -10.0 + 0.5 * k as f32);
+            }
+            // And so do its whitewater and foam.
+            let stirred: Vec<[f32; 2]> = (0..=140)
+                .map(|k| mesh.drawn_at([-10.0 + 0.5 * k as f32, z]).unwrap())
+                .map(|v| [v.turbulence, v.foam])
+                .collect();
+            for (k, pair) in stirred.windows(2).enumerate() {
+                let step = (pair[1][0] - pair[0][0]).abs().max((pair[1][1] - pair[0][1]).abs());
+                assert!(step < 0.1, "{z}: step at {}: {stirred:?}", -10.0 + 0.5 * k as f32);
+            }
+        }
+        let stir = |x: f32, z: f32| mesh.drawn_at([x, z]).map(|v| [v.turbulence, v.foam]).unwrap();
+        assert!(stir(-5.0, 0.0)[0] > 0.55 && stir(1.0, 0.0)[0] > 0.5, "{:?} {:?}", stir(-5.0, 0.0), stir(1.0, 0.0));
+        assert!(stir(1.0, 0.0)[1] > 0.5 && stir(6.0, 0.0)[1] > 0.1, "the foam drifts on out: {:?}", stir(6.0, 0.0));
+        assert!((drawn(1.0, 0.0) - inflow).abs() < 0.02, "{}", drawn(1.0, 0.0));
+        assert!(drawn(20.0, 0.0) > own + 0.2, "the plume reaches into the pond");
+        // Beyond the plume, along it and to either side, the pond's own.
+        for [x, z] in [[80.0, 0.0], [110.0, 0.0], [10.0, 24.0], [10.0, -24.0], [40.0, 30.0]] {
+            assert!((drawn(x, z) - own).abs() < 0.02, "{x} {z}: {}", drawn(x, z));
+            assert!(stir(x, z)[0] < 1e-3 && stir(x, z)[1] < 1e-3, "{x} {z}: the pond is calm: {:?}", stir(x, z));
+        }
+        // Still water no fall runs into stays calm and clear of foam.
+        assert_eq!(stir(-60.0, 15.0), [0.0, 0.0]);
+        // Out of the outlet runs the pond's own water.
+        assert!((ribbon_at(130.0) - own).abs() < 0.02, "{}", ribbon_at(130.0));
     }
 
     /// A river reaching the sea ends one row past the coast, tucked just
@@ -1346,16 +2257,23 @@ mod tests {
         };
         let nodes: Vec<RiverNode> = (0..=40).map(river_node).collect();
         let river = River { nodes, end: RiverEnd::Sea, surface_end: 38 };
-        let mesh = build(&[river], &[]);
-        // Five columns a row; the coast is the first node at the sea's level.
+        let mesh = build(&[river], &[], &no_ground);
+        // The wide columns a row; the coast is the first node at the sea's
+        // level.
         let coast = 30;
-        assert_eq!(mesh.vertices.len(), (coast + 2) * 5, "one row past the coast");
-        let row = |r: usize| &mesh.vertices[r * 5 + 2];
+        let columns = WIDE_COLUMNS.len();
+        assert_eq!(mesh.vertices.len(), (coast + 2) * columns, "one row past the coast");
+        let row = |r: usize| &mesh.vertices[r * columns + columns / 2];
         assert!((row(coast + 1).position[1] - (SEA_LEVEL - UNDER_SEA)).abs() < 1e-5);
         assert!((row(coast).position[1] - water_at(150.0)).abs() < 1e-5);
         assert_eq!(row(coast).sea, 1.0);
         assert_eq!(row(coast + 1).sea, 1.0);
         assert_eq!(row(10).sea, 0.0, "far upstream the water is the river's own");
+        // An eye in the last reach reads the sea's share the surface over it
+        // is drawn with, not the river's 0.
+        let drawn = mesh.drawn_at([120.0, 0.3]).unwrap();
+        assert!((drawn.sea - row(24).sea).abs() < 1e-5, "{drawn:?}");
+        assert!((mesh.drawn_at([149.0, 0.3]).unwrap().sea - 1.0).abs() < 0.05);
         for r in 13..=coast {
             assert!(row(r).sea >= row(r - 1).sea, "{:?} {:?}", row(r - 1), row(r));
         }

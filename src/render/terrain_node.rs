@@ -200,6 +200,54 @@ impl HabitatKey {
 /// same capture as last frame" from "a new one" even across a G-buffer rebuild.
 static HABITAT_GENERATIONS: AtomicU64 = AtomicU64::new(1);
 
+/// Which habitat capture the G-buffer's capture textures hold. The capture is
+/// kept until its inputs change, and the player moves about inside its
+/// window meanwhile, so everything that reads the capture must place it by
+/// this record rather than by the player's position.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct HabitatCapture {
+    /// The window the held capture covers, in `grass_habitat_mapping`
+    /// layout; all zero until the first capture.
+    pub mapping: [f32; 4],
+    /// Which capture is held; changes whenever it is re-rendered.
+    pub generation: u64,
+    /// What the held capture was rendered from, `None` until there is one.
+    key: Option<HabitatKey>,
+    /// Whether the habitat texture holds the capture. False while a
+    /// recapture is under way, when that texture has been cleared for it.
+    pub ready: bool,
+}
+
+impl HabitatCapture {
+    /// Whether the held capture is the one `key` asks for, and whole.
+    fn holds(&self, key: HabitatKey) -> bool {
+        self.ready && self.key == Some(key)
+    }
+
+    /// A recapture has begun: the habitat texture is cleared and redrawn, so
+    /// the grass must not read it until [`Self::complete`]. The ground
+    /// average, and the canopy the vegetation pass lays over it, still hold
+    /// the previous capture until then, so its window stays as it is.
+    fn begin(&mut self) {
+        self.ready = false;
+    }
+
+    /// The capture of `mapping` is encoded into every capture texture.
+    /// `upload` writes its window into the uniform the water places the
+    /// canopy by, in the same pass as the texels: a window written anywhere
+    /// else, before this pass in the frame (as the water's own block is) or
+    /// from a capture still pending, would pair these texels with another
+    /// capture's window for a frame, and shift every crown the water sees by
+    /// a whole 8 m window.
+    fn complete(&mut self, key: HabitatKey, mapping: [f32; 4], upload: impl FnOnce(&[f32; 4])) {
+        self.key = Some(key);
+        self.mapping = mapping;
+        self.generation = HABITAT_GENERATIONS.fetch_add(1, Ordering::Relaxed);
+        self.ready = true;
+        upload(&self.mapping);
+    }
+}
+
 /// Shared by the terrain capture and water sampling; xy = centre, z = span,
 /// w = metres per texel. One source prevents the shoreline drifting between
 /// the vertex and fragment passes or when crossing a snap boundary.
@@ -301,16 +349,14 @@ pub struct GbufferTargets {
     /// time); until then it is a plain copy.
     pub grass_ground_average_view: wgpu::TextureView,
     grass_ground_average_bind_group: BindGroup,
-    /// The window the held capture covers, in `grass_habitat_mapping` layout.
-    /// The capture is kept until its inputs change, and the player moves about
-    /// inside it meanwhile, so everything that reads the capture must use this
-    /// rather than the player's position.
-    pub grass_habitat_mapping: [f32; 4],
-    /// Which capture is held; changes whenever it is re-rendered.
-    pub grass_habitat_generation: u64,
-    /// What the held capture was rendered from, `None` until there is one.
-    grass_habitat_key: Option<HabitatKey>,
-    pub grass_habitat_ready: bool,
+    /// Which capture the textures above hold.
+    pub grass_habitat: HabitatCapture,
+    /// `grass_habitat.mapping` as a 16-byte uniform, for the GPU passes that
+    /// sample the capture after the frame's capture lands: the water, which
+    /// reads the canopy over the ground average. Written by the capture's own
+    /// pass ([`HabitatCapture::complete`]) and nowhere else; zero, no
+    /// capture, until the first.
+    pub grass_habitat_mapping_buffer: Buffer,
     pub width: u32,
     pub height: u32,
 }
@@ -653,10 +699,10 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         water,
         terrain_revision,
     );
-    if !(gbuffer.grass_habitat_ready && gbuffer.grass_habitat_key == Some(key))
+    if !gbuffer.grass_habitat.holds(key)
         && let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.habitat_pipeline)
     {
-        gbuffer.grass_habitat_ready = false;
+        gbuffer.grass_habitat.begin();
         // A crest bound protects roots even when the user increases the sea state.
         let crest_bound = |water: &super::water_node::ExtractedWater| {
             let spectrum = crate::water::waves::build(
@@ -743,10 +789,11 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
             average_pass.draw(0..3, 0..1);
             drop(average_pass);
             copy_ground_average(ctx.command_encoder(), gbuffer);
-            gbuffer.grass_habitat_key = Some(key);
-            gbuffer.grass_habitat_mapping = mapping;
-            gbuffer.grass_habitat_generation = HABITAT_GENERATIONS.fetch_add(1, Ordering::Relaxed);
-            gbuffer.grass_habitat_ready = true;
+            // Queued writes land ahead of the frame's command buffers, so the
+            // window reaches the water in the same frame as the texels.
+            gbuffer.grass_habitat.complete(key, mapping, |window| {
+                queue.write_buffer(&gbuffer.grass_habitat_mapping_buffer, 0, bytemuck::bytes_of(window));
+            });
         }
     }
 
@@ -1905,6 +1952,14 @@ pub(crate) fn resize_gbuffer(
         let grass_habitat_texture =
             device.wgpu_device().create_texture(&grass_habitat_texture_descriptor);
         let grass_habitat_view = grass_habitat_texture.create_view(&Default::default());
+        // Buffers are created zeroed: a span of zero, no capture yet, which
+        // is what the new textures hold.
+        let grass_habitat_mapping_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forest_grass_habitat_mapping"),
+            size: std::mem::size_of::<[f32; 4]>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let gbuffer_targets = GbufferTargets {
             position_view: position_texture.create_view(&wgpu::TextureViewDescriptor::default()),
             normal_view: normal_texture.create_view(&wgpu::TextureViewDescriptor::default()),
@@ -1917,10 +1972,8 @@ pub(crate) fn resize_gbuffer(
             grass_ground_base_view,
             grass_ground_average_view,
             grass_ground_average_bind_group,
-            grass_habitat_mapping: [0.0; 4],
-            grass_habitat_generation: 0,
-            grass_habitat_key: None,
-            grass_habitat_ready: false,
+            grass_habitat: HabitatCapture::default(),
+            grass_habitat_mapping_buffer,
             lighting_heightfield_key: None,
             lighting_highest_ready: false,
             shore_heightfield_key: None,
@@ -2057,6 +2110,52 @@ mod habitat_cache_tests {
             bytemuck::bytes_of(&habitat_capture_globals(globals, mapping, Some(0.4))).to_vec()
         };
         assert_eq!(capture(&a), capture(&b));
+    }
+
+    /// The water samples the canopy laid over the capture and places it by
+    /// the window uniform the capture's pass writes. In every frame of a
+    /// flight, the frames it crosses into a new window among them, and while
+    /// the first capture waits on its pipelines, that window must be the one
+    /// of the capture whose texels the water samples: none before there is a
+    /// capture, never a pending one's, never the last one's.
+    #[test]
+    fn the_water_places_the_canopy_by_the_window_of_the_capture_it_samples() {
+        let mut capture = HabitatCapture::default();
+        // The uniform as the GPU holds it: created zeroed, then whatever the
+        // capture's pass queues.
+        let mut window = [0.0f32; 4];
+        // The window of the capture the canopy texture holds, if any.
+        let mut texels: Option<[f32; 4]> = None;
+        let mut generations = Vec::new();
+        let mut copied_in_prepare_wrong = 0;
+        // East over the forest pond at the flying speed, 60 frames a second.
+        for frame in 0..240 {
+            let position = [-760.0 + 38.0 * frame as f32 / 60.0, 51.0, 992.0];
+            // What a window copied into the water's own block in Prepare,
+            // before the frame's capture, would hold.
+            let copied_in_prepare = if capture.ready { capture.mapping } else { [0.0; 4] };
+            // The terrain pass. The ground average's pipeline compiles for
+            // the first frames; until it has, a capture is begun and left.
+            let key = key(position);
+            if !capture.holds(key) {
+                capture.begin();
+                if frame >= 3 {
+                    let mapping = grass_habitat_mapping(position);
+                    texels = Some(mapping);
+                    capture.complete(key, mapping, |queued| window = *queued);
+                    generations.push(capture.generation);
+                }
+            }
+            // The water pass.
+            assert_eq!(window, texels.unwrap_or([0.0; 4]), "frame {frame}");
+            copied_in_prepare_wrong += usize::from(copied_in_prepare != window);
+        }
+        // One capture per 8 m window flown through, each a new one.
+        assert_eq!(generations.len(), 19);
+        assert!(generations.windows(2).all(|pair| pair[1] > pair[0]));
+        // The window copied before the capture was wrong in every frame that
+        // took one: a crown edge flashing 8 m aside five times a second.
+        assert_eq!(copied_in_prepare_wrong, generations.len());
     }
 
     #[test]

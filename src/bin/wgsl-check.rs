@@ -77,6 +77,15 @@ fn main() {
                 EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_canopy".into() },
                 EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_canopy".into() },
             ]
+        } else if path.file_name().is_some_and(|name| name == "water.wgsl") {
+            vec![
+                EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_sea".into() },
+                EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_inland".into() },
+                EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_water".into() },
+                EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_fullscreen".into() },
+                EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_blit".into() },
+                EntryPoint { stage: naga::ShaderStage::Fragment, name: "fs_underwater".into() },
+            ]
         } else if path.file_name().is_some_and(|name| name == "lightning.wgsl") {
             vec![
                 EntryPoint { stage: naga::ShaderStage::Vertex, name: "vs_blit".into() },

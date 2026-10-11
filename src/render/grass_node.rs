@@ -638,7 +638,7 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
         return;
     };
     let gbuffer = terrain.gbuffer.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(gbuffer) = gbuffer.as_ref().filter(|g| g.grass_habitat_ready) else {
+    let Some(gbuffer) = gbuffer.as_ref().filter(|g| g.grass_habitat.ready) else {
         return;
     };
     let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -661,7 +661,7 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
     let gust = 1.0 + 1.6 * conditions.gust_strength;
     let wind_strength = (conditions.wind_speed / 18.0).clamp(0.0, 2.0) * 0.11 * gust;
     let frame = GrassFrame {
-        mapping: gbuffer.grass_habitat_mapping,
+        mapping: gbuffer.grass_habitat.mapping,
         wind: [direction.cos(), direction.sin(), elapsed, wind_strength],
         range: [100.0, grass::SCATTER_RADIUS, center[0], center[1]],
         layer_end: [

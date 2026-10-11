@@ -505,7 +505,7 @@ const SURFACE_BUCKET: f32 = 8.0;
 impl<'a> SurfaceIndex<'a> {
     pub fn new(network: &'a RiverNetwork) -> Self {
         let mesh = &network.surface;
-        let counts: Vec<usize> = network.lakes.iter().map(|lake| super::surface::build(&[], std::slice::from_ref(lake)).vertices.len()).collect();
+        let counts: Vec<usize> = network.lakes.iter().map(|lake| super::surface::build(&[], std::slice::from_ref(lake), &|_| None).vertices.len()).collect();
         let first_lake = mesh.vertices.len() - counts.iter().sum::<usize>();
         let advance_start = |start: &mut usize, &count: &usize| {
             *start += count;
@@ -589,6 +589,8 @@ impl<'a> SurfaceIndex<'a> {
                 sea: mix(&|v| v.sea),
                 side: mix(&|v| v.side),
                 joined: [mix(&|v| v.joined[0]), mix(&|v| v.joined[1]), mix(&|v| v.joined[2])],
+                clarity: mix(&|v| v.clarity),
+                rim: [mix(&|v| v.rim[0]), mix(&|v| v.rim[1]), mix(&|v| v.rim[2]), mix(&|v| v.rim[3])],
             });
         });
         top
@@ -952,6 +954,107 @@ pub fn ribbon_checks(noise: &NoiseField, network: &RiverNetwork) -> RibbonFit {
     fit
 }
 
+/// Where the ground just outside a channel lies under its water, with no
+/// bank to hold it in and nothing but the ribbon's rounded edge between the
+/// water and the lower ground: of the samples taken out to a metre past
+/// every channel's waterline (24 directions around every node outside the
+/// lakes, a quarter metre apart), on dry land, how many lie more than 0.1 m
+/// under the water of the channel there, and the 16 m cells holding most.
+/// A start cap rising along its own axis on the inside of a steep bend or
+/// flare undercuts the reach before it so (`network::build_segments`).
+pub struct BankFit {
+    pub samples: usize,
+    pub under: usize,
+    pub cells: Vec<(usize, [f32; 2])>,
+}
+
+pub fn bank_checks(noise: &NoiseField, network: &RiverNetwork) -> BankFit {
+    const CELL: f32 = 16.0;
+    let mut fit = BankFit { samples: 0, under: 0, cells: Vec::new() };
+    let mut cells: std::collections::HashMap<[i32; 2], usize> = Default::default();
+    for river in &network.rivers {
+        let drawn = &river.nodes[..=river.surface_end.min(river.nodes.len() - 1)];
+        for node in drawn.iter().filter(|node| !node.lake) {
+            for k in 0..24 {
+                let angle = k as f32 / 24.0 * std::f32::consts::TAU;
+                for past in [0.25f32, 0.5, 0.75, 1.0] {
+                    let reach = node.half_width + past;
+                    let p = [node.position[0] + angle.cos() * reach, node.position[1] + angle.sin() * reach];
+                    let (ground, envelope) = carved_height(noise, network, p[0], p[1]);
+                    // Just past a waterline, on dry land: not a lake's bed
+                    // nor the sea's.
+                    if !(0.0..=1.0).contains(&envelope.bank_distance) || ground <= envelope.lake || ground <= SEA_LEVEL {
+                        continue;
+                    }
+                    fit.samples += 1;
+                    if ground < envelope.water - 0.1 {
+                        fit.under += 1;
+                        *cells.entry([(p[0] / CELL).floor() as i32, (p[1] / CELL).floor() as i32]).or_default() += 1;
+                    }
+                }
+            }
+        }
+    }
+    fit.cells = cells.into_iter().map(|(c, n)| (n, [(c[0] as f32 + 0.5) * CELL, (c[1] as f32 + 0.5) * CELL])).collect();
+    fit.cells.sort_by(|a, b| b.0.cmp(&a.0).then(a.1[0].total_cmp(&b.1[0])).then(a.1[1].total_cmp(&b.1[1])));
+    fit
+}
+
+/// Where a ribbon's edge, past its waterline, stands over what lies there:
+/// over dry ground, or over a lake's sheet drawn there, more than a
+/// centimetre, so the water would end in the air. Its outer strip rounds
+/// down to end under both (`surface::round_edge`), except where a
+/// tributary's water becomes its parent's, which those vertices follow
+/// (`joined`). (edge vertices, how many stand over, the worst and where.)
+pub struct EdgeFit {
+    pub edges: usize,
+    pub over: usize,
+    pub worst: (f32, [f32; 2]),
+}
+
+pub fn edge_checks(noise: &NoiseField, network: &RiverNetwork) -> EdgeFit {
+    let index = SurfaceIndex::new(network);
+    let mut fit = EdgeFit { edges: 0, over: 0, worst: (0.0, [0.0; 2]) };
+    for vertex in &network.surface.vertices {
+        if vertex.half_width <= 0.0 || vertex.across.abs() <= 1.0 || vertex.joined[2] > 0.0 || vertex.position[1] < SEA_LEVEL {
+            continue;
+        }
+        let p = [vertex.position[0], vertex.position[2]];
+        let (ground, envelope) = carved_height(noise, network, p[0], p[1]);
+        let (_, sheet, _) = index.owned(p);
+        let dry = envelope.bank_distance > 0.0 && ground > envelope.lake && ground > SEA_LEVEL;
+        let cover = if sheet > ground { sheet } else if dry { ground } else { continue };
+        fit.edges += 1;
+        let over = vertex.position[1] - cover;
+        if over > 0.01 {
+            fit.over += 1;
+            if over > fit.worst.0 {
+                fit.worst = (over, p);
+            }
+        }
+    }
+    fit
+}
+
+pub fn bank_fit(noise: &NoiseField, network: &RiverNetwork) -> Vec<String> {
+    let banks = bank_checks(noise, network);
+    let edges = edge_checks(noise, network);
+    let mut lines = vec![
+        format!(
+            "banks: of {} samples just past a waterline on dry land, {} lie over 0.1 m under the channel's water",
+            banks.samples, banks.under
+        ),
+        format!(
+            "ribbon edges: of {} over dry ground or a lake's sheet, {} stand over it (worst {:.2} m at {:.1},{:.1})",
+            edges.edges, edges.over, edges.worst.0, edges.worst.1[0], edges.worst.1[1]
+        ),
+    ];
+    for (count, at) in banks.cells.iter().take(6) {
+        lines.push(format!("  {count} bank samples under the water around {:.0},{:.0}", at[0], at[1]));
+    }
+    lines
+}
+
 pub fn ribbon_fit(noise: &NoiseField, network: &RiverNetwork) -> String {
     let fit = ribbon_checks(noise, network);
     let (perched, p) = fit.worst_perched;
@@ -979,6 +1082,9 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
         println!("{line}");
     }
     println!("{}", ribbon_fit(noise, &network));
+    for line in bank_fit(noise, &network) {
+        println!("{line}");
+    }
     println!("{}", seam_fit(noise, &network));
     // The nodes nearest the map's centre, for framing a camera on them: the
     // heading is the `--camera` yaw that looks downstream.
@@ -1213,15 +1319,48 @@ mod tests {
     /// The rivers' water sits in their channels: a ribbon stands over dry
     /// ground beyond its banks only here and there, and only a little, and
     /// a tributary's water rarely shows under its parent's where they meet.
+    /// Banks held up by how high the water stands over the lake it meets,
+    /// not by how near it is, hold a cascade's water right down to the lake.
     #[test]
     fn spawn_region_ribbons_sit_in_their_channels() {
         let noise = NoiseField::new();
         let network = network::generate(&noise, [0, 0]);
         let fit = ribbon_checks(&noise, &network);
         assert!(fit.samples > 500_000, "{}", fit.samples);
-        assert!(fit.perched * 1000 <= fit.samples, "{} of {} perched", fit.perched, fit.samples);
-        assert!(fit.worst_perched.0 < 1.5, "perched {:?}", fit.worst_perched);
+        assert!(fit.perched * 4000 <= fit.samples, "{} of {} perched", fit.perched, fit.samples);
+        assert!(fit.worst_perched.0 < 0.8, "perched {:?}", fit.worst_perched);
         assert!(fit.under * 5000 <= fit.samples, "{} of {} under another", fit.under, fit.samples);
+    }
+
+    /// No ribbon's edge ends in the air: past its waterline it ends under
+    /// the dry ground there or under the lake's sheet it reaches over,
+    /// rounding down onto it where the ground lies lower than its water.
+    /// What is left stands a few centimetres over the shelf a confluence's
+    /// rounded banks open just past the waterline, where the tributary's
+    /// water follows its parent's.
+    #[test]
+    fn spawn_region_ribbon_edges_never_end_in_the_air() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, [0, 0]);
+        let edges = edge_checks(&noise, &network);
+        assert!(edges.edges > 20_000, "{}", edges.edges);
+        assert!(edges.over * 500 <= edges.edges, "{} of {} edges over the ground", edges.over, edges.edges);
+        assert!(edges.worst.0 < 0.1, "an edge stands {:?} over the ground", edges.worst);
+    }
+
+    /// The ground just past a waterline seldom lies under the channel's
+    /// water: its banks hold it, and where they are low the levee holds them
+    /// up, as near a lake as the water stands clear of it. A guard on the
+    /// carve, whose start caps rise along their own axis and can undercut
+    /// the reach before them on the inside of a steep bend.
+    #[test]
+    fn spawn_region_banks_hold_their_water() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, [0, 0]);
+        let banks = bank_checks(&noise, &network);
+        assert!(banks.samples > 500_000, "{}", banks.samples);
+        assert!(banks.under * 100 <= banks.samples, "{} of {} under the water", banks.under, banks.samples);
+        assert!(banks.cells.first().is_none_or(|cell| cell.0 <= 200), "{:?}", &banks.cells[..banks.cells.len().min(4)]);
     }
 
     /// The highest gap between two ribbons over a point, with the lower over
@@ -1327,7 +1466,113 @@ mod tests {
         let network = network::generate(&noise, network::region_of(2222.3, 5721.5));
         let (samples, _, perched) = ribbons_around(&noise, &network, [2232.0, 5721.0], 24.0);
         assert!(samples > 200, "{samples}");
-        assert!(perched < 0.7, "the cascade's water stands {perched} m over the ground beside it");
+        assert!(perched < 0.15, "the cascade's water stands {perched} m over the ground beside it");
+    }
+
+    /// Reported: a tributary running through a lake that joined its parent
+    /// on the parent's outlet approach was carved on as a broad outlet's
+    /// mouth, cutting the hillside beside the lake's outlet down into a dry
+    /// pit under the lake's level, walled by the water drawn around it.
+    /// Near every lake's mouths, ground cut from above the lake's level to
+    /// more than 10 cm under it, beside water standing at or over the
+    /// lake's, always has water drawn over it, a ribbon, a sheet or the sea,
+    /// but for at most ten samples (2.5 square metres) by any one mouth,
+    /// where a ribbon's edge rounds down at its waterline. A channel running
+    /// away below its lake past the sill, and its banks however deep they
+    /// are cut into the hill, stand clear of the lake's water and are left
+    /// alone.
+    #[test]
+    fn spawn_region_lake_mouths_leave_no_dry_pit_under_the_lake() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, [0, 0]);
+        let index = SurfaceIndex::new(&network);
+        let mut seen = std::collections::HashSet::new();
+        let mut samples = 0;
+        let mut worst = (0usize, [0.0f32; 2]);
+        for river in &network.rivers {
+            for pair in river.nodes.windows(2) {
+                if pair[0].lake == pair[1].lake {
+                    continue;
+                }
+                let (mouth, level) = if pair[0].lake { (&pair[1], pair[0].water) } else { (&pair[0], pair[1].water) };
+                let reach = 20.0f32;
+                let steps = (2.0 * reach / 0.5) as i32;
+                let mut pits = 0;
+                for zi in 0..=steps {
+                    for xi in 0..=steps {
+                        let p = [
+                            (mouth.position[0] - reach + xi as f32 * 0.5).floor() + 0.25,
+                            (mouth.position[1] - reach + zi as f32 * 0.5).floor() + 0.25,
+                        ];
+                        let near = (p[0] - mouth.position[0]).hypot(p[1] - mouth.position[1]) <= reach;
+                        if !near || !seen.insert([(p[0] * 4.0) as i64, (p[1] * 4.0) as i64]) {
+                            continue;
+                        }
+                        if base_height(&noise, p[0], p[1]) <= level + 0.05 {
+                            continue;
+                        }
+                        samples += 1;
+                        let (ground, envelope) = carved_height(&noise, &network, p[0], p[1]);
+                        let (ribbon, sheet, _) = index.owned(p);
+                        let drawn = ribbon.max(sheet).max(SEA_LEVEL);
+                        if ground < level - 0.1 && envelope.water >= level - 0.05 && drawn <= ground {
+                            pits += 1;
+                        }
+                    }
+                }
+                if pits > worst.0 {
+                    worst = (pits, mouth.position);
+                }
+            }
+        }
+        assert!(samples > 10_000, "{samples}");
+        assert!(worst.0 <= 10, "{} samples of dry ground under the lake's level by the mouth at {:?}", worst.0, worst.1);
+    }
+
+    /// Reported: a channel's levee heaped a mound out of a pond beside its
+    /// outlet. Natural ground under a lake's drawn sheet is never raised over
+    /// it by a channel's levee, but for a few square metres (under 0.1% of
+    /// the sheets' wet area) where two channels' levees meet by a lake, none
+    /// by more than half a metre.
+    #[test]
+    fn spawn_region_levees_never_raise_a_lakes_bed_over_its_water() {
+        let noise = NoiseField::new();
+        let network = network::generate(&noise, [0, 0]);
+        let index = SurfaceIndex::new(&network);
+        let cell = network::FLOW_CELL as f32;
+        let (mut wet, mut raised, mut worst) = (0usize, 0usize, (0.0f32, [0.0f32; 2]));
+        for (number, lake) in network.lakes.iter().enumerate() {
+            let (mut minimum, mut maximum) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+            for c in lake.cells.iter().chain(&lake.shore) {
+                for axis in 0..2 {
+                    minimum[axis] = minimum[axis].min(c[axis] as f32 * cell);
+                    maximum[axis] = maximum[axis].max((c[axis] + 1) as f32 * cell);
+                }
+            }
+            let width = ((maximum[0] - minimum[0]) * 2.0).ceil() as usize;
+            let depth = ((maximum[1] - minimum[1]) * 2.0).ceil() as usize;
+            for zi in 0..depth {
+                for xi in 0..width {
+                    let p = [minimum[0] + xi as f32 * 0.5 + 0.25, minimum[1] + zi as f32 * 0.5 + 0.25];
+                    let (ribbon, sheet, owner) = index.owned(p);
+                    let natural = base_height(&noise, p[0], p[1]);
+                    if owner != number || sheet < lake.level - 0.02 || sheet <= natural + 0.02 || sheet < ribbon {
+                        continue;
+                    }
+                    wet += 1;
+                    let (ground, _) = carved_height(&noise, &network, p[0], p[1]);
+                    if ground > sheet + 0.02 {
+                        raised += 1;
+                        if ground - sheet > worst.0 {
+                            worst = (ground - sheet, p);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(wet > 100_000, "{wet}");
+        assert!(raised * 1000 < wet, "{raised} of {wet} samples of lake bed raised over the water");
+        assert!(worst.0 < 0.5, "a lake's bed is raised {} m over its water at {:?}", worst.0, worst.1);
     }
 
     /// The lakes' surface the terrain, the plants and the player measure

@@ -34,6 +34,119 @@ pub struct Player {
     pub current: Vec2,
     /// True while the current has taken the player's feet from under them.
     pub swept: bool,
+    /// The water standing where the player (and so the camera) is, whether
+    /// or not the player is in it: the renderer reads it to know when the
+    /// eye has gone under a river, a lake or the sea.
+    pub water: Option<WaterHere>,
+    /// Whether the body swam its last step: only a swimmer crouches under
+    /// standing height, to stand up out of the shallows. A walker is set on
+    /// its feet.
+    pub swimming: bool,
+    /// Whether the body is in the air from a jump or a kick, rather than
+    /// having walked or fallen off something: only a leap over deep water
+    /// steps up onto a bank from its feet.
+    pub leapt: bool,
+}
+
+/// What kind of water stands somewhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaterKind {
+    River,
+    Lake,
+    Sea,
+}
+
+/// The water standing at a point: its surface, the ground under it, its
+/// current and what kind of water it is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WaterHere {
+    pub surface: f32,
+    pub ground: f32,
+    /// Surface current, world XZ, m/s; zero in a lake or the sea.
+    pub current: Vec2,
+    /// Whitewater, 0..1.
+    pub turbulence: f32,
+    /// How clear it is, 0 (stained by the forest) to 1 (clear mountain
+    /// water), how far it is the sea's water and how still it is, each 0..1,
+    /// as the surface drawn over it has them (`SurfaceMesh::drawn_at`): the
+    /// medium around a submerged eye is the water drawn overhead, which
+    /// blends into the sea toward a mouth and into a lake's still water
+    /// toward its sheet, and carries a clear lake's clarity down its outlet.
+    pub clarity: f32,
+    pub sea: f32,
+    pub still: f32,
+    /// Which water's surface is drawn over it: a river's mouth past its
+    /// ribbon is the sea's, though its level and current are the river's.
+    pub kind: WaterKind,
+}
+
+impl WaterHere {
+    pub fn depth(&self) -> f32 {
+        self.surface - self.ground
+    }
+
+    /// The sea over ground at `ground`, if it covers it.
+    pub fn sea(ground: f32) -> Option<WaterHere> {
+        (ground < SEA_LEVEL).then_some(WaterHere {
+            surface: SEA_LEVEL,
+            ground,
+            current: Vec2::ZERO,
+            turbulence: 0.0,
+            clarity: 0.0,
+            sea: 1.0,
+            still: 1.0,
+            kind: WaterKind::Sea,
+        })
+    }
+
+    /// Where the eye of a body floating head out in this water is, if it is
+    /// too deep to stand in.
+    pub fn float_eye(&self) -> Option<f32> {
+        (self.depth() > EYE_HEIGHT - SWIM_FREEBOARD).then_some(self.surface + SWIM_FREEBOARD)
+    }
+}
+
+/// The water over the ground at `(x, z)`, if any: a river's (a little splash
+/// past its waterline counts), a lake's still water, or the sea's; where two
+/// overlap, the higher surface is the one standing there.
+pub fn water_at(erosion: &ErosionCache, noise: &NoiseField, x: f32, z: f32, visibility_center: [f32; 2]) -> Option<WaterHere> {
+    let envelope = erosion
+        .rivers
+        .as_ref()
+        .map_or(crate::rivers::carve::Envelope::NONE, |network| network.envelope(x, z));
+    let ground = crate::erosion::sample_eroded_height(erosion, noise, x, z, visibility_center);
+    let drawn = erosion.rivers.as_ref().and_then(|network| network.surface.drawn_at([x, z]));
+    let inland = |surface: f32, current: Vec2, turbulence: f32, kind: WaterKind| WaterHere {
+        surface,
+        ground,
+        current,
+        turbulence,
+        ..drawn_as(drawn, surface, ground, kind)
+    };
+    let river = (envelope.bank_distance < 0.5)
+        .then(|| inland(envelope.water, Vec2::from(envelope.velocity), envelope.turbulence, WaterKind::River));
+    let lake = (ground < envelope.lake).then(|| inland(envelope.lake, Vec2::ZERO, 0.0, WaterKind::Lake));
+    let sea = WaterHere::sea(ground);
+    [river, lake, sea]
+        .into_iter()
+        .flatten()
+        .filter(|water| water.depth() > 0.0)
+        .reduce(|a, b| if b.surface > a.surface { b } else { a })
+}
+
+/// A river's or a lake's water at `surface` over `ground` as it is drawn:
+/// the colour shares of the surface drawn over it (`drawn`), its own kind.
+/// With nothing drawn there, it is the sea's where it lies at the sea's level
+/// over the sea floor (a river's mouth past its ribbon, where the sea draws
+/// the water), else a stream's own. Only the colour shares and the kind are
+/// meant; the rest is the caller's.
+fn drawn_as(drawn: Option<crate::rivers::surface::SurfaceVertex>, surface: f32, ground: f32, kind: WaterKind) -> WaterHere {
+    let (clarity, sea, still, kind) = match drawn {
+        Some(drawn) => (drawn.clarity, drawn.sea, drawn.still, kind),
+        None if ground < SEA_LEVEL && surface <= SEA_LEVEL + 0.03 => (0.0, 1.0, 1.0, WaterKind::Sea),
+        None => (crate::rivers::surface::stream_clarity(surface), 0.0, f32::from(u8::from(kind == WaterKind::Lake)), kind),
+    };
+    WaterHere { surface, ground, current: Vec2::ZERO, turbulence: 0.0, clarity, sea, still, kind }
 }
 
 impl Default for Player {
@@ -52,6 +165,9 @@ impl Default for Player {
             wading_depth: 0.0,
             current: Vec2::ZERO,
             swept: false,
+            water: None,
+            swimming: false,
+            leapt: false,
         }
     }
 }
@@ -66,7 +182,10 @@ impl Player {
         )
     }
 
-    /// Move to finite world coordinates and discard momentum from the old pose.
+    /// Move to finite world coordinates and discard momentum from the old
+    /// pose, and the water there: the renderer may draw the new pose before
+    /// the next update looks at the water under it, and must not put the eye
+    /// in the old pose's water meanwhile.
     pub fn teleport(&mut self, position: Vec3) -> bool {
         if !position.is_finite() {
             return false;
@@ -74,7 +193,26 @@ impl Player {
         self.position = position;
         self.vertical_velocity = 0.0;
         self.velocity = Vec2::ZERO;
+        self.swimming = false;
+        self.leapt = false;
+        self.water = None;
+        self.wading_depth = 0.0;
+        self.current = Vec2::ZERO;
+        self.swept = false;
         true
+    }
+
+    /// Start or stop flying. Flight's speed is not momentum: a body that
+    /// stops flying drops from rest, rather than gliding on at flight speed
+    /// over water it has not yet reached. It is set down as it is: one
+    /// crouched under standing height, low in the shallows say, stands up as
+    /// a swimmer does rather than being lifted onto its feet in a frame.
+    pub fn set_flying(&mut self, flying: bool) {
+        self.flying = flying;
+        self.vertical_velocity = 0.0;
+        self.velocity = Vec2::ZERO;
+        self.swimming = !flying;
+        self.leapt = false;
     }
 
     /// Keep cursor visibility, grab state and mouse-motion warmup consistent.
@@ -131,6 +269,11 @@ pub fn update_player_system(
         return;
     };
     snow.recenter(Vec2::new(player.position.x, player.position.z));
+    // The water at the eye, which the renderer needs whether or not the
+    // player can move.
+    let visibility_center = Vec2::new(player.position.x, player.position.z);
+    let water = water_at(&erosion, &noise, player.position.x, player.position.z, visibility_center.to_array());
+    player.water = water;
     // A pinned --camera capture holds its pose: a click or keystroke that
     // lands on the window while it renders must not move the shot.
     if automation.is_some_and(|automation| automation.has_camera && automation.shot_path.is_some())
@@ -157,8 +300,8 @@ pub fn update_player_system(
         }
     }
     if keys.just_pressed(KeyCode::KeyV) && !ui_wants_input {
-        player.flying = !player.flying;
-        player.vertical_velocity = 0.0;
+        let flying = !player.flying;
+        player.set_flying(flying);
     }
     if player.mouse_captured && !ui_wants_input {
         let delta = mouse_motion
@@ -194,6 +337,8 @@ pub fn update_player_system(
         * player.movement_speed_multiplier;
     let walk = Vec2::new(movement.x, movement.z) * speed;
     let mut candidate = player.position + movement * (speed * dt);
+    // The water where the step ends, once a branch below has looked.
+    let mut landed = None;
     player.wading_depth = 0.0;
     player.current = Vec2::ZERO;
     player.swept = false;
@@ -206,36 +351,20 @@ pub fn update_player_system(
         };
         candidate.y += vertical * speed * dt;
         player.velocity = walk;
+        player.swimming = false;
     } else {
-        let visibility_center = Vec2::new(player.position.x, player.position.z);
-        // Flowing water: the body moves at the velocity the current's drag
-        // and the player's footing settle on, not at the walking speed.
-        let envelope = erosion
-            .rivers
-            .as_ref()
-            .map_or(crate::rivers::carve::Envelope::NONE, |network| {
-                network.envelope(player.position.x, player.position.z)
-            });
-        let here = crate::erosion::sample_eroded_height(
-            &erosion, &noise, player.position.x, player.position.z,
-            visibility_center.to_array());
-        // The water over the player's feet: a river's (a little splash past
-        // its waterline counts) or a lake's still water.
-        let river = (envelope.bank_distance < 0.5).then_some(envelope.water);
-        let lake = (here < envelope.lake).then_some(envelope.lake);
-        let (surface, flowing) = match (river, lake) {
-            (Some(r), Some(l)) if l > r => (l, false),
-            (Some(r), _) => (r, true),
-            (None, Some(l)) => (l, false),
-            (None, None) => (here, false),
+        // The water over the player's feet: a river's, a lake's or the
+        // sea's. Flowing water moves the body at the velocity the current's
+        // drag and the player's footing settle on, not at the walking speed.
+        let (surface, depth, current, turbulence) = match water {
+            Some(water) => (water.surface, water.depth(), water.current, water.turbulence),
+            None => (f32::NEG_INFINITY, 0.0, Vec2::ZERO, 0.0),
         };
-        let depth = surface - here;
         // In the water only while the feet are: a leap over a creek or a fall
         // onto a lake carries the body on through the air.
         let in_water = player.position.y - EYE_HEIGHT < surface + 0.05;
         if depth > 0.02 && in_water {
-            let current = if flowing { Vec2::from(envelope.velocity) } else { Vec2::ZERO };
-            let wading = wade(player.velocity, walk, current, depth, envelope.turbulence, dt);
+            let wading = wade(player.velocity, walk, current, depth, turbulence, dt);
             player.velocity = wading.velocity;
             player.swept = wading.swept;
             player.wading_depth = depth;
@@ -251,29 +380,121 @@ pub fn update_player_system(
         // Trunks and lilac stems are solid. Flight passes through them, as it
         // does the ground.
         collide_with_trunks(&mut player, &mut candidate, &vegetation, &erosion, &noise);
-        // A swimmer kicks up out of the water as a walker jumps off the ground.
-        let floating = depth > EYE_HEIGHT - SWIM_FREEBOARD;
+        // Water too deep to stand in is swum in: the body floats, head out,
+        // until the player dives. A swimmer crouched under standing height
+        // stands up. The ground is what walking stands on, snow and all.
+        let ground = snow::sample_surface(&erosion, &noise, visibility_center, visibility_center.to_array())
+            .height(&snow, visibility_center);
+        let swimming = swims(water, ground, player.position.y, player.vertical_velocity, player.swimming);
         let jump = keys.just_pressed(KeyCode::Space) && !ui_wants_input;
-        if floating && jump && player.position.y <= surface + SWIM_FREEBOARD + 0.03 {
-            player.vertical_velocity = 7.4;
-        }
-        update_walking_ground(
-            &mut player,
-            &mut candidate,
-            &erosion,
-            &noise,
-            &mut snow,
-            jump,
-            dt,
-        );
-        // Water too deep to stand in floats the player, head out.
-        if floating && candidate.y < surface + SWIM_FREEBOARD {
-            candidate.y = surface + SWIM_FREEBOARD;
-            player.vertical_velocity = player.vertical_velocity.max(0.0);
+        let at_surface = kicks_off(water, player.position.y);
+        if swimming && !(jump && at_surface) {
+            let stroke = SwimStroke {
+                rise: keys.pressed(KeyCode::Space) && !ui_wants_input,
+                dive: keys.pressed(KeyCode::ShiftLeft) && !ui_wants_input,
+                // Swimming forward follows the eye up or down, past a glance
+                // either way, so the usual slightly lowered eye keeps to the
+                // surface.
+                forward_pitch: movement.dot(Vec3::new(player.yaw.sin(), 0.0, -player.yaw.cos()))
+                    * (player.pitch.sin().abs() - SWIM_PITCH_DEAD_ZONE).max(0.0).copysign(player.pitch)
+                    / (1.0 - SWIM_PITCH_DEAD_ZONE),
+            };
+            let candidate_xz = Vec2::new(candidate.x, candidate.z);
+            let there = snow::sample_surface(&erosion, &noise, candidate_xz, visibility_center.to_array());
+            let mut bed = there.height(&snow, candidate_xz);
+            // A bank is as solid to a swimmer as to a walker.
+            if too_high_to_step(bed, ground, player.position.y) {
+                candidate.x = player.position.x;
+                candidate.z = player.position.z;
+                bed = ground;
+            }
+            // Crouched on dry ground, standing up, the feet tread the snow as
+            // a walker's do.
+            if water.is_none() && there.coverage > 0.0 && candidate_xz.distance_squared(visibility_center) > 0.000001
+                && candidate_xz == Vec2::new(candidate.x, candidate.z)
+            {
+                snow.stamp_segment(visibility_center, candidate_xz);
+                bed = there.height(&snow, candidate_xz);
+            }
+            let (y, vertical_velocity) = swim_vertical(player.position.y, player.vertical_velocity, stroke,
+                                                       surface, ground, bed, dt);
+            candidate.y = y;
+            player.vertical_velocity = vertical_velocity;
+            player.swimming = true;
+            player.leapt = false;
+        } else {
+            // A swimmer at the surface kicks up out of the water as a walker
+            // jumps off the ground.
+            if swimming && jump {
+                player.vertical_velocity = JUMP_SPEED;
+                player.leapt = true;
+            }
+            let before = (player.position.y, player.vertical_velocity);
+            let afloat = water.filter(|water| water.float_eye().is_some()).map(|water| water.surface);
+            player.swimming = update_walking_ground(
+                &mut player,
+                &mut candidate,
+                &erosion,
+                &noise,
+                &mut snow,
+                jump,
+                afloat,
+                dt,
+            );
+            // Falling into deep water ends at its surface, not the bed: the
+            // water the step ends over takes the fall there and the swim
+            // takes over.
+            let landing = if candidate.x != player.position.x || candidate.z != player.position.z {
+                water_at(&erosion, &noise, candidate.x, candidate.z, [candidate.x, candidate.z])
+            } else {
+                water
+            };
+            if let Some(landing) = landing
+                && landing.float_eye().is_some()
+                && let Some((y, vertical_velocity)) =
+                    takes_the_fall(before, (candidate.y, player.vertical_velocity), landing.surface)
+            {
+                candidate.y = y;
+                player.vertical_velocity = vertical_velocity;
+            }
+            landed = Some(landing);
         }
     }
+    // The step moved through the water where it started; the renderer gets
+    // the water where it ends.
+    player.water = match landed {
+        Some(landing) => landing,
+        None if candidate.x != player.position.x || candidate.z != player.position.z => {
+            water_at(&erosion, &noise, candidate.x, candidate.z, [candidate.x, candidate.z])
+        }
+        None => water,
+    };
     player.position = candidate;
     snow.recenter(Vec2::new(candidate.x, candidate.z));
+}
+
+/// Where a falling body's step ends, eye height and vertical velocity, if
+/// the step takes it from `from`, over deep water at `surface`, to `to`. A
+/// step that would carry it past the float line, even to the bed, ends there
+/// instead, at the speed the fall reached it with, so however long the frame
+/// the swim takes the body over at the same place and speed; and the water
+/// takes three quarters of that speed. A fall then reaches the same depth at
+/// any frame rate. Only a body coming down onto the water from over it is
+/// taken: not one rising through it, nor one already in it.
+fn takes_the_fall(from: (f32, f32), to: (f32, f32), surface: f32) -> Option<(f32, f32)> {
+    let (eye, vertical_velocity) = to;
+    let float = surface + SWIM_FREEBOARD;
+    let coming_down = vertical_velocity < 0.0 || eye < float;
+    if from.0 < float || eye > surface + SWIM_ENTRY || !coming_down {
+        return None;
+    }
+    let (eye, vertical_velocity) = if eye < float {
+        let drop = (from.0 - float).max(0.0);
+        (float, -(from.1 * from.1 + 2.0 * FALL_ACCELERATION * drop).sqrt())
+    } else {
+        (eye, vertical_velocity)
+    };
+    Some((eye, vertical_velocity * 0.25))
 }
 
 /// Slide the step from the player's position to `candidate` around the
@@ -311,7 +532,9 @@ fn collide_with_trunks(
 }
 
 /// Resolve against the puffed surface first, then compact only the contact
-/// segment and seat the player's feet on the newly flattened snow.
+/// segment and seat the player's feet on the newly flattened snow. Returns
+/// whether the body is still a swimmer's (`Player::swimming`): kicked up out
+/// of the water and still rising, or landed crouched on a bank, to stand up.
 #[allow(clippy::too_many_arguments)]
 fn update_walking_ground(
     player: &mut Player,
@@ -320,15 +543,17 @@ fn update_walking_ground(
     noise: &NoiseField,
     snow: &mut SnowState,
     jump_requested: bool,
+    afloat: Option<f32>,
     dt: f32,
-) {
+) -> bool {
     let previous_xz = Vec2::new(player.position.x, player.position.z);
     let visibility_center = previous_xz.to_array();
     let old_surface = snow::sample_surface(erosion, noise, previous_xz, visibility_center);
     let old_ground = old_surface.height(snow, previous_xz);
     let mut next_xz = Vec2::new(candidate.x, candidate.z);
     let mut next_surface = snow::sample_surface(erosion, noise, next_xz, visibility_center);
-    if next_surface.height(snow, next_xz) - old_ground > 1.25 {
+    let next_ground = next_surface.height(snow, next_xz);
+    if step_blocked(next_ground, old_ground, player.position.y, player.vertical_velocity, afloat, player.leapt) {
         candidate.x = player.position.x;
         candidate.z = player.position.z;
         next_xz = previous_xz;
@@ -338,10 +563,11 @@ fn update_walking_ground(
         player.position.y <= old_ground + EYE_HEIGHT + 0.03 && player.vertical_velocity <= 0.0;
     let jumping = jump_requested && grounded_before;
     if jumping {
-        player.vertical_velocity = 7.4;
+        player.vertical_velocity = JUMP_SPEED;
+        player.leapt = true;
     }
-    player.vertical_velocity -= 23.0 * dt;
-    candidate.y += player.vertical_velocity * dt;
+    let swimmer = kicked(afloat, player.vertical_velocity, player.swimming);
+    (candidate.y, player.vertical_velocity) = fall(candidate.y, player.vertical_velocity, grounded_before && !jumping, dt);
     let ground_before_stamp = next_surface.height(snow, next_xz) + EYE_HEIGHT;
     let touching = candidate.y <= ground_before_stamp && player.vertical_velocity <= 0.0;
     if touching {
@@ -354,13 +580,202 @@ fn update_walking_ground(
                 snow.stamp_segment(next_xz, next_xz);
             }
         }
-        candidate.y = next_surface.height(snow, next_xz) + EYE_HEIGHT;
+        let crouched;
+        (candidate.y, crouched) = lands(candidate.y, next_surface.height(snow, next_xz), swimmer);
         player.vertical_velocity = 0.0;
+        player.leapt = false;
+        return crouched;
+    }
+    swimmer
+}
+
+/// A body's eye height and vertical velocity after a step of falling. One in
+/// the air moves exactly, so a jump or a fall goes as high or as far at any
+/// frame rate. A walker on its feet (`on_feet`) is pulled down a whole step's
+/// fall a step, as hard again, so walking down a slope it keeps its footing,
+/// and Space finds it there to jump.
+fn fall(eye: f32, vertical_velocity: f32, on_feet: bool, dt: f32) -> (f32, f32) {
+    let after = vertical_velocity - FALL_ACCELERATION * dt;
+    let moved = if on_feet { after } else { 0.5 * (vertical_velocity + after) };
+    (eye + moved * dt, after)
+}
+
+/// Where a body that comes down onto ground at `ground` this step, its eye
+/// at `eye`, ends, and whether crouched: on its feet; or a swimmer kicked up
+/// out of the water (`swimmer`) where it lands, crouched under standing
+/// height, to stand up as a swimmer does rather than be lifted onto its feet
+/// in a frame.
+fn lands(eye: f32, ground: f32, swimmer: bool) -> (f32, bool) {
+    let standing = ground + EYE_HEIGHT;
+    if swimmer && eye < standing - STANDING_MARGIN {
+        (eye.max(ground + SWIM_BED_CLEARANCE), true)
+    } else {
+        (standing, false)
     }
 }
 
+/// The highest a body steps up onto, metres.
+const STEP_HEIGHT: f32 = 1.25;
+/// How fast a jump, or a swimmer's kick up out of the water, leaves, m/s.
+const JUMP_SPEED: f32 = 7.4;
+/// How fast a body in the air gathers downward speed, m/s². Stronger than
+/// gravity, so jumps and falls feel snappy rather than floaty.
+const FALL_ACCELERATION: f32 = 23.0;
 /// How far the eye floats above the water when it is too deep to stand in.
-const SWIM_FREEBOARD: f32 = 0.25;
+pub const SWIM_FREEBOARD: f32 = 0.25;
+/// How far over the water the eye may be and swim: a body falling into deep
+/// water is taken by it on the frame its eye comes within this.
+const SWIM_ENTRY: f32 = SWIM_FREEBOARD + 0.03;
+/// How far under standing height a body still counts as standing: walking
+/// seats a body this close to it, and one crouched lower stands up.
+const STANDING_MARGIN: f32 = 0.03;
+/// How fast a swimmer climbs or dives, m/s.
+const SWIM_VERTICAL_SPEED: f32 = 1.4;
+/// How fast a swimmer who does nothing drifts back up: a body with a breath
+/// in it floats, but only just.
+const SWIM_BUOYANT_RISE: f32 = 0.35;
+/// How closely the eye of a swimmer stretched out along the bed comes to it.
+const SWIM_BED_CLEARANCE: f32 = 0.35;
+/// How quickly the water's drag brings a swimmer's climb or dive to the speed
+/// their stroke sets, per second.
+const SWIM_RESPONSE: f32 = 3.0;
+/// Sine of the pitch below which swimming forward does not climb or dive
+/// (about 17 degrees).
+const SWIM_PITCH_DEAD_ZONE: f32 = 0.3;
+
+/// What the swimmer is doing this frame.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SwimStroke {
+    /// Swimming up (Space held).
+    pub rise: bool,
+    /// Diving (Left Shift held).
+    pub dive: bool,
+    /// Forward input times the sine of the eye's pitch: swimming forward
+    /// follows the eye down into the water or up out of it.
+    pub forward_pitch: f32,
+}
+
+/// Whether ground at `next` is too high for a body to step onto from ground
+/// at `ground`, its eye at `eye` and falling at `-vertical_velocity`, over
+/// deep water at the surface `afloat` if it is. A walker steps up to
+/// `STEP_HEIGHT`. A swimmer kicked up out of the water, or a body leaping
+/// over it (`leapt`), steps up from its feet, not from the bed far under
+/// them, so it reaches a bank; a body that walked or fell off something, or
+/// falls faster than a jump does, lands on nothing over its feet.
+fn step_blocked(next: f32, ground: f32, eye: f32, vertical_velocity: f32, afloat: Option<f32>, leapt: bool) -> bool {
+    if kicking(afloat, vertical_velocity, leapt) {
+        too_high_to_step(next, ground, eye)
+    } else if afloat.is_some() {
+        next > ground.max(eye - EYE_HEIGHT)
+    } else {
+        next - ground > STEP_HEIGHT
+    }
+}
+
+/// Whether a body in the air over deep water (`afloat`, its surface), rising
+/// at `vertical_velocity`, is a swimmer's kick up out of it or a leap over
+/// it: it jumped or kicked (`leapt`), and comes down no faster than a jump
+/// does. Such a body steps up onto a bank from its feet; one that walked off
+/// a bank, or falls faster, from a cliff top say, lands on nothing over its
+/// feet.
+fn kicking(afloat: Option<f32>, vertical_velocity: f32, leapt: bool) -> bool {
+    leapt && afloat.is_some() && vertical_velocity >= -JUMP_SPEED
+}
+
+/// Whether a body in the air this step, over deep water at the surface
+/// `afloat` if it is, is still a swimmer's (`swam`): kicked up out of the
+/// water and rising, out over a bank too, or coming back down over the
+/// water no faster than a kick does. A walker's leap is a walker's, and
+/// lands on its feet.
+fn kicked(afloat: Option<f32>, vertical_velocity: f32, swam: bool) -> bool {
+    swam && (vertical_velocity > 0.0 || (afloat.is_some() && vertical_velocity >= -JUMP_SPEED))
+}
+
+/// Whether Space kicks a swimmer whose eye is at `eye` up out of `water`
+/// rather than swimming it up: at the surface, or crouched on dry ground
+/// (come ashore), where it jumps as a walker does.
+fn kicks_off(water: Option<WaterHere>, eye: f32) -> bool {
+    water.is_none_or(|water| eye >= water.surface + SWIM_FREEBOARD - 0.05)
+}
+
+/// Whether ground at `bed` is too high for a swimmer whose eye is at `eye`,
+/// over ground at `ground`, to move onto: more than a step over its feet,
+/// or over the bed a diver lies along.
+fn too_high_to_step(bed: f32, ground: f32, eye: f32) -> bool {
+    bed - ground.max(eye - EYE_HEIGHT) > STEP_HEIGHT
+}
+
+/// Whether a body whose eye is at `eye`, over ground at `ground` and in
+/// `water` if any, rising at `vertical_velocity`, swims this step, having
+/// swum the last if `swam`. Water too deep to stand in is swum in once the
+/// eye comes down within `SWIM_ENTRY` of its surface. A swimmer crouched
+/// under standing height, a diver come up into the shallows or out onto the
+/// bank, swims on until it has stood up (`swim_vertical`) rather than being
+/// lifted to standing height in one step. A walker is set on its feet by
+/// walking, wherever the ground puts them, and so is an eye under the ground
+/// (flight set down inside a hill). A body rising faster than any stroke,
+/// kicked up out of the water, is in the air until it falls back.
+fn swims(water: Option<WaterHere>, ground: f32, eye: f32, vertical_velocity: f32, swam: bool) -> bool {
+    let floating = water.is_some_and(|water| water.float_eye().is_some() && eye <= water.surface + SWIM_ENTRY);
+    let crouched = swam && eye > ground && eye < ground + EYE_HEIGHT - STANDING_MARGIN;
+    (floating || crouched) && vertical_velocity <= SWIM_VERTICAL_SPEED
+}
+
+/// The eye height and vertical velocity a swimmer comes to after one step
+/// from over a bed at `previous_bed` to over one at `bed`: the stroke sets a
+/// climb or a dive, the water's drag eases the body toward it, a body left
+/// alone drifts up to float head out, and neither the surface (the swimmer
+/// floats there) nor the bed stops being solid.
+///
+/// Where the water is too shallow to float in, the swimmer stands up out of
+/// it instead, to standing height and no higher, at a stroke's pace from the
+/// bed as it rises under them: left alone, and whatever the stroke where it
+/// is too shallow to lie under or there is none (`surface` -inf, a body come
+/// out onto the bank). A swimmer the bed falls away from under, off the edge
+/// of a bank or a shelf, is left where it is: walking takes it on, and it
+/// falls, onto the ground or into the water.
+pub fn swim_vertical(
+    eye: f32,
+    vertical_velocity: f32,
+    stroke: SwimStroke,
+    surface: f32,
+    previous_bed: f32,
+    bed: f32,
+    dt: f32,
+) -> (f32, f32) {
+    let standing = bed + EYE_HEIGHT;
+    let shallow = standing > surface + SWIM_FREEBOARD;
+    let aground = surface < bed + SWIM_BED_CLEARANCE;
+    // A body crouched over the bed rises with it.
+    let eye = if shallow && eye < previous_bed + EYE_HEIGHT { eye + (bed - previous_bed).max(0.0) } else { eye };
+    let top = if shallow { standing } else { surface + SWIM_FREEBOARD };
+    if eye > if shallow { top } else { surface + SWIM_ENTRY } {
+        return (eye, vertical_velocity.min(0.0));
+    }
+    let mut target = SWIM_VERTICAL_SPEED * (stroke.forward_pitch.clamp(-1.0, 1.0)
+        + f32::from(u8::from(stroke.rise)) - f32::from(u8::from(stroke.dive)));
+    if aground || (!stroke.rise && !stroke.dive && stroke.forward_pitch.abs() < 0.05) {
+        target = if shallow { SWIM_VERTICAL_SPEED } else { SWIM_BUOYANT_RISE };
+    }
+    let target = target.clamp(-SWIM_VERTICAL_SPEED, SWIM_VERTICAL_SPEED);
+    // The velocity eases to the target exponentially; the body moves by its
+    // exact integral over the step, so a swim covers the same water at any
+    // frame rate.
+    let ease = 1.0 - (-SWIM_RESPONSE * dt).exp();
+    let mut velocity = vertical_velocity + (target - vertical_velocity) * ease;
+    let mut y = eye + target * dt + (vertical_velocity - target) * ease / SWIM_RESPONSE;
+    let bottom = (bed + SWIM_BED_CLEARANCE).min(top);
+    // Stood up as near as walking seats a body, the swimmer stands.
+    if y >= top - if shallow { STANDING_MARGIN } else { 0.0 } {
+        y = top;
+        velocity = velocity.min(0.0);
+    }
+    if y <= bottom {
+        y = bottom;
+        velocity = velocity.max(0.0);
+    }
+    (y, velocity)
+}
 
 pub struct Wading {
     pub velocity: Vec2,
@@ -464,10 +879,13 @@ mod tests {
     fn teleport_resets_momentum_and_rejects_invalid_coordinates() {
         let mut player = Player::default();
         player.vertical_velocity = -12.0;
+        player.water = WaterHere::sea(-5.0);
         let destination = Vec3::new(120.0, 450.0, -870.0);
         assert!(player.teleport(destination));
         assert_eq!(player.position, destination);
         assert_eq!(player.vertical_velocity, 0.0);
+        assert_eq!(player.water, None, "the old pose's water is not the new pose's");
+        assert_eq!((player.wading_depth, player.current, player.swept), (0.0, Vec2::ZERO, false));
 
         player.vertical_velocity = 4.0;
         for invalid in [
@@ -514,6 +932,7 @@ mod tests {
             &noise,
             &mut snow,
             false,
+            None,
             0.02,
         );
         let end = Vec2::new(candidate.x, candidate.z);
@@ -535,6 +954,7 @@ mod tests {
             &noise,
             &mut snow,
             true,
+            None,
             0.02,
         );
         assert!(player.vertical_velocity > 0.0);
@@ -548,6 +968,7 @@ mod tests {
             &noise,
             &mut snow,
             false,
+            None,
             0.02,
         );
         assert_eq!(snow.revision(), revision);
@@ -567,6 +988,7 @@ mod tests {
             &noise,
             &mut snow,
             false,
+            None,
             0.05,
         );
         let end = Vec2::new(candidate.x, candidate.z);
@@ -686,5 +1108,509 @@ mod tests {
     fn deep_water_carries_a_swimmer_with_the_current() {
         let state = settle(Vec2::ZERO, Vec2::new(1.0, 0.5), 2.5);
         assert!((state.velocity - Vec2::new(1.0, 0.5)).length() < 0.1, "{:?}", state.velocity);
+    }
+
+    /// Swim with one stroke for `seconds`, from an eye height and vertical
+    /// velocity, over a surface at 10 m and a bed at 4 m.
+    fn swim(mut eye: f32, mut velocity: f32, stroke: SwimStroke, seconds: f32) -> (f32, f32) {
+        let dt = 1.0 / 120.0;
+        for _ in 0..(seconds / dt) as usize {
+            (eye, velocity) = swim_vertical(eye, velocity, stroke, 10.0, 4.0, 4.0, dt);
+        }
+        (eye, velocity)
+    }
+
+    /// Still water at `surface` over ground at `ground`, where it covers it.
+    fn still_water(surface: f32, ground: f32) -> Option<WaterHere> {
+        (surface - ground > 0.02).then_some(WaterHere {
+            surface,
+            ground,
+            current: Vec2::ZERO,
+            turbulence: 0.0,
+            clarity: 0.0,
+            sea: 0.0,
+            still: 1.0,
+            kind: WaterKind::Lake,
+        })
+    }
+
+    /// A body's vertical state: eye height, vertical velocity, and whether
+    /// it swam its last step.
+    type Body = (f32, f32, bool);
+
+    /// One step of update_player_system's vertical motion from over ground
+    /// at `from` to over ground at `to`, under still water at `surface` (-inf
+    /// for none): the swim, or update_walking_ground's fall and seating on
+    /// bare ground and then the water the step ends over taking the fall.
+    fn step((eye, velocity, swam): Body, stroke: SwimStroke, surface: f32, from: f32, to: f32, dt: f32) -> Body {
+        let water = still_water(surface, from);
+        if swims(water, from, eye, velocity, swam) {
+            let here = water.map_or(f32::NEG_INFINITY, |water| water.surface);
+            let (eye, velocity) = swim_vertical(eye, velocity, stroke, here, from, to, dt);
+            return (eye, velocity, true);
+        }
+        let afloat = water.filter(|water| water.float_eye().is_some()).map(|water| water.surface);
+        let swimmer = kicked(afloat, velocity, swam);
+        let on_feet = eye <= from + EYE_HEIGHT + 0.03 && velocity <= 0.0;
+        let before = (eye, velocity);
+        let (eye, velocity) = fall(eye, velocity, on_feet, dt);
+        let (eye, velocity, crouched) = if eye <= to + EYE_HEIGHT && velocity <= 0.0 {
+            let (eye, crouched) = lands(eye, to, swimmer);
+            (eye, 0.0, crouched)
+        } else {
+            (eye, velocity, swimmer)
+        };
+        let (eye, velocity) = still_water(surface, to)
+            .filter(|water| water.float_eye().is_some())
+            .and_then(|water| takes_the_fall(before, (eye, velocity), water.surface))
+            .unwrap_or((eye, velocity));
+        (eye, velocity, crouched)
+    }
+
+    /// A swimmer floating in deep water at 10 m, `start` metres out from a
+    /// sheer bank `bank` metres over it, swimming into it at `speed` and
+    /// pressing Space on the first of `fps` frames a second, as
+    /// update_player_system steps it: the
+    /// swim or the kick and the walk, each step judged against the ground it
+    /// is over and the bank (`too_high_to_step`, `step_blocked`). The frames'
+    /// eye heights and where the body ends.
+    fn kick_out(bank: f32, start: f32, speed: f32, fps: f32) -> (Vec<f32>, f32, Body) {
+        let dt = 1.0 / fps;
+        let ground = |x: f32| if x < 0.0 { -10.0 } else { 10.0 + bank };
+        let (mut x, mut body) = (-start, (10.0 + SWIM_FREEBOARD, 0.0f32, true));
+        let mut leapt = false;
+        let mut eyes = vec![body.0];
+        for frame in 0..(4.0 * fps) as usize {
+            let (eye, velocity, swam) = body;
+            let water = still_water(10.0, ground(x));
+            let jump = frame == 0;
+            let swimming = swims(water, ground(x), eye, velocity, swam);
+            let mut to = x + speed * dt;
+            if swimming && !(jump && kicks_off(water, eye)) {
+                if too_high_to_step(ground(to), ground(x), eye) {
+                    to = x;
+                }
+                let here = water.map_or(f32::NEG_INFINITY, |water| water.surface);
+                let (eye, velocity) = swim_vertical(eye, velocity, SwimStroke::default(), here, ground(x), ground(to), dt);
+                body = (eye, velocity, true);
+                leapt = false;
+            } else {
+                let velocity = if swimming && jump { JUMP_SPEED } else { velocity };
+                leapt |= swimming && jump;
+                let afloat = water.filter(|water| water.float_eye().is_some()).map(|water| water.surface);
+                if step_blocked(ground(to), ground(x), eye, velocity, afloat, leapt) {
+                    to = x;
+                }
+                let swimmer = kicked(afloat, velocity, swam);
+                let on_feet = eye <= ground(x) + EYE_HEIGHT + 0.03 && velocity <= 0.0;
+                let before = (eye, velocity);
+                let (eye, velocity) = fall(eye, velocity, on_feet, dt);
+                body = if eye <= ground(to) + EYE_HEIGHT && velocity <= 0.0 {
+                    let (eye, crouched) = lands(eye, ground(to), swimmer);
+                    leapt = false;
+                    (eye, 0.0, crouched)
+                } else {
+                    (eye, velocity, swimmer)
+                };
+                if let Some(water) = still_water(10.0, ground(to)).filter(|water| water.float_eye().is_some())
+                    && let Some((eye, velocity)) = takes_the_fall(before, (body.0, body.1), water.surface)
+                {
+                    body = (eye, velocity, body.2);
+                }
+            }
+            x = to;
+            eyes.push(body.0);
+        }
+        (eyes, x, body)
+    }
+
+    #[test]
+    fn a_swimmer_dives_under_and_floats_back_up() {
+        let floating = 10.0 + SWIM_FREEBOARD;
+        let dive = SwimStroke { dive: true, ..Default::default() };
+        let (deep, _) = swim(floating, 0.0, dive, 2.0);
+        assert!(deep < 9.0, "a dive takes the eye under: {deep}");
+        // The bed stops the dive.
+        let (bottom, velocity) = swim(floating, 0.0, dive, 10.0);
+        assert!((bottom - (4.0 + SWIM_BED_CLEARANCE)).abs() < 1e-4 && velocity == 0.0, "{bottom} {velocity}");
+        // Left alone the body drifts back up and floats, head out.
+        let (rested, _) = swim(bottom, 0.0, SwimStroke::default(), 30.0);
+        assert!((rested - floating).abs() < 1e-4, "{rested}");
+        // Swimming up is quicker than drifting.
+        let rise = SwimStroke { rise: true, ..Default::default() };
+        let (risen, _) = swim(bottom, 0.0, rise, 2.0);
+        let (drifted, _) = swim(bottom, 0.0, SwimStroke::default(), 2.0);
+        assert!(risen > drifted + 1.0, "{risen} {drifted}");
+    }
+
+    #[test]
+    fn a_diver_in_the_shallows_stands_up_out_of_the_water() {
+        let dt = 1.0 / 60.0;
+        let dive = SwimStroke { dive: true, ..Default::default() };
+        // A diver stretched out on a bed at 9 m under water this deep: left
+        // alone, or still diving where it is too shallow to lie under.
+        for (depth, stroke) in [(1.45, SwimStroke::default()), (1.0, SwimStroke::default()), (0.5, SwimStroke::default()),
+                                (0.3, dive)] {
+            let mut body = (9.0 + SWIM_BED_CLEARANCE, 0.0, true);
+            for _ in 0..120 {
+                let previous = body.0;
+                body = step(body, stroke, 9.0 + depth, 9.0, 9.0, dt);
+                // Up at a stroke's pace, without a step.
+                assert!(body.0 - previous <= SWIM_VERTICAL_SPEED * dt + STANDING_MARGIN + 1e-5, "{depth}: {previous} {body:?}");
+            }
+            // To standing height and no higher, within two seconds.
+            assert!((body.0 - (9.0 + EYE_HEIGHT)).abs() < 1e-4 && body.1 == 0.0, "{depth}: {body:?}");
+        }
+        // Where it is deep enough to lie under, a diver stays down.
+        let mut body = (9.0 + SWIM_BED_CLEARANCE, 0.0, true);
+        for _ in 0..120 {
+            body = step(body, dive, 10.0, 9.0, 9.0, dt);
+        }
+        assert!((body.0 - (9.0 + SWIM_BED_CLEARANCE)).abs() < 1e-4, "{body:?}");
+        // A walker in the same water is standing, and an eye under the
+        // ground (flight set down inside a hill) is seated by walking.
+        assert!(!swims(still_water(10.0, 9.0), 9.0, 9.0 + EYE_HEIGHT, 0.0, true));
+        assert!(!swims(None, 9.0, 8.0, 0.0, true));
+        // Nor does a walker crouch where the ground rises under it, as it
+        // does where the erosion settles: walking sets it on its feet, and a
+        // wader looking down or diving stays on them.
+        let mut body = (9.0 + EYE_HEIGHT, 0.0, false);
+        for ground in [9.0, 9.3, 9.6, 9.6, 9.6] {
+            body = step(body, dive, 10.0, ground, ground, dt);
+            assert!((body.0 - (ground + EYE_HEIGHT)).abs() < 1e-4 && !body.2, "{ground}: {body:?}");
+        }
+    }
+
+    #[test]
+    fn a_diver_comes_up_a_beach_onto_the_bank_without_a_jump() {
+        let dive = SwimStroke { dive: true, ..Default::default() };
+        let looking_down = SwimStroke { forward_pitch: -0.5, ..Default::default() };
+        for slope in [0.1, 0.3, 1.0] {
+            // From 3 m under a surface at 10 m up onto a bank a metre over it.
+            let bed = |x: f32| (7.0 + slope * x).min(11.0);
+            for speed in [1.5, 4.0] {
+                for fps in [30.0, 60.0, 144.0] {
+                    for stroke in [SwimStroke::default(), dive, looking_down] {
+                        let dt = 1.0 / fps;
+                        let (mut x, mut body) = (0.0f32, (bed(0.0) + SWIM_BED_CLEARANCE, 0.0, true));
+                        let (mut ashore, mut stood) = (None, None);
+                        let seconds = 4.0 / slope / speed + 2.0;
+                        for frame in 0..(seconds * fps) as usize {
+                            let to = x + speed * dt;
+                            let previous = body.0;
+                            body = step(body, stroke, 10.0, bed(x), bed(to), dt);
+                            let eye = body.0;
+                            // Never up faster than the bed rises and a stroke
+                            // climbs.
+                            let climb = bed(to) - bed(x) + SWIM_VERTICAL_SPEED * dt + STANDING_MARGIN;
+                            assert!(eye - previous <= climb + 1e-4,
+                                    "{slope} {speed} {fps} {stroke:?}: {previous} -> {eye} at {x}");
+                            x = to;
+                            let t = frame as f32 * dt;
+                            ashore = ashore.or((bed(x) >= 10.0).then_some(t));
+                            stood = stood.or((eye >= bed(x) + EYE_HEIGHT - 1e-4).then_some(t));
+                        }
+                        let eye = body.0;
+                        // Standing on the bank, having stood up with the bed
+                        // rising under the body: within a stroke's climb of
+                        // the waterline.
+                        assert!((eye - (11.0 + EYE_HEIGHT)).abs() < 1e-3, "{slope} {speed} {fps} {stroke:?}: {eye}");
+                        let late = stood.unwrap() - ashore.unwrap();
+                        assert!(late < 1.5, "{slope} {speed} {fps} {stroke:?}: stood {late} s after the waterline");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_swimmer_climbs_no_bank_a_walker_could_not() {
+        // Floating head out on water at 10 m over a bed at -20 m: onto a
+        // ledge under the surface, but not up a rock face out of it.
+        let floating = 10.0 + SWIM_FREEBOARD;
+        assert!(!too_high_to_step(9.5, -20.0, floating));
+        assert!(too_high_to_step(12.0, -20.0, floating));
+        // A bank at the water's edge is out of reach afloat, but a kick up
+        // out of the water lifts the feet onto it, rising or coming back.
+        assert!(too_high_to_step(10.0, -20.0, floating));
+        assert!(!step_blocked(10.0, -20.0, 11.4, 2.0, Some(10.0), true));
+        assert!(!step_blocked(10.5, -20.0, 11.2, -3.0, Some(10.0), true));
+        // A walker steps up only so far from the ground it stands on.
+        assert!(!step_blocked(5.2, 4.0, 5.75, 0.0, None, true));
+        assert!(step_blocked(5.3, 4.0, 5.75, 0.0, None, true));
+        // A body falling past a ledge over the pool from a cliff top lands
+        // on nothing over its feet: it falls on into the water, though onto
+        // a shore below its feet it lands.
+        assert!(step_blocked(23.0, 0.0, 24.0, -18.0, Some(10.0), true));
+        assert!(!step_blocked(15.0, 0.0, 24.0, -18.0, Some(10.0), true));
+        // Near the water, a body coming down faster than a kick's own fall
+        // lands on nothing over its feet either.
+        assert!(!step_blocked(10.0, 0.0, 11.0, -3.0, Some(10.0), true));
+        assert!(step_blocked(10.0, 0.0, 11.0, -JUMP_SPEED - 1.0, Some(10.0), true));
+        // A leap over a deep channel catches the far bank's lip over its feet,
+        // but a walk off the near bank, or a slow fall past a ledge, does not:
+        // it lands on nothing over its feet, and falls in.
+        assert!(!step_blocked(11.5, -10.0, 11.3 + EYE_HEIGHT, -5.0, Some(10.0), true));
+        assert!(step_blocked(11.5, -10.0, 11.3 + EYE_HEIGHT, -5.0, Some(10.0), false));
+        // Only a swimmer's kick lands crouched; a walker's leap lands on its
+        // feet, as it does over dry ground.
+        assert!(kicked(Some(10.0), -3.0, true) && kicked(None, 2.0, true));
+        assert!(!kicked(Some(10.0), -3.0, false) && !kicked(None, -3.0, true));
+        // Stretched out along a bed at 4 m: up a slope, but not up a wall
+        // without first swimming up it.
+        assert!(!too_high_to_step(5.0, 4.0, 4.0 + SWIM_BED_CLEARANCE));
+        assert!(too_high_to_step(6.0, 4.0, 4.0 + SWIM_BED_CLEARANCE));
+        assert!(!too_high_to_step(6.0, 4.0, 7.0));
+    }
+
+    #[test]
+    fn a_swimmer_off_the_edge_of_a_bank_falls() {
+        let dt = 1.0 / 60.0;
+        // Crouched, come ashore on a bank at 10.3 m or still in a metre of
+        // water at 10 m, off the edge: onto ground at 5 m, and into the lake
+        // at 10 m, 5 m deep there.
+        for (surface, bank, eye) in [(f32::NEG_INFINITY, 10.3, 11.3), (10.0, 10.3, 11.3), (10.0, 9.0, 10.5)] {
+            let below = 5.0;
+            let mut body = (eye, 0.0, true);
+            let mut ground = bank;
+            let mut speed = 0.0f32;
+            for frame in 0..600 {
+                let next = if frame == 0 { bank } else { below };
+                let previous = body;
+                body = step(body, SwimStroke::default(), surface, ground, next, dt);
+                // Down no faster than a fall (and the water's entry band,
+                // which a swimmer settles out of onto the float line).
+                speed = speed.max((previous.0 - body.0) / dt);
+                let fall = (previous.1.min(0.0).abs() + FALL_ACCELERATION * dt) * dt;
+                assert!(previous.0 - body.0 <= fall + SWIM_ENTRY - SWIM_FREEBOARD + 1e-4,
+                        "{surface} {frame}: {previous:?} -> {body:?}");
+                ground = next;
+            }
+            if surface.is_finite() {
+                // Into the lake, taken at its surface, afloat in the end.
+                assert!((body.0 - (surface + SWIM_FREEBOARD)).abs() < 0.05, "{body:?}");
+            } else {
+                assert!((body.0 - (below + EYE_HEIGHT)).abs() < 1e-4, "{body:?}");
+            }
+            assert!(speed > 1.0, "it fell: {speed}");
+        }
+    }
+
+    #[test]
+    fn a_swimmer_over_a_drop_off_rises_at_a_strokes_pace() {
+        let dt = 1.0 / 60.0;
+        let dive = SwimStroke { dive: true, ..Default::default() };
+        // Under water at 10 m over 20 m of it, onto a shelf just under the
+        // surface: up at a stroke's pace from where the swimmer was, not
+        // carried up the cliff with the bed.
+        // (Lower down the shelf's face is a wall the swimmer cannot move
+        // onto: `too_high_to_step`.)
+        for (eye, shelf, stroke) in [(9.2, 8.6, dive), (9.5, 8.8, SwimStroke::default()), (9.6, 8.6, SwimStroke::default()),
+                                     (10.0 + SWIM_FREEBOARD, 9.74, SwimStroke::default())] {
+            assert!(!too_high_to_step(shelf, -10.0, eye));
+            let mut body = (eye, 0.0, true);
+            let mut ground = -10.0;
+            for _ in 0..180 {
+                let previous = body.0;
+                body = step(body, stroke, 10.0, ground, shelf, dt);
+                assert!(body.0 - previous <= SWIM_VERTICAL_SPEED * dt + STANDING_MARGIN + 1e-4,
+                        "{eye} {shelf}: {previous} -> {body:?}");
+                ground = shelf;
+            }
+            assert!((body.0 - (shelf + EYE_HEIGHT)).abs() < 1e-4 || stroke.dive, "{eye} {shelf}: {body:?}");
+        }
+    }
+
+    #[test]
+    fn a_swimmer_kicks_up_out_of_the_water_onto_a_bank_alike_at_any_frame_rate() {
+        // Kicking at the bank, it comes up over it rising; from half a
+        // metre out, coming down onto it.
+        for (bank, start) in [(0.0, 0.01), (0.4, 0.01), (0.8, 0.01), (0.9, 0.01), (0.0, 0.5), (0.4, 0.5)] {
+            for fps in [30.0, 60.0, 144.0, 360.0] {
+                let (eyes, x, body) = kick_out(bank, start, 1.2, fps);
+                // Out onto the bank, and standing on it.
+                assert!(x > 0.0 && (body.0 - (10.0 + bank + EYE_HEIGHT)).abs() < 1e-4 && !body.2,
+                        "{bank} m from {start} at {fps}: {x} {body:?}");
+                // Up no faster than the kick rises or a stroke climbs: the
+                // landing does not lift the body onto its feet.
+                let climb = (JUMP_SPEED / fps).max(SWIM_VERTICAL_SPEED / fps + STANDING_MARGIN);
+                for pair in eyes.windows(2) {
+                    assert!(pair[1] - pair[0] <= climb + 1e-4, "{bank} m from {start} at {fps}: {pair:?}");
+                }
+            }
+        }
+        // Out of reach of the kick, the bank stays a wall.
+        let (_, x, body) = kick_out(1.2, 0.01, 1.2, 60.0);
+        assert!(x < 0.0 && body.0 < 10.5, "{x} {body:?}");
+        // A body come ashore crouched jumps as a walker does; under the
+        // water, Space swims it up.
+        assert!(kicks_off(None, 11.0));
+        assert!(kicks_off(still_water(10.0, 9.0), 10.2));
+        assert!(!kicks_off(still_water(10.0, 9.0), 9.6));
+    }
+
+    #[test]
+    fn a_walker_keeps_its_footing_down_a_slope_and_jumps_alike_at_any_frame_rate() {
+        // Walking down a slope at walking speed and boosted, as
+        // update_walking_ground steps it: on its feet every frame, so Space
+        // finds it there.
+        for (grade, speed, fps) in [(0.13, 10.0, 60.0), (0.15, 10.0, 30.0), (0.05, 25.0, 60.0), (0.05, 25.0, 144.0)] {
+            {
+                let dt = 1.0 / fps;
+                let ground = |x: f32| -grade * x;
+                let (mut x, mut eye, mut velocity) = (0.0f32, EYE_HEIGHT, 0.0f32);
+                let mut footed = 0;
+                let frames = (3.0 * fps) as usize;
+                for _ in 0..frames {
+                    let on_feet = eye <= ground(x) + EYE_HEIGHT + 0.03 && velocity <= 0.0;
+                    footed += usize::from(on_feet);
+                    let to = x + speed * dt;
+                    (eye, velocity) = fall(eye, velocity, on_feet, dt);
+                    if eye <= ground(to) + EYE_HEIGHT && velocity <= 0.0 {
+                        (eye, velocity) = (ground(to) + EYE_HEIGHT, 0.0);
+                    }
+                    x = to;
+                }
+                assert_eq!(footed, frames, "{grade} {speed} {fps}");
+            }
+        }
+        // A jump from flat ground rises as high at any frame rate.
+        let apex = |fps: f32| {
+            let (mut eye, mut velocity, mut top) = (EYE_HEIGHT, JUMP_SPEED, EYE_HEIGHT);
+            while velocity > -JUMP_SPEED {
+                (eye, velocity) = fall(eye, velocity, false, 1.0 / fps);
+                top = top.max(eye);
+            }
+            top - EYE_HEIGHT
+        };
+        let exact = JUMP_SPEED * JUMP_SPEED / (2.0 * FALL_ACCELERATION);
+        for fps in [20.0, 30.0, 60.0, 144.0, 360.0] {
+            assert!((apex(fps) - exact).abs() < 0.01, "{fps}: {} vs {exact}", apex(fps));
+        }
+    }
+
+    #[test]
+    fn a_body_set_down_from_flight_is_taken_as_it_is() {
+        let mut player = Player::default();
+        player.set_flying(true);
+        assert!(!player.swimming);
+        // Low in the shallows it stands up as a swimmer does, rather than
+        // being lifted onto its feet in a frame.
+        player.set_flying(false);
+        assert!(player.swimming && player.vertical_velocity == 0.0 && player.velocity == Vec2::ZERO);
+        let dt = 1.0 / 60.0;
+        let mut body = (9.0 + 0.5, 0.0, player.swimming);
+        for _ in 0..120 {
+            let previous = body.0;
+            body = step(body, SwimStroke::default(), 9.6, 9.0, 9.0, dt);
+            assert!(body.0 - previous <= SWIM_VERTICAL_SPEED * dt + STANDING_MARGIN + 1e-5, "{previous} {body:?}");
+        }
+        assert!((body.0 - (9.0 + EYE_HEIGHT)).abs() < 1e-4, "{body:?}");
+        // Over its feet in the air, it falls; under the ground, walking
+        // seats it.
+        assert!(!swims(None, 0.0, 3.0, 0.0, true));
+        assert!(!swims(None, 0.0, -0.5, 0.0, true));
+    }
+
+    #[test]
+    fn deep_water_takes_a_fall_and_lets_a_kick_out_of_it() {
+        let deep = WaterHere {
+            surface: 10.0,
+            ground: 0.0,
+            current: Vec2::ZERO,
+            turbulence: 0.0,
+            clarity: 0.0,
+            sea: 1.0,
+            still: 1.0,
+            kind: WaterKind::Sea,
+        };
+        assert_eq!(deep.float_eye(), Some(10.0 + SWIM_FREEBOARD));
+        // A falling eye anywhere within the entry band is the water's.
+        for eye in [10.0, 10.0 + SWIM_FREEBOARD, 10.0 + SWIM_ENTRY] {
+            assert!(swims(Some(deep), 0.0, eye, -9.0, false), "{eye}");
+        }
+        assert!(!swims(Some(deep), 0.0, 10.0 + SWIM_ENTRY + 0.01, -9.0, true));
+        // A swimmer kicked up out of it is in the air while it rises, however
+        // short a frame leaves it inside the band.
+        assert!(!swims(Some(deep), 0.0, 10.0 + SWIM_FREEBOARD + 0.01, 7.3, true));
+        assert!(swims(Some(deep), 0.0, 10.0 + SWIM_FREEBOARD, SWIM_VERTICAL_SPEED, true));
+    }
+
+    #[test]
+    fn deep_water_takes_a_fall_alike_at_any_frame_rate() {
+        // From rest `drop` metres over the float line on water `deep` metres
+        // deep, the frames `fps` a second and the first of them `phase` of a
+        // frame: the deepest the eye goes.
+        let deepest = |deep: f32, drop: f32, fps: f32, phase: f32| {
+            let mut body = (10.0 + SWIM_FREEBOARD + drop, 0.0f32, false);
+            let mut deepest = body.0;
+            let mut dt = phase / fps;
+            for _ in 0..(20.0 * fps) as usize {
+                body = step(body, SwimStroke::default(), 10.0, 10.0 - deep, 10.0 - deep, dt);
+                deepest = deepest.min(body.0);
+                dt = 1.0 / fps;
+            }
+            deepest
+        };
+        for deep in [30.0, 2.5, 1.6] {
+            for drop in [0.3, 1.0, 10.0, 30.0] {
+                let depths: Vec<f32> = [20.0, 30.0, 60.0, 144.0, 240.0, 360.0]
+                    .into_iter()
+                    .flat_map(|fps| (0..10).map(move |k| (fps, k as f32 / 10.0)))
+                    .map(|(fps, phase)| deepest(deep, drop, fps, phase))
+                    .collect();
+                let (low, high) = depths.iter().fold((f32::MAX, f32::MIN), |(l, h), &d| (l.min(d), h.max(d)));
+                // The same plunge to within a few centimetres, from a hop to
+                // a cliff, at 20 frames a second or 360, and never stood on
+                // the bed by a frame that reached it.
+                assert!(high - low < 0.08, "{deep} m deep, {drop} m: {low}..{high}");
+                assert!(high < 10.0 + SWIM_FREEBOARD, "{deep} m deep, {drop} m: the water is entered");
+            }
+        }
+        // A wader stepping into deeper water whose surface stands higher is
+        // not lifted onto it: only a fall from over the water is taken.
+        assert_eq!(takes_the_fall((10.3, 0.0), (10.29, -0.38), 10.5), None);
+    }
+
+    #[test]
+    fn swimming_forward_follows_the_eye_down() {
+        let floating = 10.0 + SWIM_FREEBOARD;
+        let looking_down = SwimStroke { forward_pitch: -0.7, ..Default::default() };
+        let (eye, velocity) = swim(floating, 0.0, looking_down, 1.5);
+        assert!(eye < floating - 0.8 && velocity < -0.5, "{eye} {velocity}");
+        // Looking level, swimming forward keeps to the surface.
+        let level = SwimStroke { forward_pitch: 0.0, ..Default::default() };
+        let (eye, _) = swim(floating, 0.0, level, 1.5);
+        assert!((eye - floating).abs() < 1e-4, "{eye}");
+    }
+
+    #[test]
+    fn a_rivers_mouth_past_its_ribbon_is_the_seas_to_draw() {
+        let mouth = drawn_as(None, SEA_LEVEL + 0.02, SEA_LEVEL - 2.0, WaterKind::River);
+        assert_eq!((mouth.kind, mouth.sea, mouth.still, mouth.clarity), (WaterKind::Sea, 1.0, 1.0, 0.0));
+        // Under its ribbon it is the river's, in the sea's colours.
+        let ribbon = crate::rivers::surface::SurfaceVertex { sea: 1.0, still: 1.0, clarity: 0.2, ..Default::default() };
+        let reach = drawn_as(Some(ribbon), SEA_LEVEL + 0.02, SEA_LEVEL - 2.0, WaterKind::River);
+        assert_eq!((reach.kind, reach.sea, reach.clarity), (WaterKind::River, 1.0, 0.2));
+        // Upstream, over dry ground, with nothing drawn, a stream's own.
+        let stream = drawn_as(None, SEA_LEVEL + 3.0, SEA_LEVEL + 2.0, WaterKind::River);
+        assert_eq!((stream.kind, stream.sea), (WaterKind::River, 0.0));
+    }
+
+    #[test]
+    fn water_kinds_meet_at_the_higher_surface() {
+        // Flat ground at the constant field's height with no rivers: no
+        // water over it unless it lies under the sea.
+        let noise = NoiseField { samples: vec![0.70; NOISE_RESOLUTION * NOISE_RESOLUTION] };
+        let erosion = ErosionCache::default();
+        assert!(water_at(&erosion, &noise, 1000.0, 1000.0, [1000.0, 1000.0]).is_none());
+        let sea_floor = NoiseField { samples: vec![0.0; NOISE_RESOLUTION * NOISE_RESOLUTION] };
+        let ground = crate::erosion::sample_eroded_height(&erosion, &sea_floor, 1000.0, 1000.0, [1000.0, 1000.0]);
+        if ground < SEA_LEVEL {
+            let water = water_at(&erosion, &sea_floor, 1000.0, 1000.0, [1000.0, 1000.0]).unwrap();
+            assert_eq!(water.kind, WaterKind::Sea);
+            assert_eq!(water.surface, SEA_LEVEL);
+            assert!(water.depth() > 0.0);
+        }
     }
 }

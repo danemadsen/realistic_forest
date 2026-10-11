@@ -6,7 +6,6 @@
 use super::{
     ExtractedForestView, ForestGlobals, ForestShaderHandles, globals_layout,
 };
-use crate::constants::SEA_LEVEL;
 use bevy::prelude::*;
 use bevy::render::render_resource::{
     BindGroup, BindGroupLayoutDescriptor, CachedRenderPipelineId, PipelineCache,
@@ -225,10 +224,12 @@ pub fn forest_precipitation_pass(
     ) else {
         return;
     };
-    let ocean_visible = world
+    // No rain falls through the water around a submerged eye, whichever
+    // water it is.
+    if world
         .get_resource::<super::water_node::ExtractedWater>()
-        .is_some_and(|water| water.draw);
-    if ocean_visible && extracted.player_position[1] <= SEA_LEVEL + 0.2 {
+        .is_some_and(|water| water.eye_submerged(0.2))
+    {
         return;
     }
     // Rain bands can cross the particle volume and rain layers before
