@@ -382,10 +382,12 @@ struct WaterInner {
     /// Ring centre the instance buffers currently hold, so a static camera
     /// rewrites nothing.
     snapped_centre: Option<[f32; 2]>,
-    /// The sea state the wave block was built from — amplitude, wind and the
-    /// flat-surface toggle — as raw bits. All three change every wave in the
-    /// block, so they are rebuilt together.
-    wave_key: Option<(u32, u32, bool)>,
+    /// The settings the static half of the stage block was built from. The
+    /// sea state (amplitude, wind, the flat-surface toggle) changes every wave
+    /// in it and the optics preset its extinction, scatter, surface and
+    /// subsurface tint, which the surface and the underwater medium both
+    /// read, so any change rebuilds it.
+    wave_key: Option<crate::water::WaterSettings>,
     /// The per-frame half of the surface uniform: the clock and the sea state
     /// scalars. Rewritten every frame at `SURFACE_PARAMS_OFFSET`.
     surface_frame: [f32; 4],
@@ -639,11 +641,7 @@ fn prepare_water(
 
     let settings = water.settings;
     let flat = settings.flat_surface;
-    let wave_key = (
-        settings.sea_state_amplitude.to_bits(),
-        settings.wind_direction_degrees.to_bits(),
-        flat,
-    );
+    let wave_key = settings;
     let amplitude = if flat {
         0.0
     } else {
