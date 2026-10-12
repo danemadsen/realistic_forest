@@ -2112,8 +2112,11 @@ mod shading_tests {
         for gone in ["hash11", "round(", "wind_direction", "select(-1.0, 1.0"] {
             assert!(!sea.contains(gone), "windSea still uses {gone}");
         }
-        let phase = sea.lines().find(|line| line.contains("let phase =")).expect("a phase");
+        let phase = sea.lines().find(|line| line.contains("var phase =")).expect("a phase");
         assert!(phase.contains("dot(wave.xy, wrapped)") && phase.contains("wave.z"), "{phase}");
+        // The current carries a wave on by a turn of its own wave vector alone.
+        let turn = sea.lines().find(|line| line.contains("let turn =")).expect("a turn");
+        assert!(turn.contains("dot(wave.xy, drift.xy)"), "{turn}");
     }
 
     /// The shader's spread is the CPU's, which carries the measurements.
@@ -2174,7 +2177,7 @@ mod shading_tests {
             let body = format!(
                 "stage.flags = vec4<f32>(0.0);
                  stage.wind_waves = array<vec4<f32>, 56>({table});
-                 let sea = windSea(input.xy, vec2<f32>(0.0), {speed:?}, {fetch:?}, input.w, 0.0,
+                 let sea = windSea(input.xy, vec4<f32>(0.0), vec2<f32>(1.0, 0.0), {speed:?}, {fetch:?}, input.w, 0.0,
                                    vec2<f32>(input.z, 0.0), vec2<f32>(0.0, input.z), 0.0, 1.0/60.0);
                  samples[id.x] = vec4<f32>(sea.slope, sea.variance, sea.height);"
             );
@@ -2242,6 +2245,225 @@ mod shading_tests {
         assert!(along > across + 0.3, "{lag} m down the wind {along}, across it {across}");
     }
 
+    /// The wind a lake feels changes across it in gradients, never in lines.
+    /// Walked upwind from tap to tap, the shore was found only by the tap that
+    /// landed on it, so the shore was drawn again across the water at every
+    /// tap's distance from it as a line between rougher and calmer water. Here
+    /// a straight shore runs across the wind, its forest broken by clearings,
+    /// once from the waterline back and once from 60 m back behind a meadow,
+    /// and then with a spit running 120 m out from it down the wind, behind
+    /// which a single line upwind found the spit's end on one side of its
+    /// edge and the far shore on the other. The water is walked away from
+    /// the shore down the wind and along it across the wind in 10 cm steps,
+    /// and neither the shelter nor the fetch may change much over any one of
+    /// them.
+    #[test]
+    fn the_wind_on_a_lake_changes_in_gradients_not_lines() {
+        let heads = [
+            "fn smoothstepf(", "fn hash21(", "const CANOPY_HEIGHT:", "struct WindExposure", "const LEE_WIND:",
+            "const WIND_WALK_TAPS:", "const WIND_WALK_REACH:", "const FETCH_LOSS:", "const FETCH_LOSS_RISE:",
+            "const STAND_SAMPLES:", "const WIND_LANE:", "fn standCover(", "fn fetchLoss(", "fn walkFade(",
+            "fn fetchAcross(", "fn standTop(", "fn upwindRay(", "fn windExposure(",
+        ];
+        // The lake's level is 0 and the wind blows toward +x. Upwind of x = 0
+        // the bank rises 3 m over 10 m and then gently; the bed falls away to
+        // 6 m. The crowns stand from `forest_edge` metres back, on a canopy
+        // capture of 2/3 m texels, a quarter of it open in 4 m clearings. With
+        // `spit` set, the land also runs out to x = 120 m wherever z < -5.
+        let prelude = "
+            var<private> forest_edge: f32;
+            var<private> spit: f32;
+            fn riverGround(p: vec2<f32>) -> vec2<f32> {
+                let inland = max(-p.x, select(-1.0e4, min(120.0 - p.x, -5.0 - p.y), spit > 0.5));
+                let land = select(3.0 + 0.05*(inland - 10.0), 0.3*inland, inland < 10.0);
+                return vec2<f32>(select(-min(-0.2*inland, 6.0), land, inland > 0.0), 1.0);
+            }
+            fn openAt(texel: vec2<f32>) -> f32 {
+                let centre = (texel + 0.5)*(2.0/3.0);
+                return select(select(0.0, 1.0, hash21(floor(centre/4.0)) < 0.25), 1.0, centre.x > -forest_edge);
+            }
+            fn riverCanopy(p: vec2<f32>) -> vec4<f32> {
+                let u = p*1.5 - vec2<f32>(0.5);
+                let i = floor(u);
+                let f = u - i;
+                let open = mix(mix(openAt(i), openAt(i + vec2<f32>(1.0, 0.0)), f.x),
+                               mix(openAt(i + vec2<f32>(0.0, 1.0)), openAt(i + vec2<f32>(1.0, 1.0)), f.x), f.y);
+                return vec4<f32>(0.0, 0.0, 0.0, open);
+            }";
+        let body = "
+            forest_edge = input.z;
+            spit = input.w;
+            let exposure = windExposure(input.xy, 0.0, vec2<f32>(-1.0, 0.0), 1.0, 0.0, 0.0, 0.0,
+                                        vec2<f32>(0.0, 1.0), 1.0);
+            samples[id.x] = vec4<f32>(exposure.shelter, exposure.fetch, 0.0, 0.0);";
+        let mut lines: Vec<(String, Vec<[f32; 4]>)> = Vec::new();
+        for edge in [6.0f32, 60.0] {
+            for z in [0.0f32, 37.3] {
+                let walk = (5..7000).map(|i| [i as f32 * 0.1, z, edge, 0.0]).collect();
+                lines.push((format!("down the wind at z = {z}, crowns {edge} m back"), walk));
+            }
+            for x in [40.0f32, 150.0] {
+                let walk = (-1500..1500).map(|i| [x, i as f32 * 0.1, edge, 0.0]).collect();
+                lines.push((format!("across the wind at x = {x}, crowns {edge} m back"), walk));
+            }
+        }
+        for x in [160.0f32, 200.0, 300.0] {
+            let walk = (-1000..1000).map(|i| [x, i as f32 * 0.1, 6.0, 1.0]).collect();
+            lines.push((format!("across the wind behind the spit at x = {x}"), walk));
+        }
+        for z in [-17.0f32, 7.0] {
+            let walk = (1205..5000).map(|i| [i as f32 * 0.1, z, 6.0, 1.0]).collect();
+            lines.push((format!("down the wind past the spit at z = {z}"), walk));
+        }
+        let inputs: Vec<[f32; 4]> = lines.iter().flat_map(|(_, walk)| walk.iter().copied()).collect();
+        let Some(values) = evaluate_with(prelude, &heads, body, &inputs) else {
+            return;
+        };
+        let mut start = 0;
+        for (name, walk) in &lines {
+            let line = &values[start..start + walk.len()];
+            start += walk.len();
+            for (pair, points) in line.windows(2).zip(walk.windows(2)) {
+                let at = points[1];
+                let shelter = (pair[1][0] - pair[0][0]).abs();
+                let fetch = (pair[1][1] - pair[0][1]).abs();
+                assert!(shelter < 0.03, "{name}: shelter {} to {} at {at:?}", pair[0][0], pair[1][0]);
+                assert!(fetch < 1.0, "{name}: fetch {} to {} at {at:?}", pair[0][1], pair[1][1]);
+            }
+        }
+        // And it is still the wind it was: calm in the forest's lee, the fetch
+        // the water crossed from the bank, and the open lake's past the lee.
+        let first = &values[..lines[0].1.len()];
+        let at = |x: f32| first[((x * 10.0).round() as usize) - 5];
+        assert!(at(5.0)[0] < 0.32 && at(100.0)[0] < 0.45, "{:?} {:?}", at(5.0), at(100.0));
+        assert!(at(690.0)[0] > 0.95, "{:?}", at(690.0));
+        for x in [5.0f32, 50.0, 100.0, 250.0] {
+            assert!(at(x)[1] > x && at(x)[1] < x + 4.0, "fetch {} at {x} m from the bank", at(x)[1]);
+        }
+        assert_eq!(at(690.0)[1], 400.0);
+    }
+
+    /// Running water's wind waves keep their height while the current
+    /// carries them, and turn into still water's as it dies away: the waves
+    /// on a lake's slow drift through it are the waves on the still water
+    /// beside it, so no line marks where the water starts to move.
+    #[test]
+    fn carried_wind_waves_become_still_waters_as_the_current_dies_away() {
+        use crate::water::waves;
+        let table = waves::wind_sea_components(0.733)
+            .iter()
+            .map(|c| format!("vec4<f32>({:?}, {:?}, {:?}, {:?})", c[0], c[1], c[2], c[3]))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let prelude = "struct TestStage { flags: vec4<f32>, wind_waves: array<vec4<f32>, 56> };
+                       var<private> stage: TestStage;";
+        let heads = [
+            "const PI:", "const GRAVITY:", "fn smoothstepf(", "fn hash21(", "struct FlowLayer", "fn flowLayer(",
+            "const WIND_RUNGS:", "const WIND_PER_RUNG:", "const WIND_COMPONENTS:", "const WIND_SHORTEST:",
+            "const CAPILLARY_CUTOFF:", "const SURFACE_TENSION:", "const COX_MUNK_SLOPE:", "const RUNG_LOG_SPAN:",
+            "const WIND_PERIOD:", "const SPREAD_FLOOR:", "const WIND_RUNG_STRETCH:", "struct WindSea",
+            "fn windSaturation(", "fn windPeakWavenumber(", "fn spreadingBeta(", "fn windSea(",
+        ];
+        // x, z, the current (m/s, heading 53 degrees off the x axis) and the
+        // time; a lake's breeze 100 m from its upwind shore, seen through
+        // 2 mm pixels.
+        let body = format!(
+            "stage.flags = vec4<f32>(0.0);
+             stage.wind_waves = array<vec4<f32>, 56>({table});
+             let velocity = vec2<f32>(0.6, 0.8)*input.z;
+             let a = flowLayer(input.w, 3.0, 0u, 0.29, velocity);
+             let b = flowLayer(input.w, 3.0, 1u, 0.29, velocity);
+             let sea = windSea(input.xy, vec4<f32>(a.offset, b.offset), vec2<f32>(a.weight, b.weight), 5.0, 100.0,
+                               3.7, input.w, vec2<f32>(0.002, 0.0), vec2<f32>(0.0, 0.002), input.z, 1.0/60.0);
+             samples[id.x] = vec4<f32>(sea.slope, sea.height, 0.0);"
+        );
+        let mut seed = 0x6c07_8965_u32;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        let positions: Vec<[f32; 2]> = (0..2048).map(|_| [next() * 400.0 - 200.0, next() * 400.0 - 200.0]).collect();
+        let times: Vec<f32> = (0..30).map(|i| 7.0 + i as f32 * 0.1).collect();
+        let mut inputs = Vec::new();
+        // Still water, and water drifting at a hundredth of a millimetre a
+        // second, at one moment; then a slow current over three seconds, a
+        // whole cycle of its layers.
+        for current in [0.0f32, 1e-5] {
+            inputs.extend(positions.iter().map(|p| [p[0], p[1], current, 7.3]));
+        }
+        for &time in &times {
+            inputs.extend(positions.iter().map(|p| [p[0], p[1], 0.3, time]));
+        }
+        let Some(values) = evaluate_with(prelude, &heads, &body, &inputs) else {
+            return;
+        };
+        let n = positions.len();
+        let mean_square = |chunk: &[[f32; 4]]| chunk.iter().map(|v| v[0] * v[0] + v[1] * v[1]).sum::<f32>() / n as f32;
+        let (still, drifting) = (&values[..n], &values[n..2 * n]);
+        let difference = still
+            .iter()
+            .zip(drifting)
+            .map(|(a, b)| (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2))
+            .sum::<f32>()
+            / n as f32;
+        assert!(difference < 1e-3 * mean_square(still), "{difference} against {}", mean_square(still));
+        let slopes: Vec<f32> = values[2 * n..].chunks(n).map(mean_square).collect();
+        let mean = slopes.iter().sum::<f32>() / slopes.len() as f32;
+        assert!((mean / mean_square(still) - 1.0).abs() < 0.1, "carried {mean}, still {}", mean_square(still));
+        // A component dips only where the layers all but cancel it, while
+        // their shares are near even: the surface breathes by less than a
+        // tenth as they hand over.
+        for (time, slope) in times.iter().zip(&slopes) {
+            assert!((slope / mean - 1.0).abs() < 0.12, "at {time} s the slope is {slope} about {mean}");
+        }
+    }
+
+    /// A lake is too deep for its bed to stir it: its slow drift raises no
+    /// ripples of its own, and an inflow's die away as it slows, so no line
+    /// marks where the drift stops. A river's run keeps its own.
+    #[test]
+    fn still_waters_drift_raises_no_ripples_of_its_own() {
+        let heads = [
+            "const PI:", "fn smoothstepf(", "fn hash21(", "fn valueNoise(", "fn riverNoise(",
+            "const RIVER_NOISE_SLOPE_VARIANCE:", "struct FlowLayer", "fn flowLayer(", "struct FlowSurface",
+            "fn flowSurface(",
+        ];
+        // x, z, the current along x, and how still the water is.
+        let body = "
+            let ripples = flowSurface(input.xy, vec2<f32>(input.z, 0.0), 3.7, 0.0, 0.0, input.w < 0.5, input.w,
+                                      vec2<f32>(0.001), 0.0);
+            samples[id.x] = vec4<f32>(ripples.slope, ripples.variance, 0.0);";
+        let points: Vec<[f32; 2]> = (0..1024).map(|i| [(i % 32) as f32 * 0.37, (i / 32) as f32 * 0.41]).collect();
+        let speeds: Vec<f32> = (0..=60).map(|i| i as f32 * 0.01).collect();
+        let mut inputs = Vec::new();
+        for still in [1.0f32, 0.0] {
+            for &speed in &speeds {
+                inputs.extend(points.iter().map(|p| [p[0], p[1], speed, still]));
+            }
+        }
+        let Some(values) = evaluate(&heads, body, &inputs) else {
+            return;
+        };
+        let n = points.len();
+        let rms: Vec<f32> = values
+            .chunks(n)
+            .map(|chunk| (chunk.iter().map(|v| v[0] * v[0] + v[1] * v[1]).sum::<f32>() / n as f32).sqrt())
+            .collect();
+        let (lake, river) = rms.split_at(speeds.len());
+        // Slower than the drift through a lake, nothing.
+        for (speed, slope) in speeds.iter().zip(lake).take_while(|(speed, _)| **speed <= 0.05) {
+            assert!(*slope < 1e-4, "{slope} at {speed} m/s");
+        }
+        // Then it grows with the current, a little at a time.
+        for (pair, speed) in lake.windows(2).zip(&speeds[1..]) {
+            assert!(pair[1] - pair[0] < 0.25 * river[0].max(river[1]), "{pair:?} at {speed} m/s");
+        }
+        assert!(lake[speeds.len() - 1] > 0.8 * river[speeds.len() - 1], "{lake:?} {river:?}");
+        assert!(river[0] > 0.01, "a river's run is never glassy: {}", river[0]);
+    }
+
     /// A river's ripples and foam are drawn out along its current by as much
     /// as the current is fast, but how closely their crests follow one
     /// another down the river must depend only on the current there, not on
@@ -2258,7 +2480,7 @@ mod shading_tests {
         let body = "
             let flow = vec2<f32>(input.z, 0.0);
             let st = input.xy;
-            let ripples = flowSurface(st, flow, 3.7, 0.0, 0.0, true, vec2<f32>(0.001), 0.0);
+            let ripples = flowSurface(st, flow, 3.7, 0.0, 0.0, true, 0.0, vec2<f32>(0.001), 0.0);
             let foam_stretch = 1.0 + 2.5*smoothstepf(0.3, 1.5, input.z);
             let foam = riverFoamPattern(st, flow, foam_stretch, 3.7, vec2<f32>(0.001), 0.0);
             samples[id.x] = vec4<f32>(ripples.slope.x, foam, 0.0, 0.0);";
