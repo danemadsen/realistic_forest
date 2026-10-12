@@ -49,12 +49,13 @@ pub struct TrainerState {
     status: Option<String>,
 }
 
-/// The streamed fields the diagnostics read when they exist.
-type OptionalFields<'w> = (
+/// The streamed fields the diagnostics read when they exist, and the planet.
+type WorldFields<'w> = (
     Option<Res<'w, crate::vegetation::VegetationField>>,
     Option<Res<'w, crate::rivers::RiverField>>,
     Option<Res<'w, crate::buildings::BuildingField>>,
     Option<Res<'w, crate::planet::view::PlanetTerrain>>,
+    Res<'w, crate::planet::Planet>,
 );
 
 /// Draw the developer menu, passive diagnostics, and world overlays.
@@ -72,7 +73,7 @@ pub fn draw_diagnostics_ui(
     mut players: Query<&mut Player>,
     automation: Res<AutomationSettings>,
     mut rerun: ResMut<RerunErosion>,
-    (vegetation, rivers, buildings, planet_terrain): OptionalFields,
+    (vegetation, rivers, buildings, planet_terrain, planet): WorldFields,
     mut snow: ResMut<SnowState>,
     mut trainer: Local<TrainerState>,
     mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>,
@@ -120,6 +121,7 @@ pub fn draw_diagnostics_ui(
             &mut rerun,
             rivers.as_deref(),
             buildings.as_deref(),
+            &planet,
         );
         if !settings.show_trainer && automation.shot_path.is_none() {
             if let Ok(mut cursor) = cursors.single_mut() {
@@ -243,7 +245,13 @@ fn draw_debug_overlay(
         forward.z,
         player.yaw.to_degrees(),
         player.pitch.to_degrees(),
-        if player.flying { "FLYING" } else { "WALKING" },
+        if player.free_flight.is_some() {
+            "FREE FLIGHT"
+        } else if player.flying {
+            "FLYING"
+        } else {
+            "WALKING"
+        },
         player.movement_speed_multiplier,
         player.vertical_velocity,
         ground,
@@ -289,6 +297,109 @@ fn draw_debug_overlay(
             egui::Color32::WHITE,
         )
         .bottom()
+}
+
+/// A distance for the flight readouts: metres near the ground, kilometres
+/// higher up.
+fn flight_distance(metres: f64) -> String {
+    if metres.abs() >= 10_000.0 {
+        format!("{:.2} km", metres / 1000.0)
+    } else {
+        format!("{metres:.0} m")
+    }
+}
+
+/// A duration for the flight readouts.
+fn flight_duration(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    let (hours, minutes, seconds) = (total / 3600, total / 60 % 60, total % 60);
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// The flight readouts of a free-flying body, KSP's: what it is doing, how
+/// high and fast it goes, and the orbit it is on.
+fn flight_readout(player: &Player, planet: &crate::planet::Planet, flight: &crate::planet::flight::FreeFlight) -> String {
+    use crate::planet::flight::{self, OrbitReadout};
+    let orbit = OrbitReadout::of(planet, flight.position, flight.velocity);
+    let up = flight.up();
+    let vertical = flight.velocity.dot(up);
+    let horizontal = (flight.velocity - up * vertical).length();
+    let altitude = flight.altitude(planet);
+    let apoapsis = match (orbit.apoapsis, orbit.time_to_apoapsis) {
+        (None, _) => "none, escaping".to_owned(),
+        (Some(apoapsis), Some(time)) => format!("{} in {}", flight_distance(apoapsis), flight_duration(time)),
+        (Some(apoapsis), None) => flight_distance(apoapsis),
+    };
+    let periapsis = match orbit.time_to_periapsis {
+        Some(time) => format!("{} in {}", flight_distance(orbit.periapsis), flight_duration(time)),
+        None => flight_distance(orbit.periapsis),
+    };
+    let period = orbit.period.map_or_else(|| "-".to_owned(), flight_duration);
+    let warp = if flight.may_warp(planet) {
+        format!("Warp {}x  [, .]", flight.warp_rate())
+    } else {
+        "Warp above the air only".to_owned()
+    };
+    let mut text = format!(
+        "FREE FLIGHT  {}\n\
+         Altitude   {}  |  Above ground {}\n\
+         Speed      {:.1} m/s  |  Vertical {:+.1} m/s  |  Horizontal {:.1} m/s\n\
+         Gravity    {:.2} m/s2  |  Air {:.1}% of sea level\n\
+         Apoapsis   {}\n\
+         Periapsis  {}\n\
+         Period     {}  |  Eccentricity {:.4}\n\
+         Thrust     {:.0} m/s2, x{:.0} with Ctrl  |  {}\n\
+         W/S along the view, A/D sideways, Space/Shift up and down  |  G walk, V noclip",
+        flight::situation(planet, flight, &orbit),
+        flight_distance(altitude),
+        flight_distance(player.position.y as f64 - player.ground_below as f64),
+        flight.velocity.length(),
+        vertical,
+        horizontal,
+        planet.gravity_vector(flight.position).length(),
+        100.0 * flight::air_density(altitude),
+        apoapsis,
+        periapsis,
+        period,
+        orbit.eccentricity,
+        flight::THRUST * player.movement_speed_multiplier as f64,
+        flight::THRUST_BOOST,
+        warp,
+    );
+    if let Some(speed) = flight.touchdown {
+        text.push_str(&format!("\nLast touchdown at {speed:.1} m/s"));
+    }
+    text
+}
+
+/// The flight readouts in the top right corner while the player flies free.
+pub fn draw_flight_hud(
+    mut contexts: EguiContexts,
+    players: Query<&Player>,
+    planet: Res<crate::planet::Planet>,
+) -> Result {
+    let Ok(player) = players.single() else {
+        return Ok(());
+    };
+    let Some(flight) = player.free_flight.as_ref() else {
+        return Ok(());
+    };
+    let Ok(ctx) = contexts.ctx_mut() else {
+        return Ok(());
+    };
+    let text = flight_readout(player, &planet, flight);
+    let painter = ctx.layer_painter(egui::LayerId::background());
+    let position = ctx.content_rect().right_top() + egui::vec2(-12.0, 12.0);
+    let font = egui::FontId::monospace(13.0);
+    painter.text(position + egui::vec2(1.0, 1.0), egui::Align2::RIGHT_TOP, &text, font.clone(), egui::Color32::BLACK);
+    painter.text(position, egui::Align2::RIGHT_TOP, text, font, egui::Color32::WHITE);
+    Ok(())
 }
 
 fn parse_teleport_coordinates(coordinates: &[String; 3]) -> std::result::Result<Vec3, String> {
@@ -340,6 +451,7 @@ fn teleport(player: &mut Player, position: Vec3, cache: &ErosionCache, noise: &N
     moved
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_player_tools(
     ui: &mut egui::Ui,
     player: &mut Player,
@@ -348,6 +460,7 @@ fn draw_player_tools(
     noise: &NoiseField,
     snow: &SnowState,
     buildings: Option<&crate::buildings::BuildingField>,
+    planet: &crate::planet::Planet,
 ) {
     if !trainer.initialized {
         trainer.use_position(player.position);
@@ -356,6 +469,23 @@ fn draw_player_tools(
     let mut flying = player.flying;
     if ui.checkbox(&mut flying, "Fly / noclip [V]").changed() {
         player.set_flying(flying);
+    }
+    let mut free = player.free_flight.is_some();
+    if ui.checkbox(&mut free, "Free flight under gravity, KSP style [G]").changed() {
+        if free {
+            crate::planet::systems::enter_free_flight(player, planet);
+        } else {
+            player.set_flying(false);
+        }
+    }
+    if ui
+        .button("Circular orbit here")
+        .on_hover_text("Free flight in a circular orbit over this point, heading the way you face, at least 80 km up")
+        .clicked()
+    {
+        crate::planet::systems::enter_circular_orbit(player, planet);
+        trainer.use_position(player.position);
+        trainer.status = Some(format!("In a circular orbit {:.1} km up.", player.position.y / 1000.0));
     }
     let mut movement_speed_slider = egui::Slider::new(&mut player.movement_speed_multiplier, 0.1..=20.0);
     movement_speed_slider = movement_speed_slider.text("Movement speed");
@@ -475,6 +605,7 @@ fn draw_trainer_window(
     rerun: &mut RerunErosion,
     rivers: Option<&crate::rivers::RiverField>,
     buildings: Option<&crate::buildings::BuildingField>,
+    planet: &crate::planet::Planet,
 ) {
     let mut open = settings.show_trainer;
     let previous_position = player.position;
@@ -484,7 +615,7 @@ fn draw_trainer_window(
         ctx.content_rect().top() + 12.0
     };
     let trainer_panels = |ui: &mut egui::Ui| {
-        draw_player_tools(ui, player, trainer, cache, noise, snow, buildings);
+        draw_player_tools(ui, player, trainer, cache, noise, snow, buildings, planet);
         separator_text(ui, "Weather here");
         let selected = weather
             .trainer_preset
@@ -1309,6 +1440,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_flight_readout_names_an_orbit_and_its_apsides() {
+        let planet = crate::planet::Planet::default();
+        let mut player = Player::default();
+        crate::planet::systems::enter_circular_orbit(&mut player, &planet);
+        let flight = player.free_flight.unwrap();
+        let text = flight_readout(&player, &planet, &flight);
+        assert!(text.starts_with("FREE FLIGHT  ORBITING"), "{text}");
+        assert!(text.contains("Apoapsis   80.00 km\n"), "{text}");
+        assert!(text.contains("Periapsis  80.00 km\n"), "{text}");
+        assert!(text.contains("Warp 1x"), "{text}");
+        assert_eq!(flight_duration(3_725.4), "1h 02m 05s");
+        assert_eq!(flight_duration(59.6), "1m 00s");
+        assert_eq!(flight_distance(9_999.0), "9999 m");
+    }
+
+    #[test]
     fn debug_overlay_is_passive_text_at_the_top_left() {
         let ctx = egui::Context::default();
         ctx.begin_pass(egui::RawInput {
@@ -1407,6 +1554,7 @@ mod tests {
                     &mut rerun,
                     None,
                     None,
+                    &crate::planet::Planet::default(),
                 );
                 let mut output = ctx.end_pass();
                 output.textures_delta.clear();

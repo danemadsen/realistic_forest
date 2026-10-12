@@ -475,6 +475,7 @@ fn main() {
             // driver, mirroring the C++ short-circuit in main().
             erosion_stream_system.run_if(not_in_measure_mode),
             player::update_player_system,
+            planet::systems::free_flight_system,
             planet::systems::carry_player_across_faces,
             buildings::adapt_eye,
             player::sync_player_camera_transform,
@@ -486,7 +487,7 @@ fn main() {
     );
     app.add_systems(
         EguiPrimaryContextPass,
-        (ui::draw_diagnostics_ui, player::sync_player_camera_transform).chain(),
+        (ui::draw_diagnostics_ui, ui::draw_flight_hud, player::sync_player_camera_transform).chain(),
     );
     // After every pose change of the frame, the UI's teleports included, so
     // the patches drawn are the ones this pose sees.
@@ -1085,6 +1086,7 @@ impl FrameTimes {
 
 /// Unattended capture: let the erosion cache stream in around the pinned
 /// camera for `--wait` frames, then save one screenshot and exit.
+#[allow(clippy::too_many_arguments)]
 fn shot_scheduling_system(
     automation: Res<AutomationSettings>,
     cache: Res<ErosionCache>,

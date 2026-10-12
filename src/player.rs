@@ -57,6 +57,9 @@ pub struct Player {
     pub ground_below: f32,
     /// The planet's pull where the player is, over its pull at sea level.
     pub gravity_scale: f32,
+    /// Free flight under the planet's gravity, KSP style, while it lasts:
+    /// the body's own planet-centred state, which `position` follows.
+    pub free_flight: Option<crate::planet::flight::FreeFlight>,
 }
 
 /// What kind of water stands somewhere.
@@ -182,6 +185,7 @@ impl Default for Player {
             face: crate::planet::Face::PosY,
             ground_below: 0.0,
             gravity_scale: 1.0,
+            free_flight: None,
         }
     }
 }
@@ -207,6 +211,7 @@ impl Player {
         self.position = position;
         self.vertical_velocity = 0.0;
         self.velocity = Vec2::ZERO;
+        self.free_flight = None;
         self.swimming = false;
         self.leapt = false;
         self.water = None;
@@ -216,13 +221,14 @@ impl Player {
         true
     }
 
-    /// Start or stop flying. Flight's speed is not momentum: a body that
-    /// stops flying drops from rest, rather than gliding on at flight speed
+    /// Start or stop flying, ending any free flight. Flight's speed is not
+    /// momentum: a body that stops flying drops from rest, rather than gliding on at flight speed
     /// over water it has not yet reached. It is set down as it is: one
     /// crouched under standing height, low in the shallows say, stands up as
     /// a swimmer does rather than being lifted onto its feet in a frame.
     pub fn set_flying(&mut self, flying: bool) {
         self.flying = flying;
+        self.free_flight = None;
         self.vertical_velocity = 0.0;
         self.velocity = Vec2::ZERO;
         self.swimming = !flying;
@@ -331,6 +337,11 @@ pub fn update_player_system(
         }
     } else {
         mouse_motion.clear();
+    }
+    // A free-flying body is moved by the planet's gravity and its own thrust
+    // (planet::systems::free_flight_system); the player only looks around.
+    if player.free_flight.is_some() {
+        return;
     }
 
     let mut movement = Vec3::ZERO;

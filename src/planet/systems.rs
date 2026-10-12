@@ -2,16 +2,18 @@
 //! one cube face's chart to the next, and placing the camera on the planet
 //! and selecting the terrain patches it sees.
 
-use super::quadtree::LodLadder;
+use super::flight::{self, FreeFlight};
+use super::quadtree::{LodLadder, TERRAIN_HEIGHT_CEILING};
 use super::view::{PlanetTerrain, PlanetView};
 use super::{Planet, PlanetPosition};
-use crate::constants::{FAR_PLANE, NEAR_PLANE};
+use crate::constants::{EYE_HEIGHT, FAR_PLANE, NEAR_PLANE};
 use crate::erosion::ErosionCache;
 use crate::noise::NoiseField;
-use crate::player::Player;
-use bevy::math::DVec2;
+use crate::player::{Player, UiWantsInput};
+use crate::snow::{self, SnowState};
+use bevy::math::{DVec2, DVec3};
 #[cfg(test)]
-use bevy::math::Vec2;
+use std::f32::consts::FRAC_PI_2;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
@@ -40,6 +42,134 @@ pub fn streams_paused(player: &Player) -> bool {
 /// the ground under it.
 pub fn flight_speed_scale(height: f32) -> f32 {
     (height / FLIGHT_SPEED_HEIGHT).max(1.0)
+}
+
+/// Altitude below which a free-flying body looks for the ground and the
+/// water under it: above the highest the terrain reaches, with the snow and
+/// the streamed features on it.
+const GROUND_CHECK_ALTITUDE: f64 = TERRAIN_HEIGHT_CEILING + 400.0;
+
+/// Start free flight from wherever the player is, keeping the velocity it
+/// walks, swims or flies at. A body on its feet starts landed, on the floor
+/// it stands on, until its thrust lifts it.
+pub fn enter_free_flight(player: &mut Player, planet: &Planet) {
+    let (position, frame) = flight::planet_position(planet, player.face, player.position);
+    let vertical = if player.flying { 0.0 } else { player.vertical_velocity };
+    let local = DVec3::new(player.velocity.x as f64, vertical as f64, player.velocity.y as f64);
+    let mut free = FreeFlight::new(position, frame.to_planet(local));
+    free.landed = !player.flying && !player.swimming && player.vertical_velocity == 0.0;
+    if free.landed {
+        free.velocity = DVec3::ZERO;
+    }
+    player.flying = false;
+    player.free_flight = Some(free);
+}
+
+/// KSP's "set orbit": put the player in a circular orbit over where it is,
+/// heading the way it faces, raised clear of the air if it is lower.
+pub fn enter_circular_orbit(player: &mut Player, planet: &Planet) {
+    let altitude = (player.position.y as f64).max(flight::CIRCULAR_ORBIT_MIN_ALTITUDE);
+    let raised = Vec3::new(player.position.x, altitude as f32, player.position.z);
+    if !player.teleport(raised) {
+        return;
+    }
+    let (position, frame) = flight::planet_position(planet, player.face, raised);
+    let heading = frame.to_planet(DVec3::new(player.yaw.sin() as f64, 0.0, -player.yaw.cos() as f64));
+    let speed = (planet.gravitational_parameter() / position.length()).sqrt();
+    player.flying = false;
+    player.free_flight = Some(FreeFlight::new(position, heading * speed));
+}
+
+/// Free flight under the planet's gravity ([`flight`]): G starts and ends
+/// it, W and S thrust along the view, A and D sideways, Space and Shift up
+/// and down, Left Ctrl boosts, and `,` and `.` step the time warp down and
+/// up while coasting above the air. The body's state is written back into the
+/// player's chart coordinates, which the face crossing that follows carries
+/// on to the next face.
+#[allow(clippy::too_many_arguments)]
+pub fn free_flight_system(
+    planet: Res<Planet>,
+    time: Res<Time>,
+    keys: Res<ButtonInput<KeyCode>>,
+    ui_wants_input: Res<UiWantsInput>,
+    erosion: Res<ErosionCache>,
+    noise: Res<NoiseField>,
+    snow: Res<SnowState>,
+    automation: Option<Res<crate::automation::AutomationSettings>>,
+    mut players: Query<&mut Player>,
+) {
+    let Ok(mut player) = players.single_mut() else {
+        return;
+    };
+    // A pinned --camera capture holds its pose.
+    if automation.is_some_and(|automation| automation.has_camera && automation.shot_path.is_some()) {
+        return;
+    }
+    let input = !ui_wants_input.0;
+    if input && keys.just_pressed(KeyCode::KeyG) {
+        if player.free_flight.is_some() {
+            player.set_flying(false);
+            return;
+        }
+        enter_free_flight(&mut player, &planet);
+    }
+    let Some(mut free) = player.free_flight else {
+        return;
+    };
+
+    let here = flight::place_on(&planet, player.face, free.position);
+    let mut thrust = Vec3::ZERO;
+    if input {
+        let axis = |plus: KeyCode, minus: KeyCode| (keys.pressed(plus) as i32 - keys.pressed(minus) as i32) as f32;
+        let right = Vec3::new(player.yaw.cos(), 0.0, player.yaw.sin());
+        thrust = player.forward() * axis(KeyCode::KeyW, KeyCode::KeyS)
+            + right * axis(KeyCode::KeyD, KeyCode::KeyA)
+            + Vec3::Y * axis(KeyCode::Space, KeyCode::ShiftLeft);
+        if thrust.length_squared() > 1.0 {
+            thrust = thrust.normalize();
+        }
+    }
+    let boost = if input && keys.pressed(KeyCode::ControlLeft) { flight::THRUST_BOOST } else { 1.0 };
+    let acceleration = flight::THRUST * boost * player.movement_speed_multiplier as f64;
+    let thrust = here.frame.to_planet(thrust.as_dvec3() * acceleration);
+
+    // The warp is for coasting above the air, as KSP's is: thrust or the air
+    // ends it.
+    if thrust != DVec3::ZERO || !free.may_warp(&planet) {
+        free.warp = 0;
+    } else if input && keys.just_pressed(KeyCode::Period) {
+        free.warp = (free.warp + 1).min(flight::WARP_LEVELS.len() - 1);
+    } else if input && keys.just_pressed(KeyCode::Comma) {
+        free.warp = free.warp.saturating_sub(1);
+    }
+
+    let seconds = free.frame_seconds(time.delta_secs().min(0.05) as f64);
+    free.advance(&planet, thrust, seconds);
+
+    let mut placed = flight::place_on(&planet, player.face, free.position);
+    let mut water = None;
+    if free.altitude(&planet) < GROUND_CHECK_ALTITUDE {
+        let xz = Vec2::new(placed.position.x, placed.position.z);
+        let ground = snow::sample_surface(&erosion, &noise, xz, xz.to_array()).height(&snow, xz);
+        water = crate::player::water_at(&erosion, &noise, xz.x, xz.y, xz.to_array());
+        let float = water.and_then(|water| water.float_eye()).filter(|&eye| eye > ground + EYE_HEIGHT);
+        let touch = float.unwrap_or(ground + EYE_HEIGHT);
+        let speed = free.velocity.length();
+        if free.settle(&planet, touch as f64, float.is_some()) {
+            info!("FLIGHT: touched down at {speed:.1} m/s");
+        }
+        placed = flight::place_on(&planet, player.face, free.position);
+    }
+    player.position = placed.position;
+    (player.velocity, player.vertical_velocity) = flight::local_velocity(placed.frame, free.velocity);
+    player.water = water;
+    player.flying = false;
+    player.swimming = false;
+    player.leapt = false;
+    player.wading_depth = 0.0;
+    player.current = Vec2::ZERO;
+    player.swept = false;
+    player.free_flight = Some(free);
 }
 
 /// Move a player who has walked or flown past the edge of its face onto the
@@ -142,6 +272,109 @@ pub fn update_planet_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::Face;
+    use crate::constants::NOISE_RESOLUTION;
+    use std::time::Duration;
+
+    /// An app running the free flight and the face crossing over a flat
+    /// world (a constant noise field), with a hand-driven clock and keys.
+    fn flight_app(player: Player) -> (App, Entity) {
+        let mut app = App::new();
+        app.insert_resource(Planet::default());
+        app.insert_resource(Time::<()>::default());
+        app.insert_resource(ButtonInput::<KeyCode>::default());
+        app.insert_resource(UiWantsInput(false));
+        app.insert_resource(ErosionCache::default());
+        app.insert_resource(NoiseField { samples: vec![0.70; NOISE_RESOLUTION * NOISE_RESOLUTION] });
+        app.insert_resource(SnowState::default());
+        app.add_systems(Update, (free_flight_system, carry_player_across_faces).chain());
+        let entity = app.world_mut().spawn(player).id();
+        (app, entity)
+    }
+
+    /// One frame of `seconds`, with `key` pressed in it if any.
+    fn frame(app: &mut App, seconds: f32, key: Option<KeyCode>) {
+        app.world_mut().resource_mut::<Time>().advance_by(Duration::from_secs_f32(seconds));
+        if let Some(key) = key {
+            app.world_mut().resource_mut::<ButtonInput<KeyCode>>().press(key);
+        }
+        app.update();
+        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keys.release_all();
+        keys.clear();
+    }
+
+    #[test]
+    fn an_orbit_carries_the_player_across_a_face_edge_and_on_round_the_planet() {
+        let planet = Planet::default();
+        let s = planet.half_width as f32;
+        // 100 km up, 30 km short of the spawn face's east edge, heading east.
+        let mut player = Player { position: Vec3::new(s - 30_000.0, 100_000.0, 2_000.0), yaw: FRAC_PI_2, ..Player::default() };
+        enter_circular_orbit(&mut player, &planet);
+        let start = player.free_flight.unwrap();
+        let (mut app, entity) = flight_app(player);
+        let mu = planet.gravitational_parameter();
+        let energy = |flight: &FreeFlight| 0.5 * flight.velocity.length_squared() - mu / flight.position.length();
+        let mut crossed = false;
+        for _ in 0..1_200 {
+            frame(&mut app, 1.0 / 60.0, None);
+            let player = app.world().get::<Player>(entity).unwrap();
+            crossed |= player.face != Face::PosY;
+            let flight = player.free_flight.unwrap();
+            // The written-back pose is the body's.
+            let (position, _) = flight::planet_position(&planet, player.face, player.position);
+            assert!(position.distance(flight.position) < 0.5, "{}", position.distance(flight.position));
+            assert!((player.position.y - 100_000.0).abs() < 1.0, "{}", player.position.y);
+            // The view still looks along the orbit.
+            let along = player.velocity.normalize().dot(Vec2::new(player.yaw.sin(), -player.yaw.cos()));
+            assert!(along > 0.999, "{along}");
+        }
+        assert!(crossed);
+        let after = app.world().get::<Player>(entity).unwrap().free_flight.unwrap();
+        assert!(((energy(&after) - energy(&start)) / energy(&start)).abs() < 1e-9);
+        // 20 s at about 2.3 km/s.
+        let travelled = after.position.distance(start.position);
+        assert!((travelled - 20.0 * start.velocity.length()).abs() < 200.0, "{travelled}");
+    }
+
+    #[test]
+    fn g_lifts_off_into_free_flight_and_back_to_walking() {
+        let mut player = Player { position: Vec3::new(1_000.0, 0.0, 1_000.0), ..Player::default() };
+        let (mut app, entity) = flight_app(Player::default());
+        // Stand on the flat ground.
+        {
+            let world = app.world();
+            let erosion = world.resource::<ErosionCache>();
+            let noise = world.resource::<NoiseField>();
+            let snow = world.resource::<SnowState>();
+            let xz = Vec2::new(player.position.x, player.position.z);
+            player.position.y = snow::sample_surface(erosion, noise, xz, xz.to_array()).height(snow, xz) + EYE_HEIGHT;
+        }
+        let standing = player.position;
+        *app.world_mut().get_mut::<Player>(entity).unwrap() = player;
+        frame(&mut app, 1.0 / 60.0, Some(KeyCode::KeyG));
+        let player = app.world().get::<Player>(entity).unwrap();
+        let flight = player.free_flight.expect("G starts free flight");
+        assert!(flight.landed);
+        assert!(player.position.distance(standing) < 0.01);
+        // Without thrust it stays on the ground.
+        for _ in 0..60 {
+            frame(&mut app, 1.0 / 60.0, None);
+        }
+        assert!(app.world().get::<Player>(entity).unwrap().position.distance(standing) < 0.01);
+        // Space thrusts it up off the ground.
+        for _ in 0..120 {
+            frame(&mut app, 1.0 / 60.0, Some(KeyCode::Space));
+        }
+        let player = app.world().get::<Player>(entity).unwrap();
+        assert!(!player.free_flight.unwrap().landed);
+        assert!(player.position.y > standing.y + 2.0 && player.vertical_velocity > 0.0);
+        // G again ends it, from rest.
+        frame(&mut app, 1.0 / 60.0, Some(KeyCode::KeyG));
+        let player = app.world().get::<Player>(entity).unwrap();
+        assert!(player.free_flight.is_none() && !player.flying);
+        assert_eq!(player.vertical_velocity, 0.0);
+    }
 
     /// Horizontal plane vector of a heading.
     fn heading(yaw: f32) -> Vec2 {

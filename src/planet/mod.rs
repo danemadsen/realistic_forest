@@ -32,6 +32,7 @@
 //! radius costs no precision; what remains is the precision of the terrain
 //! plane coordinates themselves, bounded by the face's extent.
 
+pub mod flight;
 pub mod height;
 pub mod quadtree;
 pub mod systems;
@@ -66,8 +67,10 @@ pub const ATMOSPHERE_TOP: f64 = 60_000.0;
 /// planet wears a finite shell of air.
 pub const AIR_SCALE_HEIGHT: f32 = 8_000.0;
 
-/// Standard gravity at sea level. The player's own falls use their tuned
-/// constant; this is what scales it with altitude.
+/// Standard gravity at sea level: the planet's pull on a free-flying body
+/// ([`flight`]), which gives it Kerbin's low orbital speeds. The walking
+/// controller's own falls keep their tuned constant, scaled with altitude by
+/// the same inverse square.
 pub const PLANET_SURFACE_GRAVITY: f64 = 9.81;
 
 /// One of the six cube faces.

@@ -37,11 +37,13 @@ by naga at runtime either way.
 | Input | Action |
 | --- | --- |
 | Mouse | Look |
-| W/A/S/D | Move |
-| Space | Jump, or rise while flying; swim up, or kick out of the water at its surface |
-| Left Shift | Descend while flying; dive while swimming |
-| Left Control | Movement boost |
+| W/A/S/D | Move; in free flight, thrust along the view (W/S) and sideways (A/D) |
+| Space | Jump, or rise while flying; swim up, or kick out of the water at its surface; thrust up in free flight |
+| Left Shift | Descend while flying; dive while swimming; thrust down in free flight |
+| Left Control | Movement boost; five times the thrust in free flight |
 | V | Toggle flight |
+| G | Toggle free flight under the planet's gravity, KSP style |
+| , and . | Time warp down and up, in free flight coasting above the air |
 | 2 | Open or close the developer menu; release the cursor while open, capture it on close |
 | 3 | Toggle the debug text overlay |
 | F12 | Save a timestamped screenshot |
@@ -56,6 +58,13 @@ walls of buildings, whose doors swing open as you walk into them (see
 [Walking through them](#walking-through-them)); flight passes through them, as
 it does the ground. Water too deep to stand in, the sea's, a lake's or a
 river's, is swum in (see [Wading and swimming](#wading-and-swimming)).
+
+Free flight (G) is Kerbal Space Program's: the planet's gravity pulls toward
+its centre and momentum carries, so climbing out of the air and turning
+sideways fast enough puts the player in orbit. The developer menu's "Circular
+orbit here" goes straight there, and readouts at the top right show the
+altitude, speeds, apoapsis, periapsis and period (see
+[Gravity and orbits](#the-planet)).
 
 The developer menu opens at the top left with 2 and leaves no launcher or
 overlay when closed. Its movement tools teleport to exact XYZ coordinates
@@ -272,13 +281,53 @@ precision at its edge.
 **Frames and gravity.** The player's position is its face, its plane
 coordinates on that face and its altitude: "up" is always away from the
 planet's centre, and gravity pulls toward it, weakening with the square of
-the distance. Walking or flying off a face's edge carries the player onto
+the distance. (Walking's jumps and falls keep their tuned 23 m/s² at sea
+level; free flight, below, feels the planet's own 9.81.) Walking or flying off a face's edge carries the player onto
 the next face's chart with its heading and velocity turned to match. Each
 vertex's normal is built in its own local frame from the chart's derivatives,
 and the terrain's materials read it there, so slope, aspect and snow are the
 plane's anywhere on the planet. The day/night cycle turns the planet under
 the sun: its directions are fixed in planet axes, and each place sees the sun
 at its own elevation, so travelling far enough brings on the night.
+
+**Gravity and orbits, KSP style.** In free flight (G) the player is a body
+in Newtonian flight about the planet (`src/planet/flight.rs`). Its state is a
+planet-centred position and velocity in f64, in the planet's axes, which
+nothing turns (the day is the sun's motion round them, so there is no spin to
+borrow at launch, nor Coriolis), and every substep it feels:
+
+- the planet's pull, `μ / r²` toward its centre, with `μ = g₀ R²` for a sea
+  level `g₀` of 9.81 m/s²: on the default 667.5 km planet a low orbit at
+  80 km goes round at 2.4 km/s in 32 minutes, much as Kerbin's do;
+- the air's drag, quadratic in the speed and in proportion to the density,
+  which falls off with the 8 km scale height and is gone at the atmosphere's
+  60 km top. A fall settles to 60 m/s near sea level and faster higher up, so
+  an ascent climbs out of the thick air before turning sideways;
+- its thrust: 12 m/s², enough to hover and climb slowly, five times that with
+  Left Ctrl, and scaled by the movement speed setting. W and S thrust along
+  the view, A and D sideways, Space and Shift along the local vertical.
+
+The integrator is velocity Verlet (kick, drift, kick), with the drag taken
+implicitly in each half kick, in substeps of at most 1/120 s: without air an
+orbit keeps its energy however long it runs, and in the air no step can turn
+the velocity round. Above the atmosphere, coasting, `.` and `,` step a time
+warp through 5×, 10×, 50×, 100× and 1000×, KSP's "on rails" (only the
+player's flight is warped, not the clock); thrust or the top of the air ends
+it, and a warped frame sweeps at most a tenth of a radian of the planet. The
+body touches down where its eye would sink below the ground (with its snow)
+or the water, and rests there, landed or splashed down, until its thrust
+outweighs its weight; G again walks off. Its state is written back into the
+player's face, plane coordinates and altitude every frame, so the camera,
+the face crossings and the streams see an ordinary player. The readouts at
+the top right show KSP's situation (landed, splashed, flying, sub-orbital,
+orbiting, escaping), the altitude and height above the ground, the speed and
+its vertical and horizontal parts, the gravity and the air's density, the
+apoapsis and periapsis with the time to each, the period and the
+eccentricity, all from the body's energy and angular momentum. "Circular
+orbit here" in the developer menu is KSP's set-orbit cheat: a circular orbit
+heading the way the player faces, at least 80 km up. Free flight meets the
+terrain, its snow and the water, but not trees or buildings, which it passes
+through as the noclip flight does.
 
 **From the ground to orbit.** The sea is Crest's rings around the camera,
 bent onto the sphere, and beyond their square the terrain's own patches laid
