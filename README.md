@@ -90,12 +90,18 @@ checkbox controls whether those conditions drift. Under a thunderstorm,
 sets the loudness of thunder.
 
 **Sun, moon and time** sets the hour with the slider and the day with its
-number or the -1, +1 and +7 buttons; Dawn and Dusk stand a quarter hour after
-that day's sunrise and before its sunset where the player is, and Noon and
-Night pick 12:00 and 00:00. Changing any of them holds the selected time until
-**Hold selected time** is unchecked. **Time warp** runs the celestial clock
-10 to 100,000 times faster, to watch the moon's phases and the seasons go by;
-it is a developer tool, and gameplay always runs at real time. **Next
+number or the -1, +1 and +7 buttons. Dawn and Dusk stand a quarter hour after
+sunrise and before sunset where the player is, and Noon and Night pick the
+player's local noon and midnight, in the player's own local day (the clock
+itself keeps spawn's local time). Changing any of them holds the selected time
+until **Hold selected time** is unchecked. **Time warp** runs the celestial
+clock 10, 100 or 1,000 times faster than the **Day duration** under Advanced
+controls, to watch the moon's phases and the seasons go by: at 1,000x a day
+passes in under a second and a half, a month in nine seconds and the year in
+two minutes. It is a developer tool; without it the clock runs at the day's
+duration, a day in 24 real minutes by default. Whatever the warp and the
+duration, the clock never runs through more than a day each real second, so
+day and night do not flash. **Next
 eclipse** jumps to the deepest moment of the next eclipse of the sun or the
 moon seen from where the player stands. Below them the day, the season, the
 day of the year, the moon's phase and any eclipse under way are read out (the
@@ -1625,9 +1631,10 @@ sun.
 The sun and the moon are bodies on orbits (`src/celestial.rs`): the planet
 goes round the sun and the moon round the planet on Kepler orbits, in Earth's
 proportions. Every size, distance and mass is Earth's, the Moon's and the
-Sun's in units of the planet's radius and mass: the moon is a ball 0.273
-planet radii across, 60.3 radii out, with 1/81 of the planet's mass; the sun
-is 109 radii across and 23,481 radii away, with 333,000 times its mass. Both
+Sun's in units of the planet's radius and mass: the moon's radius is 0.273
+of the planet's, and it orbits 60.3 planet radii out with 1/81 of the
+planet's mass; the sun's radius is 109 planet radii, and it is 23,481 radii
+away with 333,000 times the planet's mass. Both
 discs therefore span the half degree they do from Earth, and the moon only
 just covers the sun. The orbits' shapes are Earth's too: eccentricities of
 0.0167 and 0.0549, the moon's orbit tilted 5.145° to the ecliptic, with its
@@ -1649,12 +1656,18 @@ lasts 8½; the equinoxes fall between, and the season shows in the debug text.
 Other places on the planet see the sun from their own latitude and longitude.
 
 The moon shows its phases as the sun lights it and lights the night by its
-phase, brightest at full; it rises about four hours later each day. It stands where it is as seen from the eye, a degree's parallax from
+phase, brightest at full, its disc dimming away from full as the light it
+gives does; it rises about four and a half hours later each day on average
+(from under two hours to nearly eight at spawn's latitude, as its declination
+swings). It stands where it is as seen from the eye, a degree's parallax from
 where the planet's centre would see it. When it passes in front of the sun it
 hides the share of the disc the two circles overlap: a partial, total or
-annular eclipse that dims the daylight, from a strip of the planet only. When
-it passes through the planet's shadow, its light fades through the penumbra
-and the umbra and it glows a dim red. Its disc shows grey seas and the faint
+annular eclipse that dims the daylight. The moon's shadow on the planet is a
+patch several hundred kilometres across that moves over the ground, darker
+toward its middle, and from high above it shows as one. When the moon passes
+through the planet's shadow, its light fades through the penumbra and the
+umbra and it glows a dim red; the readout names a penumbral, partial or total
+eclipse by how deep into the shadow it goes. Its disc shows grey seas and the faint
 earthshine on its dark side. The stars are fixed in the ecliptic's frame, so
 they wheel round the celestial pole once a sidereal day and the south pole
 stands 45° over spawn's southern horizon.

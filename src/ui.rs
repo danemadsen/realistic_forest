@@ -49,8 +49,9 @@ pub struct TrainerState {
     status: Option<String>,
     /// The last sky jump's outcome.
     sky_status: Option<String>,
-    /// Sunrise and sunset, hours, for the day they were worked out for.
-    sun_times: Option<(i64, Option<f64>, Option<f64>)>,
+    /// Sunrise and sunset, seconds from the epoch, for the local midnight
+    /// and the place (the eye's direction) they were worked out for.
+    sun_times: Option<(f64, bevy::math::DVec3, Option<f64>, Option<f64>)>,
 }
 
 /// The streamed fields the diagnostics read when they exist, and the planet.
@@ -305,8 +306,10 @@ fn draw_debug_overlay(
         .bottom()
 }
 
-/// The time warps the developer menu offers.
-const TIME_WARPS: [f32; 6] = [1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0];
+/// The time warps the developer menu offers; at the default day's length the
+/// fastest runs a day in under a second and a half (the clock is held to a
+/// day a second whatever the warp, `day_night::MAXIMUM_DAYS_PER_SECOND`).
+const TIME_WARPS: [f32; 4] = [1.0, 10.0, 100.0, 1_000.0];
 
 fn clock_label(hours: f64) -> String {
     let minutes = (hours * 60.0).round() as i64 % (24 * 60);
@@ -344,9 +347,11 @@ fn sky_readout(day_night: &DayNightCycle, planet: &crate::planet::Planet, eye: b
             "Partial"
         };
         text += &format!("\n{kind} solar eclipse: {:.0}% of the sun hidden", view.solar_eclipse * 100.0);
-    } else if view.moon_sunlight < 0.98 && view.to_moon.dot(up) > 0.0 {
-        let kind = if view.moon_sunlight < 0.02 { "Total" } else { "Partial" };
-        text += &format!("\n{kind} lunar eclipse: {:.0}% of the moon's sunlight shadowed", (1.0 - view.moon_sunlight) * 100.0);
+    } else if let Some(kind) = sky.lunar_eclipse().filter(|_| view.moon_sunlight < 0.98 && view.to_moon.dot(up) > 0.0) {
+        text += &format!(
+            "\n{kind:?} lunar eclipse: {:.0}% of the moon's sunlight shadowed",
+            (1.0 - view.moon_sunlight) * 100.0
+        );
     }
     text
 }
@@ -359,11 +364,14 @@ fn draw_sky_controls(
     planet: &crate::planet::Planet,
     eye: bevy::math::DVec3,
 ) {
-    use crate::celestial::Orbits;
+    use crate::celestial::{Orbits, SOLAR_DAY};
     separator_text(ui, "Sun, moon and time");
+    // Edits only: clamping every frame would hold the running clock under
+    // the slider's end and keep it from reaching midnight.
     if ui
         .add(
             egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99)
+                .clamping(egui::SliderClamping::Edits)
                 .custom_formatter(|hours, _| clock_label(hours)),
         )
         .changed()
@@ -382,33 +390,43 @@ fn draw_sky_controls(
             }
         }
     });
+    // The buttons pick hours of the player's own day: sunrise and sunset
+    // there, and its local noon and midnight.
     let orbits = Orbits::new(planet);
-    if trainer.sun_times.is_none_or(|(day, _, _)| day != day_night.day) {
-        let (rise, set) = orbits.sunrise_and_sunset(day_night.day, eye);
-        trainer.sun_times = Some((day_night.day, rise, set));
+    let midnight = orbits.local_midnight(day_night.seconds(), eye);
+    let up = eye.normalize();
+    // Walking moves local midnight a little; a new day moves it a whole one.
+    let stale = trainer.sun_times.is_none_or(|(day, place, _, _)| {
+        (day - midnight).abs() > 0.25 * SOLAR_DAY || place.dot(up) < 0.1f64.to_radians().cos()
+    });
+    if stale {
+        let (rise, set) = orbits.sunrise_and_sunset(day_night.seconds(), eye);
+        trainer.sun_times = Some((midnight, up, rise, set));
     }
-    let (_, sunrise, sunset) = trainer.sun_times.unwrap_or_default();
+    let (_, _, sunrise, sunset) = trainer.sun_times.unwrap_or_default();
     ui.horizontal(|ui| {
         // A quarter hour after sunrise and before sunset.
-        for (label, hour) in [
-            ("Dawn", sunrise.map_or(6.25, |hours| (hours + 0.25).rem_euclid(24.0))),
-            ("Noon", 12.0),
-            ("Dusk", sunset.map_or(17.75, |hours| (hours - 0.25).rem_euclid(24.0))),
-            ("Night", 0.0),
+        for (label, seconds) in [
+            ("Dawn", sunrise.map_or(midnight + 0.26 * SOLAR_DAY, |time| time + 900.0)),
+            ("Noon", midnight + 0.5 * SOLAR_DAY),
+            ("Dusk", sunset.map_or(midnight + 0.74 * SOLAR_DAY, |time| time - 900.0)),
+            ("Night", midnight),
         ] {
             if ui.button(label).clicked() {
-                day_night.time_hours = hour as f32;
+                day_night.set_seconds(seconds);
                 day_night.paused = true;
             }
         }
     });
+    let clock = |seconds: f64| clock_label((seconds / 3600.0).rem_euclid(24.0));
     ui.small(format!(
-        "Sunrise {}  ·  sunset {}",
-        sunrise.map_or("none".to_owned(), clock_label),
-        sunset.map_or("none".to_owned(), clock_label),
+        "Sunrise {}  ·  sunset {}  (local noon {})",
+        sunrise.map_or("none".to_owned(), clock),
+        sunset.map_or("none".to_owned(), clock),
+        clock(midnight + 0.5 * SOLAR_DAY),
     ));
     ui.checkbox(&mut day_night.paused, "Hold selected time");
-    let warp_label = |warp: f32| if warp == 1.0 { "Real time".to_owned() } else { format!("{warp:.0}x") };
+    let warp_label = |warp: f32| format!("{warp:.0}x");
     egui::ComboBox::from_label("Time warp")
         .selected_text(warp_label(day_night.warp))
         .show_ui(ui, |ui| {
@@ -418,7 +436,7 @@ fn draw_sky_controls(
         });
     if ui.button("Next eclipse").clicked() {
         // Look ten years ahead.
-        let days = 10.0 * orbits.year() / crate::celestial::SOLAR_DAY;
+        let days = 10.0 * orbits.year() / SOLAR_DAY;
         trainer.sky_status = Some(match orbits.next_eclipse(day_night.seconds(), eye, days) {
             Some((seconds, kind)) => {
                 day_night.set_seconds(seconds);
@@ -803,7 +821,8 @@ fn draw_advanced_controls(
     ui.add(thunder_volume_slider);
 
     separator_text(ui, "Sun and time");
-    let mut time_of_day_slider = egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99);
+    let mut time_of_day_slider =
+        egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99).clamping(egui::SliderClamping::Edits);
     time_of_day_slider = time_of_day_slider.text("Time of day");
     time_of_day_slider = time_of_day_slider.custom_formatter(|hours, _| {
         let minutes = (hours * 60.0).round() as u32 % (24 * 60);

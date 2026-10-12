@@ -10,14 +10,18 @@ use bevy::prelude::{Real, Res, ResMut, Resource, Time};
 
 #[derive(Clone, Copy, Debug, Resource)]
 pub struct DayNightCycle {
-    pub time_hours: f32,
+    /// Hours of the day, in [0, 24); f64 keeps a slow clock from stalling
+    /// on rounding at high frame rates.
+    pub time_hours: f64,
     /// Days since the epoch, midsummer's day with a full moon.
     pub day: i64,
     pub paused: bool,
     /// Real minutes for a complete 24-hour cycle.
     pub day_length_minutes: f32,
     /// How many times faster than that the clock runs: the developer menu's
-    /// time warp, for watching the moon's phases and the seasons go by.
+    /// time warp, for watching the moon's phases and the seasons go by. The
+    /// clock never runs faster than a day each real second, so day and
+    /// night do not flash.
     pub warp: f32,
 }
 
@@ -43,18 +47,30 @@ impl DayNightCycle {
         {
             return;
         }
-        // f64 intermediate keeps long frames and very short cycles well
-        // defined. Midnight starts the next day.
+        // Midnight starts the next day.
         let warp = if self.warp.is_finite() && self.warp > 0.0 { self.warp as f64 } else { 1.0 };
-        let elapsed_hours = delta_seconds as f64 * warp * 24.0 / (self.day_length_minutes as f64 * 60.0);
-        let hours = self.time_hours as f64 + elapsed_hours;
-        self.day += hours.div_euclid(24.0) as i64;
-        self.time_hours = (hours.rem_euclid(24.0) as f32).min(23.999_998);
+        let elapsed_hours = (delta_seconds as f64 * warp * 24.0 / (self.day_length_minutes as f64 * 60.0))
+            .min(MAXIMUM_DAYS_PER_SECOND * delta_seconds as f64 * 24.0);
+        self.set_hours(self.time_hours + elapsed_hours);
+    }
+
+    /// Set the clock to `hours` past the start of the current day, carrying
+    /// whole days into the day count.
+    fn set_hours(&mut self, hours: f64) {
+        let mut day = self.day + hours.div_euclid(24.0) as i64;
+        let mut time = hours.rem_euclid(24.0);
+        // A hair under a whole day can round up to 24.
+        if time >= 24.0 {
+            day += 1;
+            time = 0.0;
+        }
+        self.day = day;
+        self.time_hours = time;
     }
 
     /// Celestial seconds since the epoch.
     pub fn seconds(&self) -> f64 {
-        (self.day as f64 + self.time_hours as f64 / 24.0) * SOLAR_DAY
+        (self.day as f64 + self.time_hours / 24.0) * SOLAR_DAY
     }
 
     /// Set the clock to `seconds` since the epoch.
@@ -64,7 +80,7 @@ impl DayNightCycle {
         }
         let days = seconds / SOLAR_DAY;
         self.day = days.floor() as i64;
-        self.time_hours = ((days - days.floor()) * 24.0).clamp(0.0, 23.999_998) as f32;
+        self.set_hours((days - days.floor()) * 24.0);
     }
 }
 
@@ -88,11 +104,17 @@ pub struct CelestialLighting {
     pub sun_visible: f32,
     /// The share of sunlight that reaches the moon past the planet's shadow.
     pub moon_sunlight: f32,
+    /// The moon disc's sunlit radiance for its phase over a full moon's.
+    pub moon_disc_brightness: f32,
 }
 
 /// Moonlight over the ground under a full moon high in the sky, relative to
 /// the sun's intensity setting.
 pub const FULL_MOONLIGHT: f32 = 0.16;
+
+/// The most days the clock runs through in a real second, whatever the time
+/// warp and the day's length: faster, day and night would flash.
+pub const MAXIMUM_DAYS_PER_SECOND: f64 = 1.0;
 
 fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
@@ -124,6 +146,7 @@ pub fn at_elevation(sun_direction: [f32; 4], moon_direction: [f32; 4], elevation
         moon_radius: 0.004_52,
         sun_visible: 1.0,
         moon_sunlight: 1.0,
+        moon_disc_brightness: 1.0,
     }
 }
 
@@ -141,12 +164,16 @@ pub fn lighting(view: &SkyView, to_world: impl Fn(DVec3) -> DVec3) -> CelestialL
     // Near totality the sky darkens to a twilight with stars.
     light.daylight *= visible.sqrt();
     light.sun_visible = visible;
+    // Moonlight is lost in daylight, and the shaders skip its shadows and
+    // light marches once it is gone.
     light.moon_intensity = FULL_MOONLIGHT
         * (view.moon_phase_brightness * view.moon_sunlight) as f32
-        * smoothstep(0.0, 0.18, moon.y as f32);
+        * smoothstep(0.0, 0.18, moon.y as f32)
+        * smoothstep(0.0, 0.18, -sun.y as f32);
     light.sun_radius = view.sun_radius as f32;
     light.moon_radius = view.moon_radius as f32;
     light.moon_sunlight = view.moon_sunlight as f32;
+    light.moon_disc_brightness = view.moon_disc_brightness as f32;
     light
 }
 
@@ -161,7 +188,7 @@ mod tests {
     use crate::planet::Planet;
 
     /// The light over spawn at `day` and `hours`.
-    fn light_at(day: i64, hours: f32) -> CelestialLighting {
+    fn light_at(day: i64, hours: f64) -> CelestialLighting {
         let planet = Planet::default();
         let cycle = DayNightCycle { day, time_hours: hours, ..DayNightCycle::default() };
         let view = Orbits::new(&planet).at(cycle.seconds()).seen_from(DVec3::new(0.0, planet.radius, 0.0));
@@ -183,7 +210,7 @@ mod tests {
         assert!(midnight.moon_intensity > 0.5 * FULL_MOONLIGHT, "{}", midnight.moon_intensity);
         assert!(midnight.moon_direction[1] < -0.2);
         for step in 0..96 {
-            let light = light_at(0, step as f32 * 0.25);
+            let light = light_at(0, step as f64 * 0.25);
             for direction in [light.sun_direction, light.moon_direction] {
                 let length_squared: f32 = direction[..3].iter().map(|v| v * v).sum();
                 assert!((length_squared - 1.0).abs() < 1e-5);
@@ -198,8 +225,38 @@ mod tests {
         // Half a synodic month on: new, whatever the hour.
         let day = (0.5 * orbits.synodic_month() / SOLAR_DAY).round() as i64;
         for hour in 0..24 {
-            assert!(light_at(day, hour as f32).moon_intensity < 0.01 * FULL_MOONLIGHT);
+            assert!(light_at(day, hour as f64).moon_intensity < 0.01 * FULL_MOONLIGHT);
         }
+    }
+
+    #[test]
+    fn local_midnight_survives_the_clocks_round_trip() {
+        // Setting the clock to a place's local midnight, as the developer
+        // menu's Night does, leaves it in the day that midnight starts,
+        // however often it is pressed.
+        let planet = Planet::default();
+        let orbits = Orbits::new(&planet);
+        for metres_east in [1.0, 11.0, 300.0, 5000.0, 2.0e5] {
+            let angle = metres_east / planet.radius;
+            let eye = DVec3::new(angle.sin(), angle.cos(), 0.0) * planet.radius;
+            for day in [0, 1, 5, 6, 65, 70] {
+                let mut cycle = DayNightCycle { day, time_hours: 10.0, ..DayNightCycle::default() };
+                let first = orbits.local_midnight(cycle.seconds(), eye);
+                for _ in 0..3 {
+                    cycle.set_seconds(orbits.local_midnight(cycle.seconds(), eye));
+                    assert_eq!(orbits.local_midnight(cycle.seconds(), eye), first, "{metres_east} m, day {day}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_moon_gives_no_light_in_daylight() {
+        // A day and a third on, the waning moon stands high in the morning
+        // sky.
+        let light = light_at(1, 9.0);
+        assert!(light.moon_direction[1] < -0.3 && light.sun_direction[1] < -0.5);
+        assert_eq!(light.moon_intensity, 0.0);
     }
 
     #[test]
@@ -220,18 +277,33 @@ mod tests {
     fn cycle_uses_elapsed_time_counts_days_and_pauses() {
         let mut cycle = DayNightCycle::default();
         cycle.advance(60.0);
-        assert!((cycle.time_hours - 11.0).abs() < 1e-5);
+        assert!((cycle.time_hours - 11.0).abs() < 1e-9);
         cycle.time_hours = 23.5;
         cycle.advance(60.0);
-        assert!((cycle.time_hours - 0.5).abs() < 1e-5);
+        assert!((cycle.time_hours - 0.5).abs() < 1e-9);
         assert_eq!(cycle.day, 1);
-        cycle.advance(24.0 * 60.0);
-        assert!((cycle.time_hours - 0.5).abs() < 1e-5);
+        for _ in 0..24 * 60 {
+            cycle.advance(1.0);
+        }
+        assert!((cycle.time_hours - 0.5).abs() < 1e-9);
         assert_eq!(cycle.day, 2);
-        // Warp runs it faster.
+        // Warp runs it faster, but never past a day a second.
         cycle.warp = 10.0;
-        cycle.advance(24.0 * 60.0);
+        for _ in 0..24 * 60 {
+            cycle.advance(1.0);
+        }
         assert_eq!(cycle.day, 12);
+        cycle.warp = 10_000.0;
+        let before = cycle.seconds();
+        cycle.advance(0.5);
+        assert!((cycle.seconds() - before - 0.5 * SOLAR_DAY).abs() < 1e-6);
+        // A real-time day at 360 frames a second keeps time.
+        let mut slow = DayNightCycle { time_hours: 16.0, day_length_minutes: 1440.0, ..DayNightCycle::default() };
+        for _ in 0..360 * 60 {
+            slow.advance(1.0 / 360.0);
+        }
+        assert!((slow.time_hours - (16.0 + 1.0 / 60.0)).abs() < 1e-6, "{}", slow.time_hours);
+        cycle.time_hours = 0.5;
         cycle.warp = 1.0;
         cycle.paused = true;
         cycle.advance(60.0);
@@ -245,8 +317,11 @@ mod tests {
         assert!((cycle.seconds() - (12.0 + 0.5 / 24.0) * SOLAR_DAY).abs() < 1e-6);
         cycle.set_seconds(-0.25 * SOLAR_DAY);
         assert_eq!(cycle.day, -1);
-        assert!((cycle.time_hours - 18.0).abs() < 1e-4);
+        assert!((cycle.time_hours - 18.0).abs() < 1e-9);
+        cycle.set_seconds(3.0 * SOLAR_DAY - 1e-9);
+        assert!(cycle.time_hours < 24.0 && cycle.seconds() <= 3.0 * SOLAR_DAY);
+        let kept = (cycle.day, cycle.time_hours);
         cycle.set_seconds(f64::NAN);
-        assert_eq!(cycle.day, -1);
+        assert_eq!((cycle.day, cycle.time_hours), kept);
     }
 }

@@ -2,9 +2,10 @@
 //! moon round the planet, on Kepler orbits, in Earth's proportions.
 //!
 //! Every size, distance and mass is Earth's, the Moon's and the Sun's in
-//! units of the planet's own radius and mass: the moon a 0.273-radius ball
-//! 60.3 radii out with 1/81 of the planet's mass, the sun 109 radii across
-//! and 23,481 radii away with 333,000 times its mass, so both discs span the
+//! units of the planet's own radius and mass: the moon a ball of 0.273 the
+//! planet's radius 60.3 radii out with 1/81 of the planet's mass, the sun a
+//! ball of 109 radii 23,481 radii away with 333,000 times its mass, so both
+//! discs span the
 //! half degree they do from Earth and eclipses come out as Earth's do, total
 //! and annular. The orbits' shapes are Earth's too (eccentricities 0.0167 and
 //! 0.0549, the moon's tilted 5.145° to the ecliptic, its nodes and perigee
@@ -138,12 +139,12 @@ impl Orbits {
 
     /// The planet's north pole in its own (the cube faces') axes.
     pub fn pole(&self) -> DVec3 {
-        self.to_planet_axes(DVec3::Z)
+        self.planet_axes_of(DVec3::Z)
     }
 
     /// A body-axes vector in the planet's (spawn-frame) axes: east to +X, up
     /// to +Y and, for a turn rather than a mirror, north to -Z.
-    fn to_planet_axes(&self, body: DVec3) -> DVec3 {
+    fn planet_axes_of(&self, body: DVec3) -> DVec3 {
         DVec3::new(body.dot(self.spawn_east), body.dot(self.spawn_up), -body.dot(self.spawn_north))
     }
 
@@ -167,9 +168,9 @@ impl Orbits {
         );
         // Body to the planet's (spawn-frame) axes.
         let planet = DMat3::from_cols(
-            self.to_planet_axes(DVec3::X),
-            self.to_planet_axes(DVec3::Y),
-            self.to_planet_axes(DVec3::Z),
+            self.planet_axes_of(DVec3::X),
+            self.planet_axes_of(DVec3::Y),
+            self.planet_axes_of(DVec3::Z),
         );
         planet * spun * equatorial
     }
@@ -210,21 +211,42 @@ impl Orbits {
         }
     }
 
+    /// How many hours the local mean time of an eye at `eye` (planet-
+    /// centred, planet axes) runs ahead of the clock's, which is spawn's: its
+    /// longitude east of spawn, an hour for every 15°.
+    pub fn local_hours_ahead(&self, eye: DVec3) -> f64 {
+        // Back from the planet's axes to the body's (`planet_axes_of`).
+        let body = self.spawn_east * eye.x + self.spawn_up * eye.y - self.spawn_north * eye.z;
+        body.y.atan2(body.x).to_degrees() / 15.0
+    }
+
+    /// The start of the local day, in seconds from the epoch, of an eye at
+    /// `eye` at `seconds`: its local midnight.
+    pub fn local_midnight(&self, seconds: f64, eye: DVec3) -> f64 {
+        let ahead = self.local_hours_ahead(eye) * 3600.0;
+        // The clock's round trip through its day and hours can land a few
+        // ulps short of the midnight it was set to; a tenth of a millisecond
+        // of slack keeps that moment in the day it starts.
+        ((seconds + ahead) / SOLAR_DAY + 1.0e-9).floor() * SOLAR_DAY - ahead
+    }
+
     /// When the sun's centre rises and sets over the horizon of an eye at
-    /// `eye` (planet-centred, planet axes) on day `day` of the clock, in
-    /// hours: none for a crossing that day lacks, near the poles.
-    pub fn sunrise_and_sunset(&self, day: i64, eye: DVec3) -> (Option<f64>, Option<f64>) {
+    /// `eye` (planet-centred, planet axes) in its local day at `seconds`,
+    /// in seconds from the epoch: none for a crossing that day lacks, near
+    /// the poles.
+    pub fn sunrise_and_sunset(&self, seconds: f64, eye: DVec3) -> (Option<f64>, Option<f64>) {
         let up = eye.normalize();
-        let elevation = |hours: f64| self.at((day as f64 + hours / 24.0) * SOLAR_DAY).seen_from(eye).to_sun.dot(up);
+        let start = self.local_midnight(seconds, eye);
+        let elevation = |time: f64| self.at(time).seen_from(eye).to_sun.dot(up);
         let steps = 96;
-        let step = 24.0 / steps as f64;
+        let step = SOLAR_DAY / steps as f64;
         let (mut rise, mut set) = (None, None);
-        let mut previous = elevation(0.0);
+        let mut previous = elevation(start);
         for index in 1..=steps {
-            let hours = index as f64 * step;
-            let current = elevation(hours);
+            let time = start + index as f64 * step;
+            let current = elevation(time);
             if (previous < 0.0) != (current < 0.0) {
-                let (mut low, mut high) = (hours - step, hours);
+                let (mut low, mut high) = (time - step, time);
                 for _ in 0..30 {
                     let middle = 0.5 * (low + high);
                     if (elevation(middle) < 0.0) == (previous < 0.0) {
@@ -281,20 +303,25 @@ impl Orbits {
             let lunar = if view.to_moon.dot(up) > 0.0 { (1.0 - view.moon_sunlight) / 0.2 } else { 0.0 };
             if solar >= lunar { (solar, Eclipse::Solar) } else { (lunar, Eclipse::Lunar) }
         };
-        // Three degrees from both alignments the bodies cannot line up
-        // within the coarse step: the moon gains under a degree on the sun in
-        // twenty minutes, and the eclipses need it within a degree and two
-        // thirds (its parallax and the discs, or the planet's penumbra).
+        // Far enough from both alignments the bodies cannot line up within
+        // the coarse step, a 415th of the month: the moon gains under a
+        // degree on the sun in it, and the eclipses need it within a degree
+        // and two thirds of them (its parallax from the ground and the
+        // discs, or the planet's penumbra), more for an eye high above the
+        // planet, which sees the moon further displaced.
+        let perigee = MOON_DISTANCE * (1.0 - MOON_ECCENTRICITY) * self.radius;
+        let parallax = |distance: f64| (distance / perigee).min(1.0).asin();
+        let extra = (parallax(eye.length()) - parallax(self.radius)).max(0.0);
+        let threshold = (3f64.to_radians() + extra).cos();
         let far = |time: f64| {
             let sky = self.at(time);
             let sun = sky.sun.normalize();
             let moon = sky.moon.normalize();
-            let threshold = 3f64.to_radians().cos();
             sun.dot(moon) < threshold && (-sun).dot(moon) < threshold
         };
         const VISIBLE: f64 = 1.0;
-        let coarse = 1200.0;
-        let fine = 60.0;
+        let coarse = self.month() / 415.0;
+        let fine = coarse / 20.0;
         let end = seconds + days * SOLAR_DAY;
         let mut time = seconds;
         // Pass over an eclipse already under way.
@@ -311,7 +338,7 @@ impl Orbits {
                 // Follow it to its deepest moment.
                 let (mut deepest, mut at) = (now, time);
                 let mut probe = time + fine;
-                while probe < time + SOLAR_DAY {
+                while probe < time + self.month() {
                     let (next, _) = depth(probe);
                     if next <= VISIBLE {
                         break;
@@ -334,6 +361,14 @@ impl Orbits {
 pub enum Eclipse {
     Solar,
     Lunar,
+}
+
+/// How deep into the planet's shadow the moon goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LunarEclipse {
+    Penumbral,
+    Partial,
+    Total,
 }
 
 /// The true anomaly of a Kepler orbit of eccentricity `e` at `mean_anomaly`,
@@ -397,6 +432,13 @@ pub struct SkyView {
     /// and the way a rough surface dims away from opposition (Allen's
     /// lunar phase law).
     pub moon_phase_brightness: f64,
+    /// The drawn disc's sunlit radiance over a full moon's, for its light
+    /// to total the phase law's: the shaders' shading (`moonDisc`) sums to
+    /// about the lit share times 0.55 + 0.45 e^(-phase angle / 1.3) of a
+    /// full moon's. The phase law is fitted out to 150°; past it the ratio
+    /// holds its value there, about a tenth, so the thinnest crescents are
+    /// not drawn brighter than thicker ones.
+    pub moon_disc_brightness: f64,
     /// How much of the sun's disc the moon hides from the eye.
     pub solar_eclipse: f64,
     /// How much sunlight reaches the moon past the planet's shadow.
@@ -423,6 +465,11 @@ impl Sky {
         let moon_lit = 0.5 * (1.0 + phase_angle.cos());
         let degrees = phase_angle.to_degrees();
         let moon_phase_brightness = 10f64.powf(-0.4 * (0.026 * degrees + 4.0e-9 * degrees.powi(4)));
+        let fit = phase_angle.min(150f64.to_radians());
+        let fit_degrees = fit.to_degrees();
+        let fit_brightness = 10f64.powf(-0.4 * (0.026 * fit_degrees + 4.0e-9 * fit_degrees.powi(4)));
+        let shading = 0.5 * (1.0 + fit.cos()) * (0.55 + 0.45 * (-fit / 1.3).exp());
+        let moon_disc_brightness = (fit_brightness / shading).min(1.0);
         let separation = to_sun.dot(to_moon).clamp(-1.0, 1.0).acos();
         SkyView {
             to_sun,
@@ -431,6 +478,7 @@ impl Sky {
             moon_radius,
             moon_lit,
             moon_phase_brightness,
+            moon_disc_brightness,
             solar_eclipse: disc_overlap(sun_radius, moon_radius, separation),
             moon_sunlight: self.moon_sunlight(),
         }
@@ -440,20 +488,46 @@ impl Sky {
     /// one outside the planet's penumbra, none deep in its umbra, the cone
     /// widths following from the sun's and the planet's sizes.
     pub fn moon_sunlight(&self) -> f64 {
-        let away = -self.sun.normalize();
-        let along = self.moon.dot(away);
-        if along <= 0.0 {
+        let Some((off_axis, umbra, penumbra)) = self.shadow() else {
             return 1.0;
-        }
-        let off_axis = (self.moon - away * along).length();
-        let sun_distance = self.sun.length();
-        let umbra = self.planet_radius - along * (self.sun_radius - self.planet_radius) / sun_distance;
-        let penumbra = self.planet_radius + along * (self.sun_radius + self.planet_radius) / sun_distance;
+        };
         // Sunlight at a point rises across the penumbra; the moon's disc
         // takes the average over its width.
         let light = |distance: f64| ((distance - umbra) / (penumbra - umbra)).clamp(0.0, 1.0);
         let m = self.moon_radius;
         0.25 * (light(off_axis - m) + 2.0 * light(off_axis) + light(off_axis + m))
+    }
+
+    /// Where the moon is in the planet's shadow: its centre's distance from
+    /// the shadow's axis and the umbra's and the penumbra's radii there, or
+    /// none on the sun's side of the planet.
+    fn shadow(&self) -> Option<(f64, f64, f64)> {
+        let away = -self.sun.normalize();
+        let along = self.moon.dot(away);
+        if along <= 0.0 {
+            return None;
+        }
+        let off_axis = (self.moon - away * along).length();
+        let sun_distance = self.sun.length();
+        let umbra = self.planet_radius - along * (self.sun_radius - self.planet_radius) / sun_distance;
+        let penumbra = self.planet_radius + along * (self.sun_radius + self.planet_radius) / sun_distance;
+        Some((off_axis, umbra, penumbra))
+    }
+
+    /// The kind of eclipse of the moon under way, if any: all of it in the
+    /// umbra, some of it, or only in the penumbra.
+    pub fn lunar_eclipse(&self) -> Option<LunarEclipse> {
+        let (off_axis, umbra, penumbra) = self.shadow()?;
+        let m = self.moon_radius;
+        if off_axis + m <= umbra {
+            Some(LunarEclipse::Total)
+        } else if off_axis - m < umbra {
+            Some(LunarEclipse::Partial)
+        } else if off_axis - m < penumbra {
+            Some(LunarEclipse::Penumbral)
+        } else {
+            None
+        }
     }
 }
 
@@ -687,15 +761,36 @@ mod tests {
         let orbits = orbits();
         // 45° south at the solstice: a day of 15.4 hours round noon, give or
         // take the equation of time.
-        let (rise, set) = orbits.sunrise_and_sunset(0, spawn());
-        let (rise, set) = (rise.unwrap(), set.unwrap());
+        let hours = |seconds: Option<f64>| seconds.unwrap() / 3600.0;
+        let (rise, set) = orbits.sunrise_and_sunset(0.3 * SOLAR_DAY, spawn());
+        let (rise, set) = (hours(rise), hours(set));
         assert!((rise - 4.29).abs() < 0.3 && (set - 19.71).abs() < 0.3, "{rise} {set}");
         assert!((set - rise - 15.43).abs() < 0.1, "{}", set - rise);
         // Half a year on, 8.6 hours.
-        let winter = (0.5 * orbits.year() / SOLAR_DAY).round() as i64;
+        let winter = (0.5 * orbits.year() / SOLAR_DAY).round() * SOLAR_DAY;
         let (rise, set) = orbits.sunrise_and_sunset(winter, spawn());
-        let length = set.unwrap() - rise.unwrap();
+        let length = hours(set) - hours(rise);
         assert!((length - 8.57).abs() < 0.15, "{length}");
+        // Anywhere along spawn's latitude the sun rises and sets within the
+        // local day, every day of the year, at the local hours spawn sees.
+        let radius = Planet::default().radius;
+        for degrees in (0..360).step_by(30) {
+            let longitude = (degrees as f64).to_radians();
+            let latitude = SPAWN_LATITUDE_DEGREES.to_radians();
+            let body = DVec3::new(latitude.cos() * longitude.cos(), latitude.cos() * longitude.sin(), latitude.sin());
+            let eye = orbits.planet_axes_of(body) * radius;
+            let ahead = orbits.local_hours_ahead(eye);
+            assert!(((ahead - degrees as f64 / 15.0 + 12.0).rem_euclid(24.0) - 12.0).abs() < 1e-9, "{ahead}");
+            for day in 0..78 {
+                let moment = (day as f64 + 0.5) * SOLAR_DAY - ahead * 3600.0;
+                let midnight = orbits.local_midnight(moment, eye);
+                assert!((moment - midnight - 0.5 * SOLAR_DAY).abs() < 1e-6);
+                let (rise, set) = orbits.sunrise_and_sunset(moment, eye);
+                let (rise, set) = (rise.unwrap() - midnight, set.unwrap() - midnight);
+                assert!(rise > 3.0 * 3600.0 && rise < 8.5 * 3600.0, "{degrees}° day {day}: {rise}");
+                assert!(set > 15.5 * 3600.0 && set < 21.0 * 3600.0, "{degrees}° day {day}: {set}");
+            }
+        }
         // The seasons are the hemispheres' opposites.
         let sky = orbits.at(0.0);
         assert_eq!(orbits.season(&sky, spawn()), "summer");
@@ -743,5 +838,84 @@ mod tests {
         }
         assert!(solar > 0 && lunar > 0, "{solar} solar, {lunar} lunar");
         assert_eq!(orbits.next_eclipse(0.0, spawn(), 0.5), None);
+    }
+
+    #[test]
+    fn the_eclipse_search_misses_none_on_a_small_planet() {
+        // The smallest planet's month is half a day: the search's steps go
+        // with it. A dense scan finds the same eclipses.
+        let planet = Planet::with_radius(5215.0);
+        let orbits = Orbits::new(&planet);
+        let eye = DVec3::new(0.0, planet.radius, 0.0);
+        let days = 8.0;
+        let deep = |time: f64| {
+            let view = orbits.at(time).seen_from(eye);
+            (view.to_sun.y > 0.0 && view.solar_eclipse > 0.02) || (view.to_moon.y > 0.0 && view.moon_sunlight < 0.8)
+        };
+        let mut dense = Vec::new();
+        let mut inside = false;
+        let step = 10.0;
+        let mut time = 0.0;
+        while time < days * SOLAR_DAY {
+            let now = deep(time);
+            if now && !inside {
+                dense.push(time);
+            }
+            inside = now;
+            time += step;
+        }
+        assert!(!dense.is_empty());
+        let mut found = Vec::new();
+        let mut from = 0.0;
+        while let Some((at, _)) = orbits.next_eclipse(from, eye, days - from / SOLAR_DAY) {
+            found.push(at);
+            from = at;
+        }
+        // Each eclipse the dense scan saw deeply is found, at or after its
+        // start and within the month.
+        for start in &dense {
+            assert!(
+                found.iter().any(|at| *at >= start - orbits.month() / 8300.0 && *at < start + 0.25 * orbits.month()),
+                "missed the eclipse at {start}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_moon_is_drawn_as_bright_as_its_phase_and_the_shadow_names_its_eclipses() {
+        let orbits = orbits();
+        let full = orbits.at(0.0).seen_from(spawn());
+        // A few degrees off full as the eye sees it.
+        assert!(full.moon_disc_brightness > 0.85, "{}", full.moon_disc_brightness);
+        let quarter = orbits.at(0.25 * orbits.synodic_month()).seen_from(spawn());
+        assert!(quarter.moon_disc_brightness < 0.3, "{}", quarter.moon_disc_brightness);
+        for step in 0..200 {
+            let view = orbits.at(step as f64 * orbits.synodic_month() / 200.0).seen_from(spawn());
+            assert!(view.moon_disc_brightness.is_finite() && view.moon_disc_brightness > 0.0);
+            assert!(view.moon_disc_brightness <= 1.0);
+            // Toward new the disc only dims.
+            if view.moon_lit < 0.1 {
+                assert!(view.moon_disc_brightness < 0.12, "{view:?}");
+            }
+        }
+        // Over a few years: a moon wholly in the umbra is dark, one clear of
+        // the penumbra fully lit.
+        let mut kinds = [0; 3];
+        for step in 0..60_000 {
+            let sky = orbits.at(step as f64 * 0.05 * orbits.synodic_month() / 4.0 + 0.0);
+            match sky.lunar_eclipse() {
+                Some(LunarEclipse::Total) => {
+                    kinds[2] += 1;
+                    assert!(sky.moon_sunlight() < 1e-9);
+                }
+                Some(LunarEclipse::Partial) => kinds[1] += 1,
+                Some(LunarEclipse::Penumbral) => {
+                    kinds[0] += 1;
+                    assert!(sky.moon_sunlight() > 0.0);
+                }
+                None => assert_eq!(sky.moon_sunlight(), 1.0),
+            }
+        }
+        assert!(kinds.iter().all(|count| *count > 0), "{kinds:?}");
     }
 }

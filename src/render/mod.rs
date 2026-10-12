@@ -178,7 +178,7 @@ pub struct ExtractedForestView {
 // silently drift.
 // ---------------------------------------------------------------------------
 
-/// The shared `GlobalUniforms` preamble (group 0, binding 0), 528 bytes.
+/// The shared `GlobalUniforms` preamble (group 0, binding 0), 544 bytes.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GlobalUniformsGpu {
@@ -223,8 +223,12 @@ pub struct GlobalUniformsGpu {
     /// The turn from the world's axes to the ecliptic's, where the stars
     /// are fixed, as a quaternion (x, y, z, w).
     pub stars: [f32; 4],
+    /// The moon's centre from the camera in world axes, metres, for its
+    /// shadow on the planet; w the brightness of its sunlit disc for its
+    /// phase over a full moon's.
+    pub moon: [f32; 4],
 }
-const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 528);
+const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 544);
 
 /// `sun_direction.w` until the terrain pass has measured the heightfield: no
 /// march ever rises above it, so the shaders' early exits stay off.
@@ -792,6 +796,7 @@ pub fn prepare_forest_globals(
     let frame = planet_view.frame;
     let world_to_ecliptic = sky.to_ecliptic * bevy::math::DMat3::from_cols(frame.east, frame.up, frame.north);
     let stars = bevy::math::DQuat::from_mat3(&world_to_ecliptic).normalize();
+    let moon = planet_view.to_world(sky.moon - planet_view.eye);
     let weather = view.weather.conditions(&view.settings);
     let heightfield_texel = terrain_node::LIGHTING_HEIGHTFIELD_SPAN
         / terrain_node::LIGHTING_HEIGHTFIELD_SIZE as f32;
@@ -926,6 +931,7 @@ pub fn prepare_forest_globals(
         ],
         celestial: [lighting.sun_radius, lighting.moon_radius, lighting.sun_visible, lighting.moon_sunlight],
         stars: [stars.x as f32, stars.y as f32, stars.z as f32, stars.w as f32],
+        moon: [moon.x as f32, moon.y as f32, moon.z as f32, lighting.moon_disc_brightness],
     };
     if globals.buffer.is_none() {
         // Created straight off the wgpu device so the field can stay a raw
@@ -1081,6 +1087,7 @@ mod tests {
             ("planet_north", std::mem::offset_of!(GlobalUniformsGpu, planet_north)),
             ("celestial", std::mem::offset_of!(GlobalUniformsGpu, celestial)),
             ("stars", std::mem::offset_of!(GlobalUniformsGpu, stars)),
+            ("moon", std::mem::offset_of!(GlobalUniformsGpu, moon)),
         ];
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
         let mut checked = 0;

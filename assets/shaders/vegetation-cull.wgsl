@@ -50,6 +50,7 @@ struct GlobalUniforms {
     planet_north: vec4<f32>,    // camera north in planet axes
     celestial: vec4<f32>,       // sun and moon angular radii, sun's unhidden share, moon's sunlight
     stars: vec4<f32>,           // world to ecliptic axes as a quaternion: the stars' frame
+    moon: vec4<f32>,            // the moon's centre from the camera, world metres; w its disc's phase brightness
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
@@ -279,13 +280,49 @@ fn planetSunElevationAt(world: vec3<f32>) -> f32
     return dot(-normalize(globals.sun_direction.xyz), planetUpAt(world));
 }
 
+// The share of a disc of angular radius `a` that one of radius `b`, its
+// centre `separation` away, leaves showing: the circles' overlap
+// (celestial.rs disc_overlap).
+fn planetDiscShown(a: f32, b: f32, separation: f32) -> f32
+{
+    if (separation >= a + b) { return 1.0; }
+    if (separation <= abs(a - b)) {
+        if (b >= a) { return 0.0; }
+        return 1.0 - (b*b)/(a*a);
+    }
+    let lens_a = a*a*acos(clamp((separation*separation + a*a - b*b)/(2.0*separation*a), -1.0, 1.0));
+    let lens_b = b*b*acos(clamp((separation*separation + b*b - a*a)/(2.0*separation*b), -1.0, 1.0));
+    let kite = 0.5*sqrt(max((-separation + a + b)*(separation + a - b)
+                            *(separation - a + b)*(separation + a + b), 0.0));
+    return clamp(1.0 - (lens_a + lens_b - kite)/(3.14159265*a*a), 0.0, 1.0);
+}
+
+// The share of the sun's disc the moon leaves showing at a world point. The
+// moon is near enough that it hides the sun only from a patch of the planet,
+// its shadow, which moves over the ground (globals.moon, its centre from the
+// camera; its angular radius at the camera gives its size). At the camera it
+// is globals.celestial.z.
+fn planetSunShownAt(world: vec3<f32>) -> f32
+{
+    let to_moon = globals.moon.xyz - (world - globals.camera_position.xyz);
+    let to_sun = -normalize(globals.sun_direction.xyz);
+    let along = dot(to_moon, to_sun);
+    if (along <= 0.0) { return 1.0; }
+    let distance = length(to_moon);
+    let moon_radius = sin(globals.celestial.y)*length(globals.moon.xyz)/distance;
+    let separation = length(to_moon - to_sun*along)/distance;
+    let sun_radius = globals.celestial.x;
+    if (separation >= sun_radius + moon_radius) { return 1.0; }
+    return planetDiscShown(sun_radius, moon_radius, separation);
+}
+
 // The day/night cycle's daylight curve (day_night.rs at_elevation) at a world
 // point, so the night side of the planet is dark seen from the day side,
-// darkened as the moon hides the sun (globals.celestial.z, the share it leaves).
-// At the camera it is globals.atmosphere.x.
+// darkened where the moon hides the sun. At the camera it is
+// globals.atmosphere.x.
 fn planetDaylightAt(world: vec3<f32>) -> f32
 {
-    return smoothstep(-0.18, 0.18, planetSunElevationAt(world))*sqrt(globals.celestial.z);
+    return smoothstep(-0.18, 0.18, planetSunElevationAt(world))*sqrt(planetSunShownAt(world));
 }
 
 // The direct sunlight reaching a world point: the day/night cycle's colour
@@ -297,7 +334,7 @@ fn planetSunlightAt(world: vec3<f32>) -> vec3<f32>
     let elevation = planetSunElevationAt(world);
     let colourMix = smoothstep(0.0, 0.55, elevation);
     let colour = vec3<f32>(1.0, 0.29 + 0.66*colourMix, 0.095 + 0.765*colourMix);
-    return colour*globals.sun_colour.w*smoothstep(0.0, 0.12, elevation)*globals.celestial.z;
+    return colour*globals.sun_colour.w*smoothstep(0.0, 0.12, elevation)*planetSunShownAt(world);
 }
 
 // The air's density scale height. Haze thins with it above the ground fog's
