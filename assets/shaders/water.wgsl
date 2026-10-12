@@ -1757,9 +1757,15 @@ fn waterMedium(body: WaterBody) -> WaterMedium
 // weight them, so where the spread is narrower the waves across the wind
 // carry less. A gust or a nearer shore then changes how high the ripples run,
 // never where their crests lie, and nothing re-phases them from one frame to
-// the next. On running water they ride the current (`drift`). What a pixel
-// cannot resolve, or a frame cannot follow, becomes roughness at the slope
-// variance it has.
+// the next. On running water they ride the current: two layers each carry
+// them on by their own drift (`drift`, xy and zw) and hand over as the
+// current's own ripples do (`drift_share`), but since every component is
+// one plane wave the two are blended as the wave they make together, put
+// back to the component's own height. So the waves keep their height while
+// they are carried, however the layers stand, and as the current dies away
+// the two layers become one and the waves become still water's, with no
+// line where the water starts to move. What a pixel cannot resolve, or a
+// frame cannot follow, becomes roughness at the slope variance it has.
 const WIND_SHORTEST: f32 = 0.04;
 const CAPILLARY_CUTOFF: f32 = 0.017;
 // Surface tension over density, m^3/s^2.
@@ -1822,7 +1828,7 @@ fn spreadingBeta(frequency_ratio: f32) -> f32
     return max(mix(donelan, banner, smoothstepf(1.6, 2.0, r)), SPREAD_FLOOR);
 }
 
-fn windSea(xz: vec2<f32>, drift: vec2<f32>, wind: f32, fetch: f32,
+fn windSea(xz: vec2<f32>, drift: vec4<f32>, drift_share: vec2<f32>, wind: f32, fetch: f32,
            longest: f32, time: f32, pixel_dx: vec2<f32>, pixel_dy: vec2<f32>, current: f32,
            frame_seconds: f32) -> WindSea
 {
@@ -1841,8 +1847,8 @@ fn windSea(xz: vec2<f32>, drift: vec2<f32>, wind: f32, fetch: f32,
     // exact however far out the water lies: k*x itself passes a million
     // radians a few kilometres from the origin, beyond what a 32-bit float
     // can resolve.
-    let p = xz - drift;
-    let wrapped = p - WIND_PERIOD*floor(p/WIND_PERIOD);
+    let wrapped = xz - WIND_PERIOD*floor(xz/WIND_PERIOD);
+    let carried = any(drift.xy != drift.zw);
     // The pixel's narrowest width in any direction: it resolves no wave
     // shorter than twice that, whichever way the wave runs.
     let finest = abs(pixel_dx.x*pixel_dy.y - pixel_dx.y*pixel_dy.x)
@@ -1920,8 +1926,26 @@ fn windSea(xz: vec2<f32>, drift: vec2<f32>, wind: f32, fetch: f32,
                 continue;
             }
             // Slope variance (a k)^2 / 2 per component.
-            let amplitude = sqrt(2.0*component_variance)/k_wave;
-            let phase = 6.2831853*(fract(dot(wave.xy, wrapped)/WIND_PERIOD) + wave.z) - omega_wave*time;
+            var amplitude = sqrt(2.0*component_variance)/k_wave;
+            var phase = 6.2831853*(fract(dot(wave.xy, wrapped)/WIND_PERIOD) + wave.z) - omega_wave*time;
+            if (carried)
+            {
+                // Each layer moves the wave on by its drift, a turn of phase;
+                // weighted by their shares, the two make one wave of the same
+                // length, set back by their mean turn and as high as the sum
+                // of the two arrows. Taken back to the component's own height
+                // it neither swells where the layers stand together (on slow
+                // water, where the two drifts are nearly one) nor fades where
+                // they stand apart, but where the two all but cancel, which
+                // only happens while their shares are near even and so passes
+                // in a moment, it dips rather than turn its crests over.
+                let turn = 6.2831853*vec2<f32>(fract(dot(wave.xy, drift.xy)/WIND_PERIOD),
+                                               fract(dot(wave.xy, drift.zw)/WIND_PERIOD));
+                let sum = drift_share.x*vec2<f32>(cos(turn.x), sin(turn.x))
+                        + drift_share.y*vec2<f32>(cos(turn.y), sin(turn.y));
+                phase -= atan2(sum.y, sum.x);
+                amplitude *= min(2.0*length(sum), 1.0);
+            }
             result.slope -= direction*(amplitude*k_wave*sin(phase)*resolved);
             result.height += amplitude*cos(phase)*resolved;
             result.height_variance += 0.5*amplitude*amplitude*resolved*resolved;
@@ -1967,6 +1991,21 @@ struct WindExposure
 // way down into it, so even a pond ringed by trees feels some of the wind.
 const LEE_WIND: f32 = 0.3;
 
+// The walk upwind: taps from 2 m out to WIND_WALK_REACH, each 1.74 times as
+// far as the last. Past it a stand 18 m tall leaves the wind more than nine
+// tenths of its strength, so the walk ending does not draw a line.
+const WIND_WALK_TAPS: u32 = 12u;
+const WIND_WALK_REACH: f32 = 891.44;
+// The wind sea is lost over ground standing out of the water, per metre of
+// it: all of it within a metre or two of a bank half a metre high, so the
+// fetch ends there, and less over a bar barely awash, so a bar or an island
+// that the walk comes upon or loses as the water moves takes the fetch away
+// or gives it back gradually rather than at once.
+const FETCH_LOSS: f32 = 2.0;
+const FETCH_LOSS_RISE: f32 = 0.5;
+// Samples of the stand on the upwind bank.
+const STAND_SAMPLES: u32 = 12u;
+
 // Crown cover over a stand about `width` across around `p`: a forest edge
 // shelters as a porous belt, not as the one crown or gap a single point
 // lands on.
@@ -1979,42 +2018,176 @@ fn standCover(p: vec2<f32>, upwind: vec2<f32>, width: f32) -> f32
     return 1.0 - open*0.2;
 }
 
+// How fast the wind sea is lost over a stretch of ground that stands `near`
+// metres out of the water at one end and `far` at the other.
+fn fetchLoss(near: f32, far: f32) -> f32
+{
+    return FETCH_LOSS*0.5*(smoothstepf(0.0, FETCH_LOSS_RISE, near) + smoothstepf(0.0, FETCH_LOSS_RISE, far));
+}
+
+// Toward the end of the walk land counts for less and less in the fetch, so
+// a shore that the walk is about to lose sight of gives way to the open
+// water past it gradually.
+fn walkFade(reach: f32) -> f32
+{
+    return 1.0 - smoothstepf(0.5*WIND_WALK_REACH, WIND_WALK_REACH, reach);
+}
+
+// What a stretch `length` metres long, over which the wind sea is lost at
+// `loss` per metre, adds to the fetch (x), and the share of the wind sea
+// that runs on past it (y).
+fn fetchAcross(length: f32, loss: f32) -> vec2<f32>
+{
+    let kept = exp(-loss*length);
+    return vec2<f32>(select(length, (1.0 - kept)/loss, loss*length > 1e-4), kept);
+}
+
+// The top of what stands `rise` metres over the water with `open` sky over
+// it: the ground and, where it is out of the water, the crowns on it.
+fn standTop(rise: f32, open: f32) -> f32
+{
+    return max(rise, 0.0) + (1.0 - open)*CANOPY_HEIGHT*smoothstepf(-0.15, 0.25, rise);
+}
+
 fn windExposure(xz: vec2<f32>, level: f32, upwind: vec2<f32>, open_sky: f32, sea: f32,
                 across: f32, half_width: f32, cross_stream: vec2<f32>, still: f32) -> WindExposure
 {
-    // Walk upwind and keep the steepest obstacle seen, as the tangent of its
-    // top over the water (the upwind horizon). A wake spreads as it runs
-    // downwind, so each step looks at the crowns over a stand half as wide as
-    // it is far. Water ends softly at its first bank, and land beyond, even
-    // below the level, is not more water. Every term is continuous in the
-    // water's position, so shelter and fetch change in gradients, not steps.
-    var wet = 1.0;
+    // Walk upwind to the bank. The ground between two taps is taken to run
+    // straight from one to the next, and where it comes up out of the water
+    // is found by halving the stretch five times, so the bank lies where the
+    // ground meets the water, not on a tap: as the water moves, its distance
+    // to the bank changes with it, never jumping from one tap to the next,
+    // which drew the shore again across the water at every tap's distance
+    // from it as a line between rougher and calmer water. Two runs are kept:
+    // the fetch, in which the walk's far end fades out, and how far the wind
+    // runs before the bank stops it (`bank`), in which it does not.
+    let here = riverGround(xz);
+    var rises: array<f32, WIND_WALK_TAPS>;
+    var near = 0.0;
+    var near_rise = min(here.x - level, 0.0);
+    var kept = 1.0;
     var fetch = 0.0;
-    var previous = 0.0;
-    var horizon = 0.0;
-    for (var i = 0u; i < 10u; i += 1u)
+    var bank_kept = 1.0;
+    var bank = 0.0;
+    for (var i = 0u; i < WIND_WALK_TAPS; i += 1u)
     {
-        // 2 m out to 290 m.
-        let distance = 2.0*exp2(f32(i)*0.8);
-        let p = xz + upwind*distance;
-        let rise = riverGround(p).x - level;
-        let dry = smoothstepf(-0.15, 0.25, rise);
-        let top = max(rise, 0.0) + standCover(p, upwind, 0.5*distance)*CANOPY_HEIGHT*dry;
-        horizon = max(horizon, top/distance);
-        fetch += (distance - previous)*wet*(1.0 - 0.5*dry);
-        wet *= 1.0 - dry;
-        previous = distance;
+        let far = 2.0*exp2(f32(i)*0.8);
+        let far_rise = riverGround(xz + upwind*far).x - level;
+        rises[i] = far_rise;
+        // The stretch from `start` on, once any water before the bank, or any
+        // land before the water, has been taken off it.
+        var start = near;
+        var start_rise = near_rise;
+        if (near_rise <= 0.0 && far_rise > 0.0)
+        {
+            var wet = near;
+            var wet_rise = near_rise;
+            var dry = far;
+            var dry_rise = far_rise;
+            for (var k = 0u; k < 5u; k += 1u)
+            {
+                let middle = 0.5*(wet + dry);
+                let middle_rise = riverGround(xz + upwind*middle).x - level;
+                if (middle_rise > 0.0)
+                {
+                    dry = middle;
+                    dry_rise = middle_rise;
+                }
+                else
+                {
+                    wet = middle;
+                    wet_rise = middle_rise;
+                }
+            }
+            start = wet + (dry - wet)*wet_rise/(wet_rise - dry_rise);
+            start_rise = 0.0;
+            fetch += kept*(start - near);
+            bank += bank_kept*(start - near);
+        }
+        else if (near_rise > 0.0 && far_rise <= 0.0)
+        {
+            // Past a bar or an island the water opens again; how much of the
+            // wind sea it lets through is what matters, not exactly where it
+            // ends.
+            start = near + (far - near)*near_rise/(near_rise - far_rise);
+            start_rise = 0.0;
+            let loss = fetchLoss(near_rise, 0.0);
+            let land = fetchAcross(start - near, loss*walkFade(0.5*(near + start)));
+            fetch += kept*land.x;
+            kept *= land.y;
+            let bank_land = fetchAcross(start - near, loss);
+            bank += bank_kept*bank_land.x;
+            bank_kept *= bank_land.y;
+        }
+        if (start_rise <= 0.0 && far_rise <= 0.0)
+        {
+            fetch += kept*(far - start);
+            bank += bank_kept*(far - start);
+        }
+        else
+        {
+            let loss = fetchLoss(start_rise, far_rise);
+            let land = fetchAcross(far - start, loss*walkFade(0.5*(start + far)));
+            fetch += kept*land.x;
+            kept *= land.y;
+            let bank_land = fetchAcross(far - start, loss);
+            bank += bank_kept*bank_land.x;
+            bank_kept *= bank_land.y;
+        }
+        near = far;
+        near_rise = far_rise;
     }
     // No shore within reach: the open sea, whose wind sea is fully developed
     // a hundred kilometres out, or a lake wider than the walk, which in this
     // landscape is a few hundred metres at most.
     let open_fetch = mix(400.0, 1.0e5, sea);
-    fetch = min(fetch + wet*max(open_fetch - previous, 0.0), open_fetch);
+    fetch = min(fetch + kept*max(open_fetch - WIND_WALK_REACH, 0.0), open_fetch);
+    // The stand on the bank and the bank itself: the steepness of their top
+    // over the water (the upwind horizon), averaged over a belt from the
+    // bank back half as deep as the bank is far, and as wide, since a wake
+    // spreads as it runs downwind. The belt starts at the bank, not at a
+    // tap, so as the water moves down the wind its near edge stays where it
+    // is, and the forest edge or the step in the bank behind the shore does
+    // not sweep across a tap and drop out of the water's lee all at once.
+    let side = vec2<f32>(-upwind.y, upwind.x);
+    let belt = 0.5*bank + 8.0;
+    var horizon = 0.0;
+    for (var k = 0u; k < STAND_SAMPLES; k += 1u)
+    {
+        let reach = bank + belt*(f32(k) + 0.5)/f32(STAND_SAMPLES);
+        let p = xz + upwind*reach
+              + side*belt*((f32((k*5u)%STAND_SAMPLES) + 0.5)/f32(STAND_SAMPLES) - 0.5);
+        horizon += standTop(riverGround(p).x - level, riverCanopy(p).a)/reach;
+    }
+    horizon *= walkFade(bank)/f32(STAND_SAMPLES);
+    // Hills, and stands behind an island or a clearing, further upwind past
+    // the belt. A tap's crowns are read off a lattice fixed in the world, a
+    // quarter of the tap's distance across, between whose corners they are
+    // interpolated: as the water moves the tap slides across the lattice, so
+    // the edge of a stand comes into the tap's view over a quarter of its
+    // distance rather than in the moment the tap crosses it.
+    for (var i = 0u; i < WIND_WALK_TAPS; i += 1u)
+    {
+        let reach = 2.0*exp2(f32(i)*0.8);
+        let beyond = smoothstepf(bank, bank + belt, reach);
+        if (beyond > 0.0)
+        {
+            let spacing = 0.25*reach;
+            let tap = xz + upwind*reach;
+            let cell = vec2<f32>(dot(tap, upwind), dot(tap, side))/spacing;
+            let f = fract(cell);
+            let corner = tap - (upwind*f.x + side*f.y)*spacing;
+            let open = mix(mix(riverCanopy(corner).a, riverCanopy(corner + upwind*spacing).a, f.x),
+                           mix(riverCanopy(corner + side*spacing).a,
+                               riverCanopy(corner + (upwind + side)*spacing).a, f.x), f.y);
+            horizon = max(horizon, standTop(rises[i], open)/reach*beyond);
+        }
+    }
     // A channel's own cut stands in for its banks only where the one-metre
     // map cannot show them, and never where the channel's water has already
     // become a lake's or the sea's: an outlet beside an open pond feels the
     // pond's wind, not a creek's.
-    let stand_in = (1.0 - riverGround(xz).y)*(1.0 - max(still, sea));
+    let stand_in = (1.0 - here.y)*(1.0 - max(still, sea));
     if (half_width > 0.01 && stand_in > 0.0)
     {
         let sideways = dot(upwind, cross_stream);
@@ -2180,14 +2353,21 @@ struct FlowSurface
 // A texture the current carries further in one frame than about a third of
 // its own scale can no longer be followed by the eye (it strobes, and seems
 // to run backwards); it goes to roughness instead, as an unresolved one does.
+//
+// Still water (`still`, a lake's sheet and a river where it meets one) is
+// too deep for its bed to stir it: the ripples there are an inflow's, made
+// by a current fast enough to churn the water, and they die away as it
+// slows, so the slow drift through a lake raises none and no line marks
+// where it stops. A fall's roller churns it whatever the current.
 fn flowSurface(st: vec2<f32>, flow: vec2<f32>, time: f32, roughness: f32, riffle: f32,
-               river: bool, footprint: vec2<f32>, frame_seconds: f32) -> FlowSurface
+               river: bool, still: f32, footprint: vec2<f32>, frame_seconds: f32) -> FlowSurface
 {
     var result = FlowSurface(vec2<f32>(0.0), 0.0, 0.0);
     let speed = length(flow);
     // Only a channel has a frame to stretch its ripples along.
     let stretch = select(1.0, 1.0 + 1.8*smoothstepf(0.3, 1.8, speed)*(1.0 - 0.6*roughness), river);
-    let steepness = 0.018 + 0.20*roughness + 0.012*min(speed, 3.0);
+    let stirred = mix(1.0, smoothstepf(0.05, 0.5, speed), clamp(still, 0.0, 1.0));
+    let steepness = (0.018 + 0.012*min(speed, 3.0))*stirred + 0.20*roughness;
     let travel = speed*frame_seconds;
 
     // Boils, and how they stir the ripples: glassy on their domes, stirred
@@ -2894,36 +3074,23 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     let local_wind = stage.wind.x*max(exposure.shelter + gust_swing, 0.0)*(1.0 + 0.31*precipitation.w);
     // On the sea the wind sea stops where the swell's spectrum begins.
     let longest = mix(3.7, 2.0, sea);
-    var wind_sea = WindSea(vec2<f32>(0.0), 0.0, 0.0, 0.0);
-    if (speed > 0.02)
-    {
-        // Running water carries its wind waves along with it.
-        for (var layer = 0u; layer < 2u; layer += 1u)
-        {
-            let cycle = flowLayer(time, 3.0, layer, 0.29, velocity);
-            let waves = windSea(xz, cycle.offset, local_wind, exposure.fetch, longest,
-                                time, pixel_dx, pixel_dy, speed, frame_seconds);
-            wind_sea.slope += waves.slope*cycle.weight;
-            wind_sea.height += waves.height*cycle.weight;
-            wind_sea.height_variance += waves.height_variance*cycle.weight*cycle.weight;
-            wind_sea.variance += waves.variance*cycle.weight*cycle.weight;
-        }
-    }
-    else
-    {
-        wind_sea = windSea(xz, vec2<f32>(0.0), local_wind, exposure.fetch, longest,
-                           time, pixel_dx, pixel_dy, 0.0, frame_seconds);
-    }
+    // Running water carries its wind waves along with it, and still water,
+    // whose two layers never move, is the same waves at rest.
+    let carry_a = flowLayer(time, 3.0, 0u, 0.29, velocity);
+    let carry_b = flowLayer(time, 3.0, 1u, 0.29, velocity);
+    let wind_sea = windSea(xz, vec4<f32>(carry_a.offset, carry_b.offset), vec2<f32>(carry_a.weight, carry_b.weight),
+                           local_wind, exposure.fetch, longest, time, pixel_dx, pixel_dy, speed, frame_seconds);
     slope += wind_sea.slope;
     variance += wind_sea.variance;
     // The current's own surface: turbulence, boils, standing waves.
     var water_surface = FlowSurface(vec2<f32>(0.0), 0.0, 0.0);
-    if (river || speed > 0.02)
+    if (river || speed > 0.02 || roughness > 0.0)
     {
-        water_surface = flowSurface(st, flow, time, roughness, riffle, river, footprint, frame_seconds);
+        water_surface = flowSurface(st, flow, time, roughness, riffle, river, stillness, footprint, frame_seconds);
         if (joining > 0.001)
         {
-            let other = flowSurface(joined_st, flow, time, roughness, riffle, river, footprint, frame_seconds);
+            let other = flowSurface(joined_st, flow, time, roughness, riffle, river, stillness, footprint,
+                                    frame_seconds);
             water_surface.slope = mix(water_surface.slope, other.slope, joining)*restore;
             water_surface.variance = mix(water_surface.variance, other.variance, joining);
             water_surface.crest = mix(water_surface.crest, other.crest, joining);

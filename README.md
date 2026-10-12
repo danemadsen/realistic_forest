@@ -1209,16 +1209,30 @@ to the next:
   and over what fetch. The open sea takes all of it over unlimited fetch,
   with whitecaps from a fresh breeze, and adds its swell and its surf. A
   lake's waves grow from its upwind shore across it, calm in the lee of the
-  trees there and rougher toward its far shore. The shelter is the steepest
-  bank or stand upwind, its crowns averaged over a belt as wide as half its
-  distance, so the lee fades out over tens of metres instead of in stripes.
+  trees there and rougher toward its far shore, and every part of a lake
+  blends into the next: neither its fetch nor its shelter ever changes from
+  one metre of water to the next by more than a little. The walk upwind
+  that finds them, out to some 900 m, places the bank where the ground
+  between its taps comes up out of the water, halving the stretch until it
+  is found, so the fetch is the water's own distance from the bank and
+  never jumps from one tap to the next; a tap's jump used to draw the shore
+  again across the water at each tap's distance from it, as lines between
+  glassy and rippled water. The shelter is the bank and the stand on it,
+  their height over the water averaged over a belt from the bank back half
+  as deep as the bank is far and as wide, and anything taller further
+  upwind: a hill, or a forest behind a clearing or an island, whose crowns
+  are read off a lattice fixed in the world and blended between its
+  corners, so a forest edge comes into a lee over tens of metres. A bar or
+  an island takes the fetch away by how far it stands out of the water.
   A pond ringed by forest, or a creek in its cut under the crowns, lies
   calmer but never glassy: the mean wind drops faster in a lee than its
   gusts, so cat's paws still cross it, patches drawn out three times as
   long down the wind as across it. A creek's own cut stands in for banks the
   one-metre map cannot see, but never on an outlet whose water is still the
   pond's. A river adds what its current does to
-  it. The
+  it; a lake is too deep for its bed to stir it, so the slow drift through
+  it raises no ripples of its own, and an inflow's die away as its jet
+  slows. The
   crowns are read from the grass's 512-metre capture, placed by the window
   the capture itself records as it is taken, so in the frame the camera
   crosses into the next window the forest the water sees does not jump.
@@ -1242,7 +1256,11 @@ to the next:
   Standing waves stand still over riffles, fixed to the bed, while ripples
   and foam stream through them; they swell and ebb in place rather than in a
   travelling pulse, which used to read as the water running upstream. Boils
-  swell glassy on runs and pools, and the wind's waves ride the current. A
+  swell glassy on runs and pools, and the wind's waves ride the current:
+  each wave is carried by both of the current's layers and drawn as the one
+  wave the two make together, at its own height, so the waves never swell
+  or fade with the layers' hand-over, and as the current dies away they
+  become still water's, with no line where the water starts to move. A
   texture the current carries further in one frame than a third of its own
   size would strobe and seem to run backwards; it becomes roughness instead,
   as what a pixel cannot resolve does, by its true slope variance. The frame
