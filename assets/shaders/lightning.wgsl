@@ -30,6 +30,8 @@ struct GlobalUniforms {
     planet_east: vec4<f32>,     // camera east in planet axes, feature fade width
     planet_up: vec4<f32>,       // camera up in planet axes, atmosphere top altitude
     planet_north: vec4<f32>,    // camera north in planet axes
+    celestial: vec4<f32>,       // sun and moon angular radii, sun's unhidden share, moon's sunlight
+    stars: vec4<f32>,           // world to ecliptic axes as a quaternion: the stars' frame
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
@@ -259,24 +261,25 @@ fn planetSunElevationAt(world: vec3<f32>) -> f32
     return dot(-normalize(globals.sun_direction.xyz), planetUpAt(world));
 }
 
-// The day/night cycle's daylight curve (day_night.rs sample) at a world point,
-// so the night side of the planet is dark seen from the day side. At the
-// camera it is globals.atmosphere.x.
+// The day/night cycle's daylight curve (day_night.rs at_elevation) at a world
+// point, so the night side of the planet is dark seen from the day side,
+// darkened as the moon hides the sun (globals.celestial.z, the share it leaves).
+// At the camera it is globals.atmosphere.x.
 fn planetDaylightAt(world: vec3<f32>) -> f32
 {
-    return smoothstep(-0.18, 0.18, planetSunElevationAt(world));
+    return smoothstep(-0.18, 0.18, planetSunElevationAt(world))*sqrt(globals.celestial.z);
 }
 
 // The direct sunlight reaching a world point: the day/night cycle's colour
-// and strength curves (day_night.rs sample) for the sun's elevation there,
-// times the sun's intensity. At the camera it is the uniform
-// globals.sun_colour.rgb*globals.settings_a.x.
+// and strength curves (day_night.rs at_elevation) for the sun's elevation
+// there, times the sun's intensity and the share of its disc the moon leaves.
+// At the camera it is the uniform globals.sun_colour.rgb*globals.settings_a.x.
 fn planetSunlightAt(world: vec3<f32>) -> vec3<f32>
 {
     let elevation = planetSunElevationAt(world);
     let colourMix = smoothstep(0.0, 0.55, elevation);
     let colour = vec3<f32>(1.0, 0.29 + 0.66*colourMix, 0.095 + 0.765*colourMix);
-    return colour*globals.sun_colour.w*smoothstep(0.0, 0.12, elevation);
+    return colour*globals.sun_colour.w*smoothstep(0.0, 0.12, elevation)*globals.celestial.z;
 }
 
 // The air's density scale height. Haze thins with it above the ground fog's

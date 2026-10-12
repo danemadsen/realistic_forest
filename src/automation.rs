@@ -104,6 +104,8 @@ pub struct AutomationSettings {
     pub no_fog: bool,
     pub no_water: bool,
     pub time_of_day: f32,
+    /// `--day N`: days from the epoch, midsummer's day with a full moon.
+    pub day: i64,
     pub day_length_minutes: f32,
     pub pause_time: bool,
     pub no_raymarch: bool,
@@ -166,6 +168,7 @@ impl Default for AutomationSettings {
             no_fog: false,
             no_water: false,
             time_of_day: 10.0,
+            day: 0,
             day_length_minutes: 24.0,
             pause_time: false,
             no_raymarch: false,
@@ -466,6 +469,20 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                     }
                 }
             }
+            "--day" => {
+                match next.and_then(|value| value.parse::<i64>().ok()) {
+                    Some(day) => {
+                        automation.day = day;
+                        index += 1;
+                    }
+                    None => {
+                        eprintln!("WARNING: --day expects a whole number of days from the epoch; keeping day 0");
+                        if next.is_some_and(|value| !value.starts_with("--")) {
+                            index += 1;
+                        }
+                    }
+                }
+            }
             "--time-of-day" | "--day-length" => {
                 let finite_value = next
                     .and_then(|value| value.parse::<f32>().ok())
@@ -604,6 +621,9 @@ mod tests {
         ]);
         assert_eq!(settings.time_of_day, 18.5);
         assert_eq!(settings.day_length_minutes, 3.0);
+        assert_eq!(parse(&["--day", "-12"]).day, -12);
+        assert_eq!(parse(&["--day", "soon", "--pause-time"]).day, 0);
+        assert!(parse(&["--day", "soon", "--pause-time"]).pause_time);
         assert!(settings.pause_time && settings.no_raymarch);
         assert_eq!(settings.raymarch_quality, 2);
     }

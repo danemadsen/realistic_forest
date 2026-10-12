@@ -178,7 +178,7 @@ pub struct ExtractedForestView {
 // silently drift.
 // ---------------------------------------------------------------------------
 
-/// The shared `GlobalUniforms` preamble (group 0, binding 0), 496 bytes.
+/// The shared `GlobalUniforms` preamble (group 0, binding 0), 528 bytes.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GlobalUniformsGpu {
@@ -216,8 +216,15 @@ pub struct GlobalUniformsGpu {
     pub planet_east: [f32; 4],
     pub planet_up: [f32; 4],
     pub planet_north: [f32; 4],
+    /// The sun's and the moon's angular radii, the share of the sun's disc
+    /// the moon leaves showing, and the share of sunlight that reaches the
+    /// moon past the planet's shadow (`crate::celestial`).
+    pub celestial: [f32; 4],
+    /// The turn from the world's axes to the ecliptic's, where the stars
+    /// are fixed, as a quaternion (x, y, z, w).
+    pub stars: [f32; 4],
 }
-const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 496);
+const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 528);
 
 /// `sun_direction.w` until the terrain pass has measured the heightfield: no
 /// march ever rises above it, so the shaders' early exits stay off.
@@ -773,19 +780,18 @@ pub fn prepare_forest_globals(
     };
     let camera = PlayerCamera::from_player(&player);
     let view_matrix = crate::matrices::view_matrix(camera.position, camera.target, camera.up);
-    let mut lighting = crate::day_night::sample(view.day_night.time_hours);
-    // The day/night cycle turns the planet under the sun: its directions are
-    // fixed in planet axes (the spawn's frame), and each place sees them in
-    // its own east, up and north.
-    let to_world = |direction: [f32; 4]| {
-        let world = planet_view.to_world(bevy::math::DVec3::new(
-            direction[0] as f64, direction[1] as f64, direction[2] as f64,
-        ));
-        [world.x as f32, world.y as f32, world.z as f32, direction[3]]
-    };
-    let sun_direction = to_world(lighting.sun_direction);
-    let moon_direction = to_world(lighting.moon_direction);
-    lighting = crate::day_night::at_elevation(sun_direction, moon_direction, -sun_direction[1]);
+    // The sun and the moon where their orbits and the planet's turn put them
+    // (crate::celestial), seen from the camera itself: the moon is near
+    // enough that where on the planet the eye is moves it, and an eclipse of
+    // the sun is seen only from a strip of the planet.
+    let sky = crate::celestial::Orbits::new(&planet).at(view.day_night.seconds());
+    let seen = sky.seen_from(planet_view.eye);
+    let lighting = crate::day_night::lighting(&seen, |v| planet_view.to_world(v));
+    // The stars are fixed in the ecliptic's axes: the world's axes to the
+    // planet's (the camera's frame) and on to the ecliptic's.
+    let frame = planet_view.frame;
+    let world_to_ecliptic = sky.to_ecliptic * bevy::math::DMat3::from_cols(frame.east, frame.up, frame.north);
+    let stars = bevy::math::DQuat::from_mat3(&world_to_ecliptic).normalize();
     let weather = view.weather.conditions(&view.settings);
     let heightfield_texel = terrain_node::LIGHTING_HEIGHTFIELD_SPAN
         / terrain_node::LIGHTING_HEIGHTFIELD_SIZE as f32;
@@ -918,6 +924,8 @@ pub fn prepare_forest_globals(
             planet_view.frame.north.z as f32,
             0.0,
         ],
+        celestial: [lighting.sun_radius, lighting.moon_radius, lighting.sun_visible, lighting.moon_sunlight],
+        stars: [stars.x as f32, stars.y as f32, stars.z as f32, stars.w as f32],
     };
     if globals.buffer.is_none() {
         // Created straight off the wgpu device so the field can stay a raw
@@ -991,6 +999,7 @@ mod tests {
     #[test]
     fn water_and_visible_sky_share_the_same_atmosphere() {
         let common = include_str!("../../assets/shaders/atmosphere-functions.wgslinc").trim();
+        assert!(common.contains("fn skyRadiance"), "the shared atmosphere block is missing");
         for source in [
             include_str!("../../assets/shaders/composite.wgsl"),
             include_str!("../../assets/shaders/water.wgsl"),
@@ -1070,6 +1079,8 @@ mod tests {
             ("planet_east", std::mem::offset_of!(GlobalUniformsGpu, planet_east)),
             ("planet_up", std::mem::offset_of!(GlobalUniformsGpu, planet_up)),
             ("planet_north", std::mem::offset_of!(GlobalUniformsGpu, planet_north)),
+            ("celestial", std::mem::offset_of!(GlobalUniformsGpu, celestial)),
+            ("stars", std::mem::offset_of!(GlobalUniformsGpu, stars)),
         ];
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
         let mut checked = 0;

@@ -7,6 +7,7 @@
 
 mod automation;
 mod buildings;
+mod celestial;
 mod constants;
 mod day_night;
 mod erosion;
@@ -382,8 +383,10 @@ fn main() {
     app.insert_resource(startup_settings);
     app.insert_resource(day_night::DayNightCycle {
         time_hours: automation.time_of_day,
+        day: automation.day,
         paused: automation.pause_time,
         day_length_minutes: automation.day_length_minutes,
+        warp: 1.0,
     });
     app.init_resource::<weather::WeatherMotion>();
     app.init_resource::<lightning::ActiveBolt>();

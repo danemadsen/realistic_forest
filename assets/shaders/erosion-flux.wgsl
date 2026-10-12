@@ -48,6 +48,8 @@ struct GlobalUniforms {
     planet_east: vec4<f32>,     // camera east in planet axes, feature fade width
     planet_up: vec4<f32>,       // camera up in planet axes, atmosphere top altitude
     planet_north: vec4<f32>,    // camera north in planet axes
+    celestial: vec4<f32>,       // sun and moon angular radii, sun's unhidden share, moon's sunlight
+    stars: vec4<f32>,           // world to ecliptic axes as a quaternion: the stars' frame
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 

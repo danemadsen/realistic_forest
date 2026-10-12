@@ -87,15 +87,23 @@ Choose a weather preset to apply it immediately around the player, or choose
 **Natural weather** to return to varied conditions. The **Move weather fronts**
 checkbox controls whether those conditions drift. Under a thunderstorm,
 **Strike lightning** fires the next discharge at once, and **Thunder volume**
-sets the loudness of thunder. Set the hour with
-the slider or Dawn, Noon, Dusk and Night buttons; changing it holds the selected
-time until **Hold selected time** is unchecked. **Advanced controls** expands
-the full controls.
+sets the loudness of thunder.
+
+**Sun, moon and time** sets the hour with the slider and the day with its
+number or the -1, +1 and +7 buttons; Dawn and Dusk stand a quarter hour after
+that day's sunrise and before its sunset where the player is, and Noon and
+Night pick 12:00 and 00:00. Changing any of them holds the selected time until
+**Hold selected time** is unchecked. **Time warp** runs the celestial clock
+10 to 100,000 times faster, to watch the moon's phases and the seasons go by;
+it is a developer tool, and gameplay always runs at real time. **Next
+eclipse** jumps to the deepest moment of the next eclipse of the sun or the
+moon seen from where the player stands. Below them the day, the season, the
+day of the year, the moon's phase and any eclipse under way are read out (the
+debug text shows the same). **Advanced controls** expands the full controls.
 
 The developer menu's advanced **Sun and time** section sets the time of day,
-pauses the cycle, and changes its duration in real minutes. Dawn, Noon, Dusk and Night buttons
-quickly select a lighting setup. The default starts at 10:00 and completes a
-full day in 24 real minutes. **Raymarched lighting** exposes terrain shadows,
+pauses the cycle, and changes its duration in real minutes. The default starts
+at 10:00 on day 0 and completes a full day in 24 real minutes. **Raymarched lighting** exposes terrain shadows,
 volumetric sunlight, water reflections, quality and light shaft strength;
 **Rendering** includes fog density, sun intensity and exposure.
 
@@ -175,7 +183,8 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--overlap-tile x,z` | Select the tile pair to compare |
 | `--lattice` | Draw the erosion lattice overlay |
 | `--no-fog`, `--no-water` | Disable those stages |
-| `--time-of-day H` | Start at hour `H` in `[0, 24)`; default `10` |
+| `--time-of-day H` | Start at hour `H` in `[0, 24)` of local mean solar time at spawn; default `10` |
+| `--day N` | Start on day `N` (any integer, negative for before the epoch); day `0`, the default, is spawn's midsummer with a full moon |
 | `--day-length MIN` | Positive real minutes per complete day; default `24` |
 | `--pause-time` | Hold the selected time of day and freeze weather fronts and cloud wind |
 | `--advance-time` | Allow the day/night cycle, weather, and cloud wind to advance during a screenshot run |
@@ -202,12 +211,12 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 
 Screenshot runs freeze the celestial clock, weather fronts, and cloud wind automatically, so
 erosion warm-up does not change the selected weather or lighting. Keep the same
-camera and `--wait` value when comparing settings. For example, these capture noon, dusk and night from
-the same elevated position above spawn:
+camera and `--wait` value when comparing settings. For example, these capture noon, dusk and a
+full-moon night on midsummer's day from the same elevated position above spawn:
 
 ```sh
 cargo run --release --bin realistic_forest -- --camera 0,80,0,45,-8 --time-of-day 12 --shot noon.png --wait 600
-cargo run --release --bin realistic_forest -- --camera 0,80,0,45,-8 --time-of-day 17.75 --shot dusk.png --wait 600
+cargo run --release --bin realistic_forest -- --camera 0,80,0,45,-8 --time-of-day 19.5 --shot dusk.png --wait 600
 cargo run --release --bin realistic_forest -- --camera 0,80,0,45,-8 --time-of-day 0 --shot night.png --wait 600
 ```
 
@@ -292,9 +301,9 @@ the distance: 23 m/s² at sea level for everything that falls. Walking or flying
 the next face's chart with its heading and velocity turned to match. Each
 vertex's normal is built in its own local frame from the chart's derivatives,
 and the terrain's materials read it there, so slope, aspect and snow are the
-plane's anywhere on the planet. The day/night cycle turns the planet under
-the sun: its directions are fixed in planet axes, and each place sees the sun
-at its own elevation, so travelling far enough brings on the night.
+plane's anywhere on the planet. The planet turns under the sun and the moon
+(see **Sun, moon and stars**), and each place sees them from where it stands,
+so travelling far enough brings on the night.
 
 **From the ground to orbit.** The sea is Crest's rings around the camera,
 bent onto the sphere, and beyond their square the terrain's own patches laid
@@ -1604,13 +1613,51 @@ approach presented in Rockstar's
 at SIGGRAPH 2019. This prototype implements a smaller, independent version of
 those ideas with procedural volumetric clouds, fog and shared celestial lighting.
 
-The sun rises in the east at 06:00, reaches its highest point at noon, and sets
-in the west at 18:00. Its colour warms toward the horizon and its direct light
-fades out at sunset, while twilight continues to light the sky. The moon follows
-the opposite orbit and provides subdued blue light at night, when stars become
-visible. Terrain, ocean highlights and reflected sky all use the same celestial
-state. Snow placement retains its fixed climate aspect; only its lighting and
-glints move with the sun.
+The sun's colour warms toward the horizon and its direct light fades out at
+sunset, while twilight continues to light the sky. The moon gives subdued blue
+light at night by its phase, when stars become visible. Terrain, ocean
+highlights and reflected sky all use the same celestial state. Snow placement
+retains its fixed climate aspect; only its lighting and glints move with the
+sun.
+
+### Sun, moon and stars
+
+The sun and the moon are bodies on orbits (`src/celestial.rs`): the planet
+goes round the sun and the moon round the planet on Kepler orbits, in Earth's
+proportions. Every size, distance and mass is Earth's, the Moon's and the
+Sun's in units of the planet's radius and mass: the moon is a ball 0.273
+planet radii across, 60.3 radii out, with 1/81 of the planet's mass; the sun
+is 109 radii across and 23,481 radii away, with 333,000 times its mass. Both
+discs therefore span the half degree they do from Earth, and the moon only
+just covers the sun. The orbits' shapes are Earth's too: eccentricities of
+0.0167 and 0.0549, the moon's orbit tilted 5.145° to the ecliptic, with its
+nodes and perigee turning as the sun drags on them. The planet's axis leans
+23.44° to its orbit.
+
+The periods are not Earth's. They follow from the masses by Kepler's third
+law, and this planet is small and heavy: a 667.5 km radius with 23 m/s² of
+surface gravity. The year is about 77 days and the moon goes round in about
+5.8 (6.2 from one full moon to the next); both grow with the square root of
+`--planet-radius`. The planet spins so that its solar day is 24 hours.
+
+The clock counts days from the epoch, local midnight at spawn on midsummer's
+day with the moon full, and hours of local mean solar time at spawn. Spawn
+stands at 45° south, so the noon sun stands toward -Z (north), rises in the
+east and sets in the west. At midsummer it climbs to 68° and the day lasts
+about 15½ hours; at midwinter, 38 days later, it reaches only 22° and the day
+lasts 8½; the equinoxes fall between, and the season shows in the debug text.
+Other places on the planet see the sun from their own latitude and longitude.
+
+The moon shows its phases as the sun lights it and lights the night by its
+phase, brightest at full; it rises about four hours later each day. It stands where it is as seen from the eye, a degree's parallax from
+where the planet's centre would see it. When it passes in front of the sun it
+hides the share of the disc the two circles overlap: a partial, total or
+annular eclipse that dims the daylight, from a strip of the planet only. When
+it passes through the planet's shadow, its light fades through the penumbra
+and the umbra and it glows a dim red. Its disc shows grey seas and the faint
+earthshine on its dark side. The stars are fixed in the ecliptic's frame, so
+they wheel round the celestial pole once a sidereal day and the south pole
+stands 45° over spawn's southern horizon.
 
 Terrain shadows march toward the light through a camera-centred world heightfield.
 The 1024×1024 map spans 12,288 metres and samples the same procedural terrain and

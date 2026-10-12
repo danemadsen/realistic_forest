@@ -52,6 +52,95 @@ fn weatherFogAmbient(severity: f32, daylight: f32, thunder: f32) -> vec3<f32> {
     return mix(dark_night, dark_day, clamp(daylight, 0.0, 1.0));
 }
 
+// A vector turned by a unit quaternion (x, y, z, w).
+fn celestialRotate(q: vec4<f32>, v: vec3<f32>) -> vec3<f32> {
+    let t = 2.0*cross(q.xyz, v);
+    return v + q.w*t + cross(q.xyz, t);
+}
+
+// The angle between a unit ray and a unit direction, for the small angles
+// the discs span: from the sine, which f32 resolves there.
+fn celestialOffset(ray: vec3<f32>, toward: vec3<f32>) -> f32 {
+    return length(ray - toward*dot(ray, toward));
+}
+
+// The stars along a world ray, 0 to 1: a grid fixed in the ecliptic's axes
+// (globals.stars), so they wheel round the celestial pole as the planet
+// turns, and stay put as the camera turns.
+fn starField(ray: vec3<f32>) -> f32 {
+    let fixed = celestialRotate(globals.stars, ray);
+    let star_uv = vec2<f32>(atan2(fixed.y, fixed.x), asin(clamp(fixed.z, -1.0, 1.0)))*360.0;
+    let star_cell = floor(star_uv);
+    let star_hash = fract(sin(dot(star_cell, vec2<f32>(127.1, 311.7)))*43758.5453);
+    let star_local = fract(star_uv) - vec2<f32>(0.5);
+    // Smooth small discs avoid binary sparkling.
+    let star_disc = 1.0 - smoothstep(0.035, 0.18, length(star_local));
+    return step(0.997, star_hash)*star_disc*(0.25 + 0.75*star_hash);
+}
+
+// The moon's dark seas on its near side, 0 to 1, at a point of its disc in
+// moon radii (x to the right, y toward the ecliptic's north as the eye sees
+// it): Imbrium, Serenitatis, Tranquillitatis, Crisium, Fecunditatis,
+// Nubium, Humorum, Frigoris and the Ocean of Storms, roughly.
+fn moonSeas(p: vec2<f32>) -> f32 {
+    var seas = 0.0;
+    let centres = array<vec3<f32>, 9>(
+        vec3<f32>(-0.28, 0.55, 0.22), vec3<f32>(0.28, 0.42, 0.15), vec3<f32>(0.42, 0.15, 0.18),
+        vec3<f32>(0.75, 0.30, 0.10), vec3<f32>(0.62, -0.12, 0.13), vec3<f32>(-0.20, -0.35, 0.15),
+        vec3<f32>(-0.50, -0.38, 0.09), vec3<f32>(-0.05, 0.78, 0.12), vec3<f32>(-0.62, 0.18, 0.28));
+    for (var i = 0; i < 9; i += 1) {
+        let d = (p - centres[i].xy)/centres[i].z;
+        seas += exp(-dot(d, d));
+    }
+    return clamp(seas, 0.0, 1.0);
+}
+
+// The moon's disc along a world ray: its radiance (xyz) and how much of the
+// sky behind it it hides (w). The sun lights the side facing it, which is the
+// phase; a dusty surface (Lommel-Seeliger) keeps a full moon bright to its
+// limb; the seas are darker; earthshine faintly lights the night side; and
+// in the planet's shadow (globals.celestial.w, the sunlight reaching it) it
+// dims to a coppery red.
+fn moonDisc(ray: vec3<f32>, to_moon: vec3<f32>, to_sun: vec3<f32>) -> vec4<f32> {
+    let along = dot(ray, to_moon);
+    if (along <= 0.0) { return vec4<f32>(0.0); }
+    let radius = max(sin(globals.celestial.y), 1.0e-6);
+    let across = ray - to_moon*along;
+    let s = length(across)/radius;
+    let cover = 1.0 - smoothstep(0.92, 1.08, s);
+    if (cover <= 0.0) { return vec4<f32>(0.0); }
+    let r = min(s, 1.0);
+    let side = across/max(length(across), 1.0e-9);
+    let facing = sqrt(max(1.0 - r*r, 0.0));
+    let normal = side*r - to_moon*facing;
+    let incidence = max(dot(normal, to_sun), 0.0);
+    let lit = 2.0*incidence/max(incidence + facing, 1.0e-4);
+    // The disc's own axes as the eye sees them: up toward the ecliptic's
+    // north, about which the moon's near side keeps its seas.
+    let stars_to_world = vec4<f32>(-globals.stars.xyz, globals.stars.w);
+    let north = celestialRotate(stars_to_world, vec3<f32>(0.0, 0.0, 1.0));
+    let disc_up = normalize(north - to_moon*dot(north, to_moon) + vec3<f32>(0.0, 1.0e-6, 0.0));
+    let disc_right = cross(to_moon, disc_up);
+    let albedo = mix(1.0, 0.55, moonSeas(vec2<f32>(dot(side, disc_right), dot(side, disc_up))*r));
+    let sunlight = clamp(globals.celestial.w, 0.0, 1.0);
+    let radiance = vec3<f32>(0.63, 0.74, 1.0)*1.6*lit*sunlight
+                   + vec3<f32>(0.55, 0.15, 0.05)*0.08*(1.0 - sunlight)*facing
+                   + vec3<f32>(0.40, 0.50, 0.70)*0.004*facing;
+    return vec4<f32>(radiance*albedo, cover);
+}
+
+// The sun's disc along a world ray, 0 to 1, less what the moon hides of it
+// (`moon_cover`), with the corona's faint ring once the moon hides nearly all.
+fn sunDisc(ray: vec3<f32>, to_sun: vec3<f32>, moon_cover: f32) -> vec2<f32> {
+    if (dot(ray, to_sun) <= 0.0) { return vec2<f32>(0.0); }
+    let radius = max(globals.celestial.x, 1.0e-6);
+    let offset = celestialOffset(ray, to_sun)/radius;
+    let disc = (1.0 - smoothstep(0.92, 1.08, offset))*(1.0 - moon_cover);
+    let corona = exp(-max(offset - 1.0, 0.0)*2.5)*smoothstep(0.98, 1.05, offset)
+                 *(1.0 - smoothstep(0.0, 0.08, globals.celestial.z));
+    return vec2<f32>(disc, corona);
+}
+
 fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
     let ray = normalize(direction);
     let to_sun = -normalize(globals.sun_direction.xyz);
@@ -95,32 +184,29 @@ fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
     sky += vec3<f32>(0.65, 0.16, 0.025)*sunset*horizon*(0.15 + 0.85*sunward)
            *(1.0 - overcast)*(1.0 - storm);
 
+    // The moon in front of the sun and the stars: its disc hides what lies
+    // behind it, the sun's included (an eclipse).
     let sun_mu = clamp(dot(ray, to_sun), -1.0, 1.0);
+    let moon = moonDisc(ray, to_moon, to_sun);
+    let clear = (1.0 - overcast)*(1.0 - storm);
     let sun_visible = smoothstep(-0.018, 0.012, to_sun.y);
-    let sun_disk = smoothstep(0.9999832, 0.9999905, sun_mu);
-    let sun_halo = exp(-(1.0 - sun_mu)*750.0)*0.10
-                   + pow(max(sun_mu, 0.0), 24.0)*0.035;
+    let sun = sunDisc(ray, to_sun, moon.w);
+    let sun_halo = (exp(-(1.0 - sun_mu)*750.0)*0.10
+                    + pow(max(sun_mu, 0.0), 24.0)*0.035)*globals.celestial.z;
     // Direct ground irradiance fades before the visible solar disc sets.
-    sky += globals.sun_colour.rgb*sun_visible*(1.0 - overcast)*(1.0 - storm)
-           *(sun_disk*14.0*globals.sun_colour.w + sun_halo*globals.settings_a.x);
+    sky += globals.sun_colour.rgb*sun_visible*clear
+           *(sun.x*14.0*globals.sun_colour.w + sun_halo*globals.settings_a.x)
+           + vec3<f32>(0.85, 0.9, 1.0)*sun.y*0.25*globals.sun_colour.w*sun_visible*clear;
 
     let moon_mu = clamp(dot(ray, to_moon), -1.0, 1.0);
-    let moon_disk = smoothstep(0.999978, 0.999986, moon_mu);
-    let moon_visible = smoothstep(-0.02, 0.03, to_moon.y)*(1.0 - daylight*0.9);
-    sky += vec3<f32>(0.63, 0.74, 1.0)*moon_visible*(1.0 - overcast)*(1.0 - storm)
-           *(moon_disk*1.6 + exp(-(1.0 - moon_mu)*500.0)*0.025);
+    let moon_visible = smoothstep(-0.02, 0.03, to_moon.y)*(1.0 - daylight*0.9)*clear;
+    sky = mix(sky, sky*(1.0 - moon_visible), moon.w)
+          + moon.xyz*moon_visible
+          + vec3<f32>(0.63, 0.74, 1.0)*moon_visible*exp(-(1.0 - moon_mu)*500.0)*0.025
+            *globals.atmosphere.y/0.16;
 
-    // Stars occupy a world-oriented angular grid and remain stationary when
-    // the camera rotates. Smooth small discs avoid binary sparkling.
-    let star_uv = vec2<f32>(atan2(ray.z, ray.x), asin(clamp(ray.y, -1.0, 1.0)))*360.0;
-    let star_cell = floor(star_uv);
-    let star_hash = fract(sin(dot(star_cell, vec2<f32>(127.1, 311.7)))*43758.5453);
-    let star_local = fract(star_uv) - vec2<f32>(0.5);
-    let star_disc = 1.0 - smoothstep(0.035, 0.18, length(star_local));
-    let star = step(0.997, star_hash)*star_disc*(0.25 + 0.75*star_hash);
-    sky += vec3<f32>(0.6, 0.73, 1.0)*star*pow(1.0 - daylight, 4.0)
-           *(1.0 - overcast)*(1.0 - storm)
-           *smoothstep(-0.03, 0.18, ray.y)*0.7;
+    sky += vec3<f32>(0.6, 0.73, 1.0)*starField(ray)*(1.0 - moon.w)*pow(1.0 - daylight, 4.0)
+           *clear*smoothstep(-0.03, 0.18, ray.y)*0.7;
     return max(sky, vec3<f32>(0.0));
 }
 

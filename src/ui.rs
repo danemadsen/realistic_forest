@@ -47,6 +47,10 @@ pub struct TrainerState {
     initialized: bool,
     snap_to_ground: bool,
     status: Option<String>,
+    /// The last sky jump's outcome.
+    sky_status: Option<String>,
+    /// Sunrise and sunset, hours, for the day they were worked out for.
+    sun_times: Option<(i64, Option<f64>, Option<f64>)>,
 }
 
 /// The streamed fields the diagnostics read when they exist, and the planet.
@@ -56,6 +60,7 @@ type WorldFields<'w> = (
     Option<Res<'w, crate::buildings::BuildingField>>,
     Option<Res<'w, crate::planet::view::PlanetTerrain>>,
     Res<'w, crate::planet::Planet>,
+    Res<'w, crate::planet::view::PlanetView>,
 );
 
 /// Draw the developer menu, passive diagnostics, and world overlays.
@@ -73,7 +78,7 @@ pub fn draw_diagnostics_ui(
     mut players: Query<&mut Player>,
     automation: Res<AutomationSettings>,
     mut rerun: ResMut<RerunErosion>,
-    (vegetation, rivers, buildings, planet_terrain, planet): WorldFields,
+    (vegetation, rivers, buildings, planet_terrain, planet, planet_view): WorldFields,
     mut snow: ResMut<SnowState>,
     mut trainer: Local<TrainerState>,
     mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>,
@@ -86,10 +91,12 @@ pub fn draw_diagnostics_ui(
     };
 
     let debug_bottom = if settings.show_debug {
+        let sky = sky_readout(&day_night, &planet, planet_view.eye);
         draw_debug_overlay(
             ctx,
             &settings,
             &day_night,
+            &sky,
             &weather,
             &cache,
             &noise,
@@ -122,6 +129,7 @@ pub fn draw_diagnostics_ui(
             rivers.as_deref(),
             buildings.as_deref(),
             &planet,
+            planet_view.eye,
         );
         if !settings.show_trainer && automation.shot_path.is_none() {
             if let Ok(mut cursor) = cursors.single_mut() {
@@ -174,6 +182,7 @@ fn draw_debug_overlay(
     ctx: &egui::Context,
     settings: &AppSettings,
     day_night: &DayNightCycle,
+    sky: &str,
     weather: &WeatherState,
     cache: &ErosionCache,
     noise: &NoiseField,
@@ -231,6 +240,7 @@ fn draw_debug_overlay(
          Movement: {}  |  Speed: {:.1}x  |  Vertical: {:.2} m/s\n\
          Ground: {:.2} m  |  Eye above ground: {:.2} m\n\
          Time: {:02}:{:02} {}  |  Weather: {}  |  Visibility: {}\n\
+         {}\n\
          Erosion tiles: {} ready, {} streaming  |  Planet: {:?} face, {} terrain patches\n\
          Tile heights: {:.1}..{:.1} m  |  Land: {:.0}%\n\
          Incision / deposition: {:.2} / {:.2} m  |  Detail / axis: {:.3} / {:.3}\n\
@@ -256,6 +266,7 @@ fn draw_debug_overlay(
         if day_night.paused { "(paused)" } else { "" },
         weather.local_condition().label(),
         visibility,
+        sky,
         ready,
         cache.tiles.len() - ready,
         player.face,
@@ -292,6 +303,135 @@ fn draw_debug_overlay(
             egui::Color32::WHITE,
         )
         .bottom()
+}
+
+/// The time warps the developer menu offers.
+const TIME_WARPS: [f32; 6] = [1.0, 10.0, 100.0, 1_000.0, 10_000.0, 100_000.0];
+
+fn clock_label(hours: f64) -> String {
+    let minutes = (hours * 60.0).round() as i64 % (24 * 60);
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// The sky for the readouts: the day, the season and the year, the moon's
+/// phase, and any eclipse the eye at `eye` sees.
+fn sky_readout(day_night: &DayNightCycle, planet: &crate::planet::Planet, eye: bevy::math::DVec3) -> String {
+    use crate::celestial::{self, Orbits, SOLAR_DAY};
+    let orbits = Orbits::new(planet);
+    let seconds = day_night.seconds();
+    let sky = orbits.at(seconds);
+    let view = sky.seen_from(eye);
+    let up = eye.normalize();
+    let year_day = seconds.rem_euclid(orbits.year()) / SOLAR_DAY;
+    let mut text = format!(
+        "Day {}  |  {}, day {:.0} of the {:.0}-day year  |  Moon: {}, {:.0}% lit, round in {:.1} days, phases in {:.1}",
+        day_night.day,
+        orbits.season(&sky, eye),
+        year_day.floor(),
+        orbits.year() / SOLAR_DAY,
+        celestial::phase_name(&sky),
+        view.moon_lit * 100.0,
+        orbits.month() / SOLAR_DAY,
+        orbits.synodic_month() / SOLAR_DAY,
+    );
+    if view.solar_eclipse > 0.001 && view.to_sun.dot(up) > 0.0 {
+        let separation = view.to_sun.dot(view.to_moon).clamp(-1.0, 1.0).acos();
+        let kind = if view.solar_eclipse >= 0.999 {
+            "Total"
+        } else if view.moon_radius < view.sun_radius && separation <= view.sun_radius - view.moon_radius {
+            "Annular"
+        } else {
+            "Partial"
+        };
+        text += &format!("\n{kind} solar eclipse: {:.0}% of the sun hidden", view.solar_eclipse * 100.0);
+    } else if view.moon_sunlight < 0.98 && view.to_moon.dot(up) > 0.0 {
+        let kind = if view.moon_sunlight < 0.02 { "Total" } else { "Partial" };
+        text += &format!("\n{kind} lunar eclipse: {:.0}% of the moon's sunlight shadowed", (1.0 - view.moon_sunlight) * 100.0);
+    }
+    text
+}
+
+/// The clock, the day, the time warp and the sky's readouts.
+fn draw_sky_controls(
+    ui: &mut egui::Ui,
+    day_night: &mut DayNightCycle,
+    trainer: &mut TrainerState,
+    planet: &crate::planet::Planet,
+    eye: bevy::math::DVec3,
+) {
+    use crate::celestial::Orbits;
+    separator_text(ui, "Sun, moon and time");
+    if ui
+        .add(
+            egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99)
+                .custom_formatter(|hours, _| clock_label(hours)),
+        )
+        .changed()
+    {
+        day_night.paused = true;
+    }
+    ui.horizontal(|ui| {
+        ui.label("Day");
+        if ui.add(egui::DragValue::new(&mut day_night.day).speed(0.25)).changed() {
+            day_night.paused = true;
+        }
+        for (label, days) in [("-1", -1), ("+1", 1), ("+7", 7)] {
+            if ui.button(label).clicked() {
+                day_night.day += days;
+                day_night.paused = true;
+            }
+        }
+    });
+    let orbits = Orbits::new(planet);
+    if trainer.sun_times.is_none_or(|(day, _, _)| day != day_night.day) {
+        let (rise, set) = orbits.sunrise_and_sunset(day_night.day, eye);
+        trainer.sun_times = Some((day_night.day, rise, set));
+    }
+    let (_, sunrise, sunset) = trainer.sun_times.unwrap_or_default();
+    ui.horizontal(|ui| {
+        // A quarter hour after sunrise and before sunset.
+        for (label, hour) in [
+            ("Dawn", sunrise.map_or(6.25, |hours| (hours + 0.25).rem_euclid(24.0))),
+            ("Noon", 12.0),
+            ("Dusk", sunset.map_or(17.75, |hours| (hours - 0.25).rem_euclid(24.0))),
+            ("Night", 0.0),
+        ] {
+            if ui.button(label).clicked() {
+                day_night.time_hours = hour as f32;
+                day_night.paused = true;
+            }
+        }
+    });
+    ui.small(format!(
+        "Sunrise {}  ·  sunset {}",
+        sunrise.map_or("none".to_owned(), clock_label),
+        sunset.map_or("none".to_owned(), clock_label),
+    ));
+    ui.checkbox(&mut day_night.paused, "Hold selected time");
+    let warp_label = |warp: f32| if warp == 1.0 { "Real time".to_owned() } else { format!("{warp:.0}x") };
+    egui::ComboBox::from_label("Time warp")
+        .selected_text(warp_label(day_night.warp))
+        .show_ui(ui, |ui| {
+            for warp in TIME_WARPS {
+                ui.selectable_value(&mut day_night.warp, warp, warp_label(warp));
+            }
+        });
+    if ui.button("Next eclipse").clicked() {
+        // Look ten years ahead.
+        let days = 10.0 * orbits.year() / crate::celestial::SOLAR_DAY;
+        trainer.sky_status = Some(match orbits.next_eclipse(day_night.seconds(), eye, days) {
+            Some((seconds, kind)) => {
+                day_night.set_seconds(seconds);
+                day_night.paused = true;
+                format!("{kind:?} eclipse on day {}.", day_night.day)
+            }
+            None => format!("No eclipse seen from here in the next {days:.0} days."),
+        });
+    }
+    if let Some(status) = &trainer.sky_status {
+        ui.small(status);
+    }
+    ui.small(sky_readout(day_night, planet, eye));
 }
 
 fn parse_teleport_coordinates(coordinates: &[String; 3]) -> std::result::Result<Vec3, String> {
@@ -492,6 +632,7 @@ fn draw_trainer_window(
     rivers: Option<&crate::rivers::RiverField>,
     buildings: Option<&crate::buildings::BuildingField>,
     planet: &crate::planet::Planet,
+    eye: bevy::math::DVec3,
 ) {
     let mut open = settings.show_trainer;
     let previous_position = player.position;
@@ -542,34 +683,7 @@ fn draw_trainer_window(
         thunder_volume_slider = thunder_volume_slider.fixed_decimals(2);
         ui.add(thunder_volume_slider);
 
-        separator_text(ui, "Time of day");
-        if ui
-            .add(
-                egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99).custom_formatter(
-                    |hours, _| {
-                        let minutes = (hours * 60.0).round() as u32 % (24 * 60);
-                        format!("{:02}:{:02}", minutes / 60, minutes % 60)
-                    },
-                ),
-            )
-            .changed()
-        {
-            day_night.paused = true;
-        }
-        ui.horizontal(|ui| {
-            for (label, hour) in [
-                ("Dawn", 6.25),
-                ("Noon", 12.0),
-                ("Dusk", 17.75),
-                ("Night", 0.0),
-            ] {
-                if ui.button(label).clicked() {
-                    day_night.time_hours = hour;
-                    day_night.paused = true;
-                }
-            }
-        });
-        ui.checkbox(&mut day_night.paused, "Hold selected time");
+        draw_sky_controls(ui, day_night, trainer, planet, eye);
         ui.collapsing("World and rendering shortcuts", |ui| {
             ui.checkbox(
                 &mut settings.vegetation_enabled,
@@ -702,18 +816,6 @@ fn draw_advanced_controls(
     day_duration_slider = day_duration_slider.suffix(" min");
     day_duration_slider = day_duration_slider.logarithmic(true);
     ui.add(day_duration_slider);
-    ui.horizontal(|ui| {
-        for (label, hour) in [
-            ("Dawn", 6.25),
-            ("Noon", 12.0),
-            ("Dusk", 17.75),
-            ("Night", 0.0),
-        ] {
-            if ui.button(label).clicked() {
-                day_night.time_hours = hour;
-            }
-        }
-    });
 
     separator_text(ui, "Raymarched lighting");
     ui.checkbox(&mut settings.raymarched_shadows, "Terrain shadows");
@@ -1359,6 +1461,7 @@ mod tests {
             &ctx,
             &AppSettings::default(),
             &DayNightCycle::default(),
+            "Day 0",
             &WeatherState::default(),
             &ErosionCache::default(),
             &noise,
@@ -1409,7 +1512,7 @@ mod tests {
         let mut rerun = RerunErosion::default();
         for debug_visible in [false, true, false] {
             // Let egui settle its content size after each visibility change.
-            for _ in 0..2 {
+            for pass in 0..2 {
                 ctx.begin_pass(egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
@@ -1419,7 +1522,7 @@ mod tests {
                 });
                 let bottom = if debug_visible {
                     draw_debug_overlay(
-                        &ctx, &settings, &day_night, &weather, &cache, &noise, &snow, &player, None, None, None,
+                        &ctx, &settings, &day_night, "Day 0", &weather, &cache, &noise, &snow, &player, None, None, None,
                     )
                 } else {
                     0.0
@@ -1442,12 +1545,17 @@ mod tests {
                     None,
                     None,
                     &crate::planet::Planet::default(),
+                    bevy::math::DVec3::new(0.0, crate::planet::Planet::default().radius, 0.0),
                 );
                 let mut output = ctx.end_pass();
                 output.textures_delta.clear();
                 let rect = ctx
                     .memory(|memory| memory.area_rect(egui::Id::new("developer_menu")))
                     .unwrap();
+                // A window sized by its last frame may sit a frame off.
+                if pass == 0 {
+                    continue;
+                }
                 assert!((rect.left() - 12.0).abs() <= 1.0, "{rect:?}");
                 assert!(
                     rect.top() >= bottom + 11.0,
