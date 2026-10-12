@@ -18,6 +18,7 @@ mod grass_stream;
 mod lightning;
 mod matrices;
 mod noise;
+mod planet;
 mod player;
 mod render;
 mod rivers;
