@@ -127,12 +127,14 @@ fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
 // Hemisphere-integrated fill depends on the surface orientation and time of
 // day, never its screen row or camera pitch. Excludes the celestial discs.
 fn skyAmbient(normal_world: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
-    let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    // The sky over this point of the planet: its own daylight and its own
+    // up, which near the camera are the camera's.
+    let daylight = planetDaylightAt(world_position);
     let storm = stormLightAt(world_position);
     let sky_cover = weatherSkyCover(weatherSeverity(world_position.xz));
     let overcast = smoothstep(0.05, 0.9, sky_cover);
     let whiteout = smoothstep(0.78, 1.0, sky_cover);
-    let upward = clamp(normal_world.y*0.5 + 0.5, 0.0, 1.0);
+    let upward = clamp(dot(normal_world, planetUpAt(world_position))*0.5 + 0.5, 0.0, 1.0);
     let clear_day_fill = mix(vec3<f32>(0.13, 0.17, 0.22),
                              vec3<f32>(0.32, 0.44, 0.62), upward);
     let clouded_day_fill = mix(vec3<f32>(0.17, 0.19, 0.19),

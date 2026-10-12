@@ -739,13 +739,22 @@ fn build_library(
     };
     let draw_pipelines = sided_pipelines(cache, draw_pipeline_descriptor);
     // Shadows: depth only, from the light, with the same wind as the view.
+    // The globals ride along at binding 0: the shadow pass stands each plant
+    // on the planet around the camera exactly as the view does.
     let cascade_layout = BindGroupLayoutDescriptor::new(
         "vegetation_cascade_layout",
-        &[uniform_entry(
-            1,
-            wgpu::ShaderStages::VERTEX_FRAGMENT,
-            std::mem::size_of::<CascadeUniform>() as u64,
-        )],
+        &[
+            uniform_entry(
+                0,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
+                std::mem::size_of::<super::GlobalUniformsGpu>() as u64,
+            ),
+            uniform_entry(
+                1,
+                wgpu::ShaderStages::VERTEX_FRAGMENT,
+                std::mem::size_of::<CascadeUniform>() as u64,
+            ),
+        ],
     );
     let shadow_pipeline_descriptor = RenderPipelineDescriptor {
         label: Some("forest_vegetation_shadow_pipeline".into()),
@@ -831,10 +840,10 @@ fn build_library(
                 cache,
                 "vegetation_cascade",
                 &cascade_layout,
-                &[wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: buffer.as_entire_binding(),
-                }],
+                &[
+                    wgpu::BindGroupEntry { binding: 0, resource: global_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: buffer.as_entire_binding() },
+                ],
             )
         })
         .collect();

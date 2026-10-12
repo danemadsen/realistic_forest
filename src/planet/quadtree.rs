@@ -124,36 +124,27 @@ impl LodLadder {
         DVec2::new(key.x as f64 * size - self.half_width, key.z as f64 * size - self.half_width)
     }
 
-    pub fn node_centre(&self, key: NodeKey) -> DVec2 {
-        self.node_min(key) + DVec2::splat(0.5 * self.node_size(key.depth))
-    }
-
-    /// The node at `depth` holding a chart point of `face`.
-    pub fn node_at(&self, face: Face, chart: DVec2, depth: u8) -> NodeKey {
-        let size = self.node_size(depth);
-        let last = (1u64 << depth) as f64 - 1.0;
-        let column = ((chart.x + self.half_width) / size).floor().clamp(0.0, last);
-        let row = ((chart.y + self.half_width) / size).floor().clamp(0.0, last);
-        NodeKey { face, depth, x: column as u32, z: row as u32 }
-    }
 }
 
 /// The geomorph factor a vertex `distance` metres from the camera takes at
 /// `depth`: 0 on its own lattice, 1 fully on its parent's. The terrain vertex
-/// shader evaluates the same expression.
+/// shader evaluates the same expression; the tests check its stitching here.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn morph_factor(ladder: &LodLadder, depth: u8, distance: f64) -> f64 {
     let (start, end) = ladder.morph(depth);
     if start >= end {
         return 0.0;
     }
-    ((distance - start) / (end - start)).clamp(0.0, 1.0)
+    super::smoothstep(start, end, distance)
 }
 
 /// Snap a chart coordinate onto the lattice of `spacing`, rounding toward the
 /// face centre. Every face rounds toward its own centre and a shared edge's
 /// midpoint is zero on both sides of it, so the two faces collapse an edge
 /// vertex onto the same neighbour. (The clipmap rounded half up, which on a
-/// mirrored neighbouring chart would pick the opposite neighbour.)
+/// mirrored neighbouring chart would pick the opposite neighbour.) The
+/// terrain vertex shader's `planetSnapTowardCentre` is the same expression.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn snap_toward_centre(coordinate: f64, spacing: f64) -> f64 {
     (coordinate.abs() / spacing).floor().copysign(coordinate) * spacing
 }
@@ -190,7 +181,8 @@ impl ViewVolume {
         Self { eye, planes }
     }
 
-    /// Accepts everything: for captures that are not views.
+    /// Accepts everything.
+    #[cfg(test)]
     pub fn everything(eye: DVec3) -> Self {
         Self { eye, planes: [(DVec3::ZERO, 1.0); 6] }
     }
@@ -202,7 +194,7 @@ impl ViewVolume {
 
 /// The measured height range of nodes, filled a budgeted number per frame:
 /// the terrain's chunk streaming. A node is measured the first time the
-/// selection visits it and kept until the cache is cleared.
+/// selection visits it and kept: the bare relief it samples never changes.
 #[derive(Default)]
 pub struct HeightBounds {
     measured: HashMap<NodeKey, (f32, f32)>,
@@ -210,17 +202,23 @@ pub struct HeightBounds {
 }
 
 impl HeightBounds {
-    pub fn clear(&mut self) {
-        self.measured.clear();
-        self.pending.clear();
-    }
-
-    pub fn len(&self) -> usize {
+    /// How many nodes have been measured.
+    #[cfg(test)]
+    pub fn measured_count(&self) -> usize {
         self.measured.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.measured.is_empty()
+    /// The tightest range known for `key` without queueing it: its own, its
+    /// nearest measured ancestor's, or everything the terrain can reach.
+    pub fn known(&self, key: NodeKey) -> (f64, f64) {
+        let mut node = Some(key);
+        while let Some(current) = node {
+            if let Some(&(low, high)) = self.measured.get(&current) {
+                return (low as f64, high as f64);
+            }
+            node = current.parent();
+        }
+        (TERRAIN_HEIGHT_FLOOR, TERRAIN_HEIGHT_CEILING)
     }
 
     /// The tightest known range for `key`: its own if measured, else its
@@ -266,10 +264,10 @@ impl HeightBounds {
             let mut low = f64::MAX;
             let mut high = f64::MIN;
             let mut steepest = 0.0f64;
-            let mut row_previous = vec![0.0; BOUNDS_SAMPLES];
+            let mut row_previous = [0.0; BOUNDS_SAMPLES];
             for j in 0..BOUNDS_SAMPLES {
                 let mut previous = 0.0;
-                for i in 0..BOUNDS_SAMPLES {
+                for (i, above) in row_previous.iter_mut().enumerate() {
                     let chart = minimum + DVec2::new(i as f64, j as f64) * step;
                     let value = height(key.face, chart);
                     low = low.min(value);
@@ -278,13 +276,13 @@ impl HeightBounds {
                         steepest = steepest.max((value - previous).abs());
                     }
                     if j > 0 {
-                        steepest = steepest.max((value - row_previous[i]).abs());
+                        steepest = steepest.max((value - *above).abs());
                     }
                     previous = value;
-                    row_previous[i] = value;
+                    *above = value;
                 }
             }
-            let margin = steepest + 40.0;
+            let margin = steepest + super::height::FEATURE_HEIGHT_MARGIN;
             self.measured.insert(
                 key,
                 (
@@ -661,7 +659,7 @@ mod tests {
             bounds.measure(&ladder, |_, _| 0.0);
             tighter = select(&planet, &ladder, &view, &mut bounds, &mut patches);
         }
-        assert!(bounds.len() > 100);
+        assert!(bounds.measured_count() > 100);
         assert!(tighter.drawn <= stats.drawn, "{tighter:?} vs {stats:?}");
         assert_crack_free(&planet, &ladder, &view, &patches);
     }

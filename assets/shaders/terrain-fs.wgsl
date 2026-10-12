@@ -70,6 +70,11 @@ struct GlobalUniforms {
     storm: vec4<f32>, // precipitation bias, type override, elapsed time, wind direction radians
     lightning: vec4<f32>, // strike world xyz, HDR flash
     lightning_meta: vec4<f32>, // seed, age, bolt top, front speed
+    planet: vec4<f32>,          // radius, face half width, seam band, camera face (planet-functions.wgslinc)
+    planet_camera: vec4<f32>,   // camera chart xy on its face, altitude, LOD reference altitude
+    planet_east: vec4<f32>,     // camera east in planet axes, feature fade width
+    planet_up: vec4<f32>,       // camera up in planet axes, atmosphere top altitude
+    planet_north: vec4<f32>,    // camera north in planet axes
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
@@ -166,7 +171,27 @@ struct FsInput {
     // How far up the nearest river's or lake's shore the ground lies
     // (riverShoreRun, terrain-vs): negative under water, 40 near none.
     @location(9) frag_river_shore: f32,
+    // World offset from the camera; the G-buffer position is rebuilt from it.
+    @location(10) frag_view_offset: vec3<f32>,
+    // The fragment's local east and up in world axes (terrainFrame). On the
+    // planet every normal above is in this local frame: the plane's x, y and
+    // z where the fragment lies, which tilt away from the camera's own.
+    @location(11) frag_frame_east: vec3<f32>,
+    @location(12) frag_frame_up: vec3<f32>,
+    // Vertex spacing, the next coarser lattice's, and 1 where the streamed
+    // features (erosion, rivers, pads) apply: only on the camera's face, whose
+    // stretch of the terrain plane their caches hold.
+    @location(13) @interpolate(flat) frag_patch: vec4<f32>,
 };
+
+// The fragment's local frame in world axes: columns east, up, north. A
+// local-frame vector v is frame*v in world axes.
+fn terrainFrame(input: FsInput) -> mat3x3<f32>
+{
+    let east = normalize(input.frag_frame_east);
+    let up = normalize(input.frag_frame_up - east*dot(input.frag_frame_up, east));
+    return mat3x3<f32>(east, up, cross(east, up));
+}
 
 // G-buffer outputs, locations preserved from the GLSL layout qualifiers.
 struct FsOutput {
@@ -1535,7 +1560,13 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // at 1, no fog - so the pixel flashes white, and the water's
     // hidden-surface test discards over it, showing the seabed through the
     // sea. Grass-damped specular used to hide most of them.
-    let frag_position_view = (globals.view * vec4<f32>(frag_world_position, 1.0)).xyz;
+    // On the planet the world is the camera's frame and the plane position
+    // only names a material domain, so the view position comes from the
+    // camera-relative offset (a direction through the view's rotation, which
+    // also keeps it exact however far the camera is from the origin).
+    let frag_position_view = (globals.view * vec4<f32>(input.frag_view_offset, 0.0)).xyz;
+    let frame = terrainFrame(input);
+    let features = input.frag_patch.z > 0.5;
 
     var normalWorld = normalize(input.frag_world_normal);
     let height = input.frag_base_height;
@@ -1555,8 +1586,8 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // Keep the entire material fringe inside the exact lookup. Handing back
     // at 4 m cut through the soil/turf blend and made a different outline for
     // every clipmap ring, most visibly beside a broad outlet.
-    let exactReach = 16.0 + 1.5*max(stage.spacing, stage.next_spacing);
-    if (river.x < exactReach)
+    let exactReach = 16.0 + 1.5*max(input.frag_patch.x, input.frag_patch.y);
+    if (features && river.x < exactReach)
     {
         let exact = riverEnvelope(worldXZ);
         // Measured from the ground under any snow, as the vertex stage does.
@@ -1594,9 +1625,12 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // left above bedrock (A); the flow atlas adds the routed contributing area
     // (A). Every simulated signal fades with reveal and the visibility radius,
     // where slope, geology and the base cover estimate carry on alone.
-    var flowDomain: f32;
-    var surface: vec4<f32>;
-    let flow = blendedFlow(worldXZ, &flowDomain, &surface);
+    var flowDomain = 0.0;
+    var surface = vec4<f32>(0.0);
+    var flow = vec4<f32>(0.0);
+    if (features) {
+        flow = blendedFlow(worldXZ, &flowDomain, &surface);
+    }
     // Contributing area separates rills from rivers: ~20 cells (320 m2) of
     // catchment is still a grassed hollow, ~2000 cells (3.2 ha) a permanent
     // stream. The ring concentration finds each channel's thalweg inside its
@@ -1891,7 +1925,10 @@ fn shadeTerrain(input: FsInput, habitat: bool,
 
     // Around a building the turf is trodden into packed earth: worn through
     // along its walls and porch, patchy across its yard (building-pads.wgslinc).
-    let trodden = buildingPadTrodden(worldXZ)*mix(0.55, 1.0, groundGrowth);
+    var trodden = 0.0;
+    if (features) {
+        trodden = buildingPadTrodden(worldXZ)*mix(0.55, 1.0, groundGrowth);
+    }
     let grassSoilYard = 1.0 - (1.0 - grassSoilRiver)*(1.0 - trodden);
 
     let groundCover = (1.0 - fSandRiver) * (1.0 - fGravelRiver) * (1.0 - fRockRiver) * (1.0 - fSnowRiver);
@@ -2558,7 +2595,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                                         * crystalSnowRise);
         }
     }
-    let perturbedView = normalize((globals.view * vec4<f32>(perturbedWorld, 0.0)).xyz);
+    let perturbedView = normalize((globals.view * vec4<f32>(frame * perturbedWorld, 0.0)).xyz);
 
     // Filtering distributions of normals (Kaplanyan et al., HPG 2016):
     // sub-pixel normal variance widens the effective roughness by a GGX
@@ -2591,8 +2628,9 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                         abs(perturbedWorld.y) < 0.98);
         let sparkleTangent = normalize(cross(up, perturbedWorld));
         let sparkleBitangent = cross(perturbedWorld, sparkleTangent);
-        let toCamera = normalize(globals.camera_position.xyz - frag_world_position);
-        let toSun = -normalize(globals.sun_direction.xyz);
+        // Both in the fragment's local frame, like every normal here.
+        let toCamera = normalize(-input.frag_view_offset) * frame;
+        let toSun = -normalize(globals.sun_direction.xyz) * frame;
         let halfVector = normalize(toCamera + toSun);
 
         // Near octave: ~4 cm crystal facets.
@@ -2746,7 +2784,7 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         // glint field instead of decaying to the floor before midfield.
         applied = applied * step(hash12(floor(worldXZ * bestCells) + vec2<f32>(51.0, 83.0)),
                                  clamp(3.2 / cellsPerPixel, 0.08, 1.0));
-        let facetView = normalize((globals.view * vec4<f32>(facet, 0.0)).xyz);
+        let facetView = normalize((globals.view * vec4<f32>(frame * facet, 0.0)).xyz);
         outNormalView = normalize(mix(perturbedView, facetView, applied));
         // 0.13, not the old 0.10: the applied window accepts facets aligned
         // to ~13-16 degrees, but a 0.10 mirror lobe is only ~6 degrees wide —

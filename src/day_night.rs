@@ -70,6 +70,16 @@ pub fn sample(time_hours: f32) -> CelestialLighting {
     let elevation = sin_phase * 0.92;
     let sun_direction = [-cos_phase, -elevation, sin_phase * 0.39191836, 0.0];
     let moon_direction = [-sun_direction[0], -sun_direction[1], -sun_direction[2], 0.0];
+    at_elevation(sun_direction, moon_direction, elevation)
+}
+
+/// The light of a sun `elevation` (the sine of its angle) above the local
+/// horizon. The cycle's directions are the planet's, fixed in the spawn's
+/// frame; elsewhere on the planet the sun stands higher or lower, and the
+/// renderer relights the camera's place from its own elevation (the shaders'
+/// `planetSunlightAt` and `planetDaylightAt` repeat these curves for every
+/// other place).
+pub fn at_elevation(sun_direction: [f32; 4], moon_direction: [f32; 4], elevation: f32) -> CelestialLighting {
     let daylight = smoothstep(-0.18, 0.18, elevation);
     let colour_mix = smoothstep(0.0, 0.55, elevation);
     CelestialLighting {

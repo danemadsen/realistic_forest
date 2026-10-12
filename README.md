@@ -1,11 +1,13 @@
 # Forest
 
-Forest is a Rust 2024 prototype for an infinite procedural landscape. It renders
-mountains, plains, beaches, ocean, rivers and creeks, and biome colours with an
-indexed geometry clipmap. Procedural terrain can be evaluated at any world coordinate, and
-overlapping GPU hydraulic-erosion tiles are generated and cached around the
-player as the world streams. Walking and flight are not clamped to a simulation
-domain: there is no world border.
+Forest is a Rust 2024 prototype for a procedural planet. It renders
+mountains, plains, beaches, ocean, rivers and creeks, and biome colours on a
+cube-sphere with per-face quadtree LOD, from a walk through a meadow to the
+whole planet seen from orbit (see [The planet](#the-planet)). Procedural
+terrain can be evaluated at any point of the planet, and overlapping GPU
+hydraulic-erosion tiles are generated and cached around the player as the
+world streams. Walking and flight are not clamped to a simulation domain: the
+planet has no border, and walking off one cube face carries on onto the next.
 
 It is a port of the C++17/raylib/OpenGL project at `~/forest`, keeping the same
 math, constants and structure. The renderer is now wgpu through Bevy, the source
@@ -46,7 +48,9 @@ by naga at runtime either way.
 | Escape | Release the cursor |
 | Left click | Capture the cursor again |
 
-Movement is unbounded in both walking and flight modes. Walking is stopped by
+Movement is unbounded in both walking and flight modes. Flight keeps its
+speeds up to 250 m above the ground and grows in proportion beyond it, so the
+same keys that drift over a meadow cross a continent from orbit. Walking is stopped by
 trees and lilacs (see [Colliding with trees](#colliding-with-trees)) and by the
 walls of buildings, whose doors swing open as you walk into them (see
 [Walking through them](#walking-through-them)); flight passes through them, as
@@ -151,6 +155,7 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--wait n` | Frames to render before the screenshot, counted once the prewarmed erosion tiles, plants and grass are ready |
 | `--erosion-prewarm N` | Simulate the `N` nearest erosion tiles at full budget before streaming (default `4`, the quartet around the player); raise it so a capture shows erosion beyond the player's own lattice cell |
 | `--size W,H` | Window size in points (comma-separated, as the C++'s `sscanf`) |
+| `--planet-radius M` | Sea-level radius of the planet in metres, snapped so a cube face's half width is a power-of-two number of metres; default 667.5 km |
 | `--probe` | Print terrain and erosion statistics, then exit |
 | `--probe-extent`, `--probe-step` | Probe sampling window |
 | `--measure-overlap` | Compare erosion tiles across a shared lattice edge |
@@ -197,6 +202,103 @@ cargo run --release --bin realistic_forest -- --camera 0,80,0,45,-8 --time-of-da
 simple atmospheric fog. Add `--no-fog` to remove atmospheric scattering and
 extinction as well; this leaves the water's underwater optics controls separate.
 
+## The planet
+
+The world is a planet of 667.5 km sea-level radius by default
+(`--planet-radius`): six cube faces projected onto a sphere, each the root of
+its own quadtree, in the manner of Kerbal Space Program's PQS. Spawn is the
+centre of the +Y face.
+
+**Charts.** Every face has square chart coordinates out to ±524,288 m, an
+equi-angular cube map: along both axes through a face centre one chart metre is
+a metre of arc on the sea-level sphere, and at the centre the chart is
+conformal. Toward a face's edges and corners it stretches and shears as any
+cube map does (a chart metre is 0.71 m across an edge at its midpoint, and the
+axes meet at 120° at a corner). A face's chart is a window onto the terrain
+plane the planar build generated: its plane coordinates are its chart
+coordinates plus a per-face offset of a few tens of kilometres, which is zero
+on the spawn face. The ground around spawn is therefore the planar build's,
+sample for sample, and every system that works in plane coordinates (noise,
+erosion, rivers, plants, buildings, snow, weather) carries on unchanged in
+them. Each chart is in metres that are a power of two times the finest
+0.25 m spacing, so every quadtree vertex lies exactly on that lattice.
+
+**Seams.** Elevation is a function of the planet-centred direction alone.
+Inside a face it is the face's own chart's; across a 6 km band either side of
+every cube edge the neighbouring charts' bare relief cross-fades by a smooth
+partition of unity, two faces along an edge and three at a corner. Both faces
+of an edge compute the same height for the same point, so the surface is
+continuous across every seam. The streamed features (erosion, river carving,
+building pads) belong to the face the camera is on, whose stretch of the plane
+their caches hold; they fade out over 4 km before the band, and the plants,
+grass, buildings and rivers seated on them are drawn only where they are
+whole. The player's footing, the trunks and everything else on the CPU stand
+on the same ground the GPU draws.
+
+**Level of detail.** Each frame the CPU selects patches face by face, CDLOD
+style: a node is drawn where it lies within its depth's range of the camera
+and refined where its children lie within theirs, measured from the camera to
+the patch at the altitude of the ground under the camera, as the clipmap
+measured its rings in the plane. The outer 30% of every range geomorphs onto
+the next coarser lattice; the ranges are chosen so a patch always meets a
+coarser neighbour fully collapsed onto its lattice, and the morph rounds
+toward each face's centre so the two faces of an edge collapse it alike. Tests
+check both across cube edges and corners. The patches are drawn as two
+instanced draws (whole nodes and quadrants of partly refined nodes), with
+short skirts hiding any hairline left between patches placed from different
+centres. Nodes are culled against the view frustum and against the planet's
+horizon (a patch is hidden when the lines of sight grazing the lowest possible
+ground no longer reach it), and each node's height range is measured from the
+CPU relief a budgeted number per frame as the selection first meets it,
+tightening culling as the view streams.
+
+**Positions and precision.** Positions on the CPU are planet-centred f64. The
+GPU never sees a planet-centred f32 position: each patch carries its centre's
+offset from the camera, computed in f64, and its vertices are placed relative
+to that centre with differences of directions formed directly (as accurate as
+their own size, never as the planet's radius). The renderer's world is the
+planar world bent onto the planet around the camera: a frame whose axes are
+the camera's local east, up and north, with the camera at its plane
+coordinates and altitude and the planet's centre straight below it. Near the
+camera it is the plane, so every shader written for the plane keeps working;
+plants, grass, buildings, the sea, rivers and lightning are placed on the
+sphere through the same camera-relative mapping (`planet-functions.wgslinc`),
+and altitudes, the fog, the cloud layer and the terrain's shadow marches use
+true altitude above the sphere. The terrain's view-space positions are
+camera-relative throughout. The plane coordinates themselves stay f32, but no
+longer grow without bound: they never exceed a face's window, about 3 cm of
+precision at its edge.
+
+**Frames and gravity.** The player's position is its face, its plane
+coordinates on that face and its altitude: "up" is always away from the
+planet's centre, and gravity pulls toward it, weakening with the square of
+the distance. Walking or flying off a face's edge carries the player onto
+the next face's chart with its heading and velocity turned to match. Each
+vertex's normal is built in its own local frame from the chart's derivatives,
+and the terrain's materials read it there, so slope, aspect and snow are the
+plane's anywhere on the planet. The day/night cycle turns the planet under
+the sun: its directions are fixed in planet axes, and each place sees the sun
+at its own elevation, so travelling far enough brings on the night.
+
+**From the ground to orbit.** The sea is Crest's rings around the camera,
+bent onto the sphere, and beyond their square the terrain's own patches laid
+at sea level and shaded by the same water shader, out to the horizon and round
+the planet. The cloud deck is a spherical shell, fog and haze follow true
+altitude and thin with an 8 km scale height, and the sky fades into space with
+the air left above the camera, leaving stars, the sun's unreddened disc and a
+bright limb. Erosion, rivers, buildings and plants stop streaming more than
+20 km above the ground, where their detail is too small to see.
+
+**Known limitations.** The source noise is an 8 km mirror-folded texture, and
+the macro landforms repeat on a lattice of about 54 km; from the ground the
+5.8 km horizon hides it, but from high up it shows as a regular pattern of
+ranges. The per-face windows overlap on the plane, so the faces look alike
+from orbit. Near a cube corner the chart's shear distorts landforms. The grass
+habitat capture still rasterises the clipmap, whose morph bands differ from
+the quadtree's, so grass roots can sit a few centimetres off the drawn ground
+there. Instanced objects (plants, buildings) stand upright in the camera's
+frame rather than their own, a tilt of a degree at 11 km.
+
 ## Terrain and clipmap
 
 quick-noise creates a deterministic, tileable 1024×1024 R32 source field.
@@ -218,13 +320,16 @@ not z-fight with it, and the deepest basins flatten onto an abyssal plain.
 Only a small area immediately around spawn
 is gently stabilised.
 
-The terrain uses one indexed 224×224-quad centre mesh and one reusable ring
-mesh. Nine levels use vertex spacing from 0.25 to 64 metres, reaching 7168 metres
-from the clipmap anchor. All levels share a stable 64-metre world lattice. The
-outer part of each level morphs onto the next coarser global lattice, including
-its normal sampling interval, which prevents cracks and greatly reduces LOD
-shimmer. A 5800-metre far plane bounds the finite render horizon while
-generation itself remains unbounded.
+The visible terrain is the planet's quadtree (see [The planet](#the-planet)):
+32×32-quad patches whose vertex spacing runs from 0.25 metres under the camera
+to tens of kilometres on the far side of the planet, each kept out to about a
+hundred of its own spacings, as the clipmap's rings were. The outer part of
+each patch's range morphs onto the next coarser lattice, including its normal
+sampling interval, which prevents cracks and greatly reduces LOD shimmer. Near
+the ground a 5800-metre far plane bounds the render horizon as it always has;
+it grows to the planet's horizon as the camera climbs. The clipmap's meshes
+remain for the grass habitat capture, a flat top-down map of the ground
+around the player.
 
 Terrain uses triplanar PBR textures with a muted, earthy palette, placed from
 the erosion simulation's own record of the ground. The simulation tracks the
@@ -318,11 +423,13 @@ glints. The G-buffer position is rebuilt from each terrain fragment's world
 position: the interpolated view-space position arrives as zero in scattered
 fragments on Metal, which flashed white specks across the terrain and opened
 holes in the sea's hidden-surface test.
-A camera-centred sea-level plane creates ocean and shorelines. The
+The sea, a sphere at sea level around the planet, creates ocean and
+shorelines (see [The planet](#the-planet)). The
 **Dirt/gravel variant scale** control affects scan variation within soil and gravel.
 
 Ocean wave lighting is evaluated per pixel, so distant waves stay visible
-beyond the mesh's displacement fade and across the flat horizon skirt.
+beyond the mesh's displacement fade and across the far sea drawn on the
+terrain's patches.
 Each wave filters against its projected pixel footprint; unresolved ripples
 broaden the sun reflection instead of shimmering. Crest compression drives
 whitecaps and subsurface light, with foam detail also filtered at distance.
@@ -1570,7 +1677,8 @@ quality or disable clouds independently if the frame rate becomes too low.
 ## Render pipeline
 
 The renderer writes view position, view normal, and albedo to a three-target
-G-buffer: the terrain first, then the buildings, then the plants (after their
+G-buffer: the terrain first (the planet's quadtree patches, two instanced
+draws), then the buildings, then the plants (after their
 cull pass), then the grass. The plants draw their three shadow cascades and
 the buildings draw into them after. SSAO is evaluated at half resolution with a 24-sample rotated
 hemisphere kernel, followed by a depth/normal-aware bilateral blur. A separate
@@ -1604,4 +1712,4 @@ passes a pixel through untouched. The `PORT NOTES` in `assets/shaders/fxaa.wgsl`
 explains this in full.
 
 This is currently a desktop prototype with a fixed terrain seed and a bounded
-in-memory erosion cache over an unbounded procedural world.
+in-memory erosion cache over a procedural planet.

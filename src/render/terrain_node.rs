@@ -52,12 +52,28 @@ const GBUFFER_CLEAR_COLOR: wgpu::Color = wgpu::Color {
 };
 
 /// terrain-vs reads a single `vec3` position (planar grid coordinates).
-const TERRAIN_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
+pub(crate) const TERRAIN_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
     format: wgpu::VertexFormat::Float32x3,
     offset: 0,
     shader_location: 0,
 }];
-const TERRAIN_VERTEX_STRIDE: u64 = 12;
+pub(crate) const TERRAIN_VERTEX_STRIDE: u64 = 12;
+
+/// The planet terrain's per-patch instance data, `PatchInstance` in
+/// src/planet/view.rs and `PatchInput` in terrain-vs.wgsl.
+pub(crate) const PATCH_INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 6] = [
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 1 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32, offset: 12, shader_location: 2 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 16, shader_location: 3 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 24, shader_location: 4 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 32, shader_location: 5 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32, offset: 44, shader_location: 6 },
+];
+pub(crate) const PATCH_INSTANCE_STRIDE: u64 = std::mem::size_of::<crate::planet::view::PatchInstance>() as u64;
+
+/// Patches one frame can draw. The quadtree selects a few hundred; anything
+/// past this is dropped with a warning rather than reallocating mid-pass.
+pub(crate) const MAX_TERRAIN_PATCHES: usize = 8192;
 
 /// World-space shadow coverage extends beyond the 5800 m camera horizon.
 /// Reusing terrainHeight in the vertex shader keeps streamed erosion and the
@@ -448,11 +464,19 @@ struct TerrainResources {
     habitat_globals: StageUniform,
     /// The same terrain-height shader rendered through a local map transform.
     shore_globals: StageUniform,
+    /// The clipmap's meshes, still drawn by the grass habitat capture: a
+    /// top-down map of the terrain plane around the player.
     center_mesh: GpuMesh,
     ring_mesh: GpuMesh,
     /// One stage block per clipmap level, matching `DrawClipmap`'s per-level
-    /// uniforms.
+    /// uniforms. Level 0's also carries the terrain constants the planet's
+    /// patches read.
     levels: [StageUniform; CLIP_LEVELS],
+    /// The quadtree's patch grids, whole and quadrant, each skirted.
+    whole_patch_mesh: GpuMesh,
+    half_patch_mesh: GpuMesh,
+    /// This frame's patches, one instance each.
+    patch_instances: Buffer,
 }
 
 // ---------------------------------------------------------------------------
@@ -857,22 +881,34 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         1.0,
     );
 
-    // The C++ walks the levels in order and draws
-    // `level == 0 ? center : ring` for each of them.
+    // The planet: the quadtree's patches, the whole nodes in one instanced
+    // draw and the quadrants of partly refined nodes in another. Every patch
+    // reads the terrain constants from level 0's stage block; where it is
+    // and how it morphs come with its instance.
     if let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.terrain_pipeline) {
+        let count = view.patches.len().min(MAX_TERRAIN_PATCHES);
+        if count < view.patches.len() {
+            warn_once!("terrain: {} patches selected, drawing the first {count}", view.patches.len());
+        }
+        if count > 0 {
+            queue.write_buffer(&resources.patch_instances, 0, bytemuck::cast_slice(&view.patches[..count]));
+        }
+        let whole = view.whole_patches.min(count) as u32;
         pass.set_render_pipeline(pipeline);
         pass.set_bind_group(0, &resources.globals, &[]);
         pass.set_bind_group(1, &resources.terrain_textures, &[]);
-        for (level, stage) in resources.levels.iter().enumerate() {
-            let mesh = if level == 0 {
-                &resources.center_mesh
-            } else {
-                &resources.ring_mesh
-            };
-            pass.set_bind_group(2, &stage.bind_group, &[]);
+        pass.set_bind_group(2, &resources.levels[0].bind_group, &[]);
+        pass.set_vertex_buffer(1, resources.patch_instances.slice(..));
+        for (mesh, instances) in [
+            (&resources.whole_patch_mesh, 0..whole),
+            (&resources.half_patch_mesh, whole..count as u32),
+        ] {
+            if instances.is_empty() {
+                continue;
+            }
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            pass.draw_indexed(0..mesh.index_count, 0, instances);
         }
     }
 
@@ -960,6 +996,76 @@ fn build_clip_mesh(device: &RenderDevice, ring: bool) -> GpuMesh {
         "forest_clip_center"
     };
     upload_mesh(device, label, &vertices, &indices)
+}
+
+/// One quadtree patch: a `cells`-square grid of integer vertices `(i, 0, j)`,
+/// i and j in `0..=cells`, plus a skirt hanging from each of its four edges.
+/// A skirt vertex repeats its edge vertex with y = 1, which the vertex shader
+/// lowers below the ground: wherever two patches' edges disagree by a hair
+/// (they place their shared vertices from different patch centres), the
+/// skirt fills the gap instead of letting the sky through.
+///
+/// Like the clipmap's grid the triangles wind counter-clockwise seen from
+/// above, and every cube face's chart axes are oriented like the plane's
+/// (`east x up = north`), so one winding faces outward on all six faces.
+pub(crate) fn patch_mesh_data(cells: u32) -> (Vec<f32>, Vec<u32>) {
+    let side = cells + 1;
+    let mut vertices: Vec<f32> = Vec::with_capacity((side * side + 4 * side) as usize * 3);
+    for j in 0..side {
+        for i in 0..side {
+            vertices.extend_from_slice(&[i as f32, 0.0, j as f32]);
+        }
+    }
+    let grid = |i: u32, j: u32| j * side + i;
+    let mut indices: Vec<u32> = Vec::with_capacity((cells * cells * 6 + 4 * cells * 6) as usize);
+    for j in 0..cells {
+        for i in 0..cells {
+            let lower_left = grid(i, j);
+            let upper_left = grid(i, j + 1);
+            let lower_right = grid(i + 1, j);
+            let upper_right = grid(i + 1, j + 1);
+            indices.extend_from_slice(&[lower_left, upper_left, upper_right, lower_left, upper_right, lower_right]);
+        }
+    }
+    // Each edge, as its vertices in order and the direction it faces.
+    let edges = [
+        ((0..side).map(|i| (i, 0)).collect::<Vec<_>>(), [0.0f32, -1.0]),
+        ((0..side).map(|i| (i, cells)).collect(), [0.0, 1.0]),
+        ((0..side).map(|j| (0, j)).collect(), [-1.0, 0.0]),
+        ((0..side).map(|j| (cells, j)).collect(), [1.0, 0.0]),
+    ];
+    for (edge, outward) in edges {
+        let first_skirt = (vertices.len() / 3) as u32;
+        for &(i, j) in &edge {
+            vertices.extend_from_slice(&[i as f32, 1.0, j as f32]);
+        }
+        let position = |index: u32| {
+            let at = index as usize * 3;
+            // Skirt vertices hang down: y = 1 is below the edge.
+            bevy::math::Vec3::new(vertices[at], -vertices[at + 1], vertices[at + 2])
+        };
+        for k in 0..cells {
+            let top = [grid(edge[k as usize].0, edge[k as usize].1), grid(edge[k as usize + 1].0, edge[k as usize + 1].1)];
+            let bottom = [first_skirt + k, first_skirt + k + 1];
+            let mut triangles = [[top[0], bottom[0], top[1]], [top[1], bottom[0], bottom[1]]];
+            // Wind each so its front (the clipmap's convention: (b - a) x
+            // (c - a) points out) faces away from the patch.
+            for triangle in &mut triangles {
+                let [a, b, c] = triangle.map(position);
+                let facing = (b - a).cross(c - a);
+                if facing.x * outward[0] + facing.z * outward[1] < 0.0 {
+                    triangle.swap(1, 2);
+                }
+            }
+            indices.extend(triangles.iter().flatten());
+        }
+    }
+    (vertices, indices)
+}
+
+fn build_patch_mesh(device: &RenderDevice, cells: u32) -> GpuMesh {
+    let (vertices, indices) = patch_mesh_data(cells);
+    upload_mesh(device, "forest_terrain_patch", &vertices, &indices)
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,11 +1651,19 @@ fn prepare_terrain(
 
     // terrain-vs + terrain-fs over a plain vec3 position, into the same three
     // colour targets the other G-buffer passes use.
-    let terrain_vertex_buffers = vec![VertexBufferLayout {
-        array_stride: TERRAIN_VERTEX_STRIDE,
-        step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: TERRAIN_VERTEX_ATTRIBUTES.to_vec(),
-    }];
+    // The patch grid's integer vertices, and per instance the patch it is.
+    let terrain_vertex_buffers = vec![
+        VertexBufferLayout {
+            array_stride: TERRAIN_VERTEX_STRIDE,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: TERRAIN_VERTEX_ATTRIBUTES.to_vec(),
+        },
+        VertexBufferLayout {
+            array_stride: PATCH_INSTANCE_STRIDE,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: PATCH_INSTANCE_ATTRIBUTES.to_vec(),
+        },
+    ];
     let terrain_pipeline_layouts = vec![
         globals_layout.clone(),
         terrain_textures_layout.clone(),
@@ -1738,6 +1852,14 @@ fn prepare_terrain(
         center_mesh: build_clip_mesh(device, false),
         ring_mesh: build_clip_mesh(device, true),
         levels,
+        whole_patch_mesh: build_patch_mesh(device, crate::planet::quadtree::PATCH_CELLS),
+        half_patch_mesh: build_patch_mesh(device, crate::planet::quadtree::PATCH_CELLS / 2),
+        patch_instances: device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("forest_terrain_patches"),
+            size: PATCH_INSTANCE_STRIDE * MAX_TERRAIN_PATCHES as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }),
     };
     *resources = Some(terrain_resources);
 
@@ -2230,12 +2352,144 @@ mod habitat_cache_tests {
         assert_eq!(uses(fragment, "globals.settings_a."), set(&["w", "y"]));
         // Vertex: the camera enters only through materialStep, which a capture
         // takes from the middle of its window; heightfield is the separate
-        // lighting-map pass.
+        // lighting-map pass. The planet's patches (vs_main) and the planet
+        // block they use read the planet's globals, but the capture never
+        // runs them: it draws the clipmap through vs_habitat.
+        let without = |source: &str, begin: &str, end: &str| -> String {
+            let start = source.find(begin).expect(begin);
+            let stop = source[start..].find(end).expect(end) + start + end.len();
+            format!("{}{}", &source[..start], &source[stop..])
+        };
+        let vertex = without(vertex, "// BEGIN PLANET FUNCTIONS", "// END PLANET FUNCTIONS");
+        let vertex = without(&vertex, "// BEGIN PLANET TERRAIN", "// END PLANET TERRAIN");
+        for planet_call in ["planetGround(", "planetChartDelta(", "planetTerrainVertex("] {
+            assert!(!vertex.contains(planet_call), "the capture's vertex path reaches the planet");
+        }
         assert_eq!(
-            uses(vertex, "globals."),
+            uses(&vertex, "globals."),
             set(&["camera_position", "heightfield", "projection", "view"]),
             "terrain-vs.wgsl reads a global HabitatKey does not know about"
         );
+    }
+}
+
+#[cfg(test)]
+mod planet_interface_tests {
+    /// The varyings a stage's entry point writes or reads: location, type
+    /// and interpolation, from its struct's member bindings.
+    fn interface(module: &naga::Module, ty: naga::Handle<naga::Type>) -> Vec<(u32, String, String)> {
+        let naga::TypeInner::Struct { members, .. } = &module.types[ty].inner else {
+            panic!("an entry point's varyings come in a struct");
+        };
+        let mut found: Vec<(u32, String, String)> = members
+            .iter()
+            .filter_map(|member| match &member.binding {
+                Some(naga::Binding::Location { location, interpolation, .. }) => Some((
+                    *location,
+                    format!("{:?}", module.types[member.ty].inner),
+                    format!("{:?}", interpolation.unwrap_or(naga::Interpolation::Perspective)),
+                )),
+                _ => None,
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn parse(source: &str) -> naga::Module {
+        naga::front::wgsl::parse_str(source).unwrap_or_else(|error| panic!("{}", error.emit_to_string(source)))
+    }
+
+    /// terrain-vs and terrain-fs are separate modules; wgsl-check validates
+    /// each alone, so a varying added to one and not the other would only
+    /// fail when the pipeline is created. Both vertex paths, the planet's and
+    /// the capture's clipmap, must hand the fragment stage every varying it
+    /// reads, alike in type and interpolation.
+    #[test]
+    fn both_terrain_vertex_paths_feed_the_fragment_stage() {
+        let vertex = parse(include_str!("../../assets/shaders/terrain-vs.wgsl"));
+        let fragment = parse(include_str!("../../assets/shaders/terrain-fs.wgsl"));
+        let fs = fragment.entry_points.iter().find(|entry| entry.name == "fs_main").unwrap();
+        let inputs = interface(&fragment, fs.function.arguments[0].ty);
+        for name in ["vs_main", "vs_habitat"] {
+            let vs = vertex.entry_points.iter().find(|entry| entry.name == name).unwrap();
+            let outputs = interface(&vertex, vs.function.result.as_ref().unwrap().ty);
+            assert_eq!(outputs, inputs, "{name} and fs_main disagree on their varyings");
+        }
+    }
+
+    /// The patch instance buffer's attributes sit at the Rust struct's field
+    /// offsets and at the locations terrain-vs's PatchInput (and water's
+    /// SeaPatch) read them from.
+    #[test]
+    fn patch_instances_reach_the_shaders_field_by_field() {
+        use crate::planet::view::PatchInstance;
+        let offsets = [
+            std::mem::offset_of!(PatchInstance, offset),
+            std::mem::offset_of!(PatchInstance, face),
+            std::mem::offset_of!(PatchInstance, centre),
+            std::mem::offset_of!(PatchInstance, chart_min),
+            std::mem::offset_of!(PatchInstance, spacing),
+            std::mem::offset_of!(PatchInstance, flags),
+        ];
+        for (attribute, offset) in super::PATCH_INSTANCE_ATTRIBUTES.iter().zip(offsets) {
+            assert_eq!(attribute.offset as usize, offset, "location {}", attribute.shader_location);
+        }
+        // spacing, morph start and morph end are one Float32x3.
+        assert_eq!(std::mem::offset_of!(PatchInstance, morph_start), std::mem::offset_of!(PatchInstance, spacing) + 4);
+        assert_eq!(std::mem::offset_of!(PatchInstance, morph_end), std::mem::offset_of!(PatchInstance, spacing) + 8);
+        for (source, structure) in [
+            (include_str!("../../assets/shaders/terrain-vs.wgsl"), "PatchInput"),
+            (include_str!("../../assets/shaders/water.wgsl"), "SeaPatch"),
+        ] {
+            let module = parse(source);
+            let (handle, _) = module
+                .types
+                .iter()
+                .find(|(_, ty)| ty.name.as_deref() == Some(structure))
+                .unwrap_or_else(|| panic!("{structure}"));
+            let locations: Vec<u32> = interface(&module, handle).iter().map(|(location, _, _)| *location).collect();
+            let expected: Vec<u32> = super::PATCH_INSTANCE_ATTRIBUTES.iter().map(|a| a.shader_location).collect();
+            assert_eq!(locations, expected, "{structure}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod patch_mesh_tests {
+    use super::patch_mesh_data;
+    use bevy::math::Vec3;
+
+    /// The grid faces up and every skirt faces out of its patch, in the
+    /// winding the G-buffer pipeline keeps (counter-clockwise, (b - a) x
+    /// (c - a) toward the viewer), so back-face culling drops neither.
+    #[test]
+    fn the_patch_faces_up_and_its_skirts_face_out() {
+        for cells in [32, 16] {
+            let (vertices, indices) = patch_mesh_data(cells);
+            let side = (cells + 1) as usize;
+            assert_eq!(vertices.len() / 3, side * side + 4 * side);
+            assert_eq!(indices.len(), (cells * cells * 6 + 4 * cells * 6) as usize);
+            let at = |index: u32| {
+                let i = index as usize * 3;
+                Vec3::new(vertices[i], -vertices[i + 1], vertices[i + 2])
+            };
+            let middle = Vec3::new(cells as f32 * 0.5, 0.0, cells as f32 * 0.5);
+            for triangle in indices.chunks(3) {
+                let [a, b, c] = [at(triangle[0]), at(triangle[1]), at(triangle[2])];
+                let facing = (b - a).cross(c - a);
+                assert!(facing.length() > 0.0, "degenerate triangle");
+                let skirt = a.y < 0.0 || b.y < 0.0 || c.y < 0.0;
+                if skirt {
+                    let centre = (a + b + c) / 3.0;
+                    let outward = Vec3::new(centre.x - middle.x, 0.0, centre.z - middle.z);
+                    assert!(facing.dot(outward) > 0.0, "a skirt faces into its patch");
+                    assert_eq!(facing.y, 0.0);
+                } else {
+                    assert!(facing.y > 0.0, "a ground triangle faces down");
+                }
+            }
+        }
     }
 }
 

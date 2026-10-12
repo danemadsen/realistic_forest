@@ -706,8 +706,16 @@ impl WeatherState {
         if base_density <= 0.0 && precipitation.intensity() <= 0.0 {
             return f32::INFINITY;
         }
+        // `fogExtinctionProfile` in composite.wgsl: the weather's multiplier
+        // holds in the lower air and relaxes to 1 above it.
+        let multiplier = self.current.fog_multiplier.max(1.0e-6);
+        let aloft = smoothstep(1500.0, 4000.0, altitude);
+        let base_density = base_density / multiplier * (multiplier + (1.0 - multiplier) * aloft);
+        // `airDensityProfile` in composite.wgsl: the ground haze over a floor
+        // thinning with the air's scale height.
         let height_density = (-(altitude - 20.0).max(0.0) / 450.0).exp();
-        let extinction = base_density * (0.16 + 0.84 * height_density)
+        let floor_density = (-altitude.max(0.0) / crate::planet::AIR_SCALE_HEIGHT).exp();
+        let extinction = base_density * (0.16 * floor_density + 0.84 * height_density)
             + precipitation.rain * 0.0021 + precipitation.snow * 0.0013
             + precipitation.thunderstorm * 0.00035;
         2.995_732_3 / extinction

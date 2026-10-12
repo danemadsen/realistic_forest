@@ -144,6 +144,9 @@ pub fn stream_rivers(mut field: ResMut<RiverField>, players: Query<&Player>) {
     let Ok(player) = players.single() else {
         return;
     };
+    if crate::planet::systems::streams_paused(player) {
+        return;
+    }
     let wanted = network::region_of(player.position.x as f64, player.position.z as f64);
     let current = field.current.as_ref().map(|n| n.region);
     let pending = field.pending.as_ref().map(|p| p.0);

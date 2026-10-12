@@ -364,6 +364,9 @@ pub fn stream_vegetation(
         field.tasks.remove(key);
     }
     field.dirty |= !finished.is_empty();
+    if crate::planet::systems::streams_paused(player) {
+        return;
+    }
 
     // Drop what has fallen well behind; cancel work no longer wanted.
     let mut dropped = false;

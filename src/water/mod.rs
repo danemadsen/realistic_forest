@@ -153,7 +153,8 @@ pub struct WaterStageUniforms {
     /// x the surface wind at 10 m, m/s; y how gusty it is, 0..1; z the
     /// viewer's exposure in seconds (`ExtractedWater::exposure_seconds`),
     /// past which a texture the water carries moves too far a frame to
-    /// follow; w unused.
+    /// follow; w half the width of the square the rings cover, where the far
+    /// sea over the terrain's patches gives way to them.
     pub wind: [f32; 4], // 1488
     /// The water the eye is in, for the submerged medium: x its level, y the
     /// eye's height above it (negative under it), z how far the medium has

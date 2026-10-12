@@ -49,6 +49,14 @@ pub struct TrainerState {
     status: Option<String>,
 }
 
+/// The streamed fields the diagnostics read when they exist.
+type OptionalFields<'w> = (
+    Option<Res<'w, crate::vegetation::VegetationField>>,
+    Option<Res<'w, crate::rivers::RiverField>>,
+    Option<Res<'w, crate::buildings::BuildingField>>,
+    Option<Res<'w, crate::planet::view::PlanetTerrain>>,
+);
+
 /// Draw the developer menu, passive diagnostics, and world overlays.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_diagnostics_ui(
@@ -64,11 +72,7 @@ pub fn draw_diagnostics_ui(
     mut players: Query<&mut Player>,
     automation: Res<AutomationSettings>,
     mut rerun: ResMut<RerunErosion>,
-    (vegetation, rivers, buildings): (
-        Option<Res<crate::vegetation::VegetationField>>,
-        Option<Res<crate::rivers::RiverField>>,
-        Option<Res<crate::buildings::BuildingField>>,
-    ),
+    (vegetation, rivers, buildings, planet_terrain): OptionalFields,
     mut snow: ResMut<SnowState>,
     mut trainer: Local<TrainerState>,
     mut cursors: Query<&mut CursorOptions, With<PrimaryWindow>>,
@@ -92,6 +96,7 @@ pub fn draw_diagnostics_ui(
             &player,
             vegetation.as_deref(),
             buildings.as_deref(),
+            planet_terrain.as_deref(),
         )
     } else {
         0.0
@@ -173,6 +178,7 @@ fn draw_debug_overlay(
     player: &Player,
     vegetation: Option<&crate::vegetation::VegetationField>,
     buildings: Option<&crate::buildings::BuildingField>,
+    planet: Option<&crate::planet::view::PlanetTerrain>,
 ) -> f32 {
     let dt = ctx.input(|input| input.stable_dt).max(f32::EPSILON);
     let forward = player.forward();
@@ -222,7 +228,7 @@ fn draw_debug_overlay(
          Movement: {}  |  Speed: {:.1}x  |  Vertical: {:.2} m/s\n\
          Ground: {:.2} m  |  Eye above ground: {:.2} m\n\
          Time: {:02}:{:02} {}  |  Weather: {}  |  Visibility: {}\n\
-         Erosion tiles: {} ready, {} streaming  |  Clipmap: {:.0} m\n\
+         Erosion tiles: {} ready, {} streaming  |  Planet: {:?} face, {} terrain patches\n\
          Tile heights: {:.1}..{:.1} m  |  Land: {:.0}%\n\
          Incision / deposition: {:.2} / {:.2} m  |  Detail / axis: {:.3} / {:.3}\n\
          Drainage: {:.0} cells  |  Bare rock: {:.1}%  |  Cover: {:.2} m\n\
@@ -249,7 +255,8 @@ fn draw_debug_overlay(
         visibility,
         ready,
         cache.tiles.len() - ready,
-        (CLIP_CELLS as f32 * 0.5) * CLIP_FINEST_SPACING * 2.0f32.powi(CLIP_LEVELS as i32 - 1),
+        player.face,
+        planet.map_or(0, |terrain| terrain.stats.drawn),
         cache.stats.minimum_height,
         cache.stats.maximum_height,
         cache.stats.land_coverage,
@@ -409,6 +416,8 @@ fn draw_player_tools(
             }
         }
         if ui.button("Return to spawn").clicked() {
+            // Spawn is the centre of the spawn face's chart.
+            player.face = crate::planet::Face::PosY;
             teleport(player, ground_position(Vec3::ZERO, cache, noise, snow), cache, noise);
             player.flying = false;
             player.yaw = Player::default().yaw;
@@ -1323,6 +1332,7 @@ mod tests {
             &Player::default(),
             None,
             None,
+            None,
         );
         let mut output = ctx.end_pass();
         output.textures_delta.clear(); // Headless checks do not upload font textures.
@@ -1375,7 +1385,7 @@ mod tests {
                 });
                 let bottom = if debug_visible {
                     draw_debug_overlay(
-                        &ctx, &settings, &day_night, &weather, &cache, &noise, &snow, &player, None, None,
+                        &ctx, &settings, &day_night, &weather, &cache, &noise, &snow, &player, None, None, None,
                     )
                 } else {
                     0.0

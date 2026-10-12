@@ -56,11 +56,11 @@ fn weatherStormBase(world_position: vec3<f32>) -> vec3<f32> {
     // Hydrometeors leave the lower cloud and fall toward the ground. Fade
     // them through its base so flying above a storm is dry.
     let below_cloud = 1.0 - smoothstep(cloud_base + 100.0,
-                                       cloud_base + 600.0, world_position.y);
+                                       cloud_base + 600.0, planetAltitude(world_position));
     let storm_precipitation = smoothstep(0.74, 0.90, score + globals.storm.x)
                         *wet_gate*below_cloud;
     if (storm_precipitation <= 0.0) { return vec3<f32>(0.0); }
-    let cold_altitude = world_position.y
+    let cold_altitude = planetAltitude(world_position)
         + 70.0*sin((world_position.x - globals.weather.x)/18000.0
                    + (world_position.z - globals.weather.y)/27000.0 + 0.7);
     var snow_fraction = smoothstep(80.0, 260.0, cold_altitude);

@@ -121,6 +121,9 @@ pub struct AutomationSettings {
     pub snow_trail: Option<[f32; 4]>,
     /// Tiles simulated at the full iteration budget before streaming starts.
     pub erosion_prewarm: u32,
+    /// Sea-level radius the planet is asked for, metres; snapped by
+    /// `Planet::with_radius` so the terrain lattice stays exact.
+    pub planet_radius: Option<f64>,
 }
 
 impl Default for AutomationSettings {
@@ -175,6 +178,7 @@ impl Default for AutomationSettings {
             lightning: None,
             snow_trail: None,
             erosion_prewarm: DEFAULT_EROSION_PREWARM,
+            planet_radius: None,
         }
     }
 }
@@ -426,6 +430,20 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                         "WARNING: {flag} expects a finite value in [{}, {}]; keeping the previous value",
                         bounds.start(), bounds.end()
                     );
+                    if next.is_some_and(|value| !value.starts_with("--")) {
+                        index += 1;
+                    }
+                }
+            }
+            "--planet-radius" => {
+                let parsed = next
+                    .and_then(|value| value.parse::<f64>().ok())
+                    .filter(|value| value.is_finite() && *value >= 1_000.0);
+                if let Some(radius) = parsed {
+                    automation.planet_radius = Some(radius);
+                    index += 1;
+                } else {
+                    eprintln!("WARNING: --planet-radius expects a sea-level radius of at least 1000 metres");
                     if next.is_some_and(|value| !value.starts_with("--")) {
                         index += 1;
                     }

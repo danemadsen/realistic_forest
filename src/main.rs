@@ -435,6 +435,12 @@ fn main() {
         !automation.no_vegetation,
     ));
     app.insert_resource(noise_field.clone());
+    let planet = automation.planet_radius.map_or_else(planet::Planet::default, planet::Planet::with_radius);
+    info!("Planet: sea-level radius {:.1} km, face half width {:.0} m", planet.radius / 1000.0, planet.half_width);
+    app.insert_resource(planet);
+    app.insert_resource(planet::systems::PlanetLadder(planet::quadtree::LodLadder::new(&planet)));
+    app.init_resource::<planet::view::PlanetView>();
+    app.init_resource::<planet::view::PlanetTerrain>();
     app.insert_resource(automation.clone());
     // The render plugin lifts the shared noise field and erosion bridge
     // into the render sub-app at build time, so they must exist first.
@@ -469,6 +475,7 @@ fn main() {
             // driver, mirroring the C++ short-circuit in main().
             erosion_stream_system.run_if(not_in_measure_mode),
             player::update_player_system,
+            planet::systems::carry_player_across_faces,
             buildings::adapt_eye,
             player::sync_player_camera_transform,
             vegetation::stream_vegetation,
@@ -481,6 +488,9 @@ fn main() {
         EguiPrimaryContextPass,
         (ui::draw_diagnostics_ui, player::sync_player_camera_transform).chain(),
     );
+    // After every pose change of the frame, the UI's teleports included, so
+    // the patches drawn are the ones this pose sees.
+    app.add_systems(Last, planet::systems::update_planet_view);
     app.run();
 }
 
@@ -816,6 +826,12 @@ fn erosion_stream_system(
     let Ok(player) = player.single() else {
         return;
     };
+    // High above the ground the tiles' detail is too small to see; hold the
+    // cache rather than simulate tiles under a camera crossing the planet.
+    if planet::systems::streams_paused(player) {
+        erosion::apply_erosion_events(&mut cache, &bridge);
+        return;
+    }
     // Tiles begun from now on carve the network in force.
     if cache.rivers.as_ref().map(std::sync::Arc::as_ptr) != rivers.network().map(std::sync::Arc::as_ptr) {
         cache.rivers = rivers.network().cloned();
@@ -1086,6 +1102,13 @@ fn shot_scheduling_system(
     let Some(shot_path) = automation.shot_path.clone() else {
         return;
     };
+    let Ok(player) = players.single() else {
+        return;
+    };
+    // Far above the ground the plane-keyed streams hold still
+    // (planet::systems::streams_paused), so a capture from there waits for
+    // none of them.
+    let paused = planet::systems::streams_paused(player);
     // `--wait` counts frames after the prewarmed tiles have settled, so
     // captures of the same pose compare the same erosion however slowly the
     // GPU (or a software rasteriser) works through the prewarm. A tile whose
@@ -1101,24 +1124,21 @@ fn shot_scheduling_system(
             )
         })
         .count();
-    if settled_tiles < automation.erosion_prewarm as usize {
+    if !paused && settled_tiles < automation.erosion_prewarm as usize {
         return;
     }
     // Likewise the plants: the library loaded, every chunk around the pinned
     // camera scattered, and the latest snapshot on the GPU.
-    if !vegetation.ready() {
+    if !paused && !vegetation.ready() {
         return;
     }
     // And the buildings: placed around the pose, textured and uploaded.
-    if !buildings.ready() {
+    if !paused && !buildings.ready() {
         return;
     }
     // Grass arrives asynchronously too. Start counting only once every
     // wanted chunk around this pose has reached the renderer's GPU buffers.
-    let Ok(player) = players.single() else {
-        return;
-    };
-    if !grass.ready([player.position.x, player.position.z]) {
+    if !paused && !grass.ready([player.position.x, player.position.z]) {
         return;
     }
     counter.0 += 1;

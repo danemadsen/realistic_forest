@@ -97,8 +97,262 @@ struct GlobalUniforms
     storm: vec4<f32>, // precipitation bias, phase override, weather clock, wind direction radians
     lightning: vec4<f32>, // xyz terrain strike, w HDR flash radiance
     lightning_meta: vec4<f32>, // seed, age, bolt top altitude, front speed
+    planet: vec4<f32>,          // radius, face half width, seam band, camera face (planet-functions.wgslinc)
+    planet_camera: vec4<f32>,   // camera chart xy on its face, altitude, LOD reference altitude
+    planet_east: vec4<f32>,     // camera east in planet axes, feature fade width
+    planet_up: vec4<f32>,       // camera up in planet axes, atmosphere top altitude
+    planet_north: vec4<f32>,    // camera north in planet axes
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
+
+// BEGIN PLANET FUNCTIONS
+// The cube-sphere planet (src/planet/mod.rs) for the shaders. Every pass that
+// places geometry on the ground or reads altitude pastes this block; a test
+// keeps the copies identical and its constants equal to the Rust ones.
+//
+// "World" space in every shader is the planar world the passes were written
+// for, bent onto the planet around the camera: a Euclidean frame whose axes
+// are the camera's local east, up and north, placed so the camera sits at
+// globals.camera_position (its terrain plane coordinates and altitude). Near
+// the camera it agrees with the terrain plane to second order; the planet's
+// centre sits at (camera x, -radius, camera z). Plane points (x, altitude, z)
+// on the camera's face go to world through planetPlaneToWorld, which is exact
+// on the sphere and computed relative to the camera, so precision follows the
+// distance to the camera rather than the planet's radius.
+//
+// Requires GlobalUniforms as `globals` with the planet fields:
+//   planet        x sea-level radius, y face half width S, z seam band, w camera face
+//   planet_camera xy camera chart on its face, z camera altitude, w LOD reference altitude
+//   planet_east   xyz camera east in planet axes, w feature fade width
+//   planet_up     xyz camera up in planet axes, w highest altitude of the atmosphere
+//   planet_north  xyz camera north in planet axes, w unused
+const PLANET_QUARTER_PI: f32 = 0.78539816339;
+const PLANET_FACE_AXIS = array<vec3<f32>, 6>(
+    vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0),
+    vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0),
+    vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0));
+const PLANET_FACE_EAST = array<vec3<f32>, 6>(
+    vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0),
+    vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(1.0, 0.0, 0.0),
+    vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(1.0, 0.0, 0.0));
+const PLANET_FACE_NORTH = array<vec3<f32>, 6>(
+    vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 1.0, 0.0),
+    vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0),
+    vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 1.0, 0.0));
+// Where each face's chart sits on the terrain plane (FACE_PLANE_OFFSETS).
+const PLANET_FACE_PLANE_OFFSET = array<vec2<f32>, 6>(
+    vec2<f32>(37123.0, -21457.0), vec2<f32>(-45311.0, 29873.0),
+    vec2<f32>(0.0, 0.0), vec2<f32>(61207.0, 53119.0),
+    vec2<f32>(-27449.0, -58231.0), vec2<f32>(13877.0, 71363.0));
+
+fn planetCameraFace() -> u32
+{
+    return u32(globals.planet.w + 0.5);
+}
+
+// Equi-angular warp, odd by construction and exactly 1 on a face edge, so two
+// faces build bit-identical cube points along the edge they share.
+fn planetWarp(u: f32) -> f32
+{
+    let magnitude = abs(u);
+    let warped = select(tan(PLANET_QUARTER_PI*magnitude), 1.0, magnitude == 1.0);
+    return select(warped, -warped, u < 0.0);
+}
+
+// warp(u) - warp(u - du), accurate to the size of du rather than of u:
+// tan(a) - tan(b) = sin(a - b)/(cos a cos b).
+fn planetWarpDelta(u: f32, du: f32) -> f32
+{
+    return sin(PLANET_QUARTER_PI*du)/(cos(PLANET_QUARTER_PI*u)*cos(PLANET_QUARTER_PI*(u - du)));
+}
+
+fn planetCube(face: u32, chart: vec2<f32>) -> vec3<f32>
+{
+    let s = globals.planet.y;
+    return PLANET_FACE_AXIS[face] + PLANET_FACE_EAST[face]*planetWarp(chart.x/s)
+        + PLANET_FACE_NORTH[face]*planetWarp(chart.y/s);
+}
+
+// Planet-axis displacement from chart point `reference` at `referenceAltitude`
+// to `reference + delta` at `altitude`, both on `face`. Formed from the
+// difference of the two directions directly, never from two planet-centred
+// positions, so it is as precise as its own length.
+fn planetChartDelta(face: u32, reference: vec2<f32>, delta: vec2<f32>,
+                    referenceAltitude: f32, altitude: f32) -> vec3<f32>
+{
+    let s = globals.planet.y;
+    let chart = reference + delta;
+    let cubeReference = planetCube(face, reference);
+    let cube = planetCube(face, chart);
+    let du = delta/s;
+    let cubeDelta = PLANET_FACE_EAST[face]*planetWarpDelta(chart.x/s, du.x)
+        + PLANET_FACE_NORTH[face]*planetWarpDelta(chart.y/s, du.y);
+    let lengthReference = length(cubeReference);
+    let lengthPoint = length(cube);
+    // d - d_ref = dc/|c| + c_ref (1/|c| - 1/|c_ref|), with the reciprocal
+    // difference rewritten through |c|^2 - |c_ref|^2 = dc . (c + c_ref).
+    let directionDelta = cubeDelta/lengthPoint
+        - cubeReference*(dot(cubeDelta, cube + cubeReference)
+                         /(lengthPoint*lengthReference*(lengthPoint + lengthReference)));
+    return (globals.planet.x + referenceAltitude)*directionDelta
+        + (altitude - referenceAltitude)*(cube/lengthPoint);
+}
+
+// Planet axes to world axes: the camera's east, up and north.
+fn planetToWorldAxes(v: vec3<f32>) -> vec3<f32>
+{
+    return vec3<f32>(dot(v, globals.planet_east.xyz), dot(v, globals.planet_up.xyz),
+                     dot(v, globals.planet_north.xyz));
+}
+
+fn planetFromWorldAxes(v: vec3<f32>) -> vec3<f32>
+{
+    return globals.planet_east.xyz*v.x + globals.planet_up.xyz*v.y + globals.planet_north.xyz*v.z;
+}
+
+// World offset from the camera of a terrain plane point (x, altitude, z) on
+// the camera's face.
+fn planetPlaneOffset(plane: vec3<f32>) -> vec3<f32>
+{
+    let delta = plane.xz - globals.camera_position.xz;
+    return planetToWorldAxes(planetChartDelta(planetCameraFace(), globals.planet_camera.xy, delta,
+                                              globals.planet_camera.z, plane.y));
+}
+
+// A terrain plane point (x, altitude, z) on the camera's face in world space.
+fn planetPlaneToWorld(plane: vec3<f32>) -> vec3<f32>
+{
+    return globals.camera_position.xyz + planetPlaneOffset(plane);
+}
+
+// The world direction of a plane-axis vector at a plane point: the local
+// frame there, which the camera's own frame matches only at the camera.
+fn planetPlaneVectorToWorld(plane: vec3<f32>, v: vec3<f32>) -> vec3<f32>
+{
+    let face = planetCameraFace();
+    let chart = globals.planet_camera.xy + (plane.xz - globals.camera_position.xz);
+    let up = normalize(planetCube(face, chart));
+    let eastAxis = PLANET_FACE_EAST[face];
+    let east = normalize(eastAxis - up*dot(up, eastAxis));
+    let north = cross(east, up);
+    return planetToWorldAxes(east*v.x + up*v.y + north*v.z);
+}
+
+// How much of the streamed features (erosion, river carving, building pads)
+// the ground keeps at a terrain plane point of the camera's face: 1 across
+// the face, fading out before the seam band at its edges
+// (Planet::feature_weight). Things seated on those features (plants, grass,
+// buildings, river surfaces) stand only where it is whole.
+fn planetFeatureShare(plane_xz: vec2<f32>) -> f32
+{
+    let chart = plane_xz - PLANET_FACE_PLANE_OFFSET[planetCameraFace()];
+    let edge = globals.planet.y - max(abs(chart.x), abs(chart.y));
+    return smoothstep(globals.planet.z, globals.planet.z + globals.planet_east.w, edge);
+}
+
+// The planet's centre in world space.
+fn planetCentreWorld() -> vec3<f32>
+{
+    return vec3<f32>(globals.camera_position.x, -globals.planet.x, globals.camera_position.z);
+}
+
+// Altitude above sea level of a world point. Formed as
+// (|v|^2 - r^2)/(|v| + r) from the camera-relative offsets so it does not
+// lose the radius's worth of precision a plain length(v) - r would.
+fn planetAltitude(world: vec3<f32>) -> f32
+{
+    let r = globals.planet.x;
+    let horizontal = world.xz - globals.camera_position.xz;
+    let y = world.y;
+    let lifted = dot(horizontal, horizontal) + y*(2.0*r + y);
+    let distance = sqrt(dot(horizontal, horizontal) + (y + r)*(y + r));
+    return lifted/(distance + r);
+}
+
+// The local up (away from the centre) at a world point.
+fn planetUpAt(world: vec3<f32>) -> vec3<f32>
+{
+    return normalize(world - planetCentreWorld());
+}
+
+// The near and far distances along a world ray from `origin` at which it
+// crosses the sphere `altitude` metres above sea level, or (-1, -1) when it
+// misses it. A ray starting inside the sphere has a negative near distance.
+fn planetRaySphere(origin: vec3<f32>, direction: vec3<f32>, altitude: f32) -> vec2<f32>
+{
+    let r = globals.planet.x + altitude;
+    let fromCentre = origin - planetCentreWorld();
+    let b = dot(fromCentre, direction);
+    // |o|^2 - r^2 from the precise altitude of the origin.
+    let originAltitude = planetAltitude(origin) - altitude;
+    let c = originAltitude*(2.0*r + originAltitude);
+    let discriminant = b*b - c;
+    if (discriminant < 0.0) {
+        return vec2<f32>(-1.0, -1.0);
+    }
+    let root = sqrt(discriminant);
+    return vec2<f32>(-b - root, -b + root);
+}
+
+// The sun's elevation where a world point lies: the sine of its angle above
+// the local horizon there, which the camera's own frame gives only for the
+// camera's place.
+fn planetSunElevationAt(world: vec3<f32>) -> f32
+{
+    return dot(-normalize(globals.sun_direction.xyz), planetUpAt(world));
+}
+
+// The day/night cycle's daylight curve (day_night.rs sample) at a world point,
+// so the night side of the planet is dark seen from the day side. At the
+// camera it is globals.atmosphere.x.
+fn planetDaylightAt(world: vec3<f32>) -> f32
+{
+    return smoothstep(-0.18, 0.18, planetSunElevationAt(world));
+}
+
+// The direct sunlight reaching a world point: the day/night cycle's colour
+// and strength curves (day_night.rs sample) for the sun's elevation there,
+// times the sun's intensity. At the camera it is the uniform
+// globals.sun_colour.rgb*globals.settings_a.x.
+fn planetSunlightAt(world: vec3<f32>) -> vec3<f32>
+{
+    let elevation = planetSunElevationAt(world);
+    let colourMix = smoothstep(0.0, 0.55, elevation);
+    let colour = vec3<f32>(1.0, 0.29 + 0.66*colourMix, 0.095 + 0.765*colourMix);
+    return colour*globals.sun_colour.w*smoothstep(0.0, 0.12, elevation);
+}
+
+// The air's density scale height. Haze thins with it above the ground fog's
+// own 450 m scale, so the column over any point holds a finite amount of air
+// and the planet seen from orbit wears a thin, bright limb.
+const PLANET_AIR_SCALE_HEIGHT: f32 = 8000.0;
+
+// Metres of sea-level air along a world ray from `origin`, up to `limit`
+// metres or the ground: about the scale height straight up from sea level,
+// nothing in space, and most along the limb.
+fn planetAirMass(origin: vec3<f32>, ray: vec3<f32>, limit: f32) -> f32
+{
+    let shell = planetRaySphere(origin, ray, globals.planet_up.w);
+    if (shell.y <= 0.0) { return 0.0; }
+    var end = min(shell.y, limit);
+    let ground = planetRaySphere(origin, ray, 0.0);
+    if (ground.x > 0.0) { end = min(end, ground.x); }
+    let start = max(shell.x, 0.0);
+    if (end <= start) { return 0.0; }
+    // Quadratic steps from the near end, where the air is densest when the
+    // ray starts on the ground and rises.
+    var mass = 0.0;
+    let span = end - start;
+    for (var i = 0u; i < 12u; i = i + 1u) {
+        let a = f32(i)/12.0;
+        let b = (f32(i) + 1.0)/12.0;
+        let t = start + span*(a*a + b*b)*0.5;
+        let altitude = max(planetAltitude(origin + ray*t), 0.0);
+        mass += exp(-altitude/PLANET_AIR_SCALE_HEIGHT)*span*(b*b - a*a);
+    }
+    return mass;
+}
+// END PLANET FUNCTIONS
 
 struct GpuWave
 {
@@ -452,11 +706,11 @@ fn weatherStormBase(world_position: vec3<f32>) -> vec3<f32> {
     // Hydrometeors leave the lower cloud and fall toward the ground. Fade
     // them through its base so flying above a storm is dry.
     let below_cloud = 1.0 - smoothstep(cloud_base + 100.0,
-                                       cloud_base + 600.0, world_position.y);
+                                       cloud_base + 600.0, planetAltitude(world_position));
     let storm_precipitation = smoothstep(0.74, 0.90, score + globals.storm.x)
                         *wet_gate*below_cloud;
     if (storm_precipitation <= 0.0) { return vec3<f32>(0.0); }
-    let cold_altitude = world_position.y
+    let cold_altitude = planetAltitude(world_position)
         + 70.0*sin((world_position.x - globals.weather.x)/18000.0
                    + (world_position.z - globals.weather.y)/27000.0 + 0.7);
     var snow_fraction = smoothstep(80.0, 260.0, cold_altitude);
@@ -622,12 +876,14 @@ fn skyRadiance(direction: vec3<f32>) -> vec3<f32> {
 // Hemisphere-integrated fill depends on the surface orientation and time of
 // day, never its screen row or camera pitch. Excludes the celestial discs.
 fn skyAmbient(normal_world: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
-    let daylight = clamp(globals.atmosphere.x, 0.0, 1.0);
+    // The sky over this point of the planet: its own daylight and its own
+    // up, which near the camera are the camera's.
+    let daylight = planetDaylightAt(world_position);
     let storm = stormLightAt(world_position);
     let sky_cover = weatherSkyCover(weatherSeverity(world_position.xz));
     let overcast = smoothstep(0.05, 0.9, sky_cover);
     let whiteout = smoothstep(0.78, 1.0, sky_cover);
-    let upward = clamp(normal_world.y*0.5 + 0.5, 0.0, 1.0);
+    let upward = clamp(dot(normal_world, planetUpAt(world_position))*0.5 + 0.5, 0.0, 1.0);
     let clear_day_fill = mix(vec3<f32>(0.13, 0.17, 0.22),
                              vec3<f32>(0.32, 0.44, 0.62), upward);
     let clouded_day_fill = mix(vec3<f32>(0.17, 0.19, 0.19),
@@ -694,7 +950,7 @@ fn stormLightAt(world_position: vec3<f32>) -> f32 {
     let layer = cloudLocalLayer(cloudFrontSeverity(world_position.xz));
     let cloud_top = layer.x + layer.y;
     let below_deck = 1.0 - smoothstep(cloud_top - 150.0,
-                                      cloud_top + 350.0, world_position.y);
+                                      cloud_top + 350.0, planetAltitude(world_position));
     if (below_deck <= 0.0) { return 0.0; }
     return stormCoreStrength(world_position.xz)*below_deck;
 }
@@ -749,18 +1005,28 @@ fn cloudSlab() -> vec2<f32> {
 }
 
 // Return a bounded interval even when the eye lies inside or above the layer.
-// A horizontal ray is valid only if its origin already lies in the volume.
+// The layer is the shell between two spheres about the planet's centre
+// (planet-functions.wgslinc), so a deck seen from below curves down to the
+// horizon with the ground, and one seen from above wraps round the planet.
+// The first pass through the shell along the ray is returned: from below,
+// from where the ray leaves the inner sphere to where it leaves the outer;
+// from inside or above, until it leaves the shell or dips into the inner
+// sphere. An empty interval has its start past its end.
 fn cloudInterval(origin: vec3<f32>, ray: vec3<f32>, maximum_distance: f32) -> vec2<f32> {
     let slab = cloudSlab();
-    let bottom = slab.x;
-    let top = slab.y;
-    if (abs(ray.y) < 0.00001) {
-        if (origin.y <= bottom || origin.y >= top) { return vec2<f32>(0.0); }
-        return vec2<f32>(0.0, maximum_distance);
+    let outer = planetRaySphere(origin, ray, slab.y);
+    if (outer.y <= 0.0) { return vec2<f32>(0.0); }
+    var start = max(outer.x, 0.0);
+    var end = outer.y;
+    let inner = planetRaySphere(origin, ray, slab.x);
+    if (inner.y > 0.0) {
+        if (inner.x <= 0.0) {
+            start = max(start, inner.y);
+        } else {
+            end = min(end, inner.x);
+        }
     }
-    let a = (bottom - origin.y)/ray.y;
-    let b = (top - origin.y)/ray.y;
-    return vec2<f32>(max(min(a, b), 0.0), min(max(a, b), maximum_distance));
+    return vec2<f32>(start, min(end, maximum_distance));
 }
 
 fn cloudNoiseLod(sample_width: f32, texel_world_size: f32) -> f32 {
@@ -777,7 +1043,7 @@ fn cloudDensityFiltered(world_position: vec3<f32>, use_detail: bool, sample_widt
     let thickness_multiplier = select(profile.w, 1.0, (overrides & 8u) != 0u);
     let cloud_base = max(globals.clouds.w + base_offset, 100.0);
     let cloud_thickness = max(globals.cloud_layer.x*thickness_multiplier, 50.0);
-    let height = (world_position.y - cloud_base)/cloud_thickness;
+    let height = (planetAltitude(world_position) - cloud_base)/cloud_thickness;
     if (height <= 0.0 || height >= 1.0) { return 0.0; }
     let scale = max(globals.cloud_layer.y, 100.0);
     let wind_position = world_position - vec3<f32>(globals.cloud_motion.x, 0.0, globals.cloud_motion.y);
@@ -897,7 +1163,7 @@ fn marchClouds(origin: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, q
         let local_severity = cloudFrontSeverity(world_position.xz);
         let storm = stormCoreStrength(world_position.xz);
         let local_layer = cloudLocalLayer(local_severity);
-        let height = clamp((world_position.y - local_layer.x)/local_layer.y, 0.0, 1.0);
+        let height = clamp((planetAltitude(world_position) - local_layer.x)/local_layer.y, 0.0, 1.0);
         let step_transmittance = exp(-density*CLOUD_EXTINCTION*step_length);
         let contribution = result.transmittance*(1.0 - step_transmittance);
         let clear_ambient = mix(vec3<f32>(0.065, 0.080, 0.105),
@@ -1084,19 +1350,24 @@ fn terrainMapWeight(world_xz: vec2<f32>) -> f32 {
 }
 fn terrainShadow(world_position: vec3<f32>, normal_world: vec3<f32>, to_light: vec3<f32>) -> f32 {
     if (globals.raymarch.x < 0.5 || globals.heightfield.z < 1.0) { return 1.0; }
-    if (to_light.y < -0.025) { return 0.0; }
+    // On the planet the map holds altitudes over the terrain plane around
+    // the camera: march in the world, but measure each tap's clearance as
+    // its altitude over the map, and the light's rise against the local up.
+    let up = planetUpAt(world_position);
+    let light_rise = dot(to_light, up);
+    if (light_rise < -0.025) { return 0.0; }
     // The map has metre-scale texels. Lift the origin above the local map
     // mismatch and bias grazing slopes to avoid dark checkerboard acne.
     let texel = globals.heightfield.w;
-    let bias = 1.5 + texel*(0.12 + 0.25*(1.0 - abs(normal_world.y)));
+    let bias = 1.5 + texel*(0.12 + 0.25*(1.0 - abs(dot(normal_world, up))));
     let local_height = terrainHeightAt(world_position.xz);
-    let lift = max(local_height - world_position.y, 0.0) + bias;
-    let origin = world_position + vec3<f32>(0.0, lift, 0.0);
+    let lift = max(local_height - planetAltitude(world_position), 0.0) + bias;
+    let origin = world_position + up*lift;
     let quality = clamp(globals.raymarch.w, 0.0, 2.0);
     let count = 20u + u32(quality)*12u;
     // Rising faster than the penumbra widens, a tap a full penumbra above the
     // highest terrain is fully lit, and so is every tap after it.
-    let rising = to_light.y >= 0.0047;
+    let rising = light_rise >= 0.0047;
     var visibility = 1.0;
     for (var i = 0u; i < 44u; i += 1u) {
         if (i >= count) { break; }
@@ -1105,10 +1376,11 @@ fn terrainShadow(world_position: vec3<f32>, normal_world: vec3<f32>, to_light: v
         let sample_position = origin + to_light*distance;
         // A finite solar disc makes the penumbra widen with occluder range.
         let penumbra = max(1.2, distance*0.0047);
-        if (rising && sample_position.y - penumbra >= globals.sun_direction.w) { break; }
+        let sample_altitude = planetAltitude(sample_position);
+        if (rising && sample_altitude - penumbra >= globals.sun_direction.w) { break; }
         let edge_weight = terrainMapWeight(sample_position.xz);
         if (edge_weight <= 0.0) { break; }
-        let clearance = sample_position.y - terrainHeightAt(sample_position.xz);
+        let clearance = sample_altitude - terrainHeightAt(sample_position.xz);
         let sample_visibility = smoothstep(-penumbra, penumbra, clearance);
         visibility = min(visibility, mix(1.0, sample_visibility, edge_weight));
         if (visibility < 0.015) { break; }
@@ -1125,20 +1397,22 @@ fn terrainShadow(world_position: vec3<f32>, normal_world: vec3<f32>, to_light: v
 // use explicit LOD because the ray loops have nonuniform termination.
 fn volumeLightVisibility(world_position: vec3<f32>, to_light: vec3<f32>) -> f32 {
     if (globals.raymarch.x < 0.5 || globals.heightfield.z < 1.0) { return 1.0; }
-    if (to_light.y < -0.025) { return 0.0; }
+    let light_rise = dot(to_light, planetUpAt(world_position));
+    if (light_rise < -0.025) { return 0.0; }
     var visibility = 1.0;
     let count = 6u + u32(clamp(globals.raymarch.w, 0.0, 2.0))*2u;
     // Rising toward the light, a tap 5 m above the highest terrain is fully
     // lit, and so is every tap after it.
-    let rising = to_light.y > 0.0;
+    let rising = light_rise > 0.0;
     for (var i = 0u; i < 10u; i += 1u) {
         if (i >= count) { break; }
         let f = (f32(i) + 0.4)/f32(count);
         let sample_position = world_position + to_light*(16.0 + f*f*3600.0);
-        if (rising && sample_position.y - 5.0 >= globals.sun_direction.w) { break; }
+        let sample_altitude = planetAltitude(sample_position);
+        if (rising && sample_altitude - 5.0 >= globals.sun_direction.w) { break; }
         let edge_weight = terrainMapWeight(sample_position.xz);
         if (edge_weight <= 0.0) { break; }
-        let clearance = sample_position.y - terrainHeightAt(sample_position.xz);
+        let clearance = sample_altitude - terrainHeightAt(sample_position.xz);
         visibility = min(visibility, mix(1.0, smoothstep(-5.0, 5.0, clearance), edge_weight));
         if (visibility < 0.02) { break; }
     }
@@ -1150,20 +1424,43 @@ fn precipitationExtinction(precipitation: vec4<f32>) -> f32 {
     return precipitation.x*0.0021 + precipitation.y*0.0013
            + precipitation.z*0.00035;
 }
+// The fog's extinction profile over altitude (composite.wgsl's).
+fn airDensityProfile(altitude: f32) -> f32 {
+    let haze = exp(-max(altitude - 20.0, 0.0)/450.0);
+    let floor = exp(-max(altitude, 0.0)/PLANET_AIR_SCALE_HEIGHT);
+    return 0.16*floor + 0.84*haze;
+}
+
+// The fog's extinction at an altitude relative to the base density: the
+// weather's multiplier (thin in clear air, a whiteout's hundredfold) holds in
+// the lower air the fronts are made of and relaxes above it, so a fog bank
+// seen from high up is a layer on the ground rather than a wall to the sky.
+fn fogExtinctionProfile(severity: f32, altitude: f32) -> f32 {
+    let weather = mix(weatherFogMultiplier(severity), 1.0, smoothstep(1500.0, 4000.0, altitude));
+    return weather*airDensityProfile(altitude);
+}
+
 fn integrateAtmosphere(ray: vec3<f32>, distance_to_surface: f32) -> FogResult {
     var result: FogResult;
     result.scattering = vec3<f32>(0.0);
     result.transmittance = 1.0;
     let base_density = max(globals.params.x, 0.0);
-    let ray_length = min(distance_to_surface, 10000.0);
+    // Only the air inside the atmosphere's shell, as the composite marches it:
+    // the first 10 km near the ground, the whole air column from orbit.
+    let shell = planetRaySphere(globals.camera_position.xyz, ray, globals.planet_up.w);
+    if (shell.y <= 0.0) { return result; }
+    let segment_start = max(shell.x, 0.0);
+    let reach = max(10000.0, globals.camera_position.y*6.0);
+    let ray_length = max(min(min(distance_to_surface, shell.y), segment_start + reach) - segment_start, 0.0);
+    if (ray_length <= 0.001) { return result; }
     if (globals.raymarch.y < 0.5) {
-        let world_position = globals.camera_position.xyz + ray*ray_length*0.5;
+        let world_position = globals.camera_position.xyz + ray*(segment_start + ray_length*0.5);
         let severity = weatherSeverity(world_position.xz);
         let precipitation = weatherPrecipitation(world_position);
-        let density = base_density*weatherFogMultiplier(severity)
+        let density = base_density*fogExtinctionProfile(severity, planetAltitude(world_position))
                       + precipitationExtinction(precipitation);
         result.transmittance = exp(-density*ray_length);
-        var ambient = weatherFogAmbient(severity, globals.atmosphere.x,
+        var ambient = weatherFogAmbient(severity, planetDaylightAt(world_position),
                                         precipitation.z);
         if (globals.lightning.w > 0.001) {
             let source = vec3<f32>(globals.lightning.x,
@@ -1180,8 +1477,7 @@ fn integrateAtmosphere(ray: vec3<f32>, distance_to_surface: f32) -> FogResult {
     let count = select(select(8u, 12u, quality >= 1.0), 16u, quality >= 2.0);
     let to_sun = -normalize(globals.sun_direction.xyz);
     let to_moon = -normalize(globals.moon_direction.xyz);
-    let sun_scatter = globals.sun_colour.rgb*globals.settings_a.x
-                      *henyeyGreenstein(dot(ray, to_sun), 0.68);
+    let sun_phase = henyeyGreenstein(dot(ray, to_sun), 0.68);
     let moon_scatter = vec3<f32>(0.52, 0.65, 1.0)*globals.atmosphere.y
                        *henyeyGreenstein(dot(ray, to_moon), 0.45);
     let strength = max(globals.atmosphere.w, 0.0);
@@ -1193,12 +1489,12 @@ fn integrateAtmosphere(ray: vec3<f32>, distance_to_surface: f32) -> FogResult {
         let b = (f32(i) + 1.0)/f32(count);
         let start = a*a*ray_length;
         let end = b*b*ray_length;
-        let midpoint = (start + end)*0.5;
+        let midpoint = segment_start + (start + end)*0.5;
         let world_position = globals.camera_position.xyz + ray*midpoint;
         let severity = weatherSeverity(world_position.xz);
         let precipitation = weatherPrecipitation(world_position);
         let sky_cover = weatherSkyCover(severity);
-        var ambient = weatherFogAmbient(severity, globals.atmosphere.x,
+        var ambient = weatherFogAmbient(severity, planetDaylightAt(world_position),
                                         precipitation.z);
         if (globals.lightning.w > 0.001) {
             let source = vec3<f32>(globals.lightning.x,
@@ -1208,13 +1504,11 @@ fn integrateAtmosphere(ray: vec3<f32>, distance_to_surface: f32) -> FogResult {
             ambient += vec3<f32>(0.72, 0.84, 1.0)*globals.lightning.w
                        *0.35/(1.0 + pow(range/2200.0, 2.0));
         }
-        let height_density = exp(-max(world_position.y - 20.0, 0.0)/450.0);
-        let extinction = base_density*weatherFogMultiplier(severity)
-                         *(0.16 + 0.84*height_density)
+        let extinction = base_density*fogExtinctionProfile(severity, planetAltitude(world_position))
                          + precipitationExtinction(precipitation);
         let step_transmittance = exp(-extinction*(end - start));
         var sunlight_visibility = 1.0;
-        if (globals.settings_a.x > 0.01 && strength > 0.0) {
+        if (globals.sun_colour.w > 0.01 && strength > 0.0) {
             // Where the terrain blocks the sun the cloud shadow cannot matter.
             sunlight_visibility = volumeLightVisibility(world_position, to_sun);
             if (sunlight_visibility > 0.0) {
@@ -1225,7 +1519,7 @@ fn integrateAtmosphere(ray: vec3<f32>, distance_to_surface: f32) -> FogResult {
         if (globals.atmosphere.y > 0.001 && strength > 0.0) {
             moonlight_visibility = cloudShadow(world_position, to_moon);
         }
-        let lighting = ambient + (sun_scatter*weatherSunMultiplier(severity)
+        let lighting = ambient + (planetSunlightAt(world_position)*sun_phase*weatherSunMultiplier(severity)
                                   *(1.0 - sky_cover*0.85)
                                   *mix(1.0, 0.10, precipitation.z)
                                   *sunlight_visibility
@@ -1235,6 +1529,23 @@ fn integrateAtmosphere(ray: vec3<f32>, distance_to_surface: f32) -> FogResult {
         result.scattering += result.transmittance*(1.0 - step_transmittance)*lighting;
         result.transmittance *= step_transmittance;
         if (result.transmittance < 0.01) { break; }
+    }
+    // Past the march's reach the remaining air to the water is one even
+    // stretch at the density half way along it (the composite's tail).
+    let marched_end = segment_start + ray_length;
+    let tail = min(distance_to_surface, shell.y) - marched_end;
+    if (tail > 1.0 && result.transmittance > 0.01) {
+        let tail_position = globals.camera_position.xyz + ray*(marched_end + tail*0.5);
+        let severity = weatherSeverity(tail_position.xz);
+        let precipitation = weatherPrecipitation(tail_position);
+        let extinction = base_density*fogExtinctionProfile(severity, planetAltitude(tail_position))
+                         + precipitationExtinction(precipitation);
+        let tail_transmittance = exp(-extinction*tail);
+        let lighting = weatherFogAmbient(severity, planetDaylightAt(tail_position), precipitation.z)
+                       + planetSunlightAt(tail_position)*sun_phase*weatherSunMultiplier(severity)
+                       *(1.0 - weatherSkyCover(severity)*0.85)*strength;
+        result.scattering += result.transmittance*(1.0 - tail_transmittance)*lighting;
+        result.transmittance *= tail_transmittance;
     }
     return result;
 }
@@ -2797,7 +3108,24 @@ struct WaterVertexOutput
     // How clear the water is: 0 stained by the forest, 1 clear mountain
     // water. The sea's colour is its own, so 0 there.
     @location(7) clarity: f32,
+    // Where the surface lies on the terrain plane, for every lookup the
+    // planar build made by world XZ (canopy, weather, shore, rain rings): on
+    // the planet the world is bent around the camera and its XZ drifts from
+    // the plane's with distance.
+    @location(8) plane_xz: vec2<f32>,
+    // 1 on the far sea drawn over the quadtree's patches on the camera's
+    // face, which gives way to the rings inside their square; 2 on other
+    // faces' far sea; 0 on the rings and the inland waters.
+    @location(9) @interpolate(flat) far: f32,
 };
+
+// The square the Crest rings cover around their snapped centre
+// (water_node.rs snapped_centre; its half width rides in stage.wind.w).
+fn ringCentre() -> vec2<f32>
+{
+    let snap = stage.surface.w;
+    return floor(globals.camera_position.xz/snap + vec2<f32>(0.5))*snap;
+}
 
 // The sea: one of Crest's concentric tiles, displaced by the Gerstner sum.
 @vertex
@@ -2811,8 +3139,15 @@ fn vs_sea(
     let cos_r = cos(tile_rotation);
     let sin_r = sin(tile_rotation);
     let scaled = local*tile_scale;
-    let world_xz = vec2<f32>(scaled.x*cos_r - scaled.y*sin_r,
-                             scaled.x*sin_r + scaled.y*cos_r) + tile_centre;
+    // The outermost tiles' horizon skirt stretched one flat quad to the far
+    // plane. On the planet a chord that long would run far under the curved
+    // sea, so the skirt folds back onto the rings' own square, and the sea
+    // beyond is drawn over the terrain's patches (vs_sea_far).
+    let ring_centre = ringCentre();
+    let ring_half = stage.wind.w;
+    let world_xz = clamp(vec2<f32>(scaled.x*cos_r - scaled.y*sin_r,
+                                   scaled.x*sin_r + scaled.y*cos_r) + tile_centre,
+                         ring_centre - vec2<f32>(ring_half), ring_centre + vec2<f32>(ring_half));
 
     // World distance spanned by one pixel. `projection[1][1]` is cot(fov_y/2),
     // so the full vertical view at unit distance spans 2/projection[1][1] world
@@ -2830,13 +3165,17 @@ fn vs_sea(
     let wave_weight = 1.0 - smoothstepf(stage.flags.w*0.75, stage.flags.w, distance);
     let surface = sampleSurface(world_xz, sampleFootprint(distance, pixel_angle),
                                 vec2<f32>(0.0), vec2<f32>(0.0), wave_weight, sampleShore(world_xz));
-    let world_position = vec3<f32>(surface.displaced.x,
+    let plane_position = vec3<f32>(surface.displaced.x,
                                    stage.params.z + surface.displaced.y,
                                    surface.displaced.z);
+    // Bent onto the planet around the camera, like the ground.
+    let world_position = planetPlaneToWorld(plane_position);
 
     var out: WaterVertexOutput;
     out.clip_position = globals.projection*globals.view*vec4<f32>(world_position, 1.0);
     out.world_position = world_position;
+    out.plane_xz = plane_position.xz;
+    out.far = 0.0;
     out.wave_position = world_xz;
     out.velocity = vec2<f32>(0.0);
     out.channel = vec4<f32>(0.0, 0.0, stage.params.z, 1.0);
@@ -2902,23 +3241,84 @@ fn vs_inland(
     // which round its banks off above the water. Lift a distant surface by
     // about the bank those triangles leave (their spacing grows with
     // distance, a metre per 110 m), so a river still shows from a ridge.
-    let flat_distance = length(position.xz - globals.camera_position.xz);
+    // The distance to the camera, through the air: the terrain's patches
+    // coarsen with it, from the ground or from high above.
+    let flat_distance = length(planetPlaneOffset(vec3<f32>(position.x, height, position.z)));
     let spacing = max(1.0, flat_distance/110.0);
     // A lake is wide enough for any triangles and stays at its level. So does
     // a river where it meets a lake or the sea (`still` is 1 there, fading to
     // 0 some 30 m along it), so the two surfaces still meet from afar.
     let lift = smoothstepf(150.0, 650.0, flat_distance)*min(spacing*0.45, 12.0)*(1.0 - clamp(still, 0.0, 1.0));
-    let world = vec3<f32>(position.x, height + lift, position.z);
+    let plane_position = vec3<f32>(position.x, height + lift, position.z);
+    let world = planetPlaneToWorld(plane_position);
     var out: WaterVertexOutput;
     out.clip_position = globals.projection*globals.view*vec4<f32>(world, 1.0);
+    // A river or lake lies in the channel the plane's ground carves, which
+    // fades out near a cube edge; it is drawn only where that is whole.
+    if (planetFeatureShare(position.xz) < 0.999) { out.clip_position = vec4<f32>(0.0, 0.0, -1.0, 1.0); }
     out.world_position = world;
-    out.wave_position = world.xz;
+    out.plane_xz = plane_position.xz;
+    out.far = 0.0;
+    out.wave_position = plane_position.xz;
     out.velocity = velocity;
     out.channel = vec4<f32>(across, turbulence, height, still);
     out.stream = vec4<f32>(along, half_width, foam, sea);
     out.side = side;
     out.joined = joined;
     out.clarity = clarity;
+    return out;
+}
+
+// One of the terrain quadtree's patches (PatchInstance in src/planet/view.rs,
+// as terrain-vs.wgsl reads it).
+struct SeaPatch {
+    @location(1) offset: vec3<f32>,
+    @location(2) face: u32,
+    @location(3) centre: vec2<f32>,
+    @location(4) chart_min: vec2<f32>,
+    @location(5) lod: vec3<f32>,
+    @location(6) flags: u32,
+};
+
+// The sea beyond the rings, out to the horizon and round the planet seen from
+// orbit: the terrain's own patches laid at sea level, so it is tessellated
+// like the ground (fine near, coarse far, a sphere everywhere) and meets it
+// at the coast on the same lattice. Each vertex geomorphs onto the coarser
+// lattice exactly as the terrain's does (terrain-vs.wgsl planetTerrainVertex),
+// so neighbouring patches of different depths meet without gaps. The waves
+// are the fragment stage's: past the rings the sea was always flat geometry
+// with per-pixel waves.
+@vertex
+fn vs_sea_far(@location(0) grid: vec3<f32>, instance: SeaPatch) -> WaterVertexOutput
+{
+    let face = instance.face;
+    let spacing = instance.lod.x;
+    let reference = globals.planet_camera.w;
+    let fine = instance.chart_min + grid.xz*spacing;
+    let local = fine - instance.centre;
+    let reference_offset = instance.offset + planetToWorldAxes(
+        planetChartDelta(face, instance.centre, local, reference, reference));
+    let morph = smoothstepf(instance.lod.y, instance.lod.z, length(reference_offset));
+    let coarse = sign(fine)*floor(abs(fine)/(2.0*spacing))*(2.0*spacing);
+    let morphed = local + (coarse - fine)*morph;
+    let offset = instance.offset + planetToWorldAxes(
+        planetChartDelta(face, instance.centre, morphed, reference, stage.params.z));
+    let world_position = globals.camera_position.xyz + offset;
+    let plane = instance.centre + morphed + PLANET_FACE_PLANE_OFFSET[face];
+
+    var out: WaterVertexOutput;
+    out.clip_position = globals.projection*vec4<f32>(
+        (globals.view*vec4<f32>(offset, 0.0)).xyz, 1.0);
+    out.world_position = world_position;
+    out.plane_xz = plane;
+    out.far = select(2.0, 1.0, (instance.flags & 1u) != 0u);
+    out.wave_position = plane;
+    out.velocity = vec2<f32>(0.0);
+    out.channel = vec4<f32>(0.0, 0.0, stage.params.z, 1.0);
+    out.stream = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    out.side = 0.0;
+    out.joined = vec3<f32>(0.0);
+    out.clarity = 0.0;
     return out;
 }
 
@@ -3021,7 +3421,12 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
     let pixel_footprint = max(length(pixel_dx), length(pixel_dy));
     // The plane of the triangle drawn here, for the side the eye sees it from.
     let facet = facetUp(dpdx(in.world_position), dpdy(in.world_position));
-    let xz = in.world_position.xz;
+    let xz = in.plane_xz;
+    // The far sea gives way to the rings over the square they cover.
+    if (in.far > 0.5 && in.far < 1.5) {
+        let from_rings = abs(in.plane_xz - ringCentre());
+        if (max(from_rings.x, from_rings.y) < stage.wind.w) { discard; }
+    }
 
     // --- What water this is -----------------------------------------------
     let sea = clamp(in.stream.w, 0.0, 1.0);
@@ -3273,7 +3678,7 @@ fn fs_water(in: WaterVertexOutput) -> @location(0) vec4<f32>
                             phaseRayleigh(dot(to_view, -to_sun)), 0.5);
         let moon_phase = mix(henyeyGreenstein(dot(to_view, -to_moon), asymmetry),
                              phaseRayleigh(dot(to_view, -to_moon)), 0.5);
-        let sun_attenuation = exp(-medium.sigma_t*max(stage.params.z - in.world_position.y, 0.0));
+        let sun_attenuation = exp(-medium.sigma_t*max(stage.params.z - planetAltitude(in.world_position), 0.0));
         let sea_source = sun_colour*sun_phase + moon_colour*moon_phase + sky_light*(0.35/(4.0*PI));
         var sea_body = scene_linear*transmittance
                      + medium.sigma_s*sun_attenuation*sea_source*(1.0 - transmittance)/medium.sigma_t;

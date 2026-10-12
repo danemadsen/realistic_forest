@@ -48,6 +48,15 @@ pub struct Player {
     /// having walked or fallen off something: only a leap over deep water
     /// steps up onto a bank from its feet.
     pub leapt: bool,
+    /// The cube face whose chart `position` is written in: its x and z are
+    /// that face's terrain plane coordinates and y the altitude above sea
+    /// level, so "up" is always away from the planet's centre.
+    pub face: crate::planet::Face,
+    /// Altitude of the ground under the player, as the planet's view last
+    /// measured it: what flight speeds scale with.
+    pub ground_below: f32,
+    /// The planet's pull where the player is, over its pull at sea level.
+    pub gravity_scale: f32,
 }
 
 /// What kind of water stands somewhere.
@@ -170,6 +179,9 @@ impl Default for Player {
             water: None,
             swimming: false,
             leapt: false,
+            face: crate::planet::Face::PosY,
+            ground_below: 0.0,
+            gravity_scale: 1.0,
         }
     }
 }
@@ -335,9 +347,17 @@ pub fn update_player_system(
         }
     }
     let boosted = !ui_wants_input && keys.pressed(KeyCode::ControlLeft);
+    // Flight speeds up with height so the same keys that drift over a
+    // meadow carry the camera round the planet from orbit.
+    let altitude_scale = if player.flying {
+        crate::planet::systems::flight_speed_scale(player.position.y - player.ground_below)
+    } else {
+        1.0
+    };
     let speed = if player.flying { 38.0 } else { 10.0 }
         * if boosted { 2.5 } else { 1.0 }
-        * player.movement_speed_multiplier;
+        * player.movement_speed_multiplier
+        * altitude_scale;
     let walk = Vec2::new(movement.x, movement.z) * speed;
     let mut candidate = player.position + movement * (speed * dt);
     // The water where the step ends, once a branch below has looked.
@@ -609,7 +629,13 @@ fn update_walking_ground(
         player.leapt = true;
     }
     let swimmer = kicked(afloat, player.vertical_velocity, player.swimming);
-    (candidate.y, player.vertical_velocity) = fall(candidate.y, player.vertical_velocity, grounded_before && !jumping, dt);
+    (candidate.y, player.vertical_velocity) = fall_under(
+        candidate.y,
+        player.vertical_velocity,
+        grounded_before && !jumping,
+        dt,
+        player.gravity_scale,
+    );
     // A jump inside a building stops at its ceiling.
     if player.vertical_velocity > 0.0
         && let Some(ceiling) = building_collision::ceiling_over(near, next_xz, feet)
@@ -650,8 +676,16 @@ fn update_walking_ground(
 /// frame rate. A walker on its feet (`on_feet`) is pulled down a whole step's
 /// fall a step, as hard again, so walking down a slope it keeps its footing,
 /// and Space finds it there to jump.
+#[cfg_attr(not(test), allow(dead_code))]
 fn fall(eye: f32, vertical_velocity: f32, on_feet: bool, dt: f32) -> (f32, f32) {
-    let after = vertical_velocity - FALL_ACCELERATION * dt;
+    fall_under(eye, vertical_velocity, on_feet, dt, 1.0)
+}
+
+/// [`fall`] under `gravity_scale` times the surface's pull: the planet's
+/// gravity weakens with the square of the distance from its centre, so a
+/// body dropped from orbit gathers speed slowly at first.
+fn fall_under(eye: f32, vertical_velocity: f32, on_feet: bool, dt: f32, gravity_scale: f32) -> (f32, f32) {
+    let after = vertical_velocity - FALL_ACCELERATION * gravity_scale * dt;
     let moved = if on_feet { after } else { 0.5 * (vertical_velocity + after) };
     (eye + moved * dt, after)
 }

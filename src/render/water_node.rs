@@ -324,6 +324,17 @@ struct PatchGeometry {
 /// moves.
 struct WaterMeshes {
     patches: Vec<PatchGeometry>,
+    /// The far sea: the terrain quadtree's patch grids (whole nodes and
+    /// quadrants) and this frame's patches that may reach below sea level.
+    far_whole: FarSeaMesh,
+    far_half: FarSeaMesh,
+    far_instances: Buffer,
+}
+
+struct FarSeaMesh {
+    vertex: Buffer,
+    index: Buffer,
+    index_count: u32,
 }
 
 /// One tile as the vertex shader sees it: a centre in world XZ, its LOD's tile
@@ -360,6 +371,7 @@ struct WaterStage {
 #[derive(Clone, Copy)]
 struct WaterPipelines {
     sea: CachedRenderPipelineId,
+    far_sea: CachedRenderPipelineId,
     inland: CachedRenderPipelineId,
     blit: CachedRenderPipelineId,
     underwater: CachedRenderPipelineId,
@@ -439,11 +451,21 @@ impl Default for WaterNodeState {
 /// position, so a tile that jumps by a whole number of its own quads
 /// re-evaluates to exactly the same displaced surface. There is nothing to
 /// geomorph.
+///
+/// The far sea (`ringCentre` in water.wgsl) finds the rings' square by the
+/// same arithmetic, so it rounds half up as the shader's floor(x + 0.5) does.
 fn snapped_centre(camera_xz: [f32; 2]) -> [f32; 2] {
     [
-        (camera_xz[0] / WATER_SNAP).round() * WATER_SNAP,
-        (camera_xz[1] / WATER_SNAP).round() * WATER_SNAP,
+        (camera_xz[0] / WATER_SNAP + 0.5).floor() * WATER_SNAP,
+        (camera_xz[1] / WATER_SNAP + 0.5).floor() * WATER_SNAP,
     ]
+}
+
+/// Half the width of the square the rings cover around their centre: the
+/// outermost LOD's tiles reach two of their own widths out. The far sea gives
+/// way to the rings inside it, and the rings' horizon skirt folds onto it.
+fn ring_half_width() -> f32 {
+    2.0 * rings::lod_scale(crate::water::WATER_LOD_COUNT - 1)
 }
 
 /// Every tile of every LOD, grouped by patch, in `Patch::ALL` order — one
@@ -541,7 +563,69 @@ fn prepare_water_meshes(state: Res<WaterNodeState>, device: Res<RenderDevice>) {
             instance_count: instances.len() as u32,
         });
     }
-    inner.meshes = Some(WaterMeshes { patches });
+    let far_mesh = |cells: u32| {
+        let (vertices, indices) = super::terrain_node::patch_mesh_data(cells);
+        FarSeaMesh {
+            vertex: device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
+                label: Some("forest_water_far_sea_vertices"),
+                contents: bytemuck::cast_slice(&vertices),
+                usage: BufferUsages::VERTEX,
+            }),
+            index: device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
+                label: Some("forest_water_far_sea_indices"),
+                contents: bytemuck::cast_slice(&indices),
+                usage: BufferUsages::INDEX,
+            }),
+            index_count: indices.len() as u32,
+        }
+    };
+    let far_instances = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("forest_water_far_sea_patches"),
+        size: super::terrain_node::PATCH_INSTANCE_STRIDE * super::terrain_node::MAX_TERRAIN_PATCHES as u64,
+        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    inner.meshes = Some(WaterMeshes {
+        patches,
+        far_whole: far_mesh(crate::planet::quadtree::PATCH_CELLS),
+        far_half: far_mesh(crate::planet::quadtree::PATCH_CELLS / 2),
+        far_instances,
+    });
+}
+
+/// The far sea's vertex buffers: the patch grid's integer vertices, and the
+/// terrain's per-patch instance data.
+fn far_sea_vertex_layouts() -> Vec<VertexBufferLayout> {
+    vec![
+        VertexBufferLayout {
+            array_stride: super::terrain_node::TERRAIN_VERTEX_STRIDE,
+            step_mode: VertexStepMode::Vertex,
+            attributes: super::terrain_node::TERRAIN_VERTEX_ATTRIBUTES.to_vec(),
+        },
+        VertexBufferLayout {
+            array_stride: super::terrain_node::PATCH_INSTANCE_STRIDE,
+            step_mode: VertexStepMode::Instance,
+            attributes: super::terrain_node::PATCH_INSTANCE_ATTRIBUTES.to_vec(),
+        },
+    ]
+}
+
+/// The patches of this frame that the sea may cover, whole nodes first, and
+/// how many of them are whole.
+fn far_sea_patches(view: &ExtractedForestView) -> (Vec<crate::planet::view::PatchInstance>, usize) {
+    let reaches = |patch: &&crate::planet::view::PatchInstance| {
+        patch.flags & crate::planet::view::PATCH_REACHES_SEA != 0
+    };
+    let whole: Vec<_> = view.patches[..view.whole_patches.min(view.patches.len())]
+        .iter()
+        .filter(reaches)
+        .copied()
+        .collect();
+    let count = whole.len();
+    let mut patches = whole;
+    patches.extend(view.patches[view.whole_patches.min(view.patches.len())..].iter().filter(reaches).copied());
+    patches.truncate(super::terrain_node::MAX_TERRAIN_PATCHES);
+    (patches, count.min(super::terrain_node::MAX_TERRAIN_PATCHES))
 }
 
 /// Moves the rings with the camera. The instance buffers total 2 KB, so they are
@@ -699,7 +783,7 @@ fn prepare_water(
     // (`GbufferTargets::grass_habitat_mapping_buffer`, group 1).
     write(
         std::mem::offset_of!(WaterStageUniforms, wind),
-        [water.surface_wind, water.gustiness, water.exposure_seconds, 0.0],
+        [water.surface_wind, water.gustiness, water.exposure_seconds, ring_half_width()],
     );
 
     // Submerged-camera admission. The medium fades in over
@@ -899,8 +983,9 @@ pub fn forest_water_surface_pass(
     };
     // Wait for every pipeline before swapping the frame; otherwise a shader
     // still compiling would leave an unwritten target.
-    let (Some(sea), Some(inland), Some(blit), Some(_)) = (
+    let (Some(sea), Some(far_sea), Some(inland), Some(blit), Some(_)) = (
         pipeline_cache.get_render_pipeline(ids.sea),
+        pipeline_cache.get_render_pipeline(ids.far_sea),
         pipeline_cache.get_render_pipeline(ids.inland),
         pipeline_cache.get_render_pipeline(ids.blit),
         pipeline_cache.get_render_pipeline(ids.underwater),
@@ -973,6 +1058,25 @@ pub fn forest_water_surface_pass(
             render_pass.set_index_buffer(patch.index.slice(..), IndexFormat::Uint32);
             render_pass.draw_indexed(0..patch.index_count, 0, 0..patch.instance_count);
         }
+        // The sea beyond the rings, over the terrain's patches.
+        let (far, whole) = far_sea_patches(extracted);
+        if !far.is_empty() {
+            let queue = world.resource::<RenderQueue>();
+            queue.write_buffer(&meshes.far_instances, 0, bytemuck::cast_slice(&far));
+            render_pass.set_render_pipeline(far_sea);
+            render_pass.set_vertex_buffer(1, meshes.far_instances.slice(..));
+            for (mesh, instances) in [
+                (&meshes.far_whole, 0..whole as u32),
+                (&meshes.far_half, whole as u32..far.len() as u32),
+            ] {
+                if instances.is_empty() {
+                    continue;
+                }
+                render_pass.set_vertex_buffer(0, mesh.vertex.slice(..));
+                render_pass.set_index_buffer(mesh.index.slice(..), IndexFormat::Uint32);
+                render_pass.draw_indexed(0..mesh.index_count, 0, instances);
+            }
+        }
     }
 
     if let Some(rivers) = rivers {
@@ -981,7 +1085,7 @@ pub fn forest_water_surface_pass(
             * bevy::math::Mat4::from_cols_array(&g.view))
         .to_cols_array();
         let eye = [g.camera_position[0], g.camera_position[1], g.camera_position[2]];
-        let ranges = rivers.visible(&view_projection, eye);
+        let ranges = rivers.visible(&view_projection, eye, g.planet[0]);
         if !ranges.is_empty() {
             render_pass.set_render_pipeline(inland);
             render_pass.set_vertex_buffer(0, rivers.vertices.slice(..));
@@ -1100,6 +1204,14 @@ fn water_pipelines(
             "vs_sea",
             "fs_water",
             surface_vertex_layouts(),
+            layout.clone(),
+            Some(water_depth(true)),
+        ),
+        far_sea: pipeline(
+            "forest_water_far_sea_pipeline",
+            "vs_sea_far",
+            "fs_water",
+            far_sea_vertex_layouts(),
             layout.clone(),
             Some(water_depth(true)),
         ),

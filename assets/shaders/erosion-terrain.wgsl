@@ -74,6 +74,11 @@ struct GlobalUniforms {
     storm: vec4<f32>, // precipitation bias, type override, elapsed time, wind direction radians
     lightning: vec4<f32>, // strike world xyz, HDR flash
     lightning_meta: vec4<f32>, // seed, age, bolt top, front speed
+    planet: vec4<f32>,          // radius, face half width, seam band, camera face (planet-functions.wgslinc)
+    planet_camera: vec4<f32>,   // camera chart xy on its face, altitude, LOD reference altitude
+    planet_east: vec4<f32>,     // camera east in planet axes, feature fade width
+    planet_up: vec4<f32>,       // camera up in planet axes, atmosphere top altitude
+    planet_north: vec4<f32>,    // camera north in planet axes
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 

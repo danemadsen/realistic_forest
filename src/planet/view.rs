@@ -53,12 +53,12 @@ impl PlanetView {
     }
 
     /// A planet-axis vector in world axes.
-    pub fn to_world(&self, planet_vector: DVec3) -> DVec3 {
+    pub fn to_world(self, planet_vector: DVec3) -> DVec3 {
         self.frame.to_local(planet_vector)
     }
 
     /// A world-axis vector in planet axes.
-    pub fn to_planet(&self, world_vector: DVec3) -> DVec3 {
+    pub fn to_planet(self, world_vector: DVec3) -> DVec3 {
         self.frame.to_planet(world_vector)
     }
 
@@ -85,6 +85,15 @@ impl PlanetView {
         let beyond = planet.horizon_distance(quadtree::TERRAIN_HEIGHT_CEILING, 0.0);
         (over_sea + beyond).max(minimum)
     }
+
+    /// The view's far plane: the planar build's `minimum` while the camera
+    /// is near the ground, where its fog, terrain shadows and LOD were tuned
+    /// to that reach, growing to [`PlanetView::far_distance`] as it climbs
+    /// clear of the ground (from 150 m to 3 km above it).
+    pub fn far_plane(&self, planet: &Planet, minimum: f64) -> f64 {
+        let climb = super::smoothstep(150.0, 3_000.0, self.height_above_ground());
+        minimum + (self.far_distance(planet, minimum) - minimum) * climb
+    }
 }
 
 /// One drawn terrain patch as the vertex shader reads it, per instance.
@@ -107,12 +116,14 @@ pub struct PatchInstance {
     pub morph_start: f32,
     pub morph_end: f32,
     /// Bit 0: the patch is on the camera's face, so the streamed features
-    /// apply to it.
+    /// apply to it. Bit 1: its ground may lie below sea level, so the sea is
+    /// drawn over it.
     pub flags: u32,
 }
 const _: () = assert!(std::mem::size_of::<PatchInstance>() == 48);
 
 pub const PATCH_ON_CAMERA_FACE: u32 = 1;
+pub const PATCH_REACHES_SEA: u32 = 2;
 
 /// The quadtree's per-frame output: patches to draw, whole nodes first and
 /// then quadrants, so each mesh is one instanced draw.
@@ -157,16 +168,27 @@ impl PlanetTerrain {
         self.instances.extend(self.patches.iter().map(|patch| {
             let centre = patch.chart_centre();
             let point = planet.position(patch.key.face, centre, view.ground);
-            let (morph_start, morph_end) = ladder.morph(patch.key.depth);
+            // The face roots never morph; the clipmap's coarsest level sent
+            // the same pair of unreachable distances.
+            let (morph_start, morph_end) = if patch.key.depth == 0 {
+                (1.0e20, 2.0e20)
+            } else {
+                ladder.morph(patch.key.depth)
+            };
             PatchInstance {
                 offset: view.offset_of(point).as_vec3().to_array(),
                 face: patch.key.face.index() as u32,
                 centre: centre.as_vec2().to_array(),
                 chart_min: patch.chart_min.as_vec2().to_array(),
                 spacing: patch.spacing as f32,
-                morph_start: morph_start.min(f32::MAX as f64) as f32,
-                morph_end: morph_end.min(f32::MAX as f64) as f32,
-                flags: if patch.key.face == view.face { PATCH_ON_CAMERA_FACE } else { 0 },
+                morph_start: morph_start as f32,
+                morph_end: morph_end as f32,
+                flags: if patch.key.face == view.face { PATCH_ON_CAMERA_FACE } else { 0 }
+                    | if self.bounds.known(patch.key).0 < crate::constants::SEA_LEVEL as f64 {
+                        PATCH_REACHES_SEA
+                    } else {
+                        0
+                    },
             }
         }));
     }
@@ -197,8 +219,14 @@ mod tests {
         let ground = PlanetView::new(&planet, Face::PosY, Vec3::new(0.0, 2.0, 0.0), 0.0);
         let orbit = PlanetView::new(&planet, Face::PosY, Vec3::new(0.0, 300_000.0, 0.0), 0.0);
         assert!(ground.far_distance(&planet, 5_800.0) < 300_000.0);
-        // 300 km up a 667.6 km planet the sea's horizon is 700 km away.
+        // 300 km up a 667.5 km planet the sea's horizon is 700 km away.
         assert!(orbit.far_distance(&planet, 5_800.0) > 700_000.0);
+        // On the ground the view keeps the planar build's reach, which its
+        // fog and terrain shadows were tuned to.
+        assert_eq!(ground.far_plane(&planet, 5_800.0), 5_800.0);
+        let hill = PlanetView::new(&planet, Face::PosY, Vec3::new(0.0, 150.0, 0.0), 0.0);
+        assert_eq!(hill.far_plane(&planet, 5_800.0), 5_800.0);
+        assert_eq!(orbit.far_plane(&planet, 5_800.0), orbit.far_distance(&planet, 5_800.0));
     }
 
     #[test]

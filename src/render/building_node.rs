@@ -368,9 +368,14 @@ fn build_gpu(
         zero_initialize_workgroup_memory: false,
     };
     let draw_pipeline = cache.queue_render_pipeline(draw_descriptor);
+    // The globals ride along at binding 0: the shadow pass places each
+    // building on the planet around the camera exactly as the view does.
     let cascade_layout = BindGroupLayoutDescriptor::new(
         "building_cascade_layout",
-        &[uniform_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT, std::mem::size_of::<CascadeUniform>() as u64)],
+        &[
+            uniform_entry(0, wgpu::ShaderStages::VERTEX_FRAGMENT, std::mem::size_of::<super::GlobalUniformsGpu>() as u64),
+            uniform_entry(1, wgpu::ShaderStages::VERTEX_FRAGMENT, std::mem::size_of::<CascadeUniform>() as u64),
+        ],
     );
     let shadow_descriptor = RenderPipelineDescriptor {
         label: Some("forest_building_shadow_pipeline".into()),
@@ -417,10 +422,10 @@ fn build_gpu(
     let cascade_groups = cascade_buffers
         .iter()
         .map(|buffer| {
-            let entries = [wgpu::BindGroupEntry {
-                binding: 1,
-                resource: buffer.as_entire_binding(),
-            }];
+            let entries = [
+                wgpu::BindGroupEntry { binding: 0, resource: global_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: buffer.as_entire_binding() },
+            ];
             super::bind_group(device, cache, "building_cascade", &cascade_layout, &entries)
         })
         .collect();

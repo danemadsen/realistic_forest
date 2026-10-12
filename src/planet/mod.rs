@@ -5,9 +5,12 @@
 //! north axes. The chart is equi-angular: chart metres run in proportion to
 //! the angle subtended at the planet centre, so along both axes through a face
 //! centre one chart metre is one metre of arc on the sea-level sphere, and the
-//! whole face is within 15% of isometric. `S` is a power of two times the
-//! clipmap's finest spacing, which keeps every quadtree vertex on the same
-//! global 0.25 m lattice the clipmap sampled and exactly representable in f32.
+//! chart is conformal and isometric at the centre. Toward the face's edges
+//! and corners it stretches and shears like any cube map: across an edge at
+//! its midpoint a chart metre is 0.71 m of ground, and at a corner the axes
+//! meet at 120 degrees. `S` is a power of two times the clipmap's finest
+//! spacing, which keeps every quadtree vertex on the same global 0.25 m
+//! lattice the clipmap sampled and exactly representable in f32.
 //!
 //! Each chart is a window onto the existing infinite terrain plane: a face's
 //! *terrain plane coordinates* are its chart coordinates plus that face's
@@ -25,11 +28,13 @@
 //!
 //! Positions are planet-centred metres in f64 on the CPU. The GPU never sees
 //! a planet-centred f32 position: the renderer works relative to the camera
-//! (see `render::planet`), so precision is set by the distance to the camera,
-//! not by the planet's radius.
+//! (`view::PlanetView` and `planet-functions.wgslinc`), so the planet's
+//! radius costs no precision; what remains is the precision of the terrain
+//! plane coordinates themselves, bounded by the face's extent.
 
 pub mod height;
 pub mod quadtree;
+pub mod systems;
 pub mod view;
 
 use bevy::math::{DVec2, DVec3, Vec2};
@@ -37,7 +42,7 @@ use bevy::prelude::Resource;
 use std::f64::consts::{FRAC_PI_4, PI};
 
 /// Chart metres from a face centre to its edge on the default planet: 2^21
-/// times the clipmap's finest 0.25 m spacing, a 667.6 km sea-level radius.
+/// times the clipmap's finest 0.25 m spacing, a 667.5 km sea-level radius.
 pub const PLANET_DEFAULT_HALF_WIDTH: f64 = 524_288.0;
 /// The smallest and largest half widths `--planet-radius` may snap to.
 pub const PLANET_MIN_HALF_WIDTH: f64 = 4_096.0;
@@ -51,6 +56,15 @@ pub const PLANET_SEAM_BAND: f64 = 6_000.0;
 /// carving, building pads) have faded out, so a chart change inside the band
 /// never moves the ground.
 pub const PLANET_FEATURE_FADE: f64 = 4_000.0;
+
+/// Altitude of the top of the atmosphere: the haze and sky shell the composite
+/// draws around the planet from orbit.
+pub const ATMOSPHERE_TOP: f64 = 60_000.0;
+
+/// The air's density scale height (`PLANET_AIR_SCALE_HEIGHT` in the shaders):
+/// the fog's thin floor and the sky's air thin with it, so from orbit the
+/// planet wears a finite shell of air.
+pub const AIR_SCALE_HEIGHT: f32 = 8_000.0;
 
 /// Standard gravity at sea level. The player's own falls use their tuned
 /// constant; this is what scales it with altitude.
@@ -83,10 +97,6 @@ impl Face {
 
     pub fn index(self) -> usize {
         self as usize
-    }
-
-    pub fn from_index(index: usize) -> Face {
-        Face::ALL[index % 6]
     }
 
     /// The spawn face (+Y) has the planar world's own axes. The four
@@ -186,11 +196,6 @@ impl Planet {
         warped.copysign(u)
     }
 
-    /// Inverse of [`Planet::warp`].
-    pub fn unwarp(t: f64) -> f64 {
-        t.atan() / FRAC_PI_4
-    }
-
     /// The unnormalised cube point of chart `(x, z)` on `face`.
     pub fn cube_point(&self, face: Face, chart: DVec2) -> DVec3 {
         let basis = face.basis();
@@ -224,6 +229,7 @@ impl Planet {
     }
 
     /// The face a planet-centred direction lies on and its chart there.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn locate(&self, direction: DVec3) -> (Face, DVec2) {
         let face = Face::dominant(direction);
         let chart = self.chart_of(face, direction).unwrap_or(DVec2::ZERO);
@@ -292,6 +298,7 @@ impl Planet {
     /// The chart's derivatives at `chart`: how far the point at `altitude`
     /// moves, in planet-centred metres, per chart metre along x and along z.
     /// Both are unit length at a face centre at sea level.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn chart_jacobian(&self, face: Face, chart: DVec2, altitude: f64) -> (DVec3, DVec3) {
         let basis = face.basis();
         let cube = self.cube_point(face, chart);
@@ -345,12 +352,12 @@ pub struct LocalFrame {
 
 impl LocalFrame {
     /// Express a frame-local `(x, y, z)` vector in planet axes.
-    pub fn to_planet(&self, local: DVec3) -> DVec3 {
+    pub fn to_planet(self, local: DVec3) -> DVec3 {
         self.east * local.x + self.up * local.y + self.north * local.z
     }
 
     /// Express a planet-axis vector in this frame's `(x, y, z)`.
-    pub fn to_local(&self, planet: DVec3) -> DVec3 {
+    pub fn to_local(self, planet: DVec3) -> DVec3 {
         DVec3::new(planet.dot(self.east), planet.dot(self.up), planet.dot(self.north))
     }
 }
@@ -371,10 +378,12 @@ impl PlanetPosition {
         Planet::chart_of_plane(self.face, self.plane)
     }
 
-    pub fn to_planet(&self, planet: &Planet) -> DVec3 {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn to_planet(self, planet: &Planet) -> DVec3 {
         planet.position(self.face, self.chart(), self.altitude)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_planet(planet: &Planet, position: DVec3) -> Self {
         let distance = position.length();
         let direction = if distance > 0.0 { position / distance } else { DVec3::Y };
@@ -413,12 +422,19 @@ impl Planet {
         if self.edge_distance(chart) >= 0.0 {
             return None;
         }
+        // The warp is defined to just short of twice the half width; a point
+        // typed in farther out than that (a teleport) is taken from there.
+        // Every point closer than that lies over a neighbouring face.
+        let limit = 1.9 * self.half_width;
+        let chart = chart.clamp(DVec2::splat(-limit), DVec2::splat(limit));
         let direction = self.cube_point(position.face, chart).normalize();
         let face = Face::dominant(direction);
         if face == position.face {
             return None;
         }
         let to_chart = self.chart_of(face, direction)?;
+        let limit = self.half_width;
+        let to_chart = to_chart.clamp(DVec2::splat(-limit), DVec2::splat(limit));
         let to = PlanetPosition { face, plane: Planet::plane_of(face, to_chart), altitude: position.altitude };
         // A heading is a horizontal direction on the sphere; read it in both
         // frames and take the angle between them.
@@ -630,6 +646,91 @@ mod tests {
         }
         let inside = PlanetPosition { face: Face::PosY, plane: DVec2::new(100.0, 100.0), altitude: 0.0 };
         assert!(planet.transfer(inside).is_none());
+        // A teleport typed in far past the edge still lands on a face.
+        for plane in [DVec2::new(1.0e6, 0.0), DVec2::new(-1.0e6, 9.0e5), DVec2::new(3.0e6, -3.0e6)] {
+            let far = PlanetPosition { face: Face::PosY, plane, altitude: 5.0 };
+            let transfer = planet.transfer(far).expect("past the edge");
+            assert!(planet.edge_distance(transfer.to.chart()) >= -1e-6, "{plane}");
+            assert!(planet.transfer(transfer.to).is_none());
+        }
+    }
+
+    /// The shaders' copy of the faces and plane offsets is this module's.
+    #[test]
+    fn the_shader_planet_block_matches_the_faces() {
+        let block = include_str!("../../assets/shaders/planet-functions.wgslinc");
+        let vectors = |name: &str| -> Vec<[f64; 3]> {
+            let start = block.find(&format!("const {name} = array<vec3<f32>, 6>(")).expect(name);
+            let body = &block[start..block[start..].find(");").unwrap() + start];
+            // The first piece is the declaration itself.
+            body.split("vec3<f32>(")
+                .skip(1)
+                .map(|item| {
+                    let numbers: Vec<f64> = item
+                        .split(')')
+                        .next()
+                        .unwrap()
+                        .split(',')
+                        .map(|value| value.trim().parse::<f64>().unwrap())
+                        .collect();
+                    [numbers[0], numbers[1], numbers[2]]
+                })
+                .collect()
+        };
+        let axes = vectors("PLANET_FACE_AXIS");
+        let easts = vectors("PLANET_FACE_EAST");
+        let norths = vectors("PLANET_FACE_NORTH");
+        for face in Face::ALL {
+            let basis = face.basis();
+            assert_eq!(DVec3::from(axes[face.index()]), basis.axis, "{face:?} axis");
+            assert_eq!(DVec3::from(easts[face.index()]), basis.east, "{face:?} east");
+            assert_eq!(DVec3::from(norths[face.index()]), basis.north, "{face:?} north");
+        }
+        let start = block.find("const PLANET_FACE_PLANE_OFFSET").unwrap();
+        let body = &block[start..block[start..].find(");").unwrap() + start];
+        let offsets: Vec<[f32; 2]> = body
+            .split("vec2<f32>(")
+            .skip(1)
+            .map(|item| {
+                let numbers: Vec<f32> = item
+                    .split(')')
+                    .next()
+                    .unwrap()
+                    .split(',')
+                    .map(|value| value.trim().parse::<f32>().unwrap())
+                    .collect();
+                [numbers[0], numbers[1]]
+            })
+            .collect();
+        assert_eq!(offsets, FACE_PLANE_OFFSETS.to_vec());
+    }
+
+    /// Every pass that places geometry on the planet or reads altitude
+    /// pastes all of the planet block, unchanged.
+    #[test]
+    fn every_planet_shader_pastes_the_same_block() {
+        let block = include_str!("../../assets/shaders/planet-functions.wgslinc").trim();
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
+        let mut pasted = Vec::new();
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("wgsl") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            if source.contains("// BEGIN PLANET FUNCTIONS") {
+                assert!(source.contains(block), "{}: the planet block diverged", path.display());
+                pasted.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            }
+        }
+        for required in [
+            "terrain-vs.wgsl", "vegetation.wgsl", "grass.wgsl", "building.wgsl", "lightning.wgsl",
+            "composite.wgsl", "water.wgsl", "cloud-probe.wgsl", "cloud-shadow-map.wgsl",
+            "precipitation.wgsl",
+        ] {
+            assert!(pasted.iter().any(|name| name == required), "{required} lacks the planet block");
+        }
+        assert!(block.contains(&format!("const PLANET_AIR_SCALE_HEIGHT: f32 = {:.1};", AIR_SCALE_HEIGHT)));
     }
 
     #[test]
@@ -637,7 +738,7 @@ mod tests {
         let planet = planet();
         assert!((planet.gravity_at(0.0) - PLANET_SURFACE_GRAVITY).abs() < 1e-12);
         assert!((planet.gravity_at(planet.radius) - PLANET_SURFACE_GRAVITY / 4.0).abs() < 1e-9);
-        // 1.75 m eyes on a 667.6 km planet see about 1.5 km of smooth sea.
+        // 1.75 m eyes on a 667.5 km planet see about 1.5 km of smooth sea.
         let horizon = planet.horizon_distance(1.75, 0.0);
         assert!((horizon - (2.0 * planet.radius * 1.75f64).sqrt()).abs() < 0.01);
     }

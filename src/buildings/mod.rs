@@ -419,6 +419,9 @@ pub fn stream_buildings(
     let Ok(player) = players.single() else {
         return;
     };
+    if crate::planet::systems::streams_paused(player) {
+        return;
+    }
     let cell = stream_cell(Vec2::new(player.position.x, player.position.z));
     if field.streamed == Some(cell) || field.streaming.as_ref().is_some_and(|(pending, _)| *pending == cell) {
         return;

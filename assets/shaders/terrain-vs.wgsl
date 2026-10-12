@@ -48,8 +48,262 @@ struct GlobalUniforms {
     storm: vec4<f32>, // precipitation bias, type override, elapsed time, wind direction radians
     lightning: vec4<f32>, // strike world xyz, HDR flash
     lightning_meta: vec4<f32>, // seed, age, bolt top, front speed
+    planet: vec4<f32>,          // radius, face half width, seam band, camera face (planet-functions.wgslinc)
+    planet_camera: vec4<f32>,   // camera chart xy on its face, altitude, LOD reference altitude
+    planet_east: vec4<f32>,     // camera east in planet axes, feature fade width
+    planet_up: vec4<f32>,       // camera up in planet axes, atmosphere top altitude
+    planet_north: vec4<f32>,    // camera north in planet axes
 };
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
+
+// BEGIN PLANET FUNCTIONS
+// The cube-sphere planet (src/planet/mod.rs) for the shaders. Every pass that
+// places geometry on the ground or reads altitude pastes this block; a test
+// keeps the copies identical and its constants equal to the Rust ones.
+//
+// "World" space in every shader is the planar world the passes were written
+// for, bent onto the planet around the camera: a Euclidean frame whose axes
+// are the camera's local east, up and north, placed so the camera sits at
+// globals.camera_position (its terrain plane coordinates and altitude). Near
+// the camera it agrees with the terrain plane to second order; the planet's
+// centre sits at (camera x, -radius, camera z). Plane points (x, altitude, z)
+// on the camera's face go to world through planetPlaneToWorld, which is exact
+// on the sphere and computed relative to the camera, so precision follows the
+// distance to the camera rather than the planet's radius.
+//
+// Requires GlobalUniforms as `globals` with the planet fields:
+//   planet        x sea-level radius, y face half width S, z seam band, w camera face
+//   planet_camera xy camera chart on its face, z camera altitude, w LOD reference altitude
+//   planet_east   xyz camera east in planet axes, w feature fade width
+//   planet_up     xyz camera up in planet axes, w highest altitude of the atmosphere
+//   planet_north  xyz camera north in planet axes, w unused
+const PLANET_QUARTER_PI: f32 = 0.78539816339;
+const PLANET_FACE_AXIS = array<vec3<f32>, 6>(
+    vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(-1.0, 0.0, 0.0),
+    vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, -1.0, 0.0),
+    vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0));
+const PLANET_FACE_EAST = array<vec3<f32>, 6>(
+    vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0),
+    vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(1.0, 0.0, 0.0),
+    vec3<f32>(-1.0, 0.0, 0.0), vec3<f32>(1.0, 0.0, 0.0));
+const PLANET_FACE_NORTH = array<vec3<f32>, 6>(
+    vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 1.0, 0.0),
+    vec3<f32>(0.0, 0.0, 1.0), vec3<f32>(0.0, 0.0, -1.0),
+    vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(0.0, 1.0, 0.0));
+// Where each face's chart sits on the terrain plane (FACE_PLANE_OFFSETS).
+const PLANET_FACE_PLANE_OFFSET = array<vec2<f32>, 6>(
+    vec2<f32>(37123.0, -21457.0), vec2<f32>(-45311.0, 29873.0),
+    vec2<f32>(0.0, 0.0), vec2<f32>(61207.0, 53119.0),
+    vec2<f32>(-27449.0, -58231.0), vec2<f32>(13877.0, 71363.0));
+
+fn planetCameraFace() -> u32
+{
+    return u32(globals.planet.w + 0.5);
+}
+
+// Equi-angular warp, odd by construction and exactly 1 on a face edge, so two
+// faces build bit-identical cube points along the edge they share.
+fn planetWarp(u: f32) -> f32
+{
+    let magnitude = abs(u);
+    let warped = select(tan(PLANET_QUARTER_PI*magnitude), 1.0, magnitude == 1.0);
+    return select(warped, -warped, u < 0.0);
+}
+
+// warp(u) - warp(u - du), accurate to the size of du rather than of u:
+// tan(a) - tan(b) = sin(a - b)/(cos a cos b).
+fn planetWarpDelta(u: f32, du: f32) -> f32
+{
+    return sin(PLANET_QUARTER_PI*du)/(cos(PLANET_QUARTER_PI*u)*cos(PLANET_QUARTER_PI*(u - du)));
+}
+
+fn planetCube(face: u32, chart: vec2<f32>) -> vec3<f32>
+{
+    let s = globals.planet.y;
+    return PLANET_FACE_AXIS[face] + PLANET_FACE_EAST[face]*planetWarp(chart.x/s)
+        + PLANET_FACE_NORTH[face]*planetWarp(chart.y/s);
+}
+
+// Planet-axis displacement from chart point `reference` at `referenceAltitude`
+// to `reference + delta` at `altitude`, both on `face`. Formed from the
+// difference of the two directions directly, never from two planet-centred
+// positions, so it is as precise as its own length.
+fn planetChartDelta(face: u32, reference: vec2<f32>, delta: vec2<f32>,
+                    referenceAltitude: f32, altitude: f32) -> vec3<f32>
+{
+    let s = globals.planet.y;
+    let chart = reference + delta;
+    let cubeReference = planetCube(face, reference);
+    let cube = planetCube(face, chart);
+    let du = delta/s;
+    let cubeDelta = PLANET_FACE_EAST[face]*planetWarpDelta(chart.x/s, du.x)
+        + PLANET_FACE_NORTH[face]*planetWarpDelta(chart.y/s, du.y);
+    let lengthReference = length(cubeReference);
+    let lengthPoint = length(cube);
+    // d - d_ref = dc/|c| + c_ref (1/|c| - 1/|c_ref|), with the reciprocal
+    // difference rewritten through |c|^2 - |c_ref|^2 = dc . (c + c_ref).
+    let directionDelta = cubeDelta/lengthPoint
+        - cubeReference*(dot(cubeDelta, cube + cubeReference)
+                         /(lengthPoint*lengthReference*(lengthPoint + lengthReference)));
+    return (globals.planet.x + referenceAltitude)*directionDelta
+        + (altitude - referenceAltitude)*(cube/lengthPoint);
+}
+
+// Planet axes to world axes: the camera's east, up and north.
+fn planetToWorldAxes(v: vec3<f32>) -> vec3<f32>
+{
+    return vec3<f32>(dot(v, globals.planet_east.xyz), dot(v, globals.planet_up.xyz),
+                     dot(v, globals.planet_north.xyz));
+}
+
+fn planetFromWorldAxes(v: vec3<f32>) -> vec3<f32>
+{
+    return globals.planet_east.xyz*v.x + globals.planet_up.xyz*v.y + globals.planet_north.xyz*v.z;
+}
+
+// World offset from the camera of a terrain plane point (x, altitude, z) on
+// the camera's face.
+fn planetPlaneOffset(plane: vec3<f32>) -> vec3<f32>
+{
+    let delta = plane.xz - globals.camera_position.xz;
+    return planetToWorldAxes(planetChartDelta(planetCameraFace(), globals.planet_camera.xy, delta,
+                                              globals.planet_camera.z, plane.y));
+}
+
+// A terrain plane point (x, altitude, z) on the camera's face in world space.
+fn planetPlaneToWorld(plane: vec3<f32>) -> vec3<f32>
+{
+    return globals.camera_position.xyz + planetPlaneOffset(plane);
+}
+
+// The world direction of a plane-axis vector at a plane point: the local
+// frame there, which the camera's own frame matches only at the camera.
+fn planetPlaneVectorToWorld(plane: vec3<f32>, v: vec3<f32>) -> vec3<f32>
+{
+    let face = planetCameraFace();
+    let chart = globals.planet_camera.xy + (plane.xz - globals.camera_position.xz);
+    let up = normalize(planetCube(face, chart));
+    let eastAxis = PLANET_FACE_EAST[face];
+    let east = normalize(eastAxis - up*dot(up, eastAxis));
+    let north = cross(east, up);
+    return planetToWorldAxes(east*v.x + up*v.y + north*v.z);
+}
+
+// How much of the streamed features (erosion, river carving, building pads)
+// the ground keeps at a terrain plane point of the camera's face: 1 across
+// the face, fading out before the seam band at its edges
+// (Planet::feature_weight). Things seated on those features (plants, grass,
+// buildings, river surfaces) stand only where it is whole.
+fn planetFeatureShare(plane_xz: vec2<f32>) -> f32
+{
+    let chart = plane_xz - PLANET_FACE_PLANE_OFFSET[planetCameraFace()];
+    let edge = globals.planet.y - max(abs(chart.x), abs(chart.y));
+    return smoothstep(globals.planet.z, globals.planet.z + globals.planet_east.w, edge);
+}
+
+// The planet's centre in world space.
+fn planetCentreWorld() -> vec3<f32>
+{
+    return vec3<f32>(globals.camera_position.x, -globals.planet.x, globals.camera_position.z);
+}
+
+// Altitude above sea level of a world point. Formed as
+// (|v|^2 - r^2)/(|v| + r) from the camera-relative offsets so it does not
+// lose the radius's worth of precision a plain length(v) - r would.
+fn planetAltitude(world: vec3<f32>) -> f32
+{
+    let r = globals.planet.x;
+    let horizontal = world.xz - globals.camera_position.xz;
+    let y = world.y;
+    let lifted = dot(horizontal, horizontal) + y*(2.0*r + y);
+    let distance = sqrt(dot(horizontal, horizontal) + (y + r)*(y + r));
+    return lifted/(distance + r);
+}
+
+// The local up (away from the centre) at a world point.
+fn planetUpAt(world: vec3<f32>) -> vec3<f32>
+{
+    return normalize(world - planetCentreWorld());
+}
+
+// The near and far distances along a world ray from `origin` at which it
+// crosses the sphere `altitude` metres above sea level, or (-1, -1) when it
+// misses it. A ray starting inside the sphere has a negative near distance.
+fn planetRaySphere(origin: vec3<f32>, direction: vec3<f32>, altitude: f32) -> vec2<f32>
+{
+    let r = globals.planet.x + altitude;
+    let fromCentre = origin - planetCentreWorld();
+    let b = dot(fromCentre, direction);
+    // |o|^2 - r^2 from the precise altitude of the origin.
+    let originAltitude = planetAltitude(origin) - altitude;
+    let c = originAltitude*(2.0*r + originAltitude);
+    let discriminant = b*b - c;
+    if (discriminant < 0.0) {
+        return vec2<f32>(-1.0, -1.0);
+    }
+    let root = sqrt(discriminant);
+    return vec2<f32>(-b - root, -b + root);
+}
+
+// The sun's elevation where a world point lies: the sine of its angle above
+// the local horizon there, which the camera's own frame gives only for the
+// camera's place.
+fn planetSunElevationAt(world: vec3<f32>) -> f32
+{
+    return dot(-normalize(globals.sun_direction.xyz), planetUpAt(world));
+}
+
+// The day/night cycle's daylight curve (day_night.rs sample) at a world point,
+// so the night side of the planet is dark seen from the day side. At the
+// camera it is globals.atmosphere.x.
+fn planetDaylightAt(world: vec3<f32>) -> f32
+{
+    return smoothstep(-0.18, 0.18, planetSunElevationAt(world));
+}
+
+// The direct sunlight reaching a world point: the day/night cycle's colour
+// and strength curves (day_night.rs sample) for the sun's elevation there,
+// times the sun's intensity. At the camera it is the uniform
+// globals.sun_colour.rgb*globals.settings_a.x.
+fn planetSunlightAt(world: vec3<f32>) -> vec3<f32>
+{
+    let elevation = planetSunElevationAt(world);
+    let colourMix = smoothstep(0.0, 0.55, elevation);
+    let colour = vec3<f32>(1.0, 0.29 + 0.66*colourMix, 0.095 + 0.765*colourMix);
+    return colour*globals.sun_colour.w*smoothstep(0.0, 0.12, elevation);
+}
+
+// The air's density scale height. Haze thins with it above the ground fog's
+// own 450 m scale, so the column over any point holds a finite amount of air
+// and the planet seen from orbit wears a thin, bright limb.
+const PLANET_AIR_SCALE_HEIGHT: f32 = 8000.0;
+
+// Metres of sea-level air along a world ray from `origin`, up to `limit`
+// metres or the ground: about the scale height straight up from sea level,
+// nothing in space, and most along the limb.
+fn planetAirMass(origin: vec3<f32>, ray: vec3<f32>, limit: f32) -> f32
+{
+    let shell = planetRaySphere(origin, ray, globals.planet_up.w);
+    if (shell.y <= 0.0) { return 0.0; }
+    var end = min(shell.y, limit);
+    let ground = planetRaySphere(origin, ray, 0.0);
+    if (ground.x > 0.0) { end = min(end, ground.x); }
+    let start = max(shell.x, 0.0);
+    if (end <= start) { return 0.0; }
+    // Quadratic steps from the near end, where the air is densest when the
+    // ray starts on the ground and rises.
+    var mass = 0.0;
+    let span = end - start;
+    for (var i = 0u; i < 12u; i = i + 1u) {
+        let a = f32(i)/12.0;
+        let b = (f32(i) + 1.0)/12.0;
+        let t = start + span*(a*a + b*b)*0.5;
+        let altitude = max(planetAltitude(origin + ray*t), 0.0);
+        mass += exp(-altitude/PLANET_AIR_SCALE_HEIGHT)*span*(b*b - a*a);
+    }
+    return mass;
+}
+// END PLANET FUNCTIONS
 
 // Independent fullscreen heightfield pass. Sharing terrainHeight below
 // avoids a second approximation of the terrain for off-screen sun occlusion.
@@ -1143,6 +1397,20 @@ struct VsOutput {
     // coordinate of the terrain's bank band (riverShoreRun): negative under
     // water, 40 near none.
     @location(9) frag_river_shore: f32,
+    // World offset of the vertex from the camera. The fragment stage rebuilds
+    // the G-buffer's view-space position from it: on the planet "world" is
+    // the camera's frame, and the plane position above names a material
+    // domain, not a place in that frame.
+    @location(10) frag_view_offset: vec3<f32>,
+    // The vertex's own east and up in world axes. Every world-space normal
+    // and direction above is in this local frame (the plane's x, y, z where
+    // the vertex is); the fragment stage turns them into the camera's world
+    // with it. The clipmap's plane is flat, so its frame is the world's.
+    @location(11) frag_frame_east: vec3<f32>,
+    @location(12) frag_frame_up: vec3<f32>,
+    // Vertex spacing, the next coarser lattice's spacing, and whether the
+    // streamed features (erosion, rivers, pads, snow tracks) apply here.
+    @location(13) @interpolate(flat) frag_patch: vec4<f32>,
 };
 
 fn terrainVertex(vertexPosition: vec3<f32>, deformSnow: bool) -> VsOutput
@@ -1255,6 +1523,10 @@ fn terrainVertex(vertexPosition: vec3<f32>, deformSnow: bool) -> VsOutput
     output.frag_river_shore = riverShoreRunAt(river, worldXZ, output.frag_base_height, output.frag_material_normal);
 
     output.position = globals.projection*viewPosition4;
+    output.frag_view_offset = worldPosition4.xyz - globals.camera_position.xyz;
+    output.frag_frame_east = vec3<f32>(1.0, 0.0, 0.0);
+    output.frag_frame_up = vec3<f32>(0.0, 1.0, 0.0);
+    output.frag_patch = vec4<f32>(stage.spacing, stage.next_spacing, 1.0, 0.0);
     return output;
 }
 
@@ -1265,10 +1537,258 @@ fn vs_habitat(@location(0) vertexPosition: vec3<f32>) -> VsOutput {
     return terrainVertex(vertexPosition, false);
 }
 
-@vertex
-fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput {
-    return terrainVertex(vertexPosition, true);
+// BEGIN PLANET TERRAIN
+// The planet: the quadtree's patches on the cube sphere (src/planet). Only
+// vs_main reaches this section and the planet block above; the captures
+// (vs_habitat, vs_heightfield) draw the flat terrain plane and never read
+// the planet's globals, which their cache keys rely on.
+
+// One drawn patch, per instance (PatchInstance in src/planet/view.rs).
+struct PatchInput {
+    // World offset from the camera of the patch centre at the reference
+    // altitude, computed in f64 on the CPU.
+    @location(1) offset: vec3<f32>,
+    @location(2) face: u32,
+    // The patch centre and its drawn area's minimum corner, face chart metres.
+    @location(3) centre: vec2<f32>,
+    @location(4) chart_min: vec2<f32>,
+    // Vertex spacing, then the camera distances the patch morphs over.
+    @location(5) lod: vec3<f32>,
+    // Bit 0: on the camera's face, where the streamed features apply.
+    @location(6) flags: u32,
+};
+
+// How much of the streamed features (erosion, river carving, building pads)
+// a point `edge` chart metres inside its face keeps: none off the camera's
+// face, and on it none from the seam band's inner edge, rising to all of
+// them a fade width further in (Planet::feature_weight).
+fn planetFeatureWeight(edge: f32, onCameraFace: bool) -> f32
+{
+    if (!onCameraFace) { return 0.0; }
+    return smoothHermite(globals.planet.z, globals.planet.z + globals.planet_east.w, edge);
 }
+
+// The bare relief in a seam band: every chart that reaches the point, each
+// weighted by a smoothstep of its own distance to its edge, sampled where
+// the point's direction falls in it. A function of the direction alone, so
+// both faces of an edge build the same ground (planet/height.rs bare_height).
+fn planetSeamHeight(face: u32, chart: vec2<f32>) -> f32
+{
+    let s = globals.planet.y;
+    let band = globals.planet.z;
+    let direction = normalize(planetCube(face, chart));
+    var total = 0.0;
+    var weights = 0.0;
+    for (var other = 0u; other < 6u; other = other + 1u) {
+        let along = dot(direction, PLANET_FACE_AXIS[other]);
+        if (along <= 1.0e-6) { continue; }
+        let otherChart = vec2<f32>(atan2(dot(direction, PLANET_FACE_EAST[other]), along),
+                                   atan2(dot(direction, PLANET_FACE_NORTH[other]), along))
+            *(s/PLANET_QUARTER_PI);
+        let weight = smoothHermite(-band, band, s - max(abs(otherChart.x), abs(otherChart.y)));
+        if (weight > 0.0) {
+            total += weight*baseHeight(otherChart + PLANET_FACE_PLANE_OFFSET[other]);
+            weights += weight;
+        }
+    }
+    return total/max(weights, 1.0e-6);
+}
+
+// The ground at a point of a face's chart (planet/height.rs surface_height):
+// the terrain plane's inside the face, with the streamed features where they
+// apply, and the seam blend near its edges.
+fn planetGround(face: u32, chart: vec2<f32>, onCameraFace: bool) -> f32
+{
+    let edge = globals.planet.y - max(abs(chart.x), abs(chart.y));
+    if (edge <= globals.planet.z) { return planetSeamHeight(face, chart); }
+    let plane = chart + PLANET_FACE_PLANE_OFFSET[face];
+    let features = planetFeatureWeight(edge, onCameraFace);
+    if (features >= 1.0) { return terrainHeight(plane); }
+    let bare = baseHeight(plane);
+    if (features <= 0.0) { return bare; }
+    return mix(bare, terrainHeight(plane), features);
+}
+
+// Snap onto the lattice of `spacing`, rounding toward the face centre
+// (quadtree.rs snap_toward_centre). A shared edge's midpoint is zero on both
+// faces that meet there, so both collapse an edge vertex onto the same
+// neighbour, whichever way their charts run along the edge.
+fn planetSnapTowardCentre(chart: vec2<f32>, spacing: f32) -> vec2<f32>
+{
+    return sign(chart)*floor(abs(chart)/spacing)*spacing;
+}
+
+// The chart's derivatives at a point: how far a sea-level point moves (planet
+// axes) per chart metre along x, then the radial up, then per chart metre
+// along z (Planet::chart_jacobian).
+fn planetChartAxes(face: u32, chart: vec2<f32>) -> mat3x3<f32>
+{
+    let s = globals.planet.y;
+    let warpX = planetWarp(chart.x/s);
+    let warpZ = planetWarp(chart.y/s);
+    let cube = PLANET_FACE_AXIS[face] + PLANET_FACE_EAST[face]*warpX + PLANET_FACE_NORTH[face]*warpZ;
+    let cubeLength = length(cube);
+    let up = cube/cubeLength;
+    let east = PLANET_FACE_EAST[face];
+    let north = PLANET_FACE_NORTH[face];
+    return mat3x3<f32>((east - up*dot(up, east))*((1.0 + warpX*warpX)/cubeLength),
+                       up,
+                       (north - up*dot(up, north))*((1.0 + warpZ*warpZ)/cubeLength));
+}
+
+// The normal of a height field sampled `step` chart metres either side of a
+// point, in the local frame there (east, up, north = east x up). The chart
+// is neither exactly isometric nor orthogonal away from a face centre, so
+// the two tangents carry its derivatives; at the spawn this is the clipmap's
+// normalize(left - right, 2 step, back - front).
+fn planetLocalNormal(axes: mat3x3<f32>, left: f32, right: f32, back: f32, front: f32, step: f32) -> vec3<f32>
+{
+    let east = normalize(axes[0]);
+    let north = cross(east, axes[1]);
+    let alongX = vec3<f32>(2.0*step*length(axes[0]), right - left, 0.0);
+    let alongZ = vec3<f32>(2.0*step*dot(axes[2], east), front - back, 2.0*step*dot(axes[2], north));
+    return normalize(cross(alongZ, alongX));
+}
+
+fn planetTerrainVertex(grid: vec3<f32>, instance: PatchInput) -> VsOutput
+{
+    let face = instance.face;
+    let onCameraFace = (instance.flags & 1u) != 0u;
+    let spacing = instance.lod.x;
+    let referenceAltitude = globals.planet_camera.w;
+
+    // The vertex on its patch's lattice, exactly: every term is a multiple of
+    // the spacing, a power of two.
+    let fine = instance.chart_min + grid.xz*spacing;
+    let local = fine - instance.centre;
+
+    // Geomorph onto the next coarser lattice over the outer part of the
+    // patch's range, measured from the camera to the vertex at the reference
+    // altitude like the quadtree's selection, so every patch sharing a vertex
+    // morphs it alike and a patch meets a coarser neighbour fully collapsed
+    // onto its lattice.
+    let referenceOffset = instance.offset + planetToWorldAxes(
+        planetChartDelta(face, instance.centre, local, referenceAltitude, referenceAltitude));
+    let morph = smoothHermite(instance.lod.y, instance.lod.z, length(referenceOffset));
+    let coarse = planetSnapTowardCentre(fine, 2.0*spacing);
+    let morphedLocal = local + (coarse - fine)*morph;
+    let chart = instance.centre + morphedLocal;
+    let plane = chart + PLANET_FACE_PLANE_OFFSET[face];
+    let edge = globals.planet.y - max(abs(chart.x), abs(chart.y));
+    let features = select(0.0, planetFeatureWeight(edge, onCameraFace), edge > globals.planet.z);
+
+    // The terrain plane's ground, as terrainVertex builds it, wherever the
+    // streamed features apply; the bare relief, or the seam blend, elsewhere.
+    var output: VsOutput;
+    var river = riverNone();
+    var erosionContribution = 0.0;
+    var height: f32;
+    if (edge <= globals.planet.z) {
+        height = planetSeamHeight(face, chart);
+    } else {
+        let bare = baseHeight(plane);
+        height = bare;
+        if (features > 0.0) {
+            erosionContribution = erosionDelta(plane)*erosionVisibility(plane);
+            river = riverEnvelope(plane);
+            let full = buildingPadHeight(plane, riverClamp(river, riverClamp(river, bare) + erosionContribution));
+            height = mix(bare, full, features);
+            erosionContribution *= features;
+        }
+    }
+    output.fragErosionDelta = erosionContribution;
+    output.frag_base_height = height;
+    output.frag_snow_compaction = 0.0;
+    let bank = mix(riverBankAt(riverNone(), height), riverBankAt(river, height), features);
+    let lakeShare = riverLakeShare(river, height);
+    output.frag_river = vec4<f32>(clamp(bank, -40.0, 40.0),
+                                  river.bend*(1.0 - lakeShare)*features,
+                                  river.turbulence*(1.0 - lakeShare)*features,
+                                  length(river.velocity)*(1.0 - lakeShare)*features);
+
+    // Normals from the ground either side, at the clipmap's LOD-following
+    // interval, then the material's distance-prefiltered interval. The
+    // camera distance is three-dimensional so it keeps growing into orbit.
+    let axes = planetChartAxes(face, chart);
+    let normalStep = max(0.25, mix(spacing, 2.0*spacing, morph));
+    let heightLeft = planetGround(face, chart - vec2<f32>(normalStep, 0.0), onCameraFace);
+    let heightRight = planetGround(face, chart + vec2<f32>(normalStep, 0.0), onCameraFace);
+    let heightBack = planetGround(face, chart - vec2<f32>(0.0, normalStep), onCameraFace);
+    let heightFront = planetGround(face, chart + vec2<f32>(0.0, normalStep), onCameraFace);
+    var localNormal = planetLocalNormal(axes, heightLeft, heightRight, heightBack, heightFront, normalStep);
+    let cameraDistance = length(referenceOffset);
+    // The clipmap's 96 m ceiling was 1.5 of its coarsest spacing; patches
+    // seen from high up are far coarser, so the interval keeps pace with them.
+    let materialStep = clamp(cameraDistance/48.0, 4.0, max(96.0, 1.5*spacing));
+    var materialNormal = localNormal;
+    if (abs(normalStep - materialStep) > 0.0001) {
+        materialNormal = planetLocalNormal(axes,
+            planetGround(face, chart - vec2<f32>(materialStep, 0.0), onCameraFace),
+            planetGround(face, chart + vec2<f32>(materialStep, 0.0), onCameraFace),
+            planetGround(face, chart - vec2<f32>(0.0, materialStep), onCameraFace),
+            planetGround(face, chart + vec2<f32>(0.0, materialStep), onCameraFace),
+            materialStep);
+    }
+
+    // The snow pack, as terrainVertex lifts it. Only the camera's face has
+    // the trodden-snow map; elsewhere the pack lies untouched.
+    let compression = select(0.0, snowCompression(plane), features > 0.0);
+    output.frag_snow_compaction = compression;
+    let dry = smoothHermite(0.0, 1.0, bank);
+    height += dry*snowCoverage(height, materialNormal)*snow.mapping.w*(1.0 - compression);
+    let liftScale = dry*snow.mapping.w;
+    let liftLeft = liftScale*snowCoverage(heightLeft, materialNormal);
+    let liftRight = liftScale*snowCoverage(heightRight, materialNormal);
+    let liftBack = liftScale*snowCoverage(heightBack, materialNormal);
+    let liftFront = liftScale*snowCoverage(heightFront, materialNormal);
+    let trodden = features > 0.0;
+    localNormal = planetLocalNormal(axes,
+        heightLeft + liftLeft*(1.0 - select(0.0, snowCompression(plane - vec2<f32>(normalStep, 0.0)), trodden)),
+        heightRight + liftRight*(1.0 - select(0.0, snowCompression(plane + vec2<f32>(normalStep, 0.0)), trodden)),
+        heightBack + liftBack*(1.0 - select(0.0, snowCompression(plane - vec2<f32>(0.0, normalStep)), trodden)),
+        heightFront + liftFront*(1.0 - select(0.0, snowCompression(plane + vec2<f32>(0.0, normalStep)), trodden)),
+        normalStep);
+
+    // Skirt vertices hang straight down from their edge vertex, out of sight
+    // under the ground unless two patches' edges part.
+    let skirtDepth = clamp(2.0*spacing, 0.5, 200.0)*grid.y;
+    let offset = instance.offset + planetToWorldAxes(
+        planetChartDelta(face, instance.centre, morphedLocal, referenceAltitude, height - skirtDepth));
+
+    // The vertex's local frame in world axes.
+    let east = normalize(axes[0]);
+    let frameEast = planetToWorldAxes(east);
+    let frameUp = planetToWorldAxes(axes[1]);
+    let frameNorth = cross(frameEast, frameUp);
+    let worldNormal = frameEast*localNormal.x + frameUp*localNormal.y + frameNorth*localNormal.z;
+    let view3 = mat3x3<f32>(globals.view[0].xyz, globals.view[1].xyz, globals.view[2].xyz);
+    let viewPosition = view3*offset;
+
+    output.fragPositionView = viewPosition;
+    output.fragNormalView = normalize(view3*worldNormal);
+    output.fragWorldPosition = vec3<f32>(plane.x, height, plane.y);
+    output.fragWorldNormal = localNormal;
+    output.frag_material_normal = materialNormal;
+    if (features > 0.0) {
+        output.frag_river_shore = riverShoreRunAt(river, plane, output.frag_base_height, materialNormal);
+    } else {
+        output.frag_river_shore = riverShoreRun(riverNone(), output.frag_base_height, materialNormal);
+    }
+    output.frag_view_offset = offset;
+    output.frag_frame_east = frameEast;
+    output.frag_frame_up = frameUp;
+    output.frag_patch = vec4<f32>(spacing, 2.0*spacing, select(0.0, 1.0, features > 0.0), 0.0);
+    output.position = globals.projection*vec4<f32>(viewPosition, 1.0);
+    return output;
+}
+
+// The visible terrain: the planet's patches. The grass habitat capture keeps
+// drawing the clipmap (vs_habitat), a flat map of the plane around the player.
+@vertex
+fn vs_main(@location(0) vertexPosition: vec3<f32>, instance: PatchInput) -> VsOutput {
+    return planetTerrainVertex(vertexPosition, instance);
+}
+// END PLANET TERRAIN
 
 // STAGE UNIFORMS:
 //   model (mat4x4<f32>)                    — matModel: model transform of the clipmap mesh

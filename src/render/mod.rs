@@ -108,6 +108,10 @@ impl ForestRender {
     }
 }
 
+/// The camera's vertical field of view, shared by the projection and the
+/// terrain quadtree's frustum.
+pub const CAMERA_FOV_Y_DEGREES: f32 = 68.0;
+
 /// Camera-attached data extracted from the main world each frame.
 #[derive(Resource, Default)]
 pub struct ExtractedForestView {
@@ -133,6 +137,13 @@ pub struct ExtractedForestView {
     /// The eye's adaptation to the light it stands in, multiplying the
     /// exposure: 1 outdoors, more inside a building.
     pub exposure_adaptation: f32,
+    /// The planet, and where the camera is on it.
+    pub planet: crate::planet::Planet,
+    pub planet_view: crate::planet::view::PlanetView,
+    /// The terrain patches the quadtree selected for this pose, whole nodes
+    /// first; `whole_patches` of them.
+    pub patches: Vec<crate::planet::view::PatchInstance>,
+    pub whole_patches: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,7 +152,7 @@ pub struct ExtractedForestView {
 // silently drift.
 // ---------------------------------------------------------------------------
 
-/// The shared `GlobalUniforms` preamble (group 0, binding 0), 416 bytes.
+/// The shared `GlobalUniforms` preamble (group 0, binding 0), 496 bytes.
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GlobalUniformsGpu {
@@ -168,8 +179,19 @@ pub struct GlobalUniformsGpu {
     pub storm: [f32; 4],
     pub lightning: [f32; 4],
     pub lightning_meta: [f32; 4],
+    /// The planet the world is bent onto (`planet-functions.wgslinc`): sea-
+    /// level radius, face half width, seam band, the camera's face.
+    pub planet: [f32; 4],
+    /// The camera's chart position on its face, its altitude, and the
+    /// altitude the terrain's LOD distances are measured at.
+    pub planet_camera: [f32; 4],
+    /// The world's axes in planet axes: east (w the streamed features' fade
+    /// width), up (w the top of the atmosphere) and north.
+    pub planet_east: [f32; 4],
+    pub planet_up: [f32; 4],
+    pub planet_north: [f32; 4],
 }
-const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 416);
+const _: () = assert!(std::mem::size_of::<GlobalUniformsGpu>() == 496);
 
 /// `sun_direction.w` until the terrain pass has measured the heightfield: no
 /// march ever rises above it, so the shaders' early exits stay off.
@@ -670,6 +692,12 @@ fn extract_forest_view(
     view.exposure_adaptation = world
         .get_resource::<crate::buildings::EyeAdaptation>()
         .map_or(1.0, |adaptation| adaptation.exposure);
+    view.planet = *world.resource::<crate::planet::Planet>();
+    view.planet_view = *world.resource::<crate::planet::view::PlanetView>();
+    let terrain = world.resource::<crate::planet::view::PlanetTerrain>();
+    view.patches.clear();
+    view.patches.extend_from_slice(&terrain.instances);
+    view.whole_patches = terrain.whole;
     view.frame += 1;
 }
 
@@ -695,9 +723,15 @@ pub fn prepare_forest_globals(
     let width = view.physical_width.max(1) as f32;
     let height = view.physical_height.max(1) as f32;
     let aspect = width / height;
-    // GL-style projection with the GL->wgpu z conversion baked in so raster
-    // depth matches the C++ (standard depth, near -> 0, far -> 1).
-    let projection = crate::matrices::perspective(68.0, aspect, NEAR_PLANE, FAR_PLANE);
+    // GL-style projection with the GL->wgpu z conversion baked in
+    // (crate::matrices::perspective). The projection reaches over the planet's horizon from wherever the
+    // camera is: the planar build's 5.8 km near the ground, the whole visible
+    // disc from orbit. Reverse-Z keeps depth precise across either; the
+    // matrix maps the near plane to depth 1 and the far plane to 0.
+    let planet = view.planet;
+    let planet_view = view.planet_view;
+    let far = planet_view.far_plane(&planet, FAR_PLANE as f64) as f32;
+    let projection = crate::matrices::perspective(CAMERA_FOV_Y_DEGREES, aspect, NEAR_PLANE, far);
     let player = Player {
         position: bevy::math::Vec3::from(view.player_position),
         yaw: view.player_yaw,
@@ -706,7 +740,19 @@ pub fn prepare_forest_globals(
     };
     let camera = PlayerCamera::from_player(&player);
     let view_matrix = crate::matrices::view_matrix(camera.position, camera.target, camera.up);
-    let lighting = crate::day_night::sample(view.day_night.time_hours);
+    let mut lighting = crate::day_night::sample(view.day_night.time_hours);
+    // The day/night cycle turns the planet under the sun: its directions are
+    // fixed in planet axes (the spawn's frame), and each place sees them in
+    // its own east, up and north.
+    let to_world = |direction: [f32; 4]| {
+        let world = planet_view.to_world(bevy::math::DVec3::new(
+            direction[0] as f64, direction[1] as f64, direction[2] as f64,
+        ));
+        [world.x as f32, world.y as f32, world.z as f32, direction[3]]
+    };
+    let sun_direction = to_world(lighting.sun_direction);
+    let moon_direction = to_world(lighting.moon_direction);
+    lighting = crate::day_night::at_elevation(sun_direction, moon_direction, -sun_direction[1]);
     let weather = view.weather.conditions(&view.settings);
     let heightfield_texel = terrain_node::LIGHTING_HEIGHTFIELD_SPAN
         / terrain_node::LIGHTING_HEIGHTFIELD_SIZE as f32;
@@ -792,17 +838,52 @@ pub fn prepare_forest_globals(
             view.weather.elapsed_seconds,
             view.settings.cloud_wind_direction_degrees.to_radians(),
         ],
-        lightning: [
-            view.weather.lightning.position[0],
-            view.weather.lightning.position[1],
-            view.weather.lightning.position[2],
-            view.weather.lightning.flash,
-        ],
+        // The strike is placed in terrain plane coordinates; the shaders
+        // light from where it stands on the planet around the camera.
+        lightning: {
+            let strike = view.weather.lightning.position;
+            let chart = crate::planet::Planet::chart_of_plane(
+                planet_view.face,
+                bevy::math::DVec2::new(strike[0] as f64, strike[2] as f64),
+            );
+            let world = planet_view.world_of(planet.position(planet_view.face, chart, strike[1] as f64));
+            [world.x as f32, world.y as f32, world.z as f32, view.weather.lightning.flash]
+        },
         lightning_meta: [
             view.weather.lightning.seed,
             view.weather.lightning.age_seconds,
             view.weather.lightning.top_height,
             if view.weather.automatic { view.settings.cloud_wind_speed } else { 0.0 },
+        ],
+        planet: [
+            planet.radius as f32,
+            planet.half_width as f32,
+            planet.seam_band as f32,
+            planet_view.face.index() as f32,
+        ],
+        planet_camera: [
+            planet_view.chart.x as f32,
+            planet_view.chart.y as f32,
+            planet_view.plane.y as f32,
+            planet_view.ground as f32,
+        ],
+        planet_east: [
+            planet_view.frame.east.x as f32,
+            planet_view.frame.east.y as f32,
+            planet_view.frame.east.z as f32,
+            crate::planet::PLANET_FEATURE_FADE as f32,
+        ],
+        planet_up: [
+            planet_view.frame.up.x as f32,
+            planet_view.frame.up.y as f32,
+            planet_view.frame.up.z as f32,
+            crate::planet::ATMOSPHERE_TOP as f32,
+        ],
+        planet_north: [
+            planet_view.frame.north.x as f32,
+            planet_view.frame.north.y as f32,
+            planet_view.frame.north.z as f32,
+            0.0,
         ],
     };
     if globals.buffer.is_none() {
@@ -951,6 +1032,11 @@ mod tests {
             ("storm", std::mem::offset_of!(GlobalUniformsGpu, storm)),
             ("lightning", std::mem::offset_of!(GlobalUniformsGpu, lightning)),
             ("lightning_meta", std::mem::offset_of!(GlobalUniformsGpu, lightning_meta)),
+            ("planet", std::mem::offset_of!(GlobalUniformsGpu, planet)),
+            ("planet_camera", std::mem::offset_of!(GlobalUniformsGpu, planet_camera)),
+            ("planet_east", std::mem::offset_of!(GlobalUniformsGpu, planet_east)),
+            ("planet_up", std::mem::offset_of!(GlobalUniformsGpu, planet_up)),
+            ("planet_north", std::mem::offset_of!(GlobalUniformsGpu, planet_north)),
         ];
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
         let mut checked = 0;

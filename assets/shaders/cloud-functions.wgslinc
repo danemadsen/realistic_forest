@@ -47,7 +47,7 @@ fn stormLightAt(world_position: vec3<f32>) -> f32 {
     let layer = cloudLocalLayer(cloudFrontSeverity(world_position.xz));
     let cloud_top = layer.x + layer.y;
     let below_deck = 1.0 - smoothstep(cloud_top - 150.0,
-                                      cloud_top + 350.0, world_position.y);
+                                      cloud_top + 350.0, planetAltitude(world_position));
     if (below_deck <= 0.0) { return 0.0; }
     return stormCoreStrength(world_position.xz)*below_deck;
 }
@@ -102,18 +102,28 @@ fn cloudSlab() -> vec2<f32> {
 }
 
 // Return a bounded interval even when the eye lies inside or above the layer.
-// A horizontal ray is valid only if its origin already lies in the volume.
+// The layer is the shell between two spheres about the planet's centre
+// (planet-functions.wgslinc), so a deck seen from below curves down to the
+// horizon with the ground, and one seen from above wraps round the planet.
+// The first pass through the shell along the ray is returned: from below,
+// from where the ray leaves the inner sphere to where it leaves the outer;
+// from inside or above, until it leaves the shell or dips into the inner
+// sphere. An empty interval has its start past its end.
 fn cloudInterval(origin: vec3<f32>, ray: vec3<f32>, maximum_distance: f32) -> vec2<f32> {
     let slab = cloudSlab();
-    let bottom = slab.x;
-    let top = slab.y;
-    if (abs(ray.y) < 0.00001) {
-        if (origin.y <= bottom || origin.y >= top) { return vec2<f32>(0.0); }
-        return vec2<f32>(0.0, maximum_distance);
+    let outer = planetRaySphere(origin, ray, slab.y);
+    if (outer.y <= 0.0) { return vec2<f32>(0.0); }
+    var start = max(outer.x, 0.0);
+    var end = outer.y;
+    let inner = planetRaySphere(origin, ray, slab.x);
+    if (inner.y > 0.0) {
+        if (inner.x <= 0.0) {
+            start = max(start, inner.y);
+        } else {
+            end = min(end, inner.x);
+        }
     }
-    let a = (bottom - origin.y)/ray.y;
-    let b = (top - origin.y)/ray.y;
-    return vec2<f32>(max(min(a, b), 0.0), min(max(a, b), maximum_distance));
+    return vec2<f32>(start, min(end, maximum_distance));
 }
 
 fn cloudNoiseLod(sample_width: f32, texel_world_size: f32) -> f32 {
@@ -130,7 +140,7 @@ fn cloudDensityFiltered(world_position: vec3<f32>, use_detail: bool, sample_widt
     let thickness_multiplier = select(profile.w, 1.0, (overrides & 8u) != 0u);
     let cloud_base = max(globals.clouds.w + base_offset, 100.0);
     let cloud_thickness = max(globals.cloud_layer.x*thickness_multiplier, 50.0);
-    let height = (world_position.y - cloud_base)/cloud_thickness;
+    let height = (planetAltitude(world_position) - cloud_base)/cloud_thickness;
     if (height <= 0.0 || height >= 1.0) { return 0.0; }
     let scale = max(globals.cloud_layer.y, 100.0);
     let wind_position = world_position - vec3<f32>(globals.cloud_motion.x, 0.0, globals.cloud_motion.y);
@@ -250,7 +260,7 @@ fn marchClouds(origin: vec3<f32>, direction: vec3<f32>, maximum_distance: f32, q
         let local_severity = cloudFrontSeverity(world_position.xz);
         let storm = stormCoreStrength(world_position.xz);
         let local_layer = cloudLocalLayer(local_severity);
-        let height = clamp((world_position.y - local_layer.x)/local_layer.y, 0.0, 1.0);
+        let height = clamp((planetAltitude(world_position) - local_layer.x)/local_layer.y, 0.0, 1.0);
         let step_transmittance = exp(-density*CLOUD_EXTINCTION*step_length);
         let contribution = result.transmittance*(1.0 - step_transmittance);
         let clear_ambient = mix(vec3<f32>(0.065, 0.080, 0.105),

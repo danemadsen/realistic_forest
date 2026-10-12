@@ -163,11 +163,32 @@ pub fn erosion_visibility(x: f32, z: f32, center: [f32; 2]) -> f32 {
                      (dx * dx + dz * dz).sqrt())
 }
 
-/// Sample the blended eroded surface height at a world position. Four fixed
+/// Sample the ground at a terrain plane position on the face the camera
+/// stands on, as the terrain pass draws it: the plane's eroded ground
+/// ([`sample_plane_height`]), which near the edges of the face fades into
+/// the seam blend between cube faces once the planet is known to the cache
+/// (`crate::planet::height::surface_height`). Every CPU height query (the
+/// player's footing, trunks, snow, lightning, the UI) goes through here.
+pub fn sample_eroded_height(
+    cache: &ErosionCache,
+    noise: &NoiseField,
+    x: f32,
+    z: f32,
+    visibility_center: [f32; 2],
+) -> f32 {
+    match &cache.planet {
+        Some(ground) => crate::planet::height::surface_height(
+            &ground.planet, cache, noise, ground.face, x, z, visibility_center,
+        ),
+        None => sample_plane_height(cache, noise, x, z, visibility_center),
+    }
+}
+
+/// Sample the blended eroded surface height at a terrain plane position. Four fixed
 /// spatial candidate masks are normalized independently of readiness so a
 /// missing/streaming pass contributes zero erosion (the procedural base) and
 /// fades in with its own C1 mask, avoiding 512 m quartet-availability steps.
-pub fn sample_eroded_height(
+pub fn sample_plane_height(
     cache: &ErosionCache,
     noise: &NoiseField,
     x: f32,
@@ -585,6 +606,11 @@ pub struct ErosionCache {
     /// event (armed at begin, incremented in [`apply_erosion_events`], tripping
     /// `mark_tile_failed` past `EROSION_WORKER_WATCHDOG_FRAMES`).
     pub watchdog_frames: u32,
+    /// The planet and the face whose stretch of the terrain plane the cache
+    /// holds, once the planet's view has placed the camera: height queries
+    /// then fade into the seam blend near the face's edges as the drawn
+    /// ground does.
+    pub planet: Option<crate::planet::height::PlanetGround>,
 }
 
 impl Default for ErosionCache {
@@ -603,6 +629,7 @@ impl Default for ErosionCache {
             rivers: None,
             buildings: None,
             watchdog_frames: 0,
+            planet: None,
         }
     }
 }

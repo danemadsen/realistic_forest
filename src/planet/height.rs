@@ -1,6 +1,6 @@
 //! The planet's ground for the CPU: collision, spawn placement and the
-//! quadtree's height bounds. `terrain-vs.wgsl`'s `planetSurfaceHeight` is the
-//! GPU twin and follows the same three rules:
+//! quadtree's height bounds. `terrain-vs.wgsl`'s `planetGround` is the GPU
+//! twin and follows the same three rules:
 //!
 //! - Inside a face, away from its seams, the ground is the terrain plane's at
 //!   the face's plane coordinates: the procedural relief, and on the face the
@@ -23,6 +23,14 @@ use bevy::math::DVec2;
 /// building pad's cut or fill, with room to spare. Height bounds sampled from
 /// the bare relief are widened by this.
 pub const FEATURE_HEIGHT_MARGIN: f64 = 60.0;
+
+/// What the erosion cache needs to answer height queries on the planet: the
+/// planet, and the face the camera is on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlanetGround {
+    pub planet: Planet,
+    pub face: Face,
+}
 
 /// The bare procedural relief at a point of a face's chart, seams blended.
 pub fn bare_height(planet: &Planet, noise: &NoiseField, face: Face, chart: DVec2) -> f64 {
@@ -56,13 +64,13 @@ pub fn surface_height(
     let chart = Planet::chart_of_plane(face, DVec2::new(x as f64, z as f64));
     let features = planet.feature_weight(chart);
     if features >= 1.0 {
-        return crate::erosion::sample_eroded_height(cache, noise, x, z, visibility_center);
+        return crate::erosion::sample_plane_height(cache, noise, x, z, visibility_center);
     }
     let bare = bare_height(planet, noise, face, chart) as f32;
     if features <= 0.0 {
         return bare;
     }
-    let full = crate::erosion::sample_eroded_height(cache, noise, x, z, visibility_center);
+    let full = crate::erosion::sample_plane_height(cache, noise, x, z, visibility_center);
     bare + (full - bare) * features as f32
 }
 
@@ -77,7 +85,7 @@ mod tests {
         let cache = ErosionCache::default();
         let planet = Planet::default();
         for &(x, z) in &[(0.0f32, 0.0f32), (1500.0, -730.0), (-90_000.0, 210_000.0)] {
-            let planar = crate::erosion::sample_eroded_height(&cache, &noise, x, z, [0.0, 0.0]);
+            let planar = crate::erosion::sample_plane_height(&cache, &noise, x, z, [0.0, 0.0]);
             let planetary = surface_height(&planet, &cache, &noise, Face::PosY, x, z, [0.0, 0.0]);
             assert_eq!(planar, planetary);
         }
