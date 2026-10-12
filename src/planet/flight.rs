@@ -56,6 +56,8 @@ const STEP: f64 = 1.0 / 120.0;
 const WARP_STEP: f64 = 0.5;
 /// The most substeps one frame may take.
 const MAX_SUBSTEPS: usize = 4_000;
+/// How far the ground may drop from under a resting body before it falls.
+const SETTLE_TOLERANCE: f64 = 0.05;
 /// The largest arc, radians of the planet, a warped frame may sweep: the
 /// body's chart is extended past its face's edge for less than this, and
 /// [`super::systems::carry_player_across_faces`] carries it from there.
@@ -102,6 +104,13 @@ pub struct FreeFlight {
     pub landed: bool,
     /// Whether what it rests on is water: KSP's "splashed down".
     pub on_water: bool,
+    /// Whether it rests where it stood when free flight began, a building's
+    /// floor say, rather than on the ground it came down on: it stays there
+    /// while the ground under it changes.
+    pub on_floor: bool,
+    /// Altitude of the surface under it, the ground with its snow or the
+    /// water, as last measured: what its height above the ground is from.
+    pub surface: f64,
     /// Index into [`WARP_LEVELS`].
     pub warp: usize,
     /// The speed of its last touchdown, m/s.
@@ -111,7 +120,16 @@ pub struct FreeFlight {
 impl FreeFlight {
     /// A body at `position` moving at `velocity`, in the air.
     pub fn new(position: DVec3, velocity: DVec3) -> Self {
-        Self { position, velocity, landed: false, on_water: false, warp: 0, touchdown: None }
+        Self {
+            position,
+            velocity,
+            landed: false,
+            on_water: false,
+            on_floor: false,
+            surface: 0.0,
+            warp: 0,
+            touchdown: None,
+        }
     }
 
     pub fn altitude(&self, planet: &Planet) -> f64 {
@@ -167,6 +185,7 @@ impl FreeFlight {
             }
             self.landed = false;
             self.on_water = false;
+            self.on_floor = false;
         }
         let warped = self.warp_rate() > 1.0;
         let step = if warped { WARP_STEP } else { STEP };
@@ -188,10 +207,17 @@ impl FreeFlight {
 
     /// Bring the body to rest where its eye would sink below `touch` metres
     /// above sea level (the ground's or the water's surface plus the eye's
-    /// height), as KSP lands a vessel that meets the ground. Returns whether
-    /// it touched down this call.
+    /// height), as KSP lands a vessel that meets the ground. A body resting
+    /// on ground that has since dropped away under it (a tile of erosion
+    /// fading in, say) falls onto it again. Returns whether it touched down
+    /// this call.
     pub fn settle(&mut self, planet: &Planet, touch: f64, water: bool) -> bool {
-        if self.altitude(planet) > touch {
+        let altitude = self.altitude(planet);
+        if altitude > touch {
+            if self.landed && !self.on_floor && altitude > touch + SETTLE_TOLERANCE {
+                self.landed = false;
+                self.on_water = false;
+            }
             return false;
         }
         let touched_down = !self.landed;
@@ -200,6 +226,7 @@ impl FreeFlight {
             self.on_water = water;
         }
         self.landed = true;
+        self.on_floor = false;
         self.warp = 0;
         self.position = self.up() * (planet.radius + touch);
         self.velocity = DVec3::ZERO;
@@ -450,9 +477,16 @@ mod tests {
         assert!(arc <= MAX_WARP_ARC + 1e-12 && seconds > 0.05);
         // Slowed to a fall that dips into the air, the warp stops there.
         flight.velocity *= 0.9;
-        fly(&planet, &mut flight, DVec3::ZERO, 2_000.0, 1.0 / 60.0);
+        let mut left = 2_000.0;
+        while flight.warp != 0 && left > 1e-9 {
+            let step = flight.frame_seconds(1.0 / 60.0).min(left);
+            left -= flight.advance(&planet, DVec3::ZERO, step);
+        }
+        let altitude = flight.altitude(&planet);
         assert_eq!(flight.warp, 0);
-        assert!(!flight.may_warp(&planet) || flight.altitude(&planet) >= ATMOSPHERE_TOP);
+        // It drops within a half-second substep's fall of the top of the air.
+        assert!(altitude < ATMOSPHERE_TOP && altitude > ATMOSPHERE_TOP - 500.0, "{altitude}");
+        assert!(!flight.may_warp(&planet));
     }
 
     #[test]
@@ -550,7 +584,20 @@ mod tests {
         flight.settle(&planet, ground, false);
         assert!(flight.position.distance(rest) < 1e-6);
         assert!(flight.landed);
+        // Ground that drops away under it lets it fall onto it again.
+        flight.settle(&planet, ground - 3.0, false);
+        assert!(!flight.landed);
+        for _ in 0..120 {
+            flight.advance(&planet, DVec3::ZERO, 1.0 / 60.0);
+            flight.settle(&planet, ground - 3.0, false);
+        }
+        assert!(flight.landed && (flight.altitude(&planet) - (ground - 3.0)).abs() < 1e-6);
+        // But a body that began on a floor stays on it.
+        let mut on_floor = FreeFlight { landed: true, on_floor: true, ..flight };
+        on_floor.settle(&planet, ground - 10.0, false);
+        assert!(on_floor.landed);
         // Full thrust up lifts it off.
+        let ground = ground - 3.0;
         for _ in 0..60 {
             flight.advance(&planet, up * THRUST, 1.0 / 60.0);
             flight.settle(&planet, ground, false);

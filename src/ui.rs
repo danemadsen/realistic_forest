@@ -356,10 +356,11 @@ fn flight_readout(player: &Player, planet: &crate::planet::Planet, flight: &crat
          Periapsis  {}\n\
          Period     {}  |  Eccentricity {:.4}\n\
          Thrust     {:.0} m/s2, x{:.0} with Ctrl  |  {}\n\
-         W/S along the view, A/D sideways, Space/Shift head and feet, Q/E roll  |  G walk, V noclip",
+         W/S view, A/D sideways, Space/Shift head and feet\n\
+         Q/E roll  |  G walk, V noclip",
         flight::situation(planet, flight, &orbit),
         flight_distance(altitude),
-        flight_distance(player.position.y as f64 - player.ground_below as f64),
+        flight_distance((altitude - flight.surface - EYE_HEIGHT as f64).max(0.0)),
         flight.velocity.length(),
         vertical,
         horizontal,
@@ -379,11 +380,13 @@ fn flight_readout(player: &Player, planet: &crate::planet::Planet, flight: &crat
     text
 }
 
-/// The flight readouts in the top right corner while the player flies free.
+/// The flight readouts in the top right corner while the player flies free,
+/// or the bottom right while the debug text takes the top.
 pub fn draw_flight_hud(
     mut contexts: EguiContexts,
     players: Query<&Player>,
     planet: Res<crate::planet::Planet>,
+    settings: Res<AppSettings>,
 ) -> Result {
     let Ok(player) = players.single() else {
         return Ok(());
@@ -396,10 +399,14 @@ pub fn draw_flight_hud(
     };
     let text = flight_readout(player, &planet, flight);
     let painter = ctx.layer_painter(egui::LayerId::background());
-    let position = ctx.content_rect().right_top() + egui::vec2(-12.0, 12.0);
+    let (position, anchor) = if settings.show_debug {
+        (ctx.content_rect().right_bottom() + egui::vec2(-12.0, -12.0), egui::Align2::RIGHT_BOTTOM)
+    } else {
+        (ctx.content_rect().right_top() + egui::vec2(-12.0, 12.0), egui::Align2::RIGHT_TOP)
+    };
     let font = egui::FontId::monospace(13.0);
-    painter.text(position + egui::vec2(1.0, 1.0), egui::Align2::RIGHT_TOP, &text, font.clone(), egui::Color32::BLACK);
-    painter.text(position, egui::Align2::RIGHT_TOP, text, font, egui::Color32::WHITE);
+    painter.text(position + egui::vec2(1.0, 1.0), anchor, &text, font.clone(), egui::Color32::BLACK);
+    painter.text(position, anchor, text, font, egui::Color32::WHITE);
     Ok(())
 }
 

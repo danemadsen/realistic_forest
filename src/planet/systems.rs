@@ -50,14 +50,20 @@ pub fn flight_speed_scale(height: f32) -> f32 {
 const GROUND_CHECK_ALTITUDE: f64 = TERRAIN_HEIGHT_CEILING + 400.0;
 
 /// Start free flight from wherever the player is, keeping the velocity it
-/// walks, swims or flies at. A body on its feet starts landed, on the floor
-/// it stands on, until its thrust lifts it.
+/// walks, swims or falls at. The noclip flight's speed is not momentum
+/// ([`Player::set_flying`]), so a flier starts at rest. A body on its feet
+/// starts landed, on the floor it stands on, until its thrust lifts it.
 pub fn enter_free_flight(player: &mut Player, planet: &Planet) {
     let (position, frame) = flight::planet_position(planet, player.face, player.position);
-    let vertical = if player.flying { 0.0 } else { player.vertical_velocity };
-    let local = DVec3::new(player.velocity.x as f64, vertical as f64, player.velocity.y as f64);
+    let local = if player.flying {
+        DVec3::ZERO
+    } else {
+        DVec3::new(player.velocity.x as f64, player.vertical_velocity as f64, player.velocity.y as f64)
+    };
     let mut free = FreeFlight::new(position, frame.to_planet(local));
     free.landed = !player.flying && !player.swimming && player.vertical_velocity == 0.0;
+    free.on_floor = free.landed;
+    free.surface = player.ground_below as f64;
     if free.landed {
         free.velocity = DVec3::ZERO;
     }
@@ -145,6 +151,7 @@ pub fn free_flight_system(
     }
 
     let seconds = free.frame_seconds(time.delta_secs().min(0.05) as f64);
+    let before = free.altitude(&planet);
     free.advance(&planet, thrust, seconds);
 
     let mut placed = flight::place_on(&planet, player.face, free.position);
@@ -153,13 +160,22 @@ pub fn free_flight_system(
         let xz = Vec2::new(placed.position.x, placed.position.z);
         let ground = snow::sample_surface(&erosion, &noise, xz, xz.to_array()).height(&snow, xz);
         water = crate::player::water_at(&erosion, &noise, xz.x, xz.y, xz.to_array());
-        let float = water.and_then(|water| water.float_eye()).filter(|&eye| eye > ground + EYE_HEIGHT);
+        free.surface = water.map_or(ground, |water| water.surface.max(ground)) as f64;
+        // The water takes a body that comes down onto it from above; one
+        // already under it (a diver who took off) sinks to the bed or rises.
+        let float = water
+            .and_then(|water| water.float_eye())
+            .filter(|&eye| eye > ground + EYE_HEIGHT && before >= eye as f64 - 0.01);
         let touch = float.unwrap_or(ground + EYE_HEIGHT);
         let speed = free.velocity.length();
         if free.settle(&planet, touch as f64, float.is_some()) {
             info!("FLIGHT: touched down at {speed:.1} m/s");
         }
         placed = flight::place_on(&planet, player.face, free.position);
+    } else {
+        let (x, z) = (placed.position.x, placed.position.z);
+        let ground = super::height::surface_height(&planet, &erosion, &noise, player.face, x, z, [x, z]);
+        free.surface = ground.max(crate::constants::SEA_LEVEL) as f64;
     }
     player.position = placed.position;
     (player.velocity, player.vertical_velocity) = flight::local_velocity(placed.frame, free.velocity);

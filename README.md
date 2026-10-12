@@ -323,7 +323,8 @@ borrow at launch, nor Coriolis), and every substep it feels:
   sides, Space and Shift toward its head and feet.
 
 The integrator is velocity Verlet (kick, drift, kick), with the drag taken
-implicitly in each half kick, in substeps of at most 1/120 s: without air an
+implicitly in each half kick, in substeps of at most 1/120 s (half a second
+under time warp): without air an
 orbit keeps its energy however long it runs, and in the air no step can turn
 the velocity round. Above the atmosphere, coasting, `.` and `,` step a time
 warp through 5×, 10×, 50×, 100× and 1000×, KSP's "on rails" (only the
@@ -334,7 +335,7 @@ or the water, and rests there, landed or splashed down, until its thrust
 outweighs its weight; G again walks off. Its state is written back into the
 player's face, plane coordinates and altitude every frame, so the camera,
 the face crossings and the streams see an ordinary player. The readouts at
-the top right show KSP's situation (landed, splashed, flying, sub-orbital,
+the top right (the bottom right while the debug text is up) show KSP's situation (landed, splashed, flying, sub-orbital,
 orbiting, escaping), the altitude and height above the ground, the speed and
 its vertical and horizontal parts, the gravity and the air's density, the
 apoapsis and periapsis with the time to each, the period and the
