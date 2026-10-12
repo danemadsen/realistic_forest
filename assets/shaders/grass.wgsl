@@ -26,9 +26,10 @@ struct GlobalUniforms {
 // "World" space in every shader is the planar world the passes were written
 // for, bent onto the planet around the camera: a Euclidean frame whose axes
 // are the camera's local east, up and north, placed so the camera sits at
-// globals.camera_position (its terrain plane coordinates and altitude). Near
-// the camera it agrees with the terrain plane to second order; the planet's
-// centre sits at (camera x, -radius, camera z). Plane points (x, altitude, z)
+// globals.camera_position (its terrain plane coordinates and altitude). At
+// the camera it is the terrain plane mapped through the chart's derivatives
+// (the plane itself at a face centre, stretched and sheared toward its
+// edges); the planet's centre sits at (camera x, -radius, camera z). Plane points (x, altitude, z)
 // on the camera's face go to world through planetPlaneToWorld, which is exact
 // on the sphere and computed relative to the camera, so precision follows the
 // distance to the camera rather than the planet's radius.

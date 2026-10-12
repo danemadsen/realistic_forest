@@ -26,13 +26,15 @@ pub struct Player {
     pub movement_speed_multiplier: f32,
     pub mouse_captured: bool,
     pub mouse_warmup_frames: u32,
-    /// Horizontal velocity of the body over the ground, m/s. On dry land it
-    /// is whatever the player walks; in a river it is what the current and
-    /// the player's footing leave of it.
+    /// Horizontal velocity of the body over the ground, m/s, east and north
+    /// in the local frame (the camera's world X and Z). On dry land it is
+    /// whatever the player walks; in a river it is what the current and the
+    /// player's footing leave of it.
     pub velocity: Vec2,
     /// How deep the water the player stands in is, metres (0 on dry land).
     pub wading_depth: f32,
-    /// The river's current at the player, m/s, world XZ.
+    /// The river's current at the player, m/s, east and north in the local
+    /// frame.
     pub current: Vec2,
     /// True while the current has taken the player's feet from under them.
     pub swept: bool,
@@ -60,6 +62,16 @@ pub struct Player {
     /// Free flight under the planet's gravity, KSP style, while it lasts:
     /// the body's own planet-centred state, which `position` follows.
     pub free_flight: Option<crate::planet::flight::FreeFlight>,
+    /// The body's roll about its line of sight, radians, positive to the
+    /// right: Q and E roll it in flight; on the ground it is the head's tilt
+    /// as it leans.
+    pub roll: f32,
+    /// How far the player leans out to peek round something, -1 (left) to 1
+    /// (right): Q and E on the ground.
+    pub lean: f32,
+    /// Where the lean has put the eye from the body, plane XZ: as far to the
+    /// side as the walls and trunks there leave room for.
+    pub lean_offset: Vec2,
 }
 
 /// What kind of water stands somewhere.
@@ -186,6 +198,9 @@ impl Default for Player {
             ground_below: 0.0,
             gravity_scale: 1.0,
             free_flight: None,
+            roll: 0.0,
+            lean: 0.0,
+            lean_offset: Vec2::ZERO,
         }
     }
 }
@@ -198,6 +213,44 @@ impl Player {
             self.pitch.sin(),
             -self.yaw.cos() * self.pitch.cos(),
         )
+    }
+
+    /// The body's orientation in the local frame: it looks down -Z with +Y
+    /// up before yaw (about the vertical), pitch and roll (about the line of
+    /// sight) turn it.
+    pub fn attitude(&self) -> Quat {
+        Quat::from_euler(EulerRot::YXZ, -self.yaw, self.pitch, -self.roll)
+    }
+
+    /// Take yaw, pitch and roll from an orientation. Pitch stays within a
+    /// right angle of level; past straight up the yaw and roll turn over.
+    pub fn set_attitude(&mut self, attitude: Quat) {
+        let (yaw, pitch, roll) = attitude.normalize().to_euler(EulerRot::YXZ);
+        self.yaw = -yaw;
+        self.pitch = pitch;
+        self.roll = -roll;
+    }
+
+    /// The body's right, rolled with it.
+    pub fn right(&self) -> Vec3 {
+        self.attitude() * Vec3::X
+    }
+
+    /// The top of the body's head, rolled with it: the camera's up.
+    pub fn up(&self) -> Vec3 {
+        self.attitude() * Vec3::Y
+    }
+
+    /// Where the player's eye is: its position, out to the side as far as
+    /// it leans and a little lower.
+    pub fn eye(&self) -> Vec3 {
+        self.position + Vec3::new(self.lean_offset.x, -LEAN_DROP * self.lean.abs(), self.lean_offset.y)
+    }
+
+    /// Whether the body flies, under gravity or not: Q and E roll it, and
+    /// the mouse turns it about its own axes.
+    pub fn in_flight(&self) -> bool {
+        self.flying || self.free_flight.is_some()
     }
 
     /// Move to finite world coordinates and discard momentum from the old
@@ -257,10 +310,11 @@ pub struct PlayerCamera {
 
 impl PlayerCamera {
     pub fn from_player(player: &Player) -> Self {
+        let eye = player.eye();
         Self {
-            position: player.position,
-            target: player.position + player.forward(),
-            up: Vec3::Y,
+            position: eye,
+            target: eye + player.forward(),
+            up: player.up(),
             fov_y: 68.0,
         }
     }
@@ -285,6 +339,7 @@ pub fn update_player_system(
     mut buildings: ResMut<BuildingField>,
     ui_wants_input: Res<UiWantsInput>,
     automation: Option<Res<crate::automation::AutomationSettings>>,
+    planet: Option<Res<crate::planet::Planet>>,
 ) {
     let Ok(mut player) = player.single_mut() else {
         return;
@@ -331,12 +386,25 @@ pub fn update_player_system(
             .fold(Vec2::ZERO, |a, b| a + b);
         if player.mouse_warmup_frames > 0 {
             player.mouse_warmup_frames -= 1;
+        } else if player.in_flight() {
+            turn_in_flight(&mut player, delta);
         } else {
-            player.yaw += delta.x * 0.00225;
-            player.pitch = (player.pitch - delta.y * 0.00225).clamp(-1.53, 1.53);
+            player.yaw += delta.x * MOUSE_RADIANS;
+            player.pitch = (player.pitch - delta.y * MOUSE_RADIANS).clamp(-PITCH_LIMIT, PITCH_LIMIT);
         }
     } else {
         mouse_motion.clear();
+    }
+    // Q and E roll a flying body, and lean one on the ground out to peek.
+    let roll_input = if ui_wants_input {
+        0.0
+    } else {
+        (keys.pressed(KeyCode::KeyE) as i32 - keys.pressed(KeyCode::KeyQ) as i32) as f32
+    };
+    if player.in_flight() {
+        roll_in_flight(&mut player, roll_input, dt);
+    } else {
+        lean_on_feet(&mut player, roll_input, dt);
     }
     // A free-flying body is moved by the planet's gravity and its own thrust
     // (planet::systems::free_flight_system); the player only looks around.
@@ -369,8 +437,22 @@ pub fn update_player_system(
         * if boosted { 2.5 } else { 1.0 }
         * player.movement_speed_multiplier
         * altitude_scale;
+    // Movement and velocities are east and north in the local frame the
+    // camera looks through; the position moves in plane coordinates, which
+    // away from a face's centre are stretched and sheared against it.
+    let planet = planet.map_or_else(crate::planet::Planet::default, |planet| *planet);
+    let face = player.face;
+    let chart = crate::planet::Planet::chart_of_plane(
+        face,
+        bevy::math::DVec2::new(player.position.x as f64, player.position.z as f64),
+    );
+    let altitude = player.position.y as f64;
+    let to_chart = |step: Vec2| planet.frame_to_chart(face, chart, altitude, step.as_dvec2()).as_vec2();
     let walk = Vec2::new(movement.x, movement.z) * speed;
     let mut candidate = player.position + movement * (speed * dt);
+    let flown = to_chart(walk * dt);
+    candidate.x = player.position.x + flown.x;
+    candidate.z = player.position.z + flown.y;
     // The water where the step ends, once a branch below has looked.
     let mut landed = None;
     player.wading_depth = 0.0;
@@ -394,6 +476,8 @@ pub fn update_player_system(
             Some(water) => (water.surface, water.depth(), water.current, water.turbulence),
             None => (f32::NEG_INFINITY, 0.0, Vec2::ZERO, 0.0),
         };
+        // The river's current is a plane-coordinate velocity.
+        let current = planet.chart_to_frame(face, chart, altitude, current.as_dvec2()).as_vec2();
         // In the water only while the feet are: a leap over a creek or a fall
         // onto a lake carries the body on through the air.
         let in_water = player.position.y - EYE_HEIGHT < surface + 0.05;
@@ -409,8 +493,9 @@ pub fn update_player_system(
         // Airborne over the water the body keeps the velocity it left the
         // water with: a hop does not shake off the current, nor stop a body
         // the current was carrying dead in mid-air.
-        candidate.x = player.position.x + player.velocity.x * dt;
-        candidate.z = player.position.z + player.velocity.y * dt;
+        let stepped = to_chart(player.velocity * dt);
+        candidate.x = player.position.x + stepped.x;
+        candidate.z = player.position.z + stepped.y;
         // Trunks and lilac stems are solid. Flight passes through them, as it
         // does the ground.
         collide_with_trunks(&mut player, &mut candidate, &vegetation, &erosion, &noise);
@@ -419,6 +504,16 @@ pub fn update_player_system(
         let travel = visibility_center.distance(Vec2::new(candidate.x, candidate.z));
         let mut near = buildings.near_mut(visibility_center, PLAYER_RADIUS + travel + 1.0);
         collide_with_buildings(&mut player, &mut candidate, &mut near, dt);
+        // A lean puts the eye out to the side, as far as the walls and trunks
+        // there leave room for: a peek round a corner, not through it.
+        player.lean_offset = if player.lean == 0.0 {
+            Vec2::ZERO
+        } else {
+            let from = Vec2::new(candidate.x, candidate.z);
+            let side = Vec2::new(player.yaw.cos(), player.yaw.sin()) * (player.lean * LEAN_DISTANCE);
+            let feet = player.position.y - EYE_HEIGHT;
+            lean_reach(from, from + to_chart(side), feet, &mut near, &vegetation, &erosion, &noise) - from
+        };
         // Water too deep to stand in is swum in: the body floats, head out,
         // until the player dives. A swimmer crouched under standing height
         // stands up. The ground is what walking stands on, snow and all, or
@@ -574,6 +669,71 @@ fn collide_with_trunks(
     }
 }
 
+/// Turn a flying body about its own axes by a mouse movement of `delta`
+/// pixels, however it is rolled: the view moves the way the mouse moves on
+/// the screen.
+pub fn turn_in_flight(player: &mut Player, delta: Vec2) {
+    let turned = player.attitude()
+        * Quat::from_rotation_y(-delta.x * MOUSE_RADIANS)
+        * Quat::from_rotation_x(-delta.y * MOUSE_RADIANS);
+    player.set_attitude(turned);
+}
+
+/// Roll a flying body about its line of sight for `dt` seconds, `input` 1 to
+/// the right (E) and -1 to the left (Q). It leans no more.
+pub fn roll_in_flight(player: &mut Player, input: f32, dt: f32) {
+    if input != 0.0 {
+        let rolled = player.attitude() * Quat::from_rotation_z(-input * ROLL_RATE * dt);
+        player.set_attitude(rolled);
+    }
+    player.lean = 0.0;
+    player.lean_offset = Vec2::ZERO;
+}
+
+/// A body on its feet for `dt` seconds, leaning toward `input` (E 1, Q -1):
+/// it rights itself, the head coming level past any tilt of the lean and the
+/// eyes back within a glance of level, and leans out at a steady pace.
+pub fn lean_on_feet(player: &mut Player, input: f32, dt: f32) {
+    // The tilt follows the lean; what is left of a flight's roll eases away.
+    let leftover = wrap_angle(player.roll - player.lean * LEAN_ANGLE) * (-RIGHTING_RATE * dt).exp();
+    player.lean = step_toward(player.lean, input, LEAN_RATE * dt);
+    let leftover = if leftover.abs() < 1e-4 { 0.0 } else { leftover };
+    player.roll = player.lean * LEAN_ANGLE + leftover;
+    player.pitch = player.pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT);
+}
+
+/// How far toward `to` an eye leaning out from a body at `from` gets before
+/// a wall or a trunk stops it.
+fn lean_reach(
+    from: Vec2,
+    to: Vec2,
+    feet: f32,
+    near: &mut [NearBuilding<'_>],
+    vegetation: &VegetationField,
+    erosion: &ErosionCache,
+    noise: &NoiseField,
+) -> Vec2 {
+    let reach = building_collision::slide(near, from, to, feet, LEAN_HEAD_RADIUS, 0.0).position;
+    let mut solids = Vec::new();
+    vegetation.solids_near(from, PLAYER_RADIUS + from.distance(reach), &mut solids);
+    let trunks: Vec<collision::Trunk> = solids.iter().filter_map(|solid| solid.stand(erosion, noise, from)).collect();
+    if trunks.is_empty() {
+        return reach;
+    }
+    collision::slide(&trunks, from, reach, feet).position
+}
+
+/// Move `value` toward `target` by at most `step`.
+fn step_toward(value: f32, target: f32, step: f32) -> f32 {
+    value + (target - value).clamp(-step, step)
+}
+
+/// An angle in (-pi, pi].
+fn wrap_angle(angle: f32) -> f32 {
+    let wrapped = (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+    if wrapped <= -std::f32::consts::PI { wrapped + std::f32::consts::TAU } else { wrapped }
+}
+
 /// Slide the step from the player's position to `candidate` along the walls
 /// of the buildings near it, pushing their doors open, and take from the
 /// player's velocity what pressed into a wall.
@@ -716,6 +876,24 @@ fn lands(eye: f32, ground: f32, swimmer: bool) -> (f32, bool) {
 }
 
 /// The highest a body steps up onto, metres.
+/// Radians the view turns per pixel of mouse movement.
+const MOUSE_RADIANS: f32 = 0.00225;
+/// How far up or down a body on its feet can look.
+const PITCH_LIMIT: f32 = 1.53;
+/// Radians per second Q and E roll a flying body.
+pub const ROLL_RATE: f32 = 1.6;
+/// How fast a lean comes and goes: a full lean takes a sixth of a second.
+const LEAN_RATE: f32 = 6.0;
+/// How far a full lean puts the eye out to the side, how much lower, and how
+/// far it tilts the head.
+pub const LEAN_DISTANCE: f32 = 0.35;
+const LEAN_DROP: f32 = 0.06;
+pub const LEAN_ANGLE: f32 = 0.2;
+/// How close a leaning eye comes to a wall.
+const LEAN_HEAD_RADIUS: f32 = 0.15;
+/// How fast a body back on its feet rights its roll, per second.
+const RIGHTING_RATE: f32 = 6.0;
+
 const STEP_HEIGHT: f32 = 1.25;
 /// How fast a jump, or a swimmer's kick up out of the water, leaves, m/s.
 const JUMP_SPEED: f32 = 7.4;
@@ -951,7 +1129,7 @@ pub fn sync_player_camera_transform(
     let camera = PlayerCamera::from_player(&player);
     if let Ok((mut transform, mut projection)) = transforms.single_mut() {
         transform.translation = camera.position;
-        transform.look_at(camera.target, Vec3::Y);
+        transform.look_at(camera.target, camera.up);
         if let Projection::Perspective(perspective) = &mut *projection {
             perspective.fov = camera.fov_y.to_radians();
         }
@@ -1120,6 +1298,90 @@ mod tests {
         let ground = crate::erosion::sample_eroded_height(&erosion, &noise, 1000.0, 1000.0, [1000.0, 1000.0]);
         player.position = Vec3::new(1000.0, ground + EYE_HEIGHT, 1000.0);
         (noise, erosion, vegetation, player)
+    }
+
+    #[test]
+    fn the_attitude_round_trips_and_its_axes_are_orthonormal() {
+        for (yaw, pitch, roll) in [(0.0, 0.0, 0.0), (0.7, -0.4, 0.3), (-2.5, 1.2, -1.9), (3.0, -1.5, 3.0)] {
+            let mut player = Player { yaw, pitch, roll, ..Player::default() };
+            let attitude = player.attitude();
+            assert!((attitude * Vec3::NEG_Z).distance(player.forward()) < 1e-5);
+            let (forward, right, up) = (player.forward(), player.right(), player.up());
+            assert!(forward.dot(right).abs() < 1e-5 && forward.dot(up).abs() < 1e-5 && right.dot(up).abs() < 1e-5);
+            assert!(right.cross(up).distance(-forward) < 1e-5, "right-handed");
+            player.set_attitude(attitude);
+            assert!((player.yaw - yaw).abs() < 1e-4 && (player.pitch - pitch).abs() < 1e-4 && (player.roll - roll).abs() < 1e-4,
+                    "{yaw} {pitch} {roll} -> {} {} {}", player.yaw, player.pitch, player.roll);
+        }
+        // Unrolled, the camera's up is the local vertical's side of the view.
+        let level = Player::default();
+        assert!(level.up().y > 0.98 && level.right().y.abs() < 1e-6);
+    }
+
+    #[test]
+    fn e_rolls_a_flying_body_right_and_the_mouse_then_turns_it_about_its_own_axes() {
+        let mut player = Player { pitch: 0.0, flying: true, ..Player::default() };
+        let quarter = std::f32::consts::FRAC_PI_2 / ROLL_RATE;
+        let steps = 100;
+        for _ in 0..steps {
+            roll_in_flight(&mut player, 1.0, quarter / steps as f32);
+        }
+        assert!((player.roll - std::f32::consts::FRAC_PI_2).abs() < 1e-3, "{}", player.roll);
+        // Rolled onto its right side, the top of its head points east.
+        assert!(player.up().distance(Vec3::X) < 1e-3, "{}", player.up());
+        assert!(player.right().distance(Vec3::NEG_Y) < 1e-3, "{}", player.right());
+        // The mouse moved up looks toward the head: east, staying level.
+        turn_in_flight(&mut player, Vec2::new(0.0, -200.0));
+        let forward = player.forward();
+        assert!(forward.x > 0.4 && forward.y.abs() < 1e-3, "{forward}");
+        // Q rolls back the other way, all the way round.
+        let mut spun = Player { pitch: 0.0, flying: true, ..Player::default() };
+        let whole = std::f32::consts::TAU / ROLL_RATE;
+        for _ in 0..400 {
+            roll_in_flight(&mut spun, -1.0, whole / 400.0);
+        }
+        assert!(spun.up().distance(Vec3::Y) < 1e-3 && spun.forward().distance(Vec3::NEG_Z) < 1e-3);
+    }
+
+    #[test]
+    fn on_its_feet_q_and_e_lean_and_a_rolled_body_rights_itself() {
+        let mut player = Player::default();
+        for _ in 0..30 {
+            lean_on_feet(&mut player, 1.0, 1.0 / 60.0);
+        }
+        assert_eq!(player.lean, 1.0);
+        assert!((player.roll - LEAN_ANGLE).abs() < 1e-3, "{}", player.roll);
+        for _ in 0..60 {
+            lean_on_feet(&mut player, -1.0, 1.0 / 60.0);
+        }
+        assert_eq!(player.lean, -1.0);
+        assert!((player.roll + LEAN_ANGLE).abs() < 1e-3, "{}", player.roll);
+        // Landed from flight upside down and looking straight up, it comes
+        // level within a second.
+        let mut landed = Player { roll: 3.0, pitch: 1.57, ..Player::default() };
+        for _ in 0..60 {
+            lean_on_feet(&mut landed, 0.0, 1.0 / 60.0);
+        }
+        assert!(landed.roll.abs() < 0.01 && landed.pitch <= PITCH_LIMIT, "{} {}", landed.roll, landed.pitch);
+        // The camera rides the lean and its tilt.
+        let leaning = Player { lean: 1.0, lean_offset: Vec2::new(0.35, 0.0), roll: LEAN_ANGLE, ..Player::default() };
+        let camera = PlayerCamera::from_player(&leaning);
+        assert!(camera.position.distance(leaning.position + Vec3::new(0.35, -LEAN_DROP, 0.0)) < 1e-6);
+        assert!(camera.up.distance(leaning.up()) < 1e-6 && camera.up.x > 0.1);
+    }
+
+    #[test]
+    fn a_lean_peeks_round_a_trunk_but_not_into_it() {
+        let (noise, erosion, vegetation, player) = forest_of_one(0.70);
+        let feet = player.position.y - EYE_HEIGHT;
+        // In the open the eye goes the whole way.
+        let open = Vec2::new(990.0, 1000.0);
+        let reach = lean_reach(open, open + Vec2::new(LEAN_DISTANCE, 0.0), feet, &mut [], &vegetation, &erosion, &noise);
+        assert!((reach - open - Vec2::new(LEAN_DISTANCE, 0.0)).length() < 1e-3, "{reach}");
+        // Beside the trunk it stops where the trunk does.
+        let beside = Vec2::new(1003.0 - 0.4 - PLAYER_RADIUS - 0.05, 1000.0);
+        let reach = lean_reach(beside, beside + Vec2::new(LEAN_DISTANCE, 0.0), feet, &mut [], &vegetation, &erosion, &noise);
+        assert!(reach.x - beside.x < 0.06, "{reach}");
     }
 
     #[test]

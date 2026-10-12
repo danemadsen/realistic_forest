@@ -6,11 +6,14 @@
 //! the angle subtended at the planet centre, so along both axes through a face
 //! centre one chart metre is one metre of arc on the sea-level sphere, and the
 //! chart is conformal and isometric at the centre. Toward the face's edges
-//! and corners it stretches and shears like any cube map: across an edge at
-//! its midpoint a chart metre is 0.71 m of ground, and at a corner the axes
-//! meet at 120 degrees. `S` is a power of two times the clipmap's finest
-//! spacing, which keeps every quadtree vertex on the same global 0.25 m
-//! lattice the clipmap sampled and exactly representable in f32.
+//! and corners it stretches and shears like any cube map: along an edge at
+//! its midpoint a chart metre is 0.71 m of ground (across it, a full metre),
+//! and at a corner the axes meet at 120 degrees. The camera's frame is
+//! orthonormal, so anything that moves or is laid out in plane coordinates
+//! goes through the chart's derivatives ([`Planet::frame_to_chart`]). `S` is
+//! a power of two times the clipmap's finest spacing, which keeps every
+//! quadtree vertex on the same global 0.25 m lattice the clipmap sampled and
+//! exactly representable in f32.
 //!
 //! Each chart is a window onto the existing infinite terrain plane: a face's
 //! *terrain plane coordinates* are its chart coordinates plus that face's
@@ -45,9 +48,13 @@ use std::f64::consts::{FRAC_PI_4, PI};
 /// Chart metres from a face centre to its edge on the default planet: 2^21
 /// times the clipmap's finest 0.25 m spacing, a 667.5 km sea-level radius.
 pub const PLANET_DEFAULT_HALF_WIDTH: f64 = 524_288.0;
-/// The smallest and largest half widths `--planet-radius` may snap to.
+/// The smallest and largest half widths `--planet-radius` may snap to. The
+/// largest keeps every face's plane coordinates (its chart plus its offset)
+/// under 2^20 m, where f32 still resolves a sixteenth of a metre: the
+/// player's position is f32 plane coordinates, and a walking step at a high
+/// frame rate is a few centimetres.
 pub const PLANET_MIN_HALF_WIDTH: f64 = 4_096.0;
-pub const PLANET_MAX_HALF_WIDTH: f64 = 4_194_304.0;
+pub const PLANET_MAX_HALF_WIDTH: f64 = PLANET_DEFAULT_HALF_WIDTH;
 
 /// Chart metres either side of a cube edge over which neighbouring charts are
 /// blended. Wide enough that the change of chart is a gentle cross-fade of two
@@ -55,7 +62,8 @@ pub const PLANET_MAX_HALF_WIDTH: f64 = 4_194_304.0;
 pub const PLANET_SEAM_BAND: f64 = 6_000.0;
 /// How far inside the seam band the streamed plane features (erosion, river
 /// carving, building pads) have faded out, so a chart change inside the band
-/// never moves the ground.
+/// never moves the ground. A small planet's faces take a quarter of their
+/// half width ([`Planet::feature_fade`]).
 pub const PLANET_FEATURE_FADE: f64 = 4_000.0;
 
 /// Altitude of the top of the atmosphere: the haze and sky shell the composite
@@ -163,6 +171,10 @@ pub struct Planet {
     pub half_width: f64,
     /// Chart metres either side of a cube edge where charts blend.
     pub seam_band: f64,
+    /// Chart metres inside the seam band over which the streamed features
+    /// fade in: the band and the fade together take at most half of a face's
+    /// half width, so its middle always has the features whole.
+    pub feature_fade: f64,
 }
 
 impl Default for Planet {
@@ -177,6 +189,7 @@ impl Planet {
             radius: 4.0 * half_width / PI,
             half_width,
             seam_band: PLANET_SEAM_BAND.min(half_width * 0.25),
+            feature_fade: PLANET_FEATURE_FADE.min(half_width * 0.25),
         }
     }
 
@@ -279,10 +292,10 @@ impl Planet {
 
     /// How much of the streamed plane features (erosion, river carving,
     /// building pads) the ground at `chart` keeps: one across the face's
-    /// interior, fading to nothing [`PLANET_FEATURE_FADE`] metres before the
+    /// interior, fading to nothing [`Planet::feature_fade`] metres before the
     /// seam band begins, so the band blends bare procedural relief only.
     pub fn feature_weight(&self, chart: DVec2) -> f64 {
-        let inner = self.seam_band + PLANET_FEATURE_FADE;
+        let inner = self.seam_band + self.feature_fade;
         smoothstep(self.seam_band, inner, self.edge_distance(chart))
     }
 
@@ -301,7 +314,6 @@ impl Planet {
     /// The chart's derivatives at `chart`: how far the point at `altitude`
     /// moves, in planet-centred metres, per chart metre along x and along z.
     /// Both are unit length at a face centre at sea level.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn chart_jacobian(&self, face: Face, chart: DVec2, altitude: f64) -> (DVec3, DVec3) {
         let basis = face.basis();
         let cube = self.cube_point(face, chart);
@@ -314,6 +326,33 @@ impl Planet {
         let along_z = (basis.north - direction * direction.dot(basis.north))
             * (scale * secant_squared(Self::warp(chart.y / self.half_width)));
         (along_x, along_z)
+    }
+
+    /// The chart's derivatives at `chart` and `altitude` in the local frame
+    /// there: chart x moves the point `a` metres east, and chart z moves it
+    /// `b` east and `d` north (chart x has no northward part: the frame's east
+    /// is chart x's direction). `(a, b, d)`.
+    fn chart_metric(&self, face: Face, chart: DVec2, altitude: f64) -> (f64, f64, f64) {
+        let (along_x, along_z) = self.chart_jacobian(face, chart, altitude);
+        let frame = self.local_frame(face, chart);
+        (along_x.dot(frame.east), along_z.dot(frame.east), along_z.dot(frame.north))
+    }
+
+    /// The chart displacement on `face` at `chart` and `altitude` that moves
+    /// a point by `step` metres east (x) and north (y) in the local frame:
+    /// how a body that walks or flies the way it looks moves in plane
+    /// coordinates. Exact at a point; over a step, to first order.
+    pub fn frame_to_chart(&self, face: Face, chart: DVec2, altitude: f64, step: DVec2) -> DVec2 {
+        let (a, b, d) = self.chart_metric(face, chart, altitude);
+        let z = step.y / d;
+        DVec2::new((step.x - b * z) / a, z)
+    }
+
+    /// The local frame's (east, north) metres that a chart displacement
+    /// `step` on `face` at `chart` and `altitude` moves a point by.
+    pub fn chart_to_frame(&self, face: Face, chart: DVec2, altitude: f64, step: DVec2) -> DVec2 {
+        let (a, b, d) = self.chart_metric(face, chart, altitude);
+        DVec2::new(a * step.x + b * step.y, d * step.y)
     }
 
     /// The orthonormal local frame at a chart point: `up` is the outward
@@ -490,6 +529,13 @@ mod tests {
         assert!((planet.radius * PI / 2.0 - 2.0 * planet.half_width).abs() < 1e-6);
         assert_eq!(Planet::with_radius(600_000.0).half_width, 524_288.0);
         assert_eq!(Planet::with_radius(1.0).half_width, PLANET_MIN_HALF_WIDTH);
+        assert_eq!(Planet::with_radius(6.4e6).half_width, PLANET_MAX_HALF_WIDTH);
+        // Every face's plane coordinates stay where f32 resolves 1/16 m.
+        let largest = Planet::new(PLANET_MAX_HALF_WIDTH);
+        for offset in FACE_PLANE_OFFSETS {
+            let reach = largest.half_width + offset[0].abs().max(offset[1].abs()) as f64;
+            assert!(reach < 1_048_576.0, "{reach}");
+        }
     }
 
     #[test]
@@ -587,6 +633,40 @@ mod tests {
         assert_eq!(planet.feature_weight(DVec2::new(s - planet.seam_band, 0.0)), 0.0);
         let inside_band = DVec2::new(s - planet.seam_band - 1.0, 0.0);
         assert_eq!(planet.seam_weight(planet.edge_distance(inside_band)), 1.0);
+        // On every size of planet the middle of a face has them whole.
+        for half_width in [PLANET_MIN_HALF_WIDTH, 8_192.0, 65_536.0, PLANET_MAX_HALF_WIDTH] {
+            let small = Planet::new(half_width);
+            assert_eq!(small.feature_weight(DVec2::ZERO), 1.0, "{half_width}");
+            let whole = DVec2::new(0.5 * half_width, 0.0);
+            assert_eq!(small.feature_weight(whole), 1.0, "{half_width}");
+            assert_eq!(small.feature_weight(DVec2::new(half_width - small.seam_band, 0.0)), 0.0);
+        }
+    }
+
+    #[test]
+    fn a_step_in_the_frame_moves_the_ground_that_way() {
+        let planet = planet();
+        let s = planet.half_width;
+        for face in [Face::PosY, Face::NegX, Face::PosZ] {
+            for chart in [DVec2::ZERO, DVec2::new(0.5 * s, 0.5 * s), DVec2::new(s - 10_000.0, 0.0),
+                          DVec2::new(-0.95 * s, 0.9 * s)] {
+                for altitude in [0.0, 1_500.0, 400_000.0] {
+                    let (along_x, along_z) = planet.chart_jacobian(face, chart, altitude);
+                    let frame = planet.local_frame(face, chart);
+                    for step in [DVec2::new(1.0, 0.0), DVec2::new(0.0, -1.0), DVec2::new(0.6, 0.8)] {
+                        let chart_step = planet.frame_to_chart(face, chart, altitude, step);
+                        let moved = along_x * chart_step.x + along_z * chart_step.y;
+                        let wanted = frame.to_planet(DVec3::new(step.x, 0.0, step.y));
+                        assert!((moved - wanted).length() < 1e-9, "{face:?} {chart} {altitude}: {moved} vs {wanted}");
+                        let back = planet.chart_to_frame(face, chart, altitude, chart_step);
+                        assert!((back - step).length() < 1e-9);
+                    }
+                }
+            }
+        }
+        // At the spawn the chart is the frame.
+        let step = planet.frame_to_chart(Face::PosY, DVec2::ZERO, 0.0, DVec2::new(3.0, -4.0));
+        assert!((step - DVec2::new(3.0, -4.0)).length() < 1e-12);
     }
 
     #[test]
@@ -644,6 +724,18 @@ mod tests {
                     let turned = transfer.rotate(vector);
                     let c = new_frame.to_planet(DVec3::new(turned.x as f64, 0.0, turned.y as f64));
                     assert!((a - c).length() < 1e-5, "rotated vector {a} vs {c}");
+                    // And a body walking that way keeps moving that way over
+                    // the ground, at the same speed: its chart velocity on
+                    // each side is the frame velocity through that chart.
+                    let ground_velocity = |face: Face, chart: DVec2, velocity: Vec2| {
+                        let frame_step = DVec2::new(velocity.x as f64, velocity.y as f64);
+                        let chart_step = planet.frame_to_chart(face, chart, 10.0, frame_step);
+                        let (along_x, along_z) = planet.chart_jacobian(face, chart, 10.0);
+                        along_x * chart_step.x + along_z * chart_step.y
+                    };
+                    let before = ground_velocity(face, chart, vector);
+                    let after = ground_velocity(transfer.to.face, transfer.to.chart(), turned);
+                    assert!((before - after).length() < 1e-5, "ground velocity {before} vs {after}");
                 }
             }
         }

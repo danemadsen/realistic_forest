@@ -145,6 +145,7 @@ pub struct ExtractedForestView {
     pub shadow_receiver_heights: [[f32; 2]; vegetation_shadows::SHADOW_CASCADES],
     pub player_yaw: f32,
     pub player_pitch: f32,
+    pub player_roll: f32,
     pub physical_width: u32,
     pub physical_height: u32,
     pub settings: AppSettings,
@@ -683,9 +684,12 @@ fn extract_forest_view(
     let Ok(player) = player_query.single_mut(world) else {
         return;
     };
-    view.player_position = [player.position.x, player.position.y, player.position.z];
+    // The camera is at the eye, which a lean puts out to the side.
+    let eye = player.eye();
+    view.player_position = [eye.x, eye.y, eye.z];
     view.player_yaw = player.yaw;
     view.player_pitch = player.pitch;
+    view.player_roll = player.roll;
 
     if let Ok((window,)) = world.query_filtered::<(&Window,), With<PrimaryWindow>>().single(world) {
         view.physical_width = window.physical_width();
@@ -764,6 +768,7 @@ pub fn prepare_forest_globals(
         position: bevy::math::Vec3::from(view.player_position),
         yaw: view.player_yaw,
         pitch: view.player_pitch,
+        roll: view.player_roll,
         ..Player::default()
     };
     let camera = PlayerCamera::from_player(&player);
@@ -899,7 +904,7 @@ pub fn prepare_forest_globals(
             planet_view.frame.east.x as f32,
             planet_view.frame.east.y as f32,
             planet_view.frame.east.z as f32,
-            crate::planet::PLANET_FEATURE_FADE as f32,
+            planet.feature_fade as f32,
         ],
         planet_up: [
             planet_view.frame.up.x as f32,

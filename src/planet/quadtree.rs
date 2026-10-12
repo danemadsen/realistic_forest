@@ -21,6 +21,7 @@
 //! node that shares it agrees. Culling uses each node's real height range.
 
 use super::{Face, Planet};
+use crate::constants::SEA_LEVEL;
 use bevy::math::{DVec2, DVec3};
 use std::collections::HashMap;
 
@@ -46,6 +47,9 @@ pub const TERRAIN_HEIGHT_CEILING: f64 = 1_600.0;
 pub const BOUNDS_BUDGET_PER_FRAME: usize = 96;
 /// Height samples along each side of a node when its range is measured.
 const BOUNDS_SAMPLES: usize = 9;
+/// How far the sea's waves rise over its level: room for the far sea laid on
+/// patches whose ground is below it.
+const SEA_SWELL: f64 = 4.0;
 
 /// A quadtree node: `depth` levels below the face root, at column `x` and row
 /// `z` of that depth's `2^depth`-square grid.
@@ -441,6 +445,9 @@ impl Walker<'_> {
             return false;
         }
         let (low, high) = self.bounds.range(key);
+        // The far sea is laid at sea level over the patches whose ground
+        // reaches below it, so those are culled as tall as the sea.
+        let high = if low < SEA_LEVEL as f64 { high.max(SEA_LEVEL as f64 + SEA_SWELL) } else { high };
         let volume = node_volume(self.planet, self.ladder, key, low, high);
         if (volume.centre - self.view.volume.eye).length() - volume.radius > self.view.far {
             self.stats.frustum_culled += 1;
@@ -674,10 +681,15 @@ mod tests {
         let mut patches = Vec::new();
         let stats = select(&planet, &ladder, &view, &mut bounds, &mut patches);
         assert!(stats.horizon_culled > 0, "{stats:?}");
-        // Nothing past the horizon is refined: the antipodal face is only
-        // ever its root, which the depth test hides.
-        assert!(patches.iter().filter(|patch| patch.key.face == Face::NegY).all(|patch| patch.key.depth == 0));
+        // From 20 km the horizon is 14 degrees of arc away: every other
+        // face lies wholly behind it and is culled at its root.
+        assert!(patches.iter().all(|patch| patch.key.face == Face::PosY));
         assert_crack_free(&planet, &ladder, &view, &patches);
+        // Without the horizon test the far faces would be drawn.
+        let unculled = SelectionView { horizon_culling: false, ..view };
+        let mut all = Vec::new();
+        let everything = select(&planet, &ladder, &unculled, &mut HeightBounds::default(), &mut all);
+        assert!(everything.drawn > stats.drawn && all.iter().any(|patch| patch.key.face == Face::NegY));
     }
 
     #[test]

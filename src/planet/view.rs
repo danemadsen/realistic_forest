@@ -147,13 +147,14 @@ impl PlanetTerrain {
         ladder: &LodLadder,
         view: &PlanetView,
         forward: Vec3,
+        up: Vec3,
         fov_y: f64,
         aspect: f64,
         near: f64,
         far: f64,
     ) {
         let forward = view.to_planet(forward.as_dvec3()).normalize();
-        let up = view.frame.up;
+        let up = view.to_planet(up.as_dvec3());
         let up = if forward.cross(up).length_squared() < 1e-12 { view.frame.north } else { up };
         let selection = SelectionView {
             volume: ViewVolume::perspective(view.eye, forward, up, fov_y, aspect, near, far),
@@ -235,7 +236,7 @@ mod tests {
         let ladder = LodLadder::new(&planet);
         let view = PlanetView::new(&planet, Face::PosY, Vec3::new(5.0, 3.0, 5.0), 1.0);
         let mut terrain = PlanetTerrain::default();
-        terrain.select(&planet, &ladder, &view, Vec3::new(0.0, -0.2, -1.0).normalize(),
+        terrain.select(&planet, &ladder, &view, Vec3::new(0.0, -0.2, -1.0).normalize(), Vec3::Y,
                        68f64.to_radians(), 16.0 / 9.0, 0.1, 6_000.0);
         assert!(terrain.whole > 0 && terrain.whole <= terrain.instances.len());
         assert!(terrain.patches[..terrain.whole].iter().all(|patch| patch.cells == quadtree::PATCH_CELLS));

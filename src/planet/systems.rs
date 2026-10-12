@@ -81,9 +81,10 @@ pub fn enter_circular_orbit(player: &mut Player, planet: &Planet) {
 }
 
 /// Free flight under the planet's gravity ([`flight`]): G starts and ends
-/// it, W and S thrust along the view, A and D sideways, Space and Shift up
-/// and down, Left Ctrl boosts, and `,` and `.` step the time warp down and
-/// up while coasting above the air. The body's state is written back into the
+/// it, W and S thrust along the view, A and D to the body's sides, Space and
+/// Shift toward its head and feet (Q and E roll it,
+/// [`crate::player::update_player_system`]), Left Ctrl boosts, and `,` and
+/// `.` step the time warp down and up while coasting above the air. The body's state is written back into the
 /// player's chart coordinates, which the face crossing that follows carries
 /// on to the next face.
 #[allow(clippy::too_many_arguments)]
@@ -121,10 +122,10 @@ pub fn free_flight_system(
     let mut thrust = Vec3::ZERO;
     if input {
         let axis = |plus: KeyCode, minus: KeyCode| (keys.pressed(plus) as i32 - keys.pressed(minus) as i32) as f32;
-        let right = Vec3::new(player.yaw.cos(), 0.0, player.yaw.sin());
+        // Along the body's own axes, as it is turned and rolled.
         thrust = player.forward() * axis(KeyCode::KeyW, KeyCode::KeyS)
-            + right * axis(KeyCode::KeyD, KeyCode::KeyA)
-            + Vec3::Y * axis(KeyCode::Space, KeyCode::ShiftLeft);
+            + player.right() * axis(KeyCode::KeyD, KeyCode::KeyA)
+            + player.up() * axis(KeyCode::Space, KeyCode::ShiftLeft);
         if thrust.length_squared() > 1.0 {
             thrust = thrust.normalize();
         }
@@ -235,7 +236,7 @@ pub fn update_planet_view(
     if erosion.planet != Some(ground) {
         erosion.planet = Some(ground);
     }
-    let eye = player.position;
+    let eye = player.eye();
     let ground = super::height::surface_height(
         &planet, &erosion, &noise, player.face, eye.x, eye.z, [eye.x, eye.z],
     );
@@ -257,6 +258,7 @@ pub fn update_planet_view(
         &ladder.0,
         &view,
         player.forward(),
+        player.up(),
         crate::render::CAMERA_FOV_Y_DEGREES.to_radians() as f64,
         aspect,
         NEAR_PLANE as f64,
@@ -335,6 +337,25 @@ mod tests {
         // 20 s at about 2.3 km/s.
         let travelled = after.position.distance(start.position);
         assert!((travelled - 20.0 * start.velocity.length()).abs() < 200.0, "{travelled}");
+    }
+
+    #[test]
+    fn free_flight_thrusts_along_the_rolled_body() {
+        let planet = Planet::default();
+        // Rolled onto its right side a kilometre up, looking level north.
+        let mut player = Player { position: Vec3::new(2_000.0, 1_000.0, -3_000.0), pitch: 0.0,
+                                  roll: std::f32::consts::FRAC_PI_2, flying: true, ..Player::default() };
+        enter_free_flight(&mut player, &planet);
+        assert!(!player.free_flight.unwrap().landed);
+        let (mut app, entity) = flight_app(player);
+        for _ in 0..60 {
+            frame(&mut app, 1.0 / 60.0, Some(KeyCode::Space));
+        }
+        let player = app.world().get::<Player>(entity).unwrap();
+        // Space pushes toward the head, east; the planet still pulls down.
+        assert!((player.velocity.x - flight::THRUST as f32).abs() < 0.5, "{}", player.velocity);
+        assert!(player.velocity.y.abs() < 0.1, "{}", player.velocity);
+        assert!((player.vertical_velocity + 9.8).abs() < 0.3, "{}", player.vertical_velocity);
     }
 
     #[test]

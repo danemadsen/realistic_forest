@@ -355,7 +355,7 @@ fn flight_readout(player: &Player, planet: &crate::planet::Planet, flight: &crat
          Periapsis  {}\n\
          Period     {}  |  Eccentricity {:.4}\n\
          Thrust     {:.0} m/s2, x{:.0} with Ctrl  |  {}\n\
-         W/S along the view, A/D sideways, Space/Shift up and down  |  G walk, V noclip",
+         W/S along the view, A/D sideways, Space/Shift head and feet, Q/E roll  |  G walk, V noclip",
         flight::situation(planet, flight, &orbit),
         flight_distance(altitude),
         flight_distance(player.position.y as f64 - player.ground_below as f64),

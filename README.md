@@ -37,9 +37,10 @@ by naga at runtime either way.
 | Input | Action |
 | --- | --- |
 | Mouse | Look |
-| W/A/S/D | Move; in free flight, thrust along the view (W/S) and sideways (A/D) |
-| Space | Jump, or rise while flying; swim up, or kick out of the water at its surface; thrust up in free flight |
-| Left Shift | Descend while flying; dive while swimming; thrust down in free flight |
+| W/A/S/D | Move; in free flight, thrust along the view (W/S) and to the body's sides (A/D) |
+| Space | Jump, or rise while flying; swim up, or kick out of the water at its surface; thrust toward the head in free flight |
+| Left Shift | Descend while flying; dive while swimming; thrust toward the feet in free flight |
+| Q/E | Roll left and right while flying (noclip or free flight); lean out left and right to peek on the ground |
 | Left Control | Movement boost; five times the thrust in free flight |
 | V | Toggle flight |
 | G | Toggle free flight under the planet's gravity, KSP style |
@@ -58,6 +59,16 @@ walls of buildings, whose doors swing open as you walk into them (see
 [Walking through them](#walking-through-them)); flight passes through them, as
 it does the ground. Water too deep to stand in, the sea's, a lake's or a
 river's, is swum in (see [Wading and swimming](#wading-and-swimming)).
+
+On the ground Q and E lean out to the left and right, the eye a third of a
+metre to the side and the head tilted, to peek round a corner or a trunk;
+the lean stops at a wall or a trunk rather than looking through it. In flight,
+noclip or free, Q and E roll the body about its line of sight, and the mouse
+turns it about its own axes however it is rolled, as a body does in zero
+gravity. Back on its feet it rights itself within a second. Walking and the
+noclip flight move the way the camera looks anywhere on a face: each step is
+taken in the camera's east and north and carried into plane coordinates
+through the chart's derivatives.
 
 Free flight (G) is Kerbal Space Program's: the planet's gravity pulls toward
 its centre and momentum carries, so climbing out of the air and turning
@@ -222,8 +233,8 @@ centre of the +Y face.
 equi-angular cube map: along both axes through a face centre one chart metre is
 a metre of arc on the sea-level sphere, and at the centre the chart is
 conformal. Toward a face's edges and corners it stretches and shears as any
-cube map does (a chart metre is 0.71 m across an edge at its midpoint, and the
-axes meet at 120° at a corner). A face's chart is a window onto the terrain
+cube map does (a chart metre is 0.71 m along an edge at its midpoint, a full
+metre across it, and the axes meet at 120° at a corner). A face's chart is a window onto the terrain
 plane the planar build generated: its plane coordinates are its chart
 coordinates plus a per-face offset of a few tens of kilometres, which is zero
 on the spawn face. The ground around spawn is therefore the planar build's,
@@ -268,8 +279,10 @@ to that centre with differences of directions formed directly (as accurate as
 their own size, never as the planet's radius). The renderer's world is the
 planar world bent onto the planet around the camera: a frame whose axes are
 the camera's local east, up and north, with the camera at its plane
-coordinates and altitude and the planet's centre straight below it. Near the
-camera it is the plane, so every shader written for the plane keeps working;
+coordinates and altitude and the planet's centre straight below it. At the
+camera it is the plane as the chart's derivatives there map it: the plane
+itself at a face's centre, stretched and sheared by a few per cent toward its
+edges. Every shader written for the plane keeps working;
 plants, grass, buildings, the sea, rivers and lightning are placed on the
 sphere through the same camera-relative mapping (`planet-functions.wgslinc`),
 and altitudes, the fog, the cloud layer and the terrain's shadow marches use
@@ -304,8 +317,9 @@ borrow at launch, nor Coriolis), and every substep it feels:
   60 km top. A fall settles to 60 m/s near sea level and faster higher up, so
   an ascent climbs out of the thick air before turning sideways;
 - its thrust: 12 m/s², enough to hover and climb slowly, five times that with
-  Left Ctrl, and scaled by the movement speed setting. W and S thrust along
-  the view, A and D sideways, Space and Shift along the local vertical.
+  Left Ctrl, and scaled by the movement speed setting, along the body's own
+  axes as it is turned and rolled: W and S along the view, A and D to its
+  sides, Space and Shift toward its head and feet.
 
 The integrator is velocity Verlet (kick, drift, kick), with the drag taken
 implicitly in each half kick, in substeps of at most 1/120 s: without air an
