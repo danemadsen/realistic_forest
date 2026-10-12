@@ -415,6 +415,7 @@ fn main() {
     app.insert_resource(FrameCounter::default());
     app.insert_resource(ShotRequested::default());
     app.init_resource::<player::UiWantsInput>();
+    app.add_message::<CopyPose>();
     app.insert_resource(WorldOptions {
         draw_ocean: !automation.no_water,
     });
@@ -455,6 +456,7 @@ fn main() {
             // streaming system can begin a tile.
             publish_erosion_shader_sources,
             handle_global_keys,
+            copy_pose_to_clipboard,
             day_night::advance_day_night,
             weather::advance_weather,
             thunder::queue_thunder,
@@ -660,6 +662,13 @@ fn setup_cursor_and_player(
     );
 }
 
+/// The pose P copies, on its way to the OS clipboard: handle_global_keys
+/// writes it and copy_pose_to_clipboard, chained right after, copies it in the
+/// same frame. The split lets the key handling be tested without an OS
+/// clipboard, which headless CI runners do not have.
+#[derive(Message)]
+struct CopyPose(String);
+
 /// 2 toggles the trainer and pointer capture; 3 toggles passive debug text.
 /// F12 saves a timestamped screenshot.
 #[allow(clippy::too_many_arguments)]
@@ -668,7 +677,7 @@ fn handle_global_keys(
     mut player: Query<&mut Player>,
     mut cursor_options: Query<(&mut CursorOptions,), With<PrimaryWindow>>,
     keyboard: Res<ButtonInput<KeyCode>>,
-    mut clipboard: ResMut<Clipboard>,
+    mut pose_copies: MessageWriter<CopyPose>,
     mut commands: Commands,
     automation: Option<Res<AutomationSettings>>,
     egui_wants_input: Option<Res<EguiWantsInput>>,
@@ -720,16 +729,23 @@ fn handle_global_keys(
                 forward.y,
                 forward.z,
             );
-            match clipboard.set_text(pose.as_str()) {
-                Ok(()) => log::info!("POSE: copied to clipboard: {pose}"),
-                Err(error) => log::error!("POSE: clipboard write failed: {error}"),
-            }
+            pose_copies.write(CopyPose(pose));
         }
     }
     if keyboard.just_pressed(KeyCode::F12) {
         commands
             .spawn(Screenshot::primary_window())
             .observe(on_manual_screenshot);
+    }
+}
+
+/// Puts each pose P copied on the OS clipboard and logs the outcome.
+fn copy_pose_to_clipboard(mut copies: MessageReader<CopyPose>, mut clipboard: ResMut<Clipboard>) {
+    for CopyPose(pose) in copies.read() {
+        match clipboard.set_text(pose.as_str()) {
+            Ok(()) => log::info!("POSE: copied to clipboard: {pose}"),
+            Err(error) => log::error!("POSE: clipboard write failed: {error}"),
+        }
     }
 }
 
@@ -1171,9 +1187,9 @@ mod global_key_tests {
         let mut app = App::new();
         app.insert_resource(AppSettings::default());
         app.insert_resource(ButtonInput::<KeyCode>::default());
-        // ClipboardPlugin ships in DefaultPlugins; the bare test app must
-        // insert the resource itself, as handle_global_keys needs it.
-        app.init_resource::<Clipboard>();
+        // main() registers this; the bare test app must too, as
+        // handle_global_keys writes it.
+        app.add_message::<CopyPose>();
         app.add_systems(Update, handle_global_keys);
         let player = app.world_mut().spawn(Player::default()).id();
         let cursor_bundle = (
@@ -1325,12 +1341,12 @@ mod global_key_tests {
         pose_player.pitch = 0.0;
         press(&mut app, KeyCode::KeyP);
         let expected = "Position: 100.50, 20.00, -50.25\nView: 1.000, 0.000, 0.000";
-        let mut read = app.world_mut().resource_mut::<Clipboard>().fetch_text();
-        let text = read
-            .poll_result()
-            .expect("desktop clipboard reads are immediate")
-            .expect("clipboard write should have succeeded");
-        assert_eq!(text, expected);
+        let copies = app.world().resource::<Messages<CopyPose>>();
+        let copied: Vec<&str> = copies
+            .iter_current_update_messages()
+            .map(|CopyPose(pose)| pose.as_str())
+            .collect();
+        assert_eq!(copied, [expected]);
     }
 
     #[test]
