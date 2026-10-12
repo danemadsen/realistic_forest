@@ -312,6 +312,20 @@ fn nearest_on_segment(a: Vec2, b: Vec2, point: Vec2) -> Vec2 {
     a + edge * t
 }
 
+/// How far a body at `centre` (building XZ) must be pushed out of a door's
+/// leaf standing at `angle`, if it overlaps it.
+fn door_push(door: &DoorModel, angle: f32, centre: Vec2, radius: f32) -> Option<Vec2> {
+    let reach = radius + door.thickness * 0.5;
+    let (hinge, tip) = door_leaf(door, angle);
+    let offset = centre - nearest_on_segment(hinge, tip, centre);
+    let distance = offset.length();
+    if distance >= reach {
+        return None;
+    }
+    let normal = if distance > 1e-6 { offset / distance } else { (tip - hinge).perp().normalize_or_zero() };
+    Some(normal * (reach - distance))
+}
+
 /// Turn a door away from a body at `centre` (building XZ) that presses into
 /// it over `dt` seconds, as far as the body would have to move to clear it;
 /// returns how far the body must still be pushed out of the leaf, with the
@@ -440,12 +454,15 @@ pub struct Slide {
 /// building's walls and doors, turning the doors it presses on over `dt`
 /// seconds. Each piece sees the body where the last one left it. Returns the
 /// direction it was last pushed, world XZ, if it was.
+/// Push a body out of a building's walls and doors. With `push_doors` (the
+/// seconds the push lasts) a door the body presses into swings away from it;
+/// without, every door stands where it is, as solid as a wall.
 fn push_out_of_building(
     building: &mut NearBuilding<'_>,
     position: &mut Vec2,
     feet: f32,
     radius: f32,
-    dt: f32,
+    push_doors: Option<f32>,
     section: &mut Vec<Vec2>,
 ) -> Option<Vec2> {
     let mut pushed = None;
@@ -477,7 +494,11 @@ fn push_out_of_building(
             continue;
         }
         let centre = Vec2::new(local.x, local.z);
-        let Some(push) = push_door(door, state, centre, radius, dt) else {
+        let push = match push_doors {
+            Some(dt) => push_door(door, state, centre, radius, dt),
+            None => door_push(door, state.angle, centre, radius),
+        };
+        let Some(push) = push else {
             continue;
         };
         let world_push = building.frame.turn(push);
@@ -504,7 +525,7 @@ pub fn slide(buildings: &mut [NearBuilding<'_>], from: Vec2, to: Vec2, feet: f32
         for _ in 0..SETTLE_PASSES {
             let mut moved = false;
             for building in buildings.iter_mut() {
-                let pushed = push_out_of_building(building, &mut position, feet, radius, stretch_dt, &mut section);
+                let pushed = push_out_of_building(building, &mut position, feet, radius, Some(stretch_dt), &mut section);
                 if let Some(direction) = pushed {
                     normal = direction;
                     moved = true;
@@ -516,6 +537,30 @@ pub fn slide(buildings: &mut [NearBuilding<'_>], from: Vec2, to: Vec2, feet: f32
         }
     }
     Slide { position, normal }
+}
+
+/// How far toward `to` a head leaning out from `from` (world XZ) gets past the
+/// buildings' walls and doors, which it touches without moving: a peek never
+/// swings a door open.
+pub fn peek(buildings: &mut [NearBuilding<'_>], from: Vec2, to: Vec2, feet: f32, radius: f32) -> Vec2 {
+    let travel = to - from;
+    let stretches = (travel.length() / MAX_STEP).ceil().max(1.0) as usize;
+    let step = travel / stretches as f32;
+    let mut position = from;
+    let mut section = Vec::new();
+    for _ in 0..stretches {
+        position += step;
+        for _ in 0..SETTLE_PASSES {
+            let mut moved = false;
+            for building in buildings.iter_mut() {
+                moved |= push_out_of_building(building, &mut position, feet, radius, None, &mut section).is_some();
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+    position
 }
 
 /// The highest floor, deck, tread or anything else under a body at `point`
@@ -655,6 +700,26 @@ mod tests {
         let through = frame.to_local(Vec3::new(walk.position.x, floor, walk.position.y));
         assert!(through.z < middle.y - 1.0, "stuck at the front door at {through}");
         assert!(buildings[0].doors[front].angle.abs() > 0.5, "the door did not swing: {:?}", buildings[0].doors[front]);
+    }
+
+    #[test]
+    fn a_peek_stops_at_a_closed_door_and_leaves_it_shut() {
+        let library = library();
+        let model = &library.models[library.model_index("house-c").unwrap()];
+        let mut doors = vec![DoorState::default(); model.doors.len()];
+        let mut buildings = near(model, &mut doors);
+        let frame = buildings[0].frame;
+        let floor = frame.origin.y + 0.47;
+        let front = model.doors.iter().position(|door| door.name == "front-door").unwrap();
+        let (hinge, tip) = door_leaf(&model.doors[front], 0.0);
+        let middle = (hinge + tip) * 0.5;
+        // Standing on the porch a step from the door, leaning in toward it.
+        let from = frame.to_world(Vec3::new(middle.x, 0.0, middle.y + 0.6));
+        let to = frame.to_world(Vec3::new(middle.x, 0.0, middle.y - 0.4));
+        let reach = peek(&mut buildings, Vec2::new(from.x, from.z), Vec2::new(to.x, to.z), floor, 0.25);
+        let stopped = frame.to_local(Vec3::new(reach.x, floor, reach.y));
+        assert!(stopped.z > middle.y + 0.2, "peeked through the door to {stopped}");
+        assert_eq!(buildings[0].doors[front], DoorState::default(), "the peek moved the door");
     }
 
     #[test]

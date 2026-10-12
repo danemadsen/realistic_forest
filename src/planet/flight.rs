@@ -214,7 +214,10 @@ impl FreeFlight {
     pub fn settle(&mut self, planet: &Planet, touch: f64, water: bool) -> bool {
         let altitude = self.altitude(planet);
         if altitude > touch {
-            if self.landed && !self.on_floor && altitude > touch + SETTLE_TOLERANCE {
+            if altitude <= touch + SETTLE_TOLERANCE {
+                // Resting at the ground's own level: on the ground, not a floor.
+                self.on_floor = false;
+            } else if self.landed && !self.on_floor {
                 self.landed = false;
                 self.on_water = false;
             }

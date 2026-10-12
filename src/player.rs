@@ -72,6 +72,10 @@ pub struct Player {
     /// Where the lean has put the eye from the body, plane XZ: as far to the
     /// side as the walls and trunks there leave room for.
     pub lean_offset: Vec2,
+    /// What rounding to f32 took off the last step's plane position, carried
+    /// into the next: far from a face's centre f32 plane coordinates resolve
+    /// a few centimetres, coarser than a step at a high frame rate.
+    pub plane_carry: Vec2,
 }
 
 /// What kind of water stands somewhere.
@@ -204,6 +208,7 @@ impl Default for Player {
             roll: 0.0,
             lean: 0.0,
             lean_offset: Vec2::ZERO,
+            plane_carry: Vec2::ZERO,
         }
     }
 }
@@ -268,6 +273,7 @@ impl Player {
         self.vertical_velocity = 0.0;
         self.velocity = Vec2::ZERO;
         self.free_flight = None;
+        self.plane_carry = Vec2::ZERO;
         self.swimming = false;
         self.leapt = false;
         self.water = None;
@@ -417,8 +423,15 @@ pub fn update_player_system(
 
     let mut movement = Vec3::ZERO;
     if !ui_wants_input {
-        let forward = Vec3::new(player.yaw.sin(), 0.0, -player.yaw.cos());
-        let right = Vec3::new(player.yaw.cos(), 0.0, player.yaw.sin());
+        let heading = Vec3::new(player.yaw.sin(), 0.0, -player.yaw.cos());
+        // A flying body goes forward level along where it looks and sideways
+        // along its own right, however it is turned and rolled.
+        let (forward, right) = if player.flying {
+            let look = player.forward();
+            (Vec3::new(look.x, 0.0, look.z).normalize_or(heading), player.right())
+        } else {
+            (heading, Vec3::new(player.yaw.cos(), 0.0, player.yaw.sin()))
+        };
         let forward_input =
             (keys.pressed(KeyCode::KeyW) as i32 - keys.pressed(KeyCode::KeyS) as i32) as f32;
         let right_input =
@@ -453,9 +466,12 @@ pub fn update_player_system(
     let to_chart = |step: Vec2| planet.frame_to_chart(face, chart, altitude, step.as_dvec2()).as_vec2();
     let walk = Vec2::new(movement.x, movement.z) * speed;
     let mut candidate = player.position + movement * (speed * dt);
-    let flown = to_chart(walk * dt);
-    candidate.x = player.position.x + flown.x;
-    candidate.z = player.position.z + flown.y;
+    let from = Vec2::new(player.position.x, player.position.z);
+    let (flown, mut carry) = step_plane(from, to_chart(walk * dt), player.plane_carry);
+    candidate.x = flown.x;
+    candidate.z = flown.y;
+    // Where the step would end before anything stops it.
+    let mut stepped_to = flown;
     // The water where the step ends, once a branch below has looked.
     let mut landed = None;
     player.wading_depth = 0.0;
@@ -496,9 +512,9 @@ pub fn update_player_system(
         // Airborne over the water the body keeps the velocity it left the
         // water with: a hop does not shake off the current, nor stop a body
         // the current was carrying dead in mid-air.
-        let stepped = to_chart(player.velocity * dt);
-        candidate.x = player.position.x + stepped.x;
-        candidate.z = player.position.z + stepped.y;
+        (stepped_to, carry) = step_plane(from, to_chart(player.velocity * dt), player.plane_carry);
+        candidate.x = stepped_to.x;
+        candidate.z = stepped_to.y;
         // Trunks and lilac stems are solid. Flight passes through them, as it
         // does the ground.
         collide_with_trunks(&mut player, &mut candidate, &vegetation, &erosion, &noise);
@@ -614,8 +630,19 @@ pub fn update_player_system(
         }
         None => water,
     };
+    // A step the trunks, walls or banks cut short carries nothing on.
+    player.plane_carry = if Vec2::new(candidate.x, candidate.z) == stepped_to { carry } else { Vec2::ZERO };
     player.position = candidate;
     snow.recenter(Vec2::new(candidate.x, candidate.z));
+}
+
+/// Plane coordinates `from` moved by `step`, rounded to f32, and what the
+/// rounding took off, to carry into the next step: with `carry` from the
+/// last step, a walk keeps its exact speed however coarse f32 is out there.
+fn step_plane(from: Vec2, step: Vec2, carry: Vec2) -> (Vec2, Vec2) {
+    let intended = from.as_dvec2() + step.as_dvec2() + carry.as_dvec2();
+    let rounded = intended.as_vec2();
+    (rounded, (intended - rounded.as_dvec2()).as_vec2())
 }
 
 /// Where a falling body's step ends, eye height and vertical velocity, if
@@ -720,7 +747,7 @@ fn lean_reach(
     erosion: &ErosionCache,
     noise: &NoiseField,
 ) -> Vec2 {
-    let reach = building_collision::slide(near, from, to, feet, LEAN_HEAD_RADIUS, 0.0).position;
+    let reach = building_collision::peek(near, from, to, feet, LEAN_HEAD_RADIUS);
     let mut solids = Vec::new();
     vegetation.solids_near(from, PLAYER_RADIUS + from.distance(reach), &mut solids);
     let trunks: Vec<collision::Trunk> = solids.iter().filter_map(|solid| solid.stand(erosion, noise, from)).collect();
@@ -896,8 +923,10 @@ const LEAN_RATE: f32 = 6.0;
 pub const LEAN_DISTANCE: f32 = 0.35;
 const LEAN_DROP: f32 = 0.06;
 pub const LEAN_ANGLE: f32 = 0.2;
-/// How close a leaning eye comes to a wall.
-const LEAN_HEAD_RADIUS: f32 = 0.15;
+/// How close a leaning eye comes to a wall: past the corners of the near
+/// plane (0.1 m out, 68 degrees high) on a screen as wide as 21:9, so none of
+/// it reaches through.
+const LEAN_HEAD_RADIUS: f32 = 0.25;
 /// How fast a body back on its feet rights its roll, per second.
 const RIGHTING_RATE: f32 = 6.0;
 
@@ -1375,6 +1404,24 @@ mod tests {
         let camera = PlayerCamera::from_player(&leaning);
         assert!(camera.position.distance(leaning.position + Vec3::new(0.35, -LEAN_DROP, 0.0)) < 1e-6);
         assert!(camera.up.distance(leaning.up()) < 1e-6 && camera.up.x > 0.1);
+    }
+
+    #[test]
+    fn far_from_a_faces_centre_a_walk_keeps_its_speed_at_any_frame_rate() {
+        // Past 2^19 m f32 resolves only 1/16 m: a 240 Hz step of 4 cm would
+        // round to nothing, or to 6 cm, without the carried remainder.
+        for fps in [60.0f32, 144.0, 240.0] {
+            let mut position = Vec2::new(600_000.3, -560_000.7);
+            let mut carry = Vec2::ZERO;
+            let velocity = Vec2::new(10.0 * 0.6, 10.0 * 0.8);
+            let start = position.as_dvec2();
+            for _ in 0..fps as usize {
+                (position, carry) = step_plane(position, velocity / fps, carry);
+            }
+            let walked = (position.as_dvec2() + carry.as_dvec2() - start).as_vec2();
+            assert!((walked - velocity).length() < 1e-3, "{fps} fps walked {walked}");
+            assert!((position.as_dvec2() - start).as_vec2().distance(velocity) < 0.07);
+        }
     }
 
     #[test]

@@ -282,8 +282,9 @@ planar world bent onto the planet around the camera: a frame whose axes are
 the camera's local east, up and north, with the camera at its plane
 coordinates and altitude and the planet's centre straight below it. At the
 camera it is the plane as the chart's derivatives there map it: the plane
-itself at a face's centre, stretched and sheared by a few per cent toward its
-edges. Every shader written for the plane keeps working;
+itself at a face's centre, stretched and sheared more and more toward its
+edges (along an edge to 0.71, and near a corner by up to about 30% with the
+axes at 120°). Every shader written for the plane keeps working;
 plants, grass, buildings, the sea, rivers and lightning are placed on the
 sphere through the same camera-relative mapping (`planet-functions.wgslinc`),
 and altitudes, the fog, the cloud layer and the terrain's shadow marches use

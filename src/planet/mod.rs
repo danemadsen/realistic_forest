@@ -51,8 +51,10 @@ pub const PLANET_DEFAULT_HALF_WIDTH: f64 = 524_288.0;
 /// The smallest and largest half widths `--planet-radius` may snap to. The
 /// largest keeps every face's plane coordinates (its chart plus its offset)
 /// under 2^20 m, where f32 still resolves a sixteenth of a metre: the
-/// player's position is f32 plane coordinates, and a walking step at a high
-/// frame rate is a few centimetres.
+/// player's position is f32 plane coordinates, a walking step at a high frame
+/// rate is a few centimetres, and what rounding takes off a step is carried
+/// into the next (`Player::plane_carry`), which holds a sub-ulp remainder only
+/// while the coordinates themselves stay that fine.
 pub const PLANET_MIN_HALF_WIDTH: f64 = 4_096.0;
 pub const PLANET_MAX_HALF_WIDTH: f64 = PLANET_DEFAULT_HALF_WIDTH;
 

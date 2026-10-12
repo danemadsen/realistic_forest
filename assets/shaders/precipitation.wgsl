@@ -335,13 +335,18 @@ struct PrecipitationFrame {
 // Whether a point lies under a building's roof, where no rain falls.
 fn sheltered(p: vec3<f32>) -> bool {
     let count = min(u32(frame.shelter.x), 32u);
+    if (count == 0u) { return false; }
+    // The roofs are laid out in terrain plane coordinates and altitudes, as
+    // the buildings are before they go through the chart onto the planet.
+    let plane = planetWorldToPlane(p);
+    let altitude = planetAltitude(p);
     for (var i = 0u; i < count; i += 1u) {
         let placement = frame.shelters[i*2u];
         let extent = frame.shelters[i*2u + 1u];
-        let offset = p.xz - placement.xy;
+        let offset = plane - placement.xy;
         let local = vec2<f32>(offset.x*placement.z - offset.y*placement.w,
                               offset.x*placement.w + offset.y*placement.z);
-        if (all(abs(local) <= extent.xy) && p.y >= extent.z && p.y <= extent.w) {
+        if (all(abs(local) <= extent.xy) && altitude >= extent.z && altitude <= extent.w) {
             return true;
         }
     }

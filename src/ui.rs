@@ -212,7 +212,7 @@ fn draw_debug_overlay(
     );
     let houses = buildings.filter(|field| field.enabled()).map_or_else(
         || "Buildings: none placed".to_owned(),
-        |field| match field.nearest(xz) {
+        |field| match field.nearest(xz, |placement| crate::planet::height::features_whole(cache, placement.origin.x, placement.origin.z)) {
             Some(nearest) => format!(
                 "Buildings: {} placed  |  Nearest: {} at {:.0} m",
                 field.building_count(),
@@ -585,9 +585,10 @@ fn draw_player_tools(
             player.movement_speed_multiplier = 1.0;
         }
     });
-    let nearest = buildings
-        .and_then(|field| field.nearest(Vec2::new(player.position.x, player.position.z)))
-        .filter(|nearest| crate::planet::height::features_whole(cache, nearest.approach.x, nearest.approach.y));
+    let drawn = |placement: &crate::buildings::placement::Placement| {
+        crate::planet::height::features_whole(cache, placement.origin.x, placement.origin.z)
+    };
+    let nearest = buildings.and_then(|field| field.nearest(Vec2::new(player.position.x, player.position.z), drawn));
     if let Some(nearest) = nearest
         && ui.button(format!("Go to the nearest building ({}, {:.0} m)", nearest.name, nearest.distance)).clicked()
     {
@@ -1014,7 +1015,7 @@ fn draw_advanced_controls(
     match buildings.filter(|field| field.enabled()) {
         Some(field) => {
             ui.label(format!("{} buildings placed within 2.4 km", field.building_count()));
-            if let Some(nearest) = field.nearest(Vec2::new(player.position.x, player.position.z)) {
+            if let Some(nearest) = field.nearest(Vec2::new(player.position.x, player.position.z), |_| true) {
                 ui.label(format!("Nearest: {} at {:.0} m", nearest.name, nearest.distance));
             }
         }

@@ -361,6 +361,31 @@ fn turnAboutY(v: vec3<f32>, turn: vec2<f32>) -> vec3<f32> {
     return vec3<f32>(v.x*turn.x + v.z*turn.y, v.y, -v.x*turn.y + v.z*turn.x);
 }
 
+// A point `local` metres from a building's `origin`, in plane axes, on the
+// planet: through the chart as planetPlaneToWorld, but with the offset added
+// to the camera-relative displacement rather than to the origin's plane
+// coordinates, which far from a face's centre resolve only centimetres.
+fn buildingToWorld(origin: vec3<f32>, local: vec3<f32>) -> vec3<f32> {
+    let delta = (origin.xz - globals.camera_position.xz) + local.xz;
+    return globals.camera_position.xyz + planetToWorldAxes(planetChartDelta(
+        planetCameraFace(), globals.planet_camera.xy, delta, globals.planet_camera.z, origin.y + local.y));
+}
+
+// The chart's derivatives at a building's origin in world axes: where a
+// metre along plane x, up and plane z goes once drawn. Directions on the
+// building go through them; normals through their inverse transpose.
+fn buildingAxes(origin: vec3<f32>) -> mat3x3<f32> {
+    let face = planetCameraFace();
+    let chart = globals.planet_camera.xy + (origin.xz - globals.camera_position.xz);
+    let along_x = planetToWorldAxes(planetChartDelta(face, chart, vec2<f32>(1.0, 0.0), origin.y, origin.y));
+    let along_z = planetToWorldAxes(planetChartDelta(face, chart, vec2<f32>(0.0, 1.0), origin.y, origin.y));
+    return mat3x3<f32>(along_x, planetPlaneVectorToWorld(origin, vec3<f32>(0.0, 1.0, 0.0)), along_z);
+}
+
+fn buildingNormal(axes: mat3x3<f32>, n: vec3<f32>) -> vec3<f32> {
+    return normalize(cross(axes[1], axes[2])*n.x + cross(axes[2], axes[0])*n.y + cross(axes[0], axes[1])*n.z);
+}
+
 @vertex
 fn vs_main(
     @location(0) position: vec3<f32>,
@@ -375,15 +400,16 @@ fn vs_main(
     // floors and doors collide (src/buildings/collision.rs) and as its pad
     // levels the ground: every vertex goes through the chart onto the planet,
     // so away from a face's centre it stretches with the ground it stands on.
-    let world = planetPlaneToWorld(origin + turnAboutY(position, turn));
+    let world = buildingToWorld(origin, turnAboutY(position, turn));
     var out: VsOut;
     out.clip = globals.projection*globals.view*vec4<f32>(world, 1.0);
     // A building stands on its pad, which the ground near a cube edge fades
     // out of; it stands only where the pad is whole.
     if (planetFeatureShare(origin.xz) < 0.999) { out.clip = vec4<f32>(0.0, 0.0, -1.0, 1.0); }
     out.world = world;
-    out.normal = planetPlaneVectorToWorld(origin, turnAboutY(normal, turn));
-    out.tangent = vec4<f32>(planetPlaneVectorToWorld(origin, turnAboutY(tangent.xyz, turn)), tangent.w);
+    let axes = buildingAxes(origin);
+    out.normal = buildingNormal(axes, turnAboutY(normal, turn));
+    out.tangent = vec4<f32>(normalize(axes*turnAboutY(tangent.xyz, turn)), tangent.w);
     out.uv = uv;
     out.sky = sky;
     return out;
@@ -469,7 +495,7 @@ fn vs_shadow(
     @location(5) origin: vec3<f32>,
     @location(6) turn: vec2<f32>,
 ) -> @builtin(position) vec4<f32> {
-    let world = planetPlaneToWorld(origin + turnAboutY(position, turn));
+    let world = buildingToWorld(origin, turnAboutY(position, turn));
     if (planetFeatureShare(origin.xz) < 0.999) { return vec4<f32>(0.0, 0.0, -1.0, 1.0); }
     return cascade.view_projection*vec4<f32>(world, 1.0);
 }

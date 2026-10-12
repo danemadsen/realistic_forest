@@ -44,6 +44,9 @@ const INTERIOR_DISTANCE: f32 = 140.0;
 const DOOR_SHADOW_CASCADES: usize = 2;
 /// Roofs within this of the camera keep the rain off what is under them.
 const SHELTER_REACH: f32 = 70.0;
+/// The most the chart stretches a building's footprint where buildings stand
+/// (where the streamed features are whole): 1.14 near a face's corners.
+const CHART_STRETCH: f32 = 1.15;
 /// Roof boxes the rain is given at most.
 pub const MAX_SHELTERS: usize = 32;
 
@@ -588,11 +591,22 @@ fn gather_instances(
 ) -> InstanceGroups {
     let mut groups = InstanceGroups::default();
     for (index, placement) in snapshot.placements.iter().enumerate() {
+        // Near a cube face's edge the GPU draws no buildings (building.wgsl):
+        // nothing to instance, shade or shelter under.
+        let chart = crate::planet::Planet::chart_of_plane(
+            sight.planet_view.face,
+            bevy::math::DVec2::new(placement.origin.x as f64, placement.origin.z as f64),
+        );
+        if sight.planet.feature_weight(chart) < crate::planet::height::FEATURES_WHOLE {
+            continue;
+        }
         let model = &library.models[placement.model as usize];
         let frame = BuildingFrame::new(placement.origin, placement.yaw);
         let height = model.maximum.y;
         let centre = Vec3::new(placement.pad.centre.x, placement.origin.y + height * 0.5, placement.pad.centre.y);
-        let radius = Vec2::new(model.radius(), height * 0.5).length();
+        // Drawn through the chart, a building stretches with the ground by up
+        // to 15% where buildings stand (near a face's corners).
+        let radius = Vec2::new(model.radius() * CHART_STRETCH, height * 0.5).length();
         let distance = Vec2::new(centre.x - sight.camera.x, centre.z - sight.camera.z).length();
         let drawn_centre = Vec3::from_array(sight.planet_view.plane_to_world(&sight.planet, centre.to_array()));
         let drawn = distance < DRAW_DISTANCE + radius && in_frustum(&sight.planes, drawn_centre, radius);

@@ -736,6 +736,8 @@ fn handle_global_keys(
     if !editing_menu && keyboard.just_pressed(KeyCode::KeyP) {
         if let Ok(player) = player.single() {
             let forward = player.forward();
+            // The camera's pose: from the eye, where a lean puts it.
+            let eye = player.eye();
             let pose = format!(
                 "Position: {:.2}, {:.2}, {:.2}\nView: {:.3}, {:.3}, {:.3}\n\
                  --camera {:.2},{:.2},{:.2},{:.2},{:.2},{:.2} --face {}",
@@ -745,9 +747,9 @@ fn handle_global_keys(
                 forward.x,
                 forward.y,
                 forward.z,
-                player.position.x,
-                player.position.y,
-                player.position.z,
+                eye.x,
+                eye.y,
+                eye.z,
                 player.yaw.to_degrees(),
                 player.pitch.to_degrees(),
                 player.roll.to_degrees(),

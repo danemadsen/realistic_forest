@@ -186,6 +186,7 @@ pub fn free_flight_system(
     player.wading_depth = 0.0;
     player.current = Vec2::ZERO;
     player.swept = false;
+    player.plane_carry = Vec2::ZERO;
     player.free_flight = Some(free);
 }
 
@@ -228,6 +229,9 @@ pub fn carry_player_across_faces(
         player.yaw += transfer.yaw_change as f32;
         player.velocity = transfer.rotate(player.velocity);
         player.current = transfer.rotate(player.current);
+        // Plane-axis offsets of the old chart: the next frame finds them anew.
+        player.lean_offset = Vec2::ZERO;
+        player.plane_carry = Vec2::ZERO;
         position = transfer.to;
         moved = true;
     }

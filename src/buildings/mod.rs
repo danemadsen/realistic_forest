@@ -330,13 +330,16 @@ impl BuildingField {
     /// The nearest building to a world point, for the menu: its model's
     /// name, how far away it is, and a spot a few metres out from its front
     /// door with the way to face it.
-    pub fn nearest(&self, point: Vec2) -> Option<NearestBuilding> {
+    /// The nearest placed building to `point` of those `keep` accepts (the
+    /// ones drawn, say), with where to stand at its front door.
+    pub fn nearest(&self, point: Vec2, keep: impl Fn(&Placement) -> bool) -> Option<NearestBuilding> {
         let library = self.library.as_deref()?;
         let distance_to = |placement: &&Placement| placement.pad.centre.distance(point);
         let nearest = self
             .snapshot
             .placements
             .iter()
+            .filter(|placement| keep(placement))
             .min_by(|a, b| distance_to(a).total_cmp(&distance_to(b)))?;
         let model = &library.models[nearest.model as usize];
         let frame = nearest.frame();

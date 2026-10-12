@@ -3225,7 +3225,10 @@ fn vs_sea(
     // the last regular tiles, before the skirt starts. Fragment lighting has
     // its own pixel limit and continues smoothly over this flat geometry.
     // The shared distance includes the ring centre's camera-snap allowance.
-    let wave_weight = 1.0 - smoothstepf(stage.flags.w*0.75, stage.flags.w, distance);
+    // Flat at the camera face's edge, where it meets the next face's far sea.
+    let face_chart = world_xz - face_centre;
+    let edge_fade = smoothstepf(0.0, 32.0, globals.planet.y - max(abs(face_chart.x), abs(face_chart.y)));
+    let wave_weight = (1.0 - smoothstepf(stage.flags.w*0.75, stage.flags.w, distance))*edge_fade;
     let surface = sampleSurface(world_xz, sampleFootprint(distance, pixel_angle),
                                 vec2<f32>(0.0), vec2<f32>(0.0), wave_weight, sampleShore(world_xz));
     let plane_position = vec3<f32>(surface.displaced.x,

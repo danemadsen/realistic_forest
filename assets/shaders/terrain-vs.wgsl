@@ -1768,10 +1768,11 @@ fn planetTerrainVertex(grid: vec3<f32>, instance: PatchInput) -> VsOutput
     output.fragErosionDelta = erosionContribution;
     output.frag_base_height = height;
     output.frag_snow_compaction = 0.0;
-    // Blended from clamped values: a mix through the no-river sentinel
-    // (1e30) cancels to nothing where features is 1 on backends that form
-    // mix as x + (y - x)*a.
-    let bank = mix(40.0, clamp(riverBankAt(river, height), -40.0, 40.0), features);
+    // Rivers and lakes are drawn only where the features are whole
+    // (water.wgsl), so their beds are too; elsewhere the ground is dry.
+    // (No mix through the no-river sentinel, 1e30, which on backends that
+    // form mix as x + (y - x)*a cancels to nothing.)
+    let bank = select(40.0, clamp(riverBankAt(river, height), -40.0, 40.0), features >= 0.999);
     let lakeShare = riverLakeShare(river, height);
     output.frag_river = vec4<f32>(bank,
                                   river.bend*(1.0 - lakeShare)*features,
