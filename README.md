@@ -169,7 +169,8 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 
 | Flag | Effect |
 | --- | --- |
-| `--camera x,y,z,yawDeg,pitchDeg` | Pin the camera pose and fly, for reproducible shots; with `--shot`, mouse and keyboard input cannot move it |
+| `--camera x,y,z,yawDeg,pitchDeg[,rollDeg]` | Pin the camera pose and fly, for reproducible shots; with `--shot`, mouse and keyboard input cannot move it |
+| `--face NAME` | The cube face (`posx`, `negx`, `posy`, `negy`, `posz`, `negz`) whose plane coordinates `--camera` gives; default `posy`, the spawn face. P copies the current pose as these two flags |
 | `--shot path.png` | Render, save a screenshot, then exit; the log reports average, p95 and maximum frame time over the `--wait` window, split into frames while erosion tiles stream and settled frames. The water is drawn as a still of the game at 60 fps however long the frames take |
 | `--snow-trail x,z,x,z` | Seed one compressed snow segment between the two world XZ positions for reproducible screenshots |
 | `--wait n` | Frames to render before the screenshot, counted once the prewarmed erosion tiles, plants and grass are ready |

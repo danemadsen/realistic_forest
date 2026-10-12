@@ -179,10 +179,20 @@ pub fn free_flight_system(
 /// which every plane-keyed stream (erosion, rivers, plants, buildings, snow)
 /// sees as a move to new plane coordinates. Their features have faded out
 /// before the seam band, so nothing on the ground changes as they re-stream.
-pub fn carry_player_across_faces(planet: Res<Planet>, mut players: Query<&mut Player>) {
+/// The weather, keyed on plane coordinates too, is moved by as much, so the
+/// sky and the rain stay where they were over the player (its field turns
+/// about the player with the change of chart's axes).
+pub fn carry_player_across_faces(
+    planet: Res<Planet>,
+    mut players: Query<&mut Player>,
+    mut erosion: Option<ResMut<ErosionCache>>,
+    noise: Option<Res<NoiseField>>,
+    mut weather: Option<ResMut<crate::weather::WeatherMotion>>,
+) {
     let Ok(mut player) = players.single_mut() else {
         return;
     };
+    let before = Vec2::new(player.position.x, player.position.z);
     let position = PlanetPosition {
         face: player.face,
         plane: DVec2::new(player.position.x as f64, player.position.z as f64),
@@ -208,8 +218,18 @@ pub fn carry_player_across_faces(planet: Res<Planet>, mut players: Query<&mut Pl
     if !moved {
         return;
     }
-    // The water under the old chart's coordinates is not this chart's.
+    if let Some(weather) = weather.as_deref_mut() {
+        let shift = Vec2::new(player.position.x, player.position.z) - before;
+        weather.offset = [weather.offset[0] + shift.x, weather.offset[1] + shift.y];
+    }
+    // The water under the old chart's coordinates is not this chart's: look
+    // again on the new one, which the height queries answer for from now.
     player.water = None;
+    if let (Some(erosion), Some(noise)) = (erosion.as_deref_mut(), noise.as_deref()) {
+        erosion.planet = Some(super::height::PlanetGround { planet: *planet, face: player.face });
+        let (x, z) = (player.position.x, player.position.z);
+        player.water = crate::player::water_at(erosion, noise, x, z, [x, z]);
+    }
     info!("Crossed onto the {:?} face at plane ({:.1}, {:.1})", player.face, player.position.x, player.position.z);
 }
 

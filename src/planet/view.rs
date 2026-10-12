@@ -72,6 +72,14 @@ impl PlanetView {
         self.plane + self.offset_of(point)
     }
 
+    /// World position of a point given as plane coordinates and altitude on
+    /// the camera's face: where the renderer draws it (`planetPlaneToWorld`).
+    pub fn plane_to_world(&self, planet: &Planet, plane: [f32; 3]) -> [f32; 3] {
+        let chart = Planet::chart_of_plane(self.face, DVec2::new(plane[0] as f64, plane[2] as f64));
+        let world = self.world_of(planet.position(self.face, chart, plane[1] as f64));
+        [world.x as f32, world.y as f32, world.z as f32]
+    }
+
     /// The camera's altitude above the ground under it.
     pub fn height_above_ground(&self) -> f64 {
         self.plane.y - self.ground

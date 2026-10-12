@@ -22,8 +22,9 @@ use crate::lightning::BoltKind;
 use crate::weather::WeatherPreset;
 use bevy::prelude::Resource;
 
-/// `--camera x,y,z,yawDeg,pitchDeg` pins the player at a world pose (useful
-/// for reproducible before/after comparisons); `--shot path` saves a window
+/// `--camera x,y,z,yawDeg,pitchDeg[,rollDeg]` pins the player at a world
+/// pose on the cube face `--face` names (useful for reproducible before/after
+/// comparisons); `--shot path` saves a window
 /// screenshot after `--wait` frames and exits; `--probe` dumps the base
 /// landform as x,z,height CSV to stdout so camera locations can be scouted
 /// from the shell without opening a window; `--size W,H` (or `WxH`) overrides
@@ -61,6 +62,10 @@ pub struct AutomationSettings {
     pub yaw: f32,
     /// radians, matching Player
     pub pitch: f32,
+    /// radians, matching Player
+    pub roll: f32,
+    /// `--face`: the cube face whose plane coordinates `position` is in.
+    pub face: crate::planet::Face,
     pub shot_path: Option<String>,
     pub wait_frames: i32,
     pub probe: bool,
@@ -134,6 +139,8 @@ impl Default for AutomationSettings {
             position: [0.0, 0.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
+            roll: 0.0,
+            face: crate::planet::Face::PosY,
             shot_path: None,
             wait_frames: 600,
             probe: false,
@@ -240,14 +247,24 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--camera" => {
                 if let Some(next) = next {
                     index += 1;
-                    match parse_floats(next, 5) {
+                    match parse_floats(next, 5).or_else(|| parse_floats(next, 6)) {
                         Some(v) => {
                             automation.has_camera = true;
                             automation.position = [v[0], v[1], v[2]];
                             automation.yaw = v[3] * DEG_TO_RAD;
                             automation.pitch = v[4] * DEG_TO_RAD;
+                            automation.roll = v.get(5).copied().unwrap_or(0.0) * DEG_TO_RAD;
                         }
-                        None => println!("WARNING: --camera expects x,y,z,yawDeg,pitchDeg"),
+                        None => println!("WARNING: --camera expects x,y,z,yawDeg,pitchDeg[,rollDeg]"),
+                    }
+                }
+            }
+            "--face" => {
+                if let Some(next) = next {
+                    index += 1;
+                    match crate::planet::Face::from_name(next) {
+                        Some(face) => automation.face = face,
+                        None => println!("WARNING: --face expects posx, negx, posy, negy, posz or negz"),
                     }
                 }
             }

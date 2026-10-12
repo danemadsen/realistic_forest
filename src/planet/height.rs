@@ -24,6 +24,22 @@ use bevy::math::DVec2;
 /// the bare relief are widened by this.
 pub const FEATURE_HEIGHT_MARGIN: f64 = 60.0;
 
+/// The share of the streamed features at plane `(x, z)` that the GPU
+/// (`planetFeatureShare` in the shaders) must see before it draws a plant,
+/// a building or inland water there.
+pub const FEATURES_WHOLE: f64 = 0.999;
+
+/// Whether the streamed features are whole at plane `(x, z)` on the face the
+/// cache answers for: where the GPU draws the plants, buildings, rivers and
+/// lakes that stand on them, and so where they are solid or wet. Off the
+/// planet (no face set) they are whole everywhere.
+pub fn features_whole(cache: &ErosionCache, x: f32, z: f32) -> bool {
+    cache.planet.is_none_or(|ground| {
+        let chart = Planet::chart_of_plane(ground.face, DVec2::new(x as f64, z as f64));
+        ground.planet.feature_weight(chart) >= FEATURES_WHOLE
+    })
+}
+
 /// What the erosion cache needs to answer height queries on the planet: the
 /// planet, and the face the camera is on.
 #[derive(Clone, Copy, Debug, PartialEq)]

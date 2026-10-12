@@ -94,6 +94,10 @@ impl Solid {
         noise: &NoiseField,
         visibility_center: Vec2,
     ) -> Option<Trunk> {
+        // Near a cube face's edge the GPU draws no plants.
+        if !crate::planet::height::features_whole(erosion, self.position.x, self.position.y) {
+            return None;
+        }
         let height_at = |offset: Vec2| {
             let at = self.position + offset;
             sample_eroded_height(erosion, noise, at.x, at.y, visibility_center.to_array())

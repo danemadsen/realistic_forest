@@ -446,13 +446,20 @@ pub fn adapt_eye(
     mut adaptation: ResMut<EyeAdaptation>,
     players: Query<&Player>,
     time: Res<Time>,
+    erosion: Option<Res<crate::erosion::ErosionCache>>,
 ) {
     let Ok(player) = players.single() else {
         return;
     };
     let point = Vec2::new(player.position.x, player.position.z);
     let feet = player.position.y - crate::constants::EYE_HEIGHT;
-    let near = field.near_mut(point, 2.0);
+    let mut near = field.near_mut(point, 2.0);
+    // Only buildings the GPU draws shade the eye.
+    if let Some(erosion) = erosion.as_deref() {
+        near.retain(|building| {
+            crate::planet::height::features_whole(erosion, building.frame.origin.x, building.frame.origin.z)
+        });
+    }
     let enclosed = collision::enclosure(&near, point, feet);
     let target = 1.0 + (INDOOR_EXPOSURE - 1.0) * enclosed;
     let seconds = if target > adaptation.exposure { ADAPT_IN_SECONDS } else { ADAPT_OUT_SECONDS };

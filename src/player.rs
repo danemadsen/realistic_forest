@@ -149,9 +149,12 @@ pub fn water_at(erosion: &ErosionCache, noise: &NoiseField, x: f32, z: f32, visi
         turbulence,
         ..drawn_as(drawn, surface, ground, kind)
     };
-    let river = (envelope.bank_distance < 0.5)
+    // Near a cube face's edge the GPU draws no rivers or lakes; the sea is
+    // everywhere.
+    let inland_drawn = crate::planet::height::features_whole(erosion, x, z);
+    let river = (inland_drawn && envelope.bank_distance < 0.5)
         .then(|| inland(envelope.water, Vec2::from(envelope.velocity), envelope.turbulence, WaterKind::River));
-    let lake = (ground < envelope.lake).then(|| inland(envelope.lake, Vec2::ZERO, 0.0, WaterKind::Lake));
+    let lake = (inland_drawn && ground < envelope.lake).then(|| inland(envelope.lake, Vec2::ZERO, 0.0, WaterKind::Lake));
     let sea = WaterHere::sea(ground);
     [river, lake, sea]
         .into_iter()
@@ -503,6 +506,10 @@ pub fn update_player_system(
         // body that walks into them.
         let travel = visibility_center.distance(Vec2::new(candidate.x, candidate.z));
         let mut near = buildings.near_mut(visibility_center, PLAYER_RADIUS + travel + 1.0);
+        // Near a cube face's edge the GPU draws no buildings.
+        near.retain(|building| {
+            crate::planet::height::features_whole(&erosion, building.frame.origin.x, building.frame.origin.z)
+        });
         collide_with_buildings(&mut player, &mut candidate, &mut near, dt);
         // A lean puts the eye out to the side, as far as the walls and trunks
         // there leave room for: a peek round a corner, not through it.

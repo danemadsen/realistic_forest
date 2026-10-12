@@ -596,8 +596,10 @@ fn setup_cursor_and_player(
         snow.recenter(bevy::math::Vec2::new(spawn[0], spawn[2]));
         if automation.has_camera {
             player.position = bevy::math::Vec3::from(automation.position);
+            player.face = automation.face;
             player.yaw = automation.yaw;
             player.pitch = automation.pitch;
+            player.roll = automation.roll;
             player.flying = true;
         } else {
             player.position.y = erosion::sample_eroded_height(&cache, &noise, 0.0, 0.0, [0.0, 0.0]) + EYE_HEIGHT;
@@ -660,8 +662,10 @@ fn setup_cursor_and_player(
     // Fly so gravity never fights a pinned pose; leave the cursor alone so
     // the capture window does not fight mouse input.
     player.position = bevy::math::Vec3::from(automation.position);
+    player.face = automation.face;
     player.yaw = automation.yaw;
     player.pitch = automation.pitch;
+    player.roll = automation.roll;
     player.flying = true;
     player.mouse_captured = false;
     log::info!(
@@ -733,13 +737,21 @@ fn handle_global_keys(
         if let Ok(player) = player.single() {
             let forward = player.forward();
             let pose = format!(
-                "Position: {:.2}, {:.2}, {:.2}\nView: {:.3}, {:.3}, {:.3}",
+                "Position: {:.2}, {:.2}, {:.2}\nView: {:.3}, {:.3}, {:.3}\n\
+                 --camera {:.2},{:.2},{:.2},{:.2},{:.2},{:.2} --face {}",
                 player.position.x,
                 player.position.y,
                 player.position.z,
                 forward.x,
                 forward.y,
                 forward.z,
+                player.position.x,
+                player.position.y,
+                player.position.z,
+                player.yaw.to_degrees(),
+                player.pitch.to_degrees(),
+                player.roll.to_degrees(),
+                player.face.name(),
             );
             pose_copies.write(CopyPose(pose));
         }
@@ -829,13 +841,11 @@ fn erosion_stream_system(
     };
     // High above the ground the tiles' detail is too small to see; hold the
     // cache rather than simulate tiles under a camera crossing the planet.
-    // A prewarm still runs: it was asked for, and a capture waits on it.
-    if planet::systems::streams_paused(player) && prewarm.0 == 0 {
-        erosion::apply_erosion_events(&mut cache, &bridge);
-        return;
-    }
+    // The tile under way still runs to its end and is published, and a
+    // prewarm still runs: it was asked for, and a capture waits on it.
+    let paused = planet::systems::streams_paused(player) && prewarm.0 == 0;
     // Tiles begun from now on carve the network in force.
-    if cache.rivers.as_ref().map(std::sync::Arc::as_ptr) != rivers.network().map(std::sync::Arc::as_ptr) {
+    if !paused && cache.rivers.as_ref().map(std::sync::Arc::as_ptr) != rivers.network().map(std::sync::Arc::as_ptr) {
         cache.rivers = rivers.network().cloned();
     }
     erosion::apply_erosion_events(&mut cache, &bridge);
@@ -867,6 +877,7 @@ fn erosion_stream_system(
         budget,
         prewarming,
         time.delta_secs(),
+        !paused,
     );
     // Each pass simulates exactly one tile, mirroring the C++ loop.
     if prewarming && began {
@@ -1369,7 +1380,8 @@ mod global_key_tests {
         pose_player.yaw = std::f32::consts::FRAC_PI_2;
         pose_player.pitch = 0.0;
         press(&mut app, KeyCode::KeyP);
-        let expected = "Position: 100.50, 20.00, -50.25\nView: 1.000, 0.000, 0.000";
+        let expected = "Position: 100.50, 20.00, -50.25\nView: 1.000, 0.000, 0.000\n\
+                        --camera 100.50,20.00,-50.25,90.00,0.00,0.00 --face posy";
         let copies = app.world().resource::<Messages<CopyPose>>();
         let copied: Vec<&str> = copies
             .iter_current_update_messages()

@@ -1085,7 +1085,8 @@ pub fn forest_water_surface_pass(
             * bevy::math::Mat4::from_cols_array(&g.view))
         .to_cols_array();
         let eye = [g.camera_position[0], g.camera_position[1], g.camera_position[2]];
-        let ranges = rivers.visible(&view_projection, eye, g.planet[0]);
+        let (planet, planet_view) = (extracted.planet, extracted.planet_view);
+        let ranges = rivers.visible(&view_projection, eye, |p| planet_view.plane_to_world(&planet, p));
         if !ranges.is_empty() {
             render_pass.set_render_pipeline(inland);
             render_pass.set_vertex_buffer(0, rivers.vertices.slice(..));

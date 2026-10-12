@@ -548,6 +548,8 @@ pub(super) fn prepare_buildings(
         camera: Vec3::from_array(view.player_position),
         planes,
         shadows: shadow.is_some(),
+        planet: view.planet,
+        planet_view: view.planet_view,
     };
     let groups = gather_instances(library, snapshot, &sight, &open, &mut shelters.boxes);
 
@@ -568,6 +570,10 @@ struct Sight {
     camera: Vec3,
     planes: [[f32; 4]; 4],
     shadows: bool,
+    /// The planet and the camera on it: a building is tested for the frustum
+    /// where it is drawn, through the chart's stretch and the curve.
+    planet: crate::planet::Planet,
+    planet_view: crate::planet::view::PlanetView,
 }
 
 /// Every placed building and door the view or the shadow cascades need this
@@ -588,7 +594,8 @@ fn gather_instances(
         let centre = Vec3::new(placement.pad.centre.x, placement.origin.y + height * 0.5, placement.pad.centre.y);
         let radius = Vec2::new(model.radius(), height * 0.5).length();
         let distance = Vec2::new(centre.x - sight.camera.x, centre.z - sight.camera.z).length();
-        let drawn = distance < DRAW_DISTANCE + radius && in_frustum(&sight.planes, centre, radius);
+        let drawn_centre = Vec3::from_array(sight.planet_view.plane_to_world(&sight.planet, centre.to_array()));
+        let drawn = distance < DRAW_DISTANCE + radius && in_frustum(&sight.planes, drawn_centre, radius);
         let shadow_cascades = if sight.shadows {
             SHADOW_SPLITS[1..].iter().filter(|&&split| distance < split + radius + 30.0).count()
         } else {

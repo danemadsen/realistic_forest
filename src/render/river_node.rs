@@ -32,9 +32,15 @@ pub const RIVER_DRAW_DISTANCE: f32 = 3200.0;
 impl RiverSurfaceBuffers {
     /// The chunks a view can see: near enough and not wholly outside one
     /// side of the frustum. `view_projection` is column-major. The surfaces
-    /// are drawn bent onto a planet of `radius` around the eye, which lowers
-    /// a chunk below its planar bounds by the curvature's drop there.
-    pub fn visible(&self, view_projection: &[f32; 16], eye: [f32; 3], radius: f32) -> Vec<(u32, u32)> {
+    /// are drawn bent onto the planet around the eye, through the chart's
+    /// stretch and the planet's curve, so a chunk's plane-coordinate corners
+    /// are tested where `to_world` puts them.
+    pub fn visible(
+        &self,
+        view_projection: &[f32; 16],
+        eye: [f32; 3],
+        to_world: impl Fn([f32; 3]) -> [f32; 3],
+    ) -> Vec<(u32, u32)> {
         let m = view_projection;
         let clip = |p: [f32; 3]| {
             [
@@ -55,18 +61,16 @@ impl RiverSurfaceBuffers {
                 continue;
             }
             // Lifted distant surfaces stand a little above their bounds, and
-            // the planet's curve sets the far side of a chunk down below them.
+            // a chunk's faces sag between its corners by the curve's sagitta.
             let top = chunk.maximum[1] + 12.0;
-            let reach = (chunk.maximum[0] - eye[0]).abs().max((chunk.minimum[0] - eye[0]).abs()).powi(2)
-                + (chunk.maximum[2] - eye[2]).abs().max((chunk.minimum[2] - eye[2]).abs()).powi(2);
-            let bottom = chunk.minimum[1] - reach / (2.0 * radius.max(1.0));
+            let bottom = chunk.minimum[1] - 1.0;
             let mut outside = [true; 5];
             for corner in 0..8 {
-                let p = [
+                let p = to_world([
                     if corner & 1 == 0 { chunk.minimum[0] } else { chunk.maximum[0] },
                     if corner & 2 == 0 { bottom } else { top },
                     if corner & 4 == 0 { chunk.minimum[2] } else { chunk.maximum[2] },
-                ];
+                ]);
                 let [x, y, w] = clip(p);
                 outside[0] &= x < -w;
                 outside[1] &= x > w;

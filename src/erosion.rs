@@ -1004,6 +1004,8 @@ pub fn advance_active_tile(
 /// full-budget pass per tile, so the caller counts down its four passes here.
 /// With `preparation`, the next tile's inputs are built off the main thread
 /// and it begins once they are ready; without, it begins in this frame.
+/// Without `begin_new` the cache holds what it has: the active tile runs to
+/// its end and is published, but no tile is queued, evicted or begun.
 #[allow(clippy::too_many_arguments)]
 pub fn update_erosion_cache(
     cache: &mut ErosionCache,
@@ -1015,13 +1017,16 @@ pub fn update_erosion_cache(
     iteration_budget: usize,
     reveal_immediately: bool,
     delta_time: f32,
+    begin_new: bool,
 ) -> bool {
     if !cache.ready {
         return false;
     }
     let player_tile = world_tile(player_position[0], player_position[2]);
     let player_minimum = erosion_candidate_minimum(player_position[0], player_position[2]);
-    ensure_erosion_cache(cache, player_tile);
+    if begin_new {
+        ensure_erosion_cache(cache, player_tile);
+    }
 
     let reveal_step = (delta_time.min(0.05) / EROSION_REVEAL_SECONDS).min(1.0);
     for existing in cache.tiles.values_mut() {
@@ -1042,7 +1047,7 @@ pub fn update_erosion_cache(
     };
 
     let mut began_tile = false;
-    if !cache.has_active_tile {
+    if begin_new && !cache.has_active_tile {
         if let Some(next) = choose_next_erosion_tile(cache, player_tile, player_minimum) {
             match preparation {
                 Some(preparation) => {

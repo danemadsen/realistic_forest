@@ -106,6 +106,16 @@ pub struct FaceBasis {
 impl Face {
     pub const ALL: [Face; 6] = [Face::PosX, Face::NegX, Face::PosY, Face::NegY, Face::PosZ, Face::NegZ];
 
+    /// The face named `posx`, `negy` and so on, in any case: how `--face`
+    /// and a copied pose name it.
+    pub fn from_name(name: &str) -> Option<Face> {
+        Face::ALL.into_iter().find(|face| face.name().eq_ignore_ascii_case(name.trim()))
+    }
+
+    pub fn name(self) -> &'static str {
+        ["posx", "negx", "posy", "negy", "posz", "negz"][self.index()]
+    }
+
     pub fn index(self) -> usize {
         self as usize
     }
@@ -523,6 +533,15 @@ mod tests {
     }
 
     #[test]
+    fn faces_are_named_both_ways() {
+        for face in Face::ALL {
+            assert_eq!(Face::from_name(face.name()), Some(face));
+            assert_eq!(Face::from_name(&face.name().to_uppercase()), Some(face));
+        }
+        assert_eq!(Face::from_name("top"), None);
+    }
+
+    #[test]
     fn the_radius_follows_the_half_width() {
         let planet = planet();
         // A quarter of a great circle spans a face from edge to edge.
@@ -821,7 +840,7 @@ mod tests {
         for required in [
             "terrain-vs.wgsl", "vegetation.wgsl", "grass.wgsl", "building.wgsl", "lightning.wgsl",
             "composite.wgsl", "water.wgsl", "cloud-probe.wgsl", "cloud-shadow-map.wgsl",
-            "precipitation.wgsl",
+            "precipitation.wgsl", "vegetation-cull.wgsl",
         ] {
             assert!(pasted.iter().any(|name| name == required), "{required} lacks the planet block");
         }

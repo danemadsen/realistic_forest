@@ -145,6 +145,7 @@ pub fn draw_diagnostics_ui(
         draw_erosion_lattice(
             &painter,
             &player,
+            &planet,
             &cache,
             &noise,
             viewport,
@@ -503,6 +504,7 @@ fn draw_player_tools(
             ));
         }
     });
+    ui.small(format!("Plane coordinates on the {} face", player.face.name()));
     let mut coordinate_grid = egui::Grid::new("teleport_coordinates");
     coordinate_grid = coordinate_grid.num_columns(2);
     coordinate_grid.show(ui, |ui| {
@@ -546,9 +548,16 @@ fn draw_player_tools(
             }
         }
         if ui.button("Return to spawn").clicked() {
-            // Spawn is the centre of the spawn face's chart.
-            player.face = crate::planet::Face::PosY;
-            teleport(player, ground_position(Vec3::ZERO, cache, noise, snow), cache, noise);
+            // Spawn is the centre of the spawn face's chart. Its ground is
+            // measured there, not on the face the height queries answer for
+            // until the frame ends.
+            let spawn = crate::planet::Face::PosY;
+            let ground = crate::planet::height::surface_height(planet, cache, noise, spawn, 0.0, 0.0, [0.0, 0.0]);
+            let sea = crate::player::WaterHere::sea(ground);
+            let eye = sea.and_then(|water| water.float_eye()).map_or(ground + EYE_HEIGHT, |eye| eye.max(ground + EYE_HEIGHT));
+            player.face = spawn;
+            player.teleport(Vec3::new(0.0, eye, 0.0));
+            player.water = sea;
             player.flying = false;
             player.yaw = Player::default().yaw;
             player.pitch = Player::default().pitch;
@@ -569,7 +578,9 @@ fn draw_player_tools(
             player.movement_speed_multiplier = 1.0;
         }
     });
-    let nearest = buildings.and_then(|field| field.nearest(Vec2::new(player.position.x, player.position.z)));
+    let nearest = buildings
+        .and_then(|field| field.nearest(Vec2::new(player.position.x, player.position.z)))
+        .filter(|nearest| crate::planet::height::features_whole(cache, nearest.approach.x, nearest.approach.y));
     if let Some(nearest) = nearest
         && ui.button(format!("Go to the nearest building ({}, {:.0} m)", nearest.name, nearest.distance)).clicked()
     {
@@ -1124,20 +1135,29 @@ fn draw_advanced_controls(
 /// broken into short terrain-anchored segments: a single chord between two
 /// endpoint heights would cut straight through hills, and a segment whose
 /// endpoint passes behind the camera would project mirrored into the sky.
+#[allow(clippy::too_many_arguments)]
 fn draw_erosion_lattice(
     painter: &egui::Painter,
     player: &Player,
+    planet: &crate::planet::Planet,
     cache: &ErosionCache,
     noise: &NoiseField,
     viewport: (u32, u32),
     pixels_per_point: f32,
 ) {
     // The same matrices the render side builds for `GlobalUniforms`, so the
-    // overlay lines up with the rasterized terrain.
+    // overlay lines up with the rasterized terrain, and plane points placed
+    // on the planet as the terrain's are.
     let camera = PlayerCamera::from_player(player);
+    let planet_view = crate::planet::view::PlanetView::new(planet, player.face, camera.position, player.ground_below as f64);
     let aspect = viewport.0 as f32 / viewport.1 as f32;
     let view = matrices::view_matrix(camera.position, camera.target, camera.up);
-    let projection = matrices::perspective(camera.fov_y, aspect, NEAR_PLANE, FAR_PLANE);
+    let far = planet_view.far_plane(planet, FAR_PLANE as f64) as f32;
+    let projection = matrices::perspective(camera.fov_y, aspect, NEAR_PLANE, far);
+    let on_planet = |x: f32, y: f32, z: f32| -> Vec3 {
+        let chart = crate::planet::Planet::chart_of_plane(player.face, bevy::math::DVec2::new(x as f64, z as f64));
+        planet_view.world_of(planet.position(player.face, chart, y as f64)).as_vec3()
+    };
 
     let visibility_center = [player.position.x, player.position.z];
     let base_x = (player.position.x / EROSION_TILE_STRIDE).round() * EROSION_TILE_STRIDE;
@@ -1154,8 +1174,10 @@ fn draw_erosion_lattice(
         camera.target.z - position.z,
     )
     .normalize_or_zero();
-    let point_in_front =
-        |x: f32, z: f32| (x - position.x) * forward.x + (z - position.z) * forward.z > 1.0;
+    let point_in_front = |x: f32, z: f32| {
+        let world = on_planet(x, position.y, z);
+        (world.x - position.x) * forward.x + (world.z - position.z) * forward.z > 1.0
+    };
     // The C++ guarded only with pointInFront; world_to_screen's own
     // behind-the-near-plane rejection is the same predicate for a perspective
     // matrix, so the two agree on every point that reaches the painter.
@@ -1185,8 +1207,9 @@ fn draw_erosion_lattice(
                     visibility_center,
                 ) + 1.5;
                 let h1 = erosion::sample_eroded_height(cache, noise, x, z, visibility_center) + 1.5;
+                let (start, end) = (on_planet(previous_x, h0, previous_z), on_planet(x, h1, z));
                 if let (Some(start), Some(end)) =
-                    (project(previous_x, h0, previous_z), project(x, h1, z))
+                    (project(start.x, start.y, start.z), project(end.x, end.y, end.z))
                 {
                     painter.line_segment([start, end], stroke);
                 }
