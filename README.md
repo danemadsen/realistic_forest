@@ -362,8 +362,15 @@ ranges. The per-face windows overlap on the plane, so the faces look alike
 from orbit. Near a cube corner the chart's shear distorts landforms. The grass
 habitat capture still rasterises the clipmap, whose morph bands differ from
 the quadtree's, so grass roots can sit a few centimetres off the drawn ground
-there. Instanced objects (plants, buildings) stand upright in the camera's
-frame rather than their own, a tilt of a degree at 11 km.
+there. Plants stand upright in the camera's frame rather than their own, a
+tilt of a degree at 11 km (buildings go through the chart onto the ground they
+stand on). Across a cube edge the ground's height and its snow pack are blended
+between the two faces' charts, but its materials are not: their textures and
+noise-keyed masks follow each face's plane coordinates, so the surface's look
+changes along the edge itself, and the snow's sunny-side cover is reckoned in
+each face's own axes. The weather is keyed on plane coordinates too: crossing
+an edge keeps the sky over the player, but its field turns about the player
+by the angle between the two faces' axes.
 
 ## Terrain and clipmap
 

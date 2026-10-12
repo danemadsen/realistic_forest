@@ -208,6 +208,22 @@ fn planetCentreWorld() -> vec3<f32>
     return vec3<f32>(globals.camera_position.x, -globals.planet.x, globals.camera_position.z);
 }
 
+// The terrain plane point (x, z) under a world position, on the camera's
+// face: where planetPlaneToWorld put it, read back through the chart. Maps
+// keyed on plane coordinates (the lighting heightfield) are read through it:
+// away from a face's centre a world offset is not the plane offset, the
+// chart's stretch and shear lie between them.
+fn planetWorldToPlane(world: vec3<f32>) -> vec2<f32>
+{
+    let face = planetCameraFace();
+    let d = planetFromWorldAxes(world - planetCentreWorld());
+    let along = dot(d, PLANET_FACE_AXIS[face]);
+    let chart = vec2<f32>(atan2(dot(d, PLANET_FACE_EAST[face]), along),
+                          atan2(dot(d, PLANET_FACE_NORTH[face]), along))
+        *(globals.planet.y/PLANET_QUARTER_PI);
+    return chart + PLANET_FACE_PLANE_OFFSET[face];
+}
+
 // Altitude above sea level of a world point. Formed as
 // (|v|^2 - r^2)/(|v| + r) from the camera-relative offsets so it does not
 // lose the radius's worth of precision a plain length(v) - r would.
@@ -244,6 +260,18 @@ fn planetRaySphere(origin: vec3<f32>, direction: vec3<f32>, altitude: f32) -> ve
     }
     let root = sqrt(discriminant);
     return vec2<f32>(-b - root, -b + root);
+}
+
+// A vector given as if `up` were the camera's up (a surface normal built
+// from its slopes, say), turned the least way that takes the camera's up
+// onto `up`: the same vector at a point of the planet away from the camera.
+fn planetTiltUp(v: vec3<f32>, up: vec3<f32>) -> vec3<f32>
+{
+    let c = up.y;
+    if (c < -0.999) { return vec3<f32>(v.x, -v.y, -v.z); }
+    // (0, 1, 0) x up
+    let k = vec3<f32>(up.z, 0.0, -up.x);
+    return v*c + cross(k, v) + k*(dot(k, v)/(1.0 + c));
 }
 
 // The sun's elevation where a world point lies: the sine of its angle above
@@ -1573,22 +1601,62 @@ fn planetFeatureWeight(edge: f32, onCameraFace: bool) -> f32
 // weighted by a smoothstep of its own distance to its edge, sampled where
 // the point's direction falls in it. A function of the direction alone, so
 // both faces of an edge build the same ground (planet/height.rs bare_height).
+// A point's chart on `other` face, from its unnormalised cube point on its
+// own face (the angles need no unit vector). Its own face's chart is the one
+// it was given, exactly: no round trip, so no jitter of the lattice it sits on
+// and no step where the band begins.
+fn planetSeamChart(face: u32, chart: vec2<f32>, cube: vec3<f32>, other: u32) -> vec2<f32>
+{
+    if (other == face) { return chart; }
+    let along = dot(cube, PLANET_FACE_AXIS[other]);
+    return vec2<f32>(atan2(dot(cube, PLANET_FACE_EAST[other]), along),
+                     atan2(dot(cube, PLANET_FACE_NORTH[other]), along))
+        *(globals.planet.y/PLANET_QUARTER_PI);
+}
+
 fn planetSeamHeight(face: u32, chart: vec2<f32>) -> f32
 {
     let s = globals.planet.y;
     let band = globals.planet.z;
-    let direction = normalize(planetCube(face, chart));
+    let cube = planetCube(face, chart);
     var total = 0.0;
     var weights = 0.0;
     for (var other = 0u; other < 6u; other = other + 1u) {
-        let along = dot(direction, PLANET_FACE_AXIS[other]);
-        if (along <= 1.0e-6) { continue; }
-        let otherChart = vec2<f32>(atan2(dot(direction, PLANET_FACE_EAST[other]), along),
-                                   atan2(dot(direction, PLANET_FACE_NORTH[other]), along))
-            *(s/PLANET_QUARTER_PI);
+        if (dot(cube, PLANET_FACE_AXIS[other]) <= 1.0e-6) { continue; }
+        let otherChart = planetSeamChart(face, chart, cube, other);
         let weight = smoothHermite(-band, band, s - max(abs(otherChart.x), abs(otherChart.y)));
         if (weight > 0.0) {
             total += weight*baseHeight(otherChart + PLANET_FACE_PLANE_OFFSET[other]);
+            weights += weight;
+        }
+    }
+    return total/max(weights, 1.0e-6);
+}
+
+// The snow cover at a point of a face's chart for the snow lift: inside the
+// face, snowCoverage with the normal in the face's own frame; in a seam band,
+// each chart's cover with the normal turned into that chart's frame, blended
+// as the heights are, so the faces either side of an edge lift the vertices
+// they share alike (the cover's sunny aspect is measured in a chart's axes).
+fn planetSnowCoverage(face: u32, chart: vec2<f32>, height: f32, normal: vec3<f32>) -> f32
+{
+    let s = globals.planet.y;
+    let band = globals.planet.z;
+    if (s - max(abs(chart.x), abs(chart.y)) > band) { return snowCoverage(height, normal); }
+    let cube = planetCube(face, chart);
+    let up = normalize(cube);
+    let ownEast = normalize(PLANET_FACE_EAST[face] - up*dot(up, PLANET_FACE_EAST[face]));
+    let horizontal = ownEast*normal.x + cross(ownEast, up)*normal.z;
+    var total = 0.0;
+    var weights = 0.0;
+    for (var other = 0u; other < 6u; other = other + 1u) {
+        if (dot(cube, PLANET_FACE_AXIS[other]) <= 1.0e-6) { continue; }
+        let otherChart = planetSeamChart(face, chart, cube, other);
+        let weight = smoothHermite(-band, band, s - max(abs(otherChart.x), abs(otherChart.y)));
+        if (weight > 0.0) {
+            let east = normalize(PLANET_FACE_EAST[other] - up*dot(up, PLANET_FACE_EAST[other]));
+            let turned = vec3<f32>(dot(horizontal, east), normal.y, dot(horizontal, cross(east, up)));
+            total += weight*snowCoverage(height, turned);
             weights += weight;
         }
     }
@@ -1700,9 +1768,12 @@ fn planetTerrainVertex(grid: vec3<f32>, instance: PatchInput) -> VsOutput
     output.fragErosionDelta = erosionContribution;
     output.frag_base_height = height;
     output.frag_snow_compaction = 0.0;
-    let bank = mix(riverBankAt(riverNone(), height), riverBankAt(river, height), features);
+    // Blended from clamped values: a mix through the no-river sentinel
+    // (1e30) cancels to nothing where features is 1 on backends that form
+    // mix as x + (y - x)*a.
+    let bank = mix(40.0, clamp(riverBankAt(river, height), -40.0, 40.0), features);
     let lakeShare = riverLakeShare(river, height);
-    output.frag_river = vec4<f32>(clamp(bank, -40.0, 40.0),
+    output.frag_river = vec4<f32>(bank,
                                   river.bend*(1.0 - lakeShare)*features,
                                   river.turbulence*(1.0 - lakeShare)*features,
                                   length(river.velocity)*(1.0 - lakeShare)*features);
@@ -1736,12 +1807,12 @@ fn planetTerrainVertex(grid: vec3<f32>, instance: PatchInput) -> VsOutput
     let compression = select(0.0, snowCompression(plane), features > 0.0);
     output.frag_snow_compaction = compression;
     let dry = smoothHermite(0.0, 1.0, bank);
-    height += dry*snowCoverage(height, materialNormal)*snow.mapping.w*(1.0 - compression);
+    height += dry*planetSnowCoverage(face, chart, height, materialNormal)*snow.mapping.w*(1.0 - compression);
     let liftScale = dry*snow.mapping.w;
-    let liftLeft = liftScale*snowCoverage(heightLeft, materialNormal);
-    let liftRight = liftScale*snowCoverage(heightRight, materialNormal);
-    let liftBack = liftScale*snowCoverage(heightBack, materialNormal);
-    let liftFront = liftScale*snowCoverage(heightFront, materialNormal);
+    let liftLeft = liftScale*planetSnowCoverage(face, chart, heightLeft, materialNormal);
+    let liftRight = liftScale*planetSnowCoverage(face, chart, heightRight, materialNormal);
+    let liftBack = liftScale*planetSnowCoverage(face, chart, heightBack, materialNormal);
+    let liftFront = liftScale*planetSnowCoverage(face, chart, heightFront, materialNormal);
     let trodden = features > 0.0;
     localNormal = planetLocalNormal(axes,
         heightLeft + liftLeft*(1.0 - select(0.0, snowCompression(plane - vec2<f32>(normalStep, 0.0)), trodden)),

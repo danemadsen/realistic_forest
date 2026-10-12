@@ -203,6 +203,22 @@ fn planetCentreWorld() -> vec3<f32>
     return vec3<f32>(globals.camera_position.x, -globals.planet.x, globals.camera_position.z);
 }
 
+// The terrain plane point (x, z) under a world position, on the camera's
+// face: where planetPlaneToWorld put it, read back through the chart. Maps
+// keyed on plane coordinates (the lighting heightfield) are read through it:
+// away from a face's centre a world offset is not the plane offset, the
+// chart's stretch and shear lie between them.
+fn planetWorldToPlane(world: vec3<f32>) -> vec2<f32>
+{
+    let face = planetCameraFace();
+    let d = planetFromWorldAxes(world - planetCentreWorld());
+    let along = dot(d, PLANET_FACE_AXIS[face]);
+    let chart = vec2<f32>(atan2(dot(d, PLANET_FACE_EAST[face]), along),
+                          atan2(dot(d, PLANET_FACE_NORTH[face]), along))
+        *(globals.planet.y/PLANET_QUARTER_PI);
+    return chart + PLANET_FACE_PLANE_OFFSET[face];
+}
+
 // Altitude above sea level of a world point. Formed as
 // (|v|^2 - r^2)/(|v| + r) from the camera-relative offsets so it does not
 // lose the radius's worth of precision a plain length(v) - r would.
@@ -239,6 +255,18 @@ fn planetRaySphere(origin: vec3<f32>, direction: vec3<f32>, altitude: f32) -> ve
     }
     let root = sqrt(discriminant);
     return vec2<f32>(-b - root, -b + root);
+}
+
+// A vector given as if `up` were the camera's up (a surface normal built
+// from its slopes, say), turned the least way that takes the camera's up
+// onto `up`: the same vector at a point of the planet away from the camera.
+fn planetTiltUp(v: vec3<f32>, up: vec3<f32>) -> vec3<f32>
+{
+    let c = up.y;
+    if (c < -0.999) { return vec3<f32>(v.x, -v.y, -v.z); }
+    // (0, 1, 0) x up
+    let k = vec3<f32>(up.z, 0.0, -up.x);
+    return v*c + cross(k, v) + k*(dot(k, v)/(1.0 + c));
 }
 
 // The sun's elevation where a world point lies: the sine of its angle above

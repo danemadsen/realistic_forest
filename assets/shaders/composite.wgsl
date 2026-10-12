@@ -184,6 +184,22 @@ fn planetCentreWorld() -> vec3<f32>
     return vec3<f32>(globals.camera_position.x, -globals.planet.x, globals.camera_position.z);
 }
 
+// The terrain plane point (x, z) under a world position, on the camera's
+// face: where planetPlaneToWorld put it, read back through the chart. Maps
+// keyed on plane coordinates (the lighting heightfield) are read through it:
+// away from a face's centre a world offset is not the plane offset, the
+// chart's stretch and shear lie between them.
+fn planetWorldToPlane(world: vec3<f32>) -> vec2<f32>
+{
+    let face = planetCameraFace();
+    let d = planetFromWorldAxes(world - planetCentreWorld());
+    let along = dot(d, PLANET_FACE_AXIS[face]);
+    let chart = vec2<f32>(atan2(dot(d, PLANET_FACE_EAST[face]), along),
+                          atan2(dot(d, PLANET_FACE_NORTH[face]), along))
+        *(globals.planet.y/PLANET_QUARTER_PI);
+    return chart + PLANET_FACE_PLANE_OFFSET[face];
+}
+
 // Altitude above sea level of a world point. Formed as
 // (|v|^2 - r^2)/(|v| + r) from the camera-relative offsets so it does not
 // lose the radius's worth of precision a plain length(v) - r would.
@@ -220,6 +236,18 @@ fn planetRaySphere(origin: vec3<f32>, direction: vec3<f32>, altitude: f32) -> ve
     }
     let root = sqrt(discriminant);
     return vec2<f32>(-b - root, -b + root);
+}
+
+// A vector given as if `up` were the camera's up (a surface normal built
+// from its slopes, say), turned the least way that takes the camera's up
+// onto `up`: the same vector at a point of the planet away from the camera.
+fn planetTiltUp(v: vec3<f32>, up: vec3<f32>) -> vec3<f32>
+{
+    let c = up.y;
+    if (c < -0.999) { return vec3<f32>(v.x, -v.y, -v.z); }
+    // (0, 1, 0) x up
+    let k = vec3<f32>(up.z, 0.0, -up.x);
+    return v*c + cross(k, v) + k*(dot(k, v)/(1.0 + c));
 }
 
 // The sun's elevation where a world point lies: the sine of its angle above
@@ -1016,12 +1044,14 @@ fn skyAmbient(normal_world: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
 // BEGIN SHARED TERRAIN SHADOWS
 // The map follows the camera, includes off-screen terrain, and contains the
 // same procedural + erosion height used by the terrain vertex shader.
-fn terrainHeightAt(world_xz: vec2<f32>) -> f32 {
-    let uv = (world_xz - globals.heightfield.xy)/globals.heightfield.z + vec2<f32>(0.5);
+// Both take terrain plane coordinates: a world position goes through
+// planetWorldToPlane first.
+fn terrainHeightAt(plane_xz: vec2<f32>) -> f32 {
+    let uv = (plane_xz - globals.heightfield.xy)/globals.heightfield.z + vec2<f32>(0.5);
     return textureSampleLevel(terrain_heightfield, terrain_heightfield_sampler, uv, 0.0).r;
 }
-fn terrainMapWeight(world_xz: vec2<f32>) -> f32 {
-    let uv = (world_xz - globals.heightfield.xy)/globals.heightfield.z + vec2<f32>(0.5);
+fn terrainMapWeight(plane_xz: vec2<f32>) -> f32 {
+    let uv = (plane_xz - globals.heightfield.xy)/globals.heightfield.z + vec2<f32>(0.5);
     let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
     return smoothstep(0.0, 0.06, edge);
 }
@@ -1107,7 +1137,8 @@ fn terrainShadow(world_position: vec3<f32>, normal_world: vec3<f32>, to_light: v
     // mismatch and bias grazing slopes to avoid dark checkerboard acne.
     let texel = globals.heightfield.w;
     let bias = 1.5 + texel*(0.12 + 0.25*(1.0 - abs(dot(normal_world, up))));
-    let local_height = terrainHeightAt(world_position.xz);
+    let plane = planetWorldToPlane(world_position);
+    let local_height = terrainHeightAt(plane);
     let lift = max(local_height - planetAltitude(world_position), 0.0) + bias;
     let origin = world_position + up*lift;
     let quality = clamp(globals.raymarch.w, 0.0, 2.0);
@@ -1125,14 +1156,15 @@ fn terrainShadow(world_position: vec3<f32>, normal_world: vec3<f32>, to_light: v
         let penumbra = max(1.2, distance*0.0047);
         let sample_altitude = planetAltitude(sample_position);
         if (rising && sample_altitude - penumbra >= globals.sun_direction.w) { break; }
-        let edge_weight = terrainMapWeight(sample_position.xz);
+        let sample_plane = planetWorldToPlane(sample_position);
+        let edge_weight = terrainMapWeight(sample_plane);
         if (edge_weight <= 0.0) { break; }
-        let clearance = sample_altitude - terrainHeightAt(sample_position.xz);
+        let clearance = sample_altitude - terrainHeightAt(sample_plane);
         let sample_visibility = smoothstep(-penumbra, penumbra, clearance);
         visibility = min(visibility, mix(1.0, sample_visibility, edge_weight));
         if (visibility < 0.015) { break; }
     }
-    return mix(1.0, visibility, terrainMapWeight(world_position.xz));
+    return mix(1.0, visibility, terrainMapWeight(plane));
 }
 // END SHARED TERRAIN SHADOWS
 
@@ -1153,9 +1185,10 @@ fn volumeLightVisibility(world_position: vec3<f32>, to_light: vec3<f32>) -> f32 
         let sample_position = world_position + to_light*(16.0 + f*f*3600.0);
         let sample_altitude = planetAltitude(sample_position);
         if (rising && sample_altitude - 5.0 >= globals.sun_direction.w) { break; }
-        let edge_weight = terrainMapWeight(sample_position.xz);
+        let sample_plane = planetWorldToPlane(sample_position);
+        let edge_weight = terrainMapWeight(sample_plane);
         if (edge_weight <= 0.0) { break; }
-        let clearance = sample_altitude - terrainHeightAt(sample_position.xz);
+        let clearance = sample_altitude - terrainHeightAt(sample_plane);
         visibility = min(visibility, mix(1.0, smoothstep(-5.0, 5.0, clearance), edge_weight));
         if (visibility < 0.02) { break; }
     }
@@ -1193,7 +1226,8 @@ fn fogExtinctionProfile(severity: f32, altitude: f32) -> f32 {
     return weather*airDensityProfile(altitude);
 }
 
-fn integrateAtmosphereSegment(ray: vec3<f32>, start_distance: f32, end_distance: f32) -> FogResult {
+fn integrateAtmosphereSegment(ray: vec3<f32>, start_distance: f32, end_distance: f32,
+                              whole_end: f32) -> FogResult {
     var result: FogResult;
     result.scattering = vec3<f32>(0.0);
     result.transmittance = 1.0;
@@ -1202,15 +1236,22 @@ fn integrateAtmosphereSegment(ray: vec3<f32>, start_distance: f32, end_distance:
     // march covers the first 10 km as it always has; from high up it starts
     // where the ray enters the air and reaches as far as the ray stays in it,
     // so the planet seen from orbit is hazed by the column of air above it.
+    // The rest of the air, past the march's reach, is the tail's.
     let camera_altitude = globals.camera_position.y;
     let shell = planetRaySphere(globals.camera_position.xyz, ray, globals.planet_up.w);
     if (shell.y <= 0.0) { return result; }
     let reach = max(10000.0, camera_altitude*6.0);
+    let march_end = max(shell.x, 0.0) + reach;
     let segment_start = max(max(start_distance, 0.0), shell.x);
-    let segment_end = min(min(end_distance, shell.y), max(shell.x, 0.0) + reach);
+    let segment_end = min(min(end_distance, shell.y), march_end);
     let ray_length = max(segment_end - segment_start, 0.0);
-    if (ray_length <= 0.001) { return result; }
-    if (globals.raymarch.y < 0.5) {
+    let to_sun = -normalize(globals.sun_direction.xyz);
+    let to_moon = -normalize(globals.moon_direction.xyz);
+    // The sun lights each sample with its own colour and strength there
+    // (planetSunlightAt), which near the camera is the camera's.
+    let sun_phase = henyeyGreenstein(dot(ray, to_sun), 0.68);
+    let strength = max(globals.atmosphere.w, 0.0);
+    if (ray_length > 0.001 && globals.raymarch.y < 0.5) {
         let midpoint = segment_start + ray_length*0.5;
         let world_position = globals.camera_position.xyz + ray*midpoint;
         let severity = weatherSeverity(world_position.xz);
@@ -1229,87 +1270,102 @@ fn integrateAtmosphereSegment(ray: vec3<f32>, start_distance: f32, end_distance:
                        *0.28/(1.0 + pow(range/2200.0, 2.0));
         }
         result.scattering = ambient*(1.0 - result.transmittance);
-        return result;
-    }
-    let quality = clamp(globals.raymarch.w, 0.0, 2.0);
-    let count = select(select(12u, 16u, quality >= 1.0), 24u, quality >= 2.0);
-    let to_sun = -normalize(globals.sun_direction.xyz);
-    let to_moon = -normalize(globals.moon_direction.xyz);
-    // The sun lights each sample with its own colour and strength there
-    // (planetSunlightAt), which near the camera is the camera's.
-    let sun_phase = henyeyGreenstein(dot(ray, to_sun), 0.68);
-    let moon_scatter = vec3<f32>(0.52, 0.65, 1.0)*globals.atmosphere.y
-                       *henyeyGreenstein(dot(ray, to_moon), 0.45);
-    let strength = max(globals.atmosphere.w, 0.0);
-    // Quadratic view steps keep close shafts detailed while reaching the
-    // distant landscape. Beer-Lambert accumulation conserves transmittance.
-    for (var i = 0u; i < 24u; i += 1u) {
-        if (i >= count) { break; }
-        let a = f32(i)/f32(count);
-        let b = (f32(i) + 1.0)/f32(count);
-        let start = a*a*ray_length;
-        let end = b*b*ray_length;
-        let midpoint = segment_start + (start + end)*0.5;
-        let world_position = globals.camera_position.xyz + ray*midpoint;
-        let severity = weatherSeverity(world_position.xz);
-        let precipitation = weatherPrecipitation(world_position);
-        let sky_cover = weatherSkyCover(severity);
-        var ambient = weatherFogAmbient(severity, planetDaylightAt(world_position),
-                                        precipitation.z);
-        if (globals.lightning.w > 0.001) {
-            let source = vec3<f32>(globals.lightning.x,
-                                   mix(globals.lightning.y, globals.lightning_meta.z, 0.60),
-                                   globals.lightning.z);
-            let range = length(world_position - source);
-            ambient += vec3<f32>(0.72, 0.84, 1.0)*globals.lightning.w
-                       *0.35/(1.0 + pow(range/2200.0, 2.0));
-        }
-        let extinction = base_density*fogExtinctionProfile(severity, planetAltitude(world_position))
-                         + precipitationExtinction(precipitation);
-        let step_transmittance = exp(-extinction*(end - start));
-        var sunlight_visibility = 1.0;
-        if (globals.sun_colour.w > 0.01 && strength > 0.0) {
-            // Where the terrain blocks the sun the cloud shadow cannot matter.
-            sunlight_visibility = volumeLightVisibility(world_position, to_sun);
-            if (sunlight_visibility > 0.0) {
-                sunlight_visibility *= cloudSunShadow(world_position, to_sun);
+    } else if (ray_length > 0.001) {
+        let quality = clamp(globals.raymarch.w, 0.0, 2.0);
+        let count = select(select(12u, 16u, quality >= 1.0), 24u, quality >= 2.0);
+        let moon_scatter = vec3<f32>(0.52, 0.65, 1.0)*globals.atmosphere.y
+                           *henyeyGreenstein(dot(ray, to_moon), 0.45);
+        // Quadratic view steps keep close shafts detailed while reaching the
+        // distant landscape. Beer-Lambert accumulation conserves transmittance.
+        for (var i = 0u; i < 24u; i += 1u) {
+            if (i >= count) { break; }
+            let a = f32(i)/f32(count);
+            let b = (f32(i) + 1.0)/f32(count);
+            let start = a*a*ray_length;
+            let end = b*b*ray_length;
+            let midpoint = segment_start + (start + end)*0.5;
+            let world_position = globals.camera_position.xyz + ray*midpoint;
+            let severity = weatherSeverity(world_position.xz);
+            let precipitation = weatherPrecipitation(world_position);
+            let sky_cover = weatherSkyCover(severity);
+            var ambient = weatherFogAmbient(severity, planetDaylightAt(world_position),
+                                            precipitation.z);
+            if (globals.lightning.w > 0.001) {
+                let source = vec3<f32>(globals.lightning.x,
+                                       mix(globals.lightning.y, globals.lightning_meta.z, 0.60),
+                                       globals.lightning.z);
+                let range = length(world_position - source);
+                ambient += vec3<f32>(0.72, 0.84, 1.0)*globals.lightning.w
+                           *0.35/(1.0 + pow(range/2200.0, 2.0));
             }
+            let extinction = base_density*fogExtinctionProfile(severity, planetAltitude(world_position))
+                             + precipitationExtinction(precipitation);
+            let step_transmittance = exp(-extinction*(end - start));
+            var sunlight_visibility = 1.0;
+            if (globals.sun_colour.w > 0.01 && strength > 0.0) {
+                // Where the terrain blocks the sun the cloud shadow cannot matter.
+                sunlight_visibility = volumeLightVisibility(world_position, to_sun);
+                if (sunlight_visibility > 0.0) {
+                    sunlight_visibility *= cloudSunShadow(world_position, to_sun);
+                }
+            }
+            var moonlight_visibility = 1.0;
+            if (globals.atmosphere.y > 0.001 && strength > 0.0) {
+                moonlight_visibility = cloudShadow(world_position, to_moon);
+            }
+            let lighting = ambient + (planetSunlightAt(world_position)*sun_phase*weatherSunMultiplier(severity)
+                                      *(1.0 - sky_cover*0.85)
+                                      *mix(1.0, 0.10, precipitation.z)
+                                      *sunlight_visibility
+                                      + moon_scatter*weatherSunMultiplier(severity)
+                                      *mix(1.0, 0.42, precipitation.z)
+                                      *moonlight_visibility)*strength;
+            result.scattering += result.transmittance*(1.0 - step_transmittance)*lighting;
+            result.transmittance *= step_transmittance;
+            if (result.transmittance < 0.01) { break; }
         }
-        var moonlight_visibility = 1.0;
-        if (globals.atmosphere.y > 0.001 && strength > 0.0) {
-            moonlight_visibility = cloudShadow(world_position, to_moon);
-        }
-        let lighting = ambient + (planetSunlightAt(world_position)*sun_phase*weatherSunMultiplier(severity)
-                                  *(1.0 - sky_cover*0.85)
-                                  *mix(1.0, 0.10, precipitation.z)
-                                  *sunlight_visibility
-                                  + moon_scatter*weatherSunMultiplier(severity)
-                                  *mix(1.0, 0.42, precipitation.z)
-                                  *moonlight_visibility)*strength;
-        result.scattering += result.transmittance*(1.0 - step_transmittance)*lighting;
-        result.transmittance *= step_transmittance;
-        if (result.transmittance < 0.01) { break; }
     }
-    // Past the march's reach the remaining air to the surface is taken as
-    // one even stretch at the density half way along it: the far terrain a
-    // high camera sees is hazed by all of the air in front of it.
-    let tail_end = min(end_distance, shell.y);
-    let tail = tail_end - segment_end;
-    if (tail > 1.0 && result.transmittance > 0.01) {
-        let tail_position = globals.camera_position.xyz + ray*(segment_end + tail*0.5);
-        let severity = weatherSeverity(tail_position.xz);
-        let precipitation = weatherPrecipitation(tail_position);
-        let extinction = base_density*fogExtinctionProfile(severity, planetAltitude(tail_position))
-                         + precipitationExtinction(precipitation);
-        let tail_transmittance = exp(-extinction*tail);
-        let lighting = weatherFogAmbient(severity, planetDaylightAt(tail_position), precipitation.z)
-                       + planetSunlightAt(tail_position)*sun_phase*weatherSunMultiplier(severity)
-                       *(1.0 - weatherSkyCover(severity)*0.85)*strength;
-        result.scattering += result.transmittance*(1.0 - tail_transmittance)*lighting;
-        result.transmittance *= tail_transmittance;
+    return atmosphereTail(result, ray, max(segment_start, march_end), min(end_distance, shell.y),
+                          min(whole_end, shell.y), march_end, sun_phase, strength);
+}
+
+// BEGIN SHARED ATMOSPHERE TAIL
+// The air past the march's reach (`march_end`), from `from_distance` to
+// `to_distance` along the ray: stretches whose ends are fixed along the ray
+// (10, 30, 70, 150 km and on past the reach), each taken as even at the
+// density and light half way along it, up to where the whole ray ends
+// (`whole_end`). A ray cut at a cloud so integrates the same air in front of
+// it and behind as it would whole, and the far terrain a high camera sees is
+// hazed by all of the air in front of it.
+fn atmosphereTail(fog: FogResult, ray: vec3<f32>, from_distance: f32, to_distance: f32,
+                  whole_end: f32, march_end: f32, sun_phase: f32, strength: f32) -> FogResult {
+    var result = fog;
+    let base_density = max(globals.params.x, 0.0);
+    var near = march_end;
+    var width = 10000.0;
+    for (var i = 0u; i < 8u; i += 1u) {
+        if (near >= to_distance || result.transmittance <= 0.01) { break; }
+        let far = near + width;
+        let stretch = min(far, to_distance) - max(near, from_distance);
+        if (stretch > 1.0) {
+            let middle = globals.camera_position.xyz + ray*(0.5*(near + min(far, whole_end)));
+            let severity = weatherSeverity(middle.xz);
+            let precipitation = weatherPrecipitation(middle);
+            let extinction = base_density*fogExtinctionProfile(severity, planetAltitude(middle))
+                             + precipitationExtinction(precipitation);
+            let transmittance = exp(-extinction*stretch);
+            let lighting = weatherFogAmbient(severity, planetDaylightAt(middle), precipitation.z)
+                           + planetSunlightAt(middle)*sun_phase*weatherSunMultiplier(severity)
+                           *(1.0 - weatherSkyCover(severity)*0.85)*strength;
+            result.scattering += result.transmittance*(1.0 - transmittance)*lighting;
+            result.transmittance *= transmittance;
+        }
+        near = far;
+        width *= 2.0;
     }
     return result;
 }
+// END SHARED ATMOSPHERE TAIL
 
 // Space: black, with the sun's disc unreddened by any air and stars fixed to
 // the planet's axes (they turn with the day/night cycle no more than the
@@ -1443,14 +1499,14 @@ fn fs_atmosphere(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f3
                                      packed_position.a < 0.5);
     let clouds = marchClouds(globals.camera_position.xyz, ray, distance_to_surface, globals.cloud_layer.w);
     if (clouds.transmittance > 0.9999) {
-        let fog = integrateAtmosphereSegment(ray, 0.0, distance_to_surface);
+        let fog = integrateAtmosphereSegment(ray, 0.0, distance_to_surface, distance_to_surface);
         return vec4<f32>(fog.scattering, fog.transmittance);
     }
     // Place the integrated cloud at its extinction-weighted distance, then
     // transport air in front and behind separately. This preserves foreground
     // haze and mountain silhouettes without drawing clouds over opaque terrain.
-    let front = integrateAtmosphereSegment(ray, 0.0, clouds.distance);
-    let back = integrateAtmosphereSegment(ray, clouds.distance, distance_to_surface);
+    let front = integrateAtmosphereSegment(ray, 0.0, clouds.distance, distance_to_surface);
+    let back = integrateAtmosphereSegment(ray, clouds.distance, distance_to_surface, distance_to_surface);
     let scattering = front.scattering + front.transmittance
                      *(clouds.scattering + clouds.transmittance*back.scattering);
     let transmittance = front.transmittance*clouds.transmittance*back.transmittance;
@@ -1557,13 +1613,14 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     // small bumps of the surface texture, so levelness comes from the terrain
     // heightfield's slope rather than the shading normal.
     let texel = globals.heightfield.w;
+    let ground_plane = planetWorldToPlane(world_position);
     let slope = vec2<f32>(
-        terrainHeightAt(world_position.xz + vec2<f32>(texel, 0.0))
-            - terrainHeightAt(world_position.xz - vec2<f32>(texel, 0.0)),
-        terrainHeightAt(world_position.xz + vec2<f32>(0.0, texel))
-            - terrainHeightAt(world_position.xz - vec2<f32>(0.0, texel)))/(2.0*texel);
+        terrainHeightAt(ground_plane + vec2<f32>(texel, 0.0))
+            - terrainHeightAt(ground_plane - vec2<f32>(texel, 0.0)),
+        terrainHeightAt(ground_plane + vec2<f32>(0.0, texel))
+            - terrainHeightAt(ground_plane - vec2<f32>(0.0, texel)))/(2.0*texel);
     let level = (1.0 - smoothstep(0.03, 0.09, length(slope)))
-                *smoothstep(0.55, 0.8, normal_world.y)*terrainMapWeight(world_position.xz);
+                *smoothstep(0.55, 0.8, normal_world.y)*terrainMapWeight(ground_plane);
     let hollows = groundNoise(world_position.xz/4.5)*0.7
                   + groundNoise(world_position.xz/1.6 + vec2<f32>(17.0, 5.0))*0.3;
     let puddle = smoothstep(0.66 - 0.14*soak, 0.72 - 0.14*soak, hollows)
