@@ -113,6 +113,31 @@ impl ForestRender {
 pub const CAMERA_FOV_Y_DEGREES: f32 = 68.0;
 
 /// Camera-attached data extracted from the main world each frame.
+/// Which of the passes that make a frame have drawn, shared between the main
+/// and render worlds. Their pipelines compile in the background, and until
+/// they have a frame is blank, so a capture counts its `--wait` frames only
+/// once each has drawn.
+#[derive(Resource, Clone, Default)]
+pub struct FrameReadiness(std::sync::Arc<std::sync::atomic::AtomicU32>);
+
+impl FrameReadiness {
+    /// The terrain's G-buffer pass.
+    pub const TERRAIN: u32 = 1;
+    /// The atmosphere and composite passes.
+    pub const COMPOSITE: u32 = 2;
+    /// The FXAA pass that writes the frame out.
+    pub const PRESENT: u32 = 4;
+    const ALL: u32 = Self::TERRAIN | Self::COMPOSITE | Self::PRESENT;
+
+    pub fn drew(&self, pass: u32) {
+        self.0.fetch_or(pass, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn ready(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed) & Self::ALL == Self::ALL
+    }
+}
+
 #[derive(Resource, Default)]
 pub struct ExtractedForestView {
     pub player_position: [f32; 3],
@@ -562,9 +587,12 @@ impl Plugin for ForestRenderPlugin {
             grass_readiness.disable();
         }
         app.insert_resource(grass_readiness.clone());
+        let frame_readiness = FrameReadiness::default();
+        app.insert_resource(frame_readiness.clone());
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
         };
+        render_app.insert_resource(frame_readiness);
 
         if let Ok(assets) = grass_assets {
             render_app.insert_resource(assets);

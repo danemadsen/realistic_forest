@@ -830,6 +830,9 @@ pub fn forest_composite_pass(
         width,
         height,
     );
+    if let Some(readiness) = world.get_resource::<super::FrameReadiness>() {
+        readiness.drew(super::FrameReadiness::COMPOSITE);
+    }
 }
 
 /// `PresentFxaa`: edge smoothing of the composited frame, blitted out to the
@@ -931,6 +934,9 @@ pub fn forest_fxaa_pass(
         extracted.physical_width.max(1) as f32,
         extracted.physical_height.max(1) as f32,
     );
+    if let Some(readiness) = world.get_resource::<super::FrameReadiness>() {
+        readiness.drew(super::FrameReadiness::PRESENT);
+    }
 }
 
 // ---------------------------------------------------------------------------

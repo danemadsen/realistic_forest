@@ -828,7 +828,8 @@ fn erosion_stream_system(
     };
     // High above the ground the tiles' detail is too small to see; hold the
     // cache rather than simulate tiles under a camera crossing the planet.
-    if planet::systems::streams_paused(player) {
+    // A prewarm still runs: it was asked for, and a capture waits on it.
+    if planet::systems::streams_paused(player) && prewarm.0 == 0 {
         erosion::apply_erosion_events(&mut cache, &bridge);
         return;
     }
@@ -1098,6 +1099,7 @@ fn shot_scheduling_system(
     time: Res<Time<Real>>,
     mut frame_times: Local<FrameTimes>,
     offscreen: Option<Res<OffscreenCapture>>,
+    frame: Option<Res<render::FrameReadiness>>,
 ) {
     let Some(shot_path) = automation.shot_path.clone() else {
         return;
@@ -1106,8 +1108,8 @@ fn shot_scheduling_system(
         return;
     };
     // Far above the ground the plane-keyed streams hold still
-    // (planet::systems::streams_paused), so a capture from there waits for
-    // none of them.
+    // (planet::systems::streams_paused), so a capture from there waits only
+    // for the erosion prewarm, which runs regardless.
     let paused = planet::systems::streams_paused(player);
     // `--wait` counts frames after the prewarmed tiles have settled, so
     // captures of the same pose compare the same erosion however slowly the
@@ -1124,7 +1126,7 @@ fn shot_scheduling_system(
             )
         })
         .count();
-    if !paused && settled_tiles < automation.erosion_prewarm as usize {
+    if settled_tiles < automation.erosion_prewarm as usize {
         return;
     }
     // Likewise the plants: the library loaded, every chunk around the pinned
@@ -1139,6 +1141,10 @@ fn shot_scheduling_system(
     // Grass arrives asynchronously too. Start counting only once every
     // wanted chunk around this pose has reached the renderer's GPU buffers.
     if !paused && !grass.ready([player.position.x, player.position.z]) {
+        return;
+    }
+    // And the renderer itself: every pass that makes the frame has drawn.
+    if frame.is_some_and(|frame| !frame.ready()) {
         return;
     }
     counter.0 += 1;

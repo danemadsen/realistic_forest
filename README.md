@@ -287,7 +287,8 @@ the planet. The cloud deck is a spherical shell, fog and haze follow true
 altitude and thin with an 8 km scale height, and the sky fades into space with
 the air left above the camera, leaving stars, the sun's unreddened disc and a
 bright limb. Erosion, rivers, buildings and plants stop streaming more than
-20 km above the ground, where their detail is too small to see.
+20 km above the ground, where their detail is too small to see; an
+`--erosion-prewarm` still runs there, and a `--shot` waits for it.
 
 **Known limitations.** The source noise is an 8 km mirror-folded texture, and
 the macro landforms repeat on a lattice of about 54 km; from the ground the

@@ -886,6 +886,9 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
     // reads the terrain constants from level 0's stage block; where it is
     // and how it morphs come with its instance.
     if let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.terrain_pipeline) {
+        if let Some(readiness) = world.get_resource::<super::FrameReadiness>() {
+            readiness.drew(super::FrameReadiness::TERRAIN);
+        }
         let count = view.patches.len().min(MAX_TERRAIN_PATCHES);
         if count < view.patches.len() {
             warn_once!("terrain: {} patches selected, drawing the first {count}", view.patches.len());
@@ -911,7 +914,6 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
             pass.draw_indexed(0..mesh.index_count, 0, instances);
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
