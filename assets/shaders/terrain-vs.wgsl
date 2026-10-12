@@ -1772,7 +1772,8 @@ fn planetTerrainVertex(grid: vec3<f32>, instance: PatchInput) -> VsOutput
     // (water.wgsl), so their beds are too; elsewhere the ground is dry.
     // (No mix through the no-river sentinel, 1e30, which on backends that
     // form mix as x + (y - x)*a cancels to nothing.)
-    let bank = select(40.0, clamp(riverBankAt(river, height), -40.0, 40.0), features >= 0.999);
+    let whole = features >= 0.999;
+    let bank = select(40.0, clamp(riverBankAt(river, height), -40.0, 40.0), whole);
     let lakeShare = riverLakeShare(river, height);
     output.frag_river = vec4<f32>(bank,
                                   river.bend*(1.0 - lakeShare)*features,
@@ -1842,7 +1843,7 @@ fn planetTerrainVertex(grid: vec3<f32>, instance: PatchInput) -> VsOutput
     output.fragWorldPosition = vec3<f32>(plane.x, height, plane.y);
     output.fragWorldNormal = localNormal;
     output.frag_material_normal = materialNormal;
-    if (features > 0.0) {
+    if (whole) {
         output.frag_river_shore = riverShoreRunAt(river, plane, output.frag_base_height, materialNormal);
     } else {
         output.frag_river_shore = riverShoreRun(riverNone(), output.frag_base_height, materialNormal);

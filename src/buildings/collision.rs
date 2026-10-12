@@ -518,6 +518,7 @@ pub fn slide(buildings: &mut [NearBuilding<'_>], from: Vec2, to: Vec2, feet: f32
     let stretch_dt = dt / stretches as f32;
     let mut position = from;
     let mut normal = Vec2::ZERO;
+    let mut touched = false;
     let mut section = Vec::new();
     for _ in 0..stretches {
         position += step;
@@ -531,10 +532,16 @@ pub fn slide(buildings: &mut [NearBuilding<'_>], from: Vec2, to: Vec2, feet: f32
                     moved = true;
                 }
             }
+            touched |= moved;
             if !moved {
                 break;
             }
         }
+    }
+    // A walk that touched nothing ends exactly where it was going, not where
+    // its stretches' rounding left it.
+    if !touched {
+        position = to;
     }
     Slide { position, normal }
 }
@@ -547,6 +554,7 @@ pub fn peek(buildings: &mut [NearBuilding<'_>], from: Vec2, to: Vec2, feet: f32,
     let stretches = (travel.length() / MAX_STEP).ceil().max(1.0) as usize;
     let step = travel / stretches as f32;
     let mut position = from;
+    let mut touched = false;
     let mut section = Vec::new();
     for _ in 0..stretches {
         position += step;
@@ -555,12 +563,13 @@ pub fn peek(buildings: &mut [NearBuilding<'_>], from: Vec2, to: Vec2, feet: f32,
             for building in buildings.iter_mut() {
                 moved |= push_out_of_building(building, &mut position, feet, radius, None, &mut section).is_some();
             }
+            touched |= moved;
             if !moved {
                 break;
             }
         }
     }
-    position
+    if touched { position } else { to }
 }
 
 /// The highest floor, deck, tread or anything else under a body at `point`
@@ -700,6 +709,21 @@ mod tests {
         let through = frame.to_local(Vec3::new(walk.position.x, floor, walk.position.y));
         assert!(through.z < middle.y - 1.0, "stuck at the front door at {through}");
         assert!(buildings[0].doors[front].angle.abs() > 0.5, "the door did not swing: {:?}", buildings[0].doors[front]);
+    }
+
+    #[test]
+    fn a_walk_that_touches_nothing_ends_exactly_where_it_was_going() {
+        // Far out on a face, where f32 resolves 1/32 m and the stretches'
+        // sums would round off the step the player's carry relies on.
+        let library = library();
+        let model = &library.models[library.model_index("house-c").unwrap()];
+        let mut doors = vec![DoorState::default(); model.doors.len()];
+        let mut buildings =
+            vec![NearBuilding { model, frame: BuildingFrame::new(Vec3::new(300_000.0, 20.0, -200_000.0), 0.7), doors: &mut doors }];
+        let from = Vec2::new(300_030.03, -200_030.97);
+        let to = from + Vec2::new(0.31, 0.27);
+        assert_eq!(slide(&mut buildings, from, to, 20.0, PLAYER_RADIUS, 1.0 / 60.0).position, to);
+        assert_eq!(peek(&mut buildings, from, to, 20.0, 0.25), to);
     }
 
     #[test]

@@ -229,8 +229,9 @@ pub fn carry_player_across_faces(
         player.yaw += transfer.yaw_change as f32;
         player.velocity = transfer.rotate(player.velocity);
         player.current = transfer.rotate(player.current);
-        // Plane-axis offsets of the old chart: the next frame finds them anew.
-        player.lean_offset = Vec2::ZERO;
+        // The lean's offset turns with the axes, close enough at a seam; the
+        // rounding carry is the old chart's alone.
+        player.lean_offset = transfer.rotate(player.lean_offset);
         player.plane_carry = Vec2::ZERO;
         position = transfer.to;
         moved = true;

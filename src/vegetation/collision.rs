@@ -192,6 +192,7 @@ pub fn slide(trunks: &[Trunk], from: Vec2, to: Vec2, feet: f32) -> Slide {
     let blocking = || trunks.iter().filter(|trunk| trunk.blocks(feet));
     let mut position = from;
     let mut normal = Vec2::ZERO;
+    let mut touched = false;
     for _ in 0..steps as usize {
         position += increment;
         for _ in 0..SETTLE_PASSES {
@@ -208,6 +209,7 @@ pub fn slide(trunks: &[Trunk], from: Vec2, to: Vec2, feet: f32) -> Slide {
                 position = trunk.position + direction * (trunk.radius + PLAYER_RADIUS);
                 normal += direction;
                 pushed = true;
+                touched = true;
             }
             if !pushed {
                 break;
@@ -218,6 +220,11 @@ pub fn slide(trunks: &[Trunk], from: Vec2, to: Vec2, feet: f32) -> Slide {
     // rather than end the step inside one.
     if blocking().any(|trunk| trunk.touches(position)) && !blocking().any(|trunk| trunk.touches(from)) {
         return Slide { position: from, normal: normal.normalize_or_zero() };
+    }
+    // A step that touched nothing ends exactly where it was going, not where
+    // its stretches' rounding left it.
+    if !touched {
+        position = to;
     }
     Slide { position, normal: normal.normalize_or_zero() }
 }

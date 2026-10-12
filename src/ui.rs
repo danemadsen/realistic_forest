@@ -731,6 +731,7 @@ fn draw_trainer_window(
                 rerun,
                 rivers,
                 buildings,
+                cache,
             );
         }
         ui.small("2 close menu  |  3 debug text  |  F12 screenshot");
@@ -767,6 +768,7 @@ fn draw_advanced_controls(
     rerun: &mut RerunErosion,
     rivers: Option<&crate::rivers::RiverField>,
     buildings: Option<&crate::buildings::BuildingField>,
+    cache: &ErosionCache,
 ) {
     separator_text(ui, "Weather");
     ui.checkbox(&mut weather.automatic, "Moving weather fronts");
@@ -1015,7 +1017,10 @@ fn draw_advanced_controls(
     match buildings.filter(|field| field.enabled()) {
         Some(field) => {
             ui.label(format!("{} buildings placed within 2.4 km", field.building_count()));
-            if let Some(nearest) = field.nearest(Vec2::new(player.position.x, player.position.z), |_| true) {
+            let drawn = |placement: &crate::buildings::placement::Placement| {
+                crate::planet::height::features_whole(cache, placement.origin.x, placement.origin.z)
+            };
+            if let Some(nearest) = field.nearest(Vec2::new(player.position.x, player.position.z), drawn) {
                 ui.label(format!("Nearest: {} at {:.0} m", nearest.name, nearest.distance));
             }
         }
