@@ -59,9 +59,6 @@ pub struct Player {
     pub ground_below: f32,
     /// The planet's pull where the player is, over its pull at sea level.
     pub gravity_scale: f32,
-    /// Free flight under the planet's gravity, KSP style, while it lasts:
-    /// the body's own planet-centred state, which `position` follows.
-    pub free_flight: Option<crate::planet::flight::FreeFlight>,
     /// The body's roll about its line of sight, radians, positive to the
     /// right: Q and E roll it in flight; on the ground it is the head's tilt
     /// as it leans.
@@ -204,7 +201,6 @@ impl Default for Player {
             face: crate::planet::Face::PosY,
             ground_below: 0.0,
             gravity_scale: 1.0,
-            free_flight: None,
             roll: 0.0,
             lean: 0.0,
             lean_offset: Vec2::ZERO,
@@ -255,11 +251,6 @@ impl Player {
         self.position + Vec3::new(self.lean_offset.x, -LEAN_DROP * self.lean.abs(), self.lean_offset.y)
     }
 
-    /// Whether the body flies, under gravity or not: Q and E roll it, and
-    /// the mouse turns it about its own axes.
-    pub fn in_flight(&self) -> bool {
-        self.flying || self.free_flight.is_some()
-    }
 
     /// Move to finite world coordinates and discard momentum from the old
     /// pose, and the water there: the renderer may draw the new pose before
@@ -272,7 +263,6 @@ impl Player {
         self.position = position;
         self.vertical_velocity = 0.0;
         self.velocity = Vec2::ZERO;
-        self.free_flight = None;
         self.plane_carry = Vec2::ZERO;
         self.swimming = false;
         self.leapt = false;
@@ -283,14 +273,13 @@ impl Player {
         true
     }
 
-    /// Start or stop flying, ending any free flight. Flight's speed is not
-    /// momentum: a body that stops flying drops from rest, rather than gliding on at flight speed
+    /// Start or stop flying. Flight's speed is not momentum: a body that
+    /// stops flying drops from rest, rather than gliding on at flight speed
     /// over water it has not yet reached. It is set down as it is: one
     /// crouched under standing height, low in the shallows say, stands up as
     /// a swimmer does rather than being lifted onto its feet in a frame.
     pub fn set_flying(&mut self, flying: bool) {
         self.flying = flying;
-        self.free_flight = None;
         self.vertical_velocity = 0.0;
         self.velocity = Vec2::ZERO;
         self.swimming = !flying;
@@ -395,7 +384,7 @@ pub fn update_player_system(
             .fold(Vec2::ZERO, |a, b| a + b);
         if player.mouse_warmup_frames > 0 {
             player.mouse_warmup_frames -= 1;
-        } else if player.in_flight() {
+        } else if player.flying {
             turn_in_flight(&mut player, delta);
         } else {
             player.yaw += delta.x * MOUSE_RADIANS;
@@ -410,15 +399,10 @@ pub fn update_player_system(
     } else {
         (keys.pressed(KeyCode::KeyE) as i32 - keys.pressed(KeyCode::KeyQ) as i32) as f32
     };
-    if player.in_flight() {
+    if player.flying {
         roll_in_flight(&mut player, roll_input, dt);
     } else {
         lean_on_feet(&mut player, roll_input, dt);
-    }
-    // A free-flying body is moved by the planet's gravity and its own thrust
-    // (planet::systems::free_flight_system); the player only looks around.
-    if player.free_flight.is_some() {
-        return;
     }
 
     let mut movement = Vec3::ZERO;
@@ -935,7 +919,7 @@ const STEP_HEIGHT: f32 = 1.25;
 const JUMP_SPEED: f32 = 7.4;
 /// How fast a body in the air gathers downward speed, m/s². Stronger than
 /// gravity, so jumps and falls feel snappy rather than floaty.
-const FALL_ACCELERATION: f32 = 23.0;
+const FALL_ACCELERATION: f32 = crate::planet::PLANET_SURFACE_GRAVITY as f32;
 /// How far the eye floats above the water when it is too deep to stand in.
 pub const SWIM_FREEBOARD: f32 = 0.25;
 /// How far over the water the eye may be and swim: a body falling into deep

@@ -35,7 +35,6 @@
 //! radius costs no precision; what remains is the precision of the terrain
 //! plane coordinates themselves, bounded by the face's extent.
 
-pub mod flight;
 pub mod height;
 pub mod quadtree;
 pub mod systems;
@@ -77,11 +76,11 @@ pub const ATMOSPHERE_TOP: f64 = 60_000.0;
 /// planet wears a finite shell of air.
 pub const AIR_SCALE_HEIGHT: f32 = 8_000.0;
 
-/// Standard gravity at sea level: the planet's pull on a free-flying body
-/// ([`flight`]), which gives it Kerbin's low orbital speeds. The walking
-/// controller's own falls keep their tuned constant, scaled with altitude by
-/// the same inverse square.
-pub const PLANET_SURFACE_GRAVITY: f64 = 9.81;
+/// The planet's pull at sea level, m/s²: the one gravity everything that
+/// falls feels, weakening with the square of the distance from the centre.
+/// With the planet's radius it is also its mass, which sets how the moon
+/// goes round it.
+pub const PLANET_SURFACE_GRAVITY: f64 = 23.0;
 
 /// One of the six cube faces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
@@ -376,6 +375,12 @@ impl Planet {
         let east_axis = face.basis().east;
         let east = (east_axis - up * up.dot(east_axis)).normalize();
         LocalFrame { east, up, north: east.cross(up) }
+    }
+
+    /// The planet's gravitational parameter `GM`, m³/s²: what gives
+    /// [`PLANET_SURFACE_GRAVITY`] at sea level.
+    pub fn gravitational_parameter(&self) -> f64 {
+        PLANET_SURFACE_GRAVITY * self.radius * self.radius
     }
 
     /// Gravitational acceleration at `altitude`, falling off with the square
