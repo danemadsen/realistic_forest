@@ -2112,8 +2112,11 @@ mod shading_tests {
         for gone in ["hash11", "round(", "wind_direction", "select(-1.0, 1.0"] {
             assert!(!sea.contains(gone), "windSea still uses {gone}");
         }
-        let phase = sea.lines().find(|line| line.contains("let phase =")).expect("a phase");
+        let phase = sea.lines().find(|line| line.contains("var phase =")).expect("a phase");
         assert!(phase.contains("dot(wave.xy, wrapped)") && phase.contains("wave.z"), "{phase}");
+        // The current carries a wave on by a turn of its own wave vector alone.
+        let turn = sea.lines().find(|line| line.contains("let turn =")).expect("a turn");
+        assert!(turn.contains("dot(wave.xy, drift.xy)"), "{turn}");
     }
 
     /// The shader's spread is the CPU's, which carries the measurements.
