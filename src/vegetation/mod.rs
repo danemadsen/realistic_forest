@@ -314,6 +314,7 @@ fn chunk_distance(chunk: [i64; 2], x: f64, z: f64) -> f64 {
 pub fn stream_vegetation(
     mut field: ResMut<VegetationField>,
     rivers: Res<crate::rivers::RiverField>,
+    buildings: Res<crate::buildings::BuildingField>,
     players: Query<&Player>,
     time: Res<Time>,
 ) {
@@ -410,7 +411,16 @@ pub fn stream_vegetation(
         let noise = field.noise.clone();
         let catalog = catalog.clone();
         let network = rivers.network().cloned();
-        let task = pool.spawn(async move { scatter::generate_level(&noise, &catalog, network.as_deref(), chunk, level) });
+        let planner = buildings.planner().cloned();
+        let generate = async move {
+            // The buildings around the chunk, whose yards its plants keep out of.
+            let clearings = match &planner {
+                Some(planner) => crate::buildings::clearings_around(planner, network.as_ref(), chunk),
+                None => Vec::new(),
+            };
+            scatter::generate_level(&noise, &catalog, network.as_deref(), &clearings, chunk, level)
+        };
+        let task = pool.spawn(generate);
         field.tasks.insert((chunk, level), task);
     }
     field.settled = wanted.is_empty() && field.tasks.is_empty();
@@ -493,7 +503,7 @@ pub(crate) mod tests {
         let mut plants = Vec::new();
         for chunk in [[-1, -1], [0, -1], [-1, 0], [0, 0]] {
             for level in [LEVEL_TREES, LEVEL_SHRUBS] {
-                plants.extend(scatter::generate_level(&noise, &catalog, None, chunk, level));
+                plants.extend(scatter::generate_level(&noise, &catalog, None, &[], chunk, level));
             }
         }
         let solids: Vec<(collision::Solid, u32)> = plants

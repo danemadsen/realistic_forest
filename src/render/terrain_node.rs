@@ -1123,6 +1123,7 @@ fn terrain_texture_layout() -> BindGroupLayoutDescriptor {
             },
             river_storage_entry(17), // river lookup grid
             river_storage_entry(18), // river carve segments
+            river_storage_entry(19), // building pads
         ],
     )
 }
@@ -1364,6 +1365,10 @@ fn terrain_texture_bind_group(
         wgpu::BindGroupEntry {
             binding: 18,
             resource: textures.river_segments.as_entire_binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 19,
+            resource: textures.building_pads.as_entire_binding(),
         },
     ];
     super::bind_group(device, cache, "forest_terrain_textures", layout, &entries)
@@ -2406,13 +2411,13 @@ mod heightfield_cache_tests {
         };
 
         // The two uniform blocks below; the base noise and blend mask,
-        // uploaded once; the surface atlas, tile lookup and river buffers,
-        // which all move TerrainRevision; and their samplers. Not the snow,
-        // so a fresh trail leaves both maps be.
+        // uploaded once; the surface atlas, tile lookup, river buffers and
+        // building pads, which all move TerrainRevision; and their samplers.
+        // Not the snow, so a fresh trail leaves both maps be.
         assert_eq!(
             read,
             set(&[
-                "globals", "river_grid", "river_segments", "stage", "tex0", "tex0_sampler",
+                "building_pads", "globals", "river_grid", "river_segments", "stage", "tex0", "tex0_sampler",
                 "tex1", "tex1_sampler", "tex3", "tex4", "tex4_sampler",
             ]),
             "the heightfield capture reads a resource HeightfieldKey does not know about"

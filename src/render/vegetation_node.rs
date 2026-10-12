@@ -287,7 +287,7 @@ pub struct VegetationNodeState(Mutex<Option<VegetationResources>>);
 // Layout helpers
 // ---------------------------------------------------------------------------
 
-fn texture_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+pub(super) fn texture_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility,
@@ -300,7 +300,7 @@ fn texture_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
     }
 }
 
-fn sampler_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+pub(super) fn sampler_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility,
@@ -309,7 +309,7 @@ fn sampler_entry(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGrou
     }
 }
 
-fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages, size: u64) -> wgpu::BindGroupLayoutEntry {
+pub(super) fn uniform_entry(binding: u32, visibility: wgpu::ShaderStages, size: u64) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility,
@@ -335,7 +335,7 @@ fn storage_entry(binding: u32, visibility: wgpu::ShaderStages, read_only: bool) 
     }
 }
 
-fn sampler(device: &RenderDevice, label: &str, address: wgpu::AddressMode, anisotropy: u16) -> wgpu::Sampler {
+pub(super) fn sampler(device: &RenderDevice, label: &str, address: wgpu::AddressMode, anisotropy: u16) -> wgpu::Sampler {
     let sampler_descriptor = wgpu::SamplerDescriptor {
         label: Some(label),
         address_mode_u: address,
@@ -363,7 +363,7 @@ fn sided_pipelines(cache: &PipelineCache, descriptor: RenderPipelineDescriptor) 
     })
 }
 
-fn upload_texture(device: &RenderDevice, queue: &RenderQueue, source: &PreparedTexture) -> wgpu::TextureView {
+pub(super) fn upload_texture(device: &RenderDevice, queue: &RenderQueue, source: &PreparedTexture) -> wgpu::TextureView {
     let texture_descriptor = wgpu::TextureDescriptor {
         label: Some(&source.label),
         size: wgpu::Extent3d {
@@ -648,6 +648,7 @@ fn build_library(
             sampler_entry(9, compute),
             storage_entry(10, compute, true),
             storage_entry(11, compute, true),
+            storage_entry(12, compute, true),
         ],
     );
     let cull_layout = BindGroupLayoutDescriptor::new(
@@ -1062,7 +1063,7 @@ fn prepare_vegetation(
 
 /// The four side planes of the view frustum in world space, inward facing,
 /// from the combined view-projection (Gribb-Hartmann).
-fn frustum_planes(view: &[f32; 16], projection: &[f32; 16]) -> [[f32; 4]; 4] {
+pub(super) fn frustum_planes(view: &[f32; 16], projection: &[f32; 16]) -> [[f32; 4]; 4] {
     let m = crate::matrices::mul_m4(projection, view);
     let row = |r: usize| [m[r], m[4 + r], m[8 + r], m[12 + r]];
     let (x, y, w) = (row(0), row(1), row(3));
@@ -1085,7 +1086,7 @@ fn frustum_planes(view: &[f32; 16], projection: &[f32; 16]) -> [[f32; 4]; 4] {
 
 /// The light whose shadows the plants cast this frame: the sun while it is
 /// up, else the moon while it shines, as (direction of travel, is the moon).
-fn shadowing_light(globals: &super::GlobalUniformsGpu) -> Option<([f32; 3], bool)> {
+pub(super) fn shadowing_light(globals: &super::GlobalUniformsGpu) -> Option<([f32; 3], bool)> {
     let sun = [globals.sun_direction[0], globals.sun_direction[1], globals.sun_direction[2]];
     let moon = [globals.moon_direction[0], globals.moon_direction[1], globals.moon_direction[2]];
     if globals.settings_a[0] > 0.01 && sun[1] < -0.01 {
@@ -1294,6 +1295,10 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
             binding: 11,
             resource: textures.river_segments.as_entire_binding(),
         },
+        wgpu::BindGroupEntry {
+            binding: 12,
+            resource: textures.building_pads.as_entire_binding(),
+        },
     ];
     let terrain_group = super::bind_group(
         device,
@@ -1428,6 +1433,7 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
         }
     }
     queue.write_buffer(&targets.uniform, 0, bytemuck::bytes_of(&ShadowUniform::new(&cascades, &light, moon)));
+    targets.drawn_frame.store(view.frame, std::sync::atomic::Ordering::Release);
 }
 
 pub fn register_vegetation_systems(app: &mut bevy::app::SubApp) {

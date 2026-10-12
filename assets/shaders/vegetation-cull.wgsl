@@ -99,6 +99,7 @@ struct StageUniforms {
 
 @group(1) @binding(10) var<storage, read> river_grid: array<u32>;      // river lookup grid
 @group(1) @binding(11) var<storage, read> river_segments: array<RiverSegment>; // river carve segments
+@group(1) @binding(12) var<storage, read> building_pads: array<u32>;         // building pads (building-pads.wgslinc)
 
 // BEGIN SHARED TERRAIN HEIGHT
 // The streamed landform: base noise relief plus the four-pass erosion delta,
@@ -107,8 +108,9 @@ struct StageUniforms {
 // plant's root on it; a test keeps the pasted copies identical, so a trunk
 // stands exactly on the ground the terrain pass draws. Requires StageUniforms
 // as `stage` and the base noise, surface atlas, tile lookup and blend mask as
-// tex0, tex1, tex3 and tex4 with their samplers, and the shared river block
-// (river-functions.wgslinc) with its two storage buffers.
+// tex0, tex1, tex3 and tex4 with their samplers, the shared river block
+// (river-functions.wgslinc) with its two storage buffers, and the shared
+// building pads (building-pads.wgslinc) with theirs.
 fn smoothHermite(edge0: f32, edge1: f32, value: f32) -> f32
 {
     let t = clamp((value - edge0)/max(edge1 - edge0, 0.0001), 0.0, 1.0);
@@ -359,9 +361,12 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
     // Erosion was simulated over the river-carved base, so its delta goes on
     // top of the carved base, and the channels are held once more over the
     // result: a river keeps its bed and banks whatever the water did there.
+    // The buildings' pads level the result last, so a house stands on the
+    // same ground whatever the erosion did under it (building-pads.wgslinc).
     let river = riverEnvelope(worldXZ);
-    return riverClamp(river, riverClamp(river, baseHeight(worldXZ))
-                             + erosionDelta(worldXZ)*erosionVisibility(worldXZ));
+    let ground = riverClamp(river, riverClamp(river, baseHeight(worldXZ))
+                                   + erosionDelta(worldXZ)*erosionVisibility(worldXZ));
+    return buildingPadHeight(worldXZ, ground);
 }
 // END SHARED TERRAIN HEIGHT
 
@@ -879,6 +884,120 @@ fn riverClamp(envelope: RiverEnvelope, height: f32) -> f32
                           envelope.upper, RIVER_CARVE_ROUNDING);
 }
 // END SHARED RIVERS
+
+// BEGIN SHARED BUILDING PADS
+// The ground levelled under and around each building (src/buildings/pads.rs,
+// which mirrors this on the CPU for the player's footing). A pad is a
+// rectangle turned with its building, flat at one level, and a skirt around
+// it over which the ground eases back into the land: the pad's weight falls
+// from one to nothing as a smootherstep of the distance from the rectangle.
+// Pads apply last, over the eroded and river-carved ground, in the order the
+// CPU lists them. A town's main street is a pad too, of the second kind: it
+// wears the ground into a dirt road and leaves its height be. Requires
+// `building_pads`, the u32 buffer PadIndex::gpu_words writes: a header (grid
+// origin, cell size, cells across, pad offset, pad count), a grid of (list
+// offset, count) pairs, the lists, then the pads.
+const BUILDING_PAD_HEADER_WORDS: u32 = 8u;
+const BUILDING_PAD_WORDS: u32 = 12u;
+const BUILDING_PAD_MAX_CANDIDATES: u32 = 12u;
+const BUILDING_PAD_STREET: u32 = 1u;
+
+fn buildingPadFloat(word: u32) -> f32
+{
+    return bitcast<f32>(building_pads[word]);
+}
+
+// The offset and length of the list of pads reaching `p`; none outside the grid.
+fn buildingPadList(p: vec2<f32>) -> vec2<u32>
+{
+    let resolution = building_pads[3];
+    if (resolution == 0u) { return vec2<u32>(0u); }
+    let origin = vec2<f32>(buildingPadFloat(0u), buildingPadFloat(1u));
+    let cell = floor((p - origin)/buildingPadFloat(2u));
+    if (any(cell < vec2<f32>(0.0)) || any(cell >= vec2<f32>(f32(resolution)))) { return vec2<u32>(0u); }
+    let entry = BUILDING_PAD_HEADER_WORDS + (u32(cell.y)*resolution + u32(cell.x))*2u;
+    return vec2<u32>(building_pads[entry], min(building_pads[entry + 1u], BUILDING_PAD_MAX_CANDIDATES));
+}
+
+// A point in a pad's own axes, from its centre.
+fn buildingPadLocal(base: u32, p: vec2<f32>) -> vec2<f32>
+{
+    let offset = p - vec2<f32>(buildingPadFloat(base), buildingPadFloat(base + 1u));
+    let axis = vec2<f32>(buildingPadFloat(base + 2u), buildingPadFloat(base + 3u));
+    return vec2<f32>(offset.x*axis.x - offset.y*axis.y, offset.x*axis.y + offset.y*axis.x);
+}
+
+fn buildingPadSmoother(t: f32) -> f32
+{
+    let x = clamp(t, 0.0, 1.0);
+    return x*x*x*(x*(x*6.0 - 15.0) + 10.0);
+}
+
+// The ground at `p` once every pad reaching it has levelled it.
+fn buildingPadHeight(p: vec2<f32>, height: f32) -> f32
+{
+    let list = buildingPadList(p);
+    var levelled = height;
+    for (var i = 0u; i < list.y; i += 1u)
+    {
+        let base = building_pads[4] + building_pads[list.x + i]*BUILDING_PAD_WORDS;
+        if (building_pads[base + 9u] == BUILDING_PAD_STREET) { continue; }
+        let local = buildingPadLocal(base, p);
+        let half = vec2<f32>(buildingPadFloat(base + 4u), buildingPadFloat(base + 5u));
+        let outside = length(max(abs(local) - half, vec2<f32>(0.0)));
+        let weight = 1.0 - buildingPadSmoother(outside/buildingPadFloat(base + 7u));
+        levelled += (buildingPadFloat(base + 6u) - levelled)*weight;
+    }
+    return levelled;
+}
+
+// How much a building's footprint keeps grass out at `p`: all of it on the
+// building's floor and a little past its walls, none two metres out.
+fn buildingPadFootprint(p: vec2<f32>) -> f32
+{
+    let list = buildingPadList(p);
+    var covered = 0.0;
+    for (var i = 0u; i < list.y; i += 1u)
+    {
+        let base = building_pads[4] + building_pads[list.x + i]*BUILDING_PAD_WORDS;
+        if (building_pads[base + 9u] == BUILDING_PAD_STREET) { continue; }
+        let local = buildingPadLocal(base, p);
+        let inset = buildingPadFloat(base + 8u);
+        let half = vec2<f32>(buildingPadFloat(base + 4u), buildingPadFloat(base + 5u));
+        let footprint = max(half - vec2<f32>(inset), vec2<f32>(0.0));
+        let beyond = length(max(abs(local) - footprint, vec2<f32>(0.0)));
+        covered = max(covered, 1.0 - smoothstep(0.6, 2.0, beyond));
+    }
+    return covered;
+}
+// How worn the ground around a building is, 0 to 1: trodden through to the
+// earth along its walls and porch, patchy across its yard, untouched past its
+// pad's skirt; and down a town's main street, a dirt road from porch to porch.
+fn buildingPadTrodden(p: vec2<f32>) -> f32
+{
+    let list = buildingPadList(p);
+    var worn = 0.0;
+    for (var i = 0u; i < list.y; i += 1u)
+    {
+        let base = building_pads[4] + building_pads[list.x + i]*BUILDING_PAD_WORDS;
+        let local = buildingPadLocal(base, p);
+        let inset = buildingPadFloat(base + 8u);
+        let half = vec2<f32>(buildingPadFloat(base + 4u), buildingPadFloat(base + 5u));
+        let footprint = max(half - vec2<f32>(inset), vec2<f32>(0.0));
+        let beyond = length(max(abs(local) - footprint, vec2<f32>(0.0)));
+        if (building_pads[base + 9u] == BUILDING_PAD_STREET)
+        {
+            worn = max(worn, 0.85*(1.0 - smoothstep(0.0, buildingPadFloat(base + 7u), beyond)));
+            continue;
+        }
+        let yard = inset + 0.7*buildingPadFloat(base + 7u);
+        let path = 0.9*(1.0 - smoothstep(0.5, 3.5, beyond));
+        let patches = 0.4*(1.0 - smoothstep(2.0, yard, beyond));
+        worn = max(worn, max(path, patches));
+    }
+    return clamp(worn, 0.0, 1.0);
+}
+// END SHARED BUILDING PADS
 
 // One streamed plant, as the scatter wrote it. Mirrors `PlantInstance` in
 // src/vegetation/scatter.rs (32 bytes).

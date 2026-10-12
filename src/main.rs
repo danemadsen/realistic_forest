@@ -6,6 +6,7 @@
 //! terrain G-buffer -> SSAO -> blur -> composite -> FXAA -> egui -> upscale).
 
 mod automation;
+mod buildings;
 mod constants;
 mod day_night;
 mod erosion;
@@ -80,6 +81,14 @@ struct PrewarmRemaining(pub u32);
 
 #[derive(Resource, Default)]
 struct FrameCounter(pub u64);
+
+/// `--offscreen --shot`: the image the camera renders into in place of a
+/// window, and its size in pixels.
+#[derive(Resource, Clone)]
+pub struct OffscreenCapture {
+    pub image: Option<Handle<Image>>,
+    pub size: [u32; 2],
+}
 
 #[derive(Resource, Default)]
 struct ShotRequested(pub bool);
@@ -190,6 +199,12 @@ fn main() {
         rivers::map::run_map(&noise_field, path, automation.map_centre, extent);
         return;
     }
+    // --building-map charts the settlements and exits with no window.
+    if let Some(path) = &automation.building_map {
+        let extent = if automation.map_extent_set { automation.map_extent } else { 8192.0 };
+        buildings::map::run_map(&noise_field, path, automation.map_centre, extent);
+        return;
+    }
 
     let startup_settings = {
         let mut settings = AppSettings::default();
@@ -234,10 +249,32 @@ fn main() {
         field
     };
 
+    // The buildings around spawn are placed before anything streams too: the
+    // ground the player first stands on is already levelled under them.
+    let building_field = {
+        let spawn = if automation.has_camera { automation.position } else { [0.0, 0.0, 0.0] };
+        let models = std::path::PathBuf::from(resolve_asset_root()).join("models").join("buildings");
+        let mut field = buildings::BuildingField::new(
+            std::sync::Arc::new(noise_field.clone()),
+            river_field.network(),
+            &models,
+            bevy::math::Vec2::new(spawn[0], spawn[2]),
+            !automation.no_buildings,
+        );
+        if automation.open_doors {
+            field.hold_doors_open();
+        }
+        field
+    };
+
     // The size raylib would have handed to glfwCreateWindow, clamped to the
-    // primary monitor's work area the way raylib clamps it.
-    let (screen_width, screen_height) =
-        clamp_to_primary_work_area(automation.width as u32, automation.height as u32);
+    // primary monitor's work area the way raylib clamps it. An offscreen
+    // capture has no window to fit on a screen.
+    let (screen_width, screen_height) = if automation.offscreen && automation.shot_path.is_some() {
+        (automation.width as u32, automation.height as u32)
+    } else {
+        clamp_to_primary_work_area(automation.width as u32, automation.height as u32)
+    };
 
     let window = Window {
         title: "Forest - Infinite Procedural Terrain".into(),
@@ -279,11 +316,23 @@ fn main() {
         resolution: WindowResolution::new(screen_width, screen_height),
         ..default()
     };
-    let window_plugin = bevy::window::WindowPlugin {
-        primary_window: Some(window),
-        exit_condition: bevy::window::ExitCondition::OnPrimaryClosed,
-        close_when_requested: true,
-        ..default()
+    // An offscreen capture opens no window at all: the camera renders into an
+    // image, and the app runs on a plain loop instead of winit's.
+    let offscreen = automation.offscreen && automation.shot_path.is_some();
+    let window_plugin = if offscreen {
+        bevy::window::WindowPlugin {
+            primary_window: None,
+            exit_condition: bevy::window::ExitCondition::DontExit,
+            close_when_requested: false,
+            ..default()
+        }
+    } else {
+        bevy::window::WindowPlugin {
+            primary_window: Some(window),
+            exit_condition: bevy::window::ExitCondition::OnPrimaryClosed,
+            close_when_requested: true,
+            ..default()
+        }
     };
     // The port filters R32Float (the noise field) and Rgba32Float
     // (the erosion atlases and the G-buffer position target)
@@ -306,9 +355,19 @@ fn main() {
         ..default()
     });
     default_plugins = default_plugins.set(render_plugin);
+    if offscreen {
+        default_plugins = default_plugins.disable::<bevy::winit::WinitPlugin>();
+    }
 
     let mut app = App::new();
     app.add_plugins(default_plugins);
+    if offscreen {
+        app.add_plugins(bevy::app::ScheduleRunnerPlugin::run_loop(std::time::Duration::ZERO));
+        app.insert_resource(OffscreenCapture {
+            image: None,
+            size: [automation.width.max(1) as u32, automation.height.max(1) as u32],
+        });
+    }
     app.add_plugins(EguiPlugin::default());
     // Developer teleports update the camera during the egui pass. Run
     // that pass before propagation so visibility sees the same pose.
@@ -342,9 +401,12 @@ fn main() {
     app.insert_resource(weather);
     app.insert_resource(ErosionCache {
         rivers: river_field.network().cloned(),
+        buildings: Some(building_field.pads().clone()),
         ..Default::default()
     });
     app.insert_resource(river_field);
+    app.insert_resource(building_field);
+    app.init_resource::<buildings::EyeAdaptation>();
     app.init_resource::<snow::SnowState>();
     app.insert_resource(ErosionSettings::default());
     app.insert_resource(AppliedErosionSettings(ErosionSettings::default()));
@@ -399,10 +461,12 @@ fn main() {
             thunder::play_thunder,
             ui::ui_wants_input_system,
             rivers::stream_rivers,
+            buildings::stream_buildings,
             // --measure-overlap replaces normal streaming with its own
             // driver, mirroring the C++ short-circuit in main().
             erosion_stream_system.run_if(not_in_measure_mode),
             player::update_player_system,
+            buildings::adapt_eye,
             player::sync_player_camera_transform,
             vegetation::stream_vegetation,
             measure_overlap_system.run_if(in_measure_mode),
@@ -444,8 +508,13 @@ fn resolve_asset_root() -> String {
 }
 
 /// The camera and the player. This is the only camera entity in the app, so
-/// bevy_egui's auto-creation attaches the primary egui context to it.
-fn spawn_scene(mut commands: Commands) {
+/// bevy_egui's auto-creation attaches the primary egui context to it. An
+/// offscreen capture's camera renders into its image instead of the window.
+fn spawn_scene(
+    mut commands: Commands,
+    offscreen: Option<ResMut<OffscreenCapture>>,
+    mut images: ResMut<Assets<Image>>,
+) {
     commands.spawn(Player::default());
     let camera_bundle = (
         Transform::default(),
@@ -464,7 +533,20 @@ fn spawn_scene(mut commands: Commands) {
         VisibleEntities::default(),
         Msaa::Off,
     );
-    commands.spawn(camera_bundle);
+    let camera = commands.spawn(camera_bundle).id();
+    if let Some(mut offscreen) = offscreen {
+        // The swapchain's own format, so every pass builds the pipelines it
+        // would for the window, and the PNG writer reads it as it does a
+        // window capture.
+        let format = bevy::render::render_resource::TextureFormat::Bgra8UnormSrgb;
+        let mut target = Image::new_target_texture(offscreen.size[0], offscreen.size[1], format, None);
+        target.texture_descriptor.usage |= bevy::render::render_resource::TextureUsages::COPY_SRC;
+        let handle = images.add(target);
+        commands
+            .entity(camera)
+            .insert(bevy::camera::RenderTarget::Image(handle.clone().into()));
+        offscreen.image = Some(handle);
+    }
 }
 
 /// The CPU half of `CreateErosionBlendMask`: the per-texel mask that erosion
@@ -485,8 +567,36 @@ fn setup_cursor_and_player(
     mut player: Query<&mut Player>,
     mut windows: Query<(&mut bevy::window::CursorOptions,), With<PrimaryWindow>>,
     mut snow: ResMut<snow::SnowState>,
+    offscreen: Option<Res<OffscreenCapture>>,
 ) {
     if *local {
+        return;
+    }
+    // An offscreen capture has no window, and no cursor to set.
+    if offscreen.is_some() {
+        let Ok(mut player) = player.single_mut() else {
+            return;
+        };
+        *local = true;
+        let spawn = if automation.has_camera { automation.position } else { [0.0, 0.0, 0.0] };
+        snow.recenter(bevy::math::Vec2::new(spawn[0], spawn[2]));
+        if automation.has_camera {
+            player.position = bevy::math::Vec3::from(automation.position);
+            player.yaw = automation.yaw;
+            player.pitch = automation.pitch;
+            player.flying = true;
+        } else {
+            player.position.y = erosion::sample_eroded_height(&cache, &noise, 0.0, 0.0, [0.0, 0.0]) + EYE_HEIGHT;
+        }
+        player.mouse_captured = false;
+        log::info!(
+            "SHOT: pose pinned at {:.1},{:.1},{:.1} yaw {:.1} pitch {:.1} (offscreen)",
+            player.position.x,
+            player.position.y,
+            player.position.z,
+            player.yaw.to_degrees(),
+            player.pitch.to_degrees(),
+        );
         return;
     }
     // The one-shot latch is set only once the queries actually resolve. Both
@@ -945,6 +1055,7 @@ fn shot_scheduling_system(
     automation: Res<AutomationSettings>,
     cache: Res<ErosionCache>,
     vegetation: Res<vegetation::VegetationField>,
+    buildings: Res<buildings::BuildingField>,
     grass: Res<grass::GrassReadiness>,
     bridge: Option<Res<erosion::ErosionBridge>>,
     players: Query<&Player>,
@@ -953,6 +1064,7 @@ fn shot_scheduling_system(
     mut commands: Commands,
     time: Res<Time<Real>>,
     mut frame_times: Local<FrameTimes>,
+    offscreen: Option<Res<OffscreenCapture>>,
 ) {
     let Some(shot_path) = automation.shot_path.clone() else {
         return;
@@ -978,6 +1090,10 @@ fn shot_scheduling_system(
     // Likewise the plants: the library loaded, every chunk around the pinned
     // camera scattered, and the latest snapshot on the GPU.
     if !vegetation.ready() {
+        return;
+    }
+    // And the buildings: placed around the pose, textured and uploaded.
+    if !buildings.ready() {
         return;
     }
     // Grass arrives asynchronously too. Start counting only once every
@@ -1039,9 +1155,11 @@ fn shot_scheduling_system(
         // code rather than looking like a success.
         std::process::exit(if saved { 0 } else { 1 });
     };
-    commands
-        .spawn(Screenshot::primary_window())
-        .observe(save_and_exit);
+    let screenshot = match offscreen.as_ref().and_then(|offscreen| offscreen.image.clone()) {
+        Some(image) => Screenshot::image(image),
+        None => Screenshot::primary_window(),
+    };
+    commands.spawn(screenshot).observe(save_and_exit);
 }
 
 #[cfg(test)]
@@ -1256,10 +1374,10 @@ mod shot_scheduling_tests {
         let empty_noise = NoiseField {
             samples: Vec::new(),
         };
-        app.insert_resource(vegetation::VegetationField::new(
-            Arc::new(empty_noise),
-            false,
-        ));
+        let empty_noise = Arc::new(empty_noise);
+        app.insert_resource(vegetation::VegetationField::new(empty_noise.clone(), false));
+        let no_buildings = buildings::BuildingField::new(empty_noise, None, std::path::Path::new("."), Vec2::ZERO, false);
+        app.insert_resource(no_buildings);
         app.add_systems(Update, shot_scheduling_system);
         let player = app.world_mut().spawn(Player::default()).id();
         (app, player)

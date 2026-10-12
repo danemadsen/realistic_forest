@@ -40,8 +40,30 @@ struct PrecipitationFrame {
     snow: vec4<f32>,
     // Ground splashes: screen cells across and down, unused, last instance + 1.
     splash: vec4<f32>,
+    // x the number of roof boxes in `shelters`.
+    shelter: vec4<f32>,
+    // The roofs near the camera, two vec4 each: centre XZ and the turn's
+    // cosine and sine, then half extents, the ground under the box and the
+    // top of its roof (src/render/building_node.rs).
+    shelters: array<vec4<f32>, 64>,
 };
 @group(2) @binding(0) var<uniform> frame: PrecipitationFrame;
+
+// Whether a point lies under a building's roof, where no rain falls.
+fn sheltered(p: vec3<f32>) -> bool {
+    let count = min(u32(frame.shelter.x), 32u);
+    for (var i = 0u; i < count; i += 1u) {
+        let placement = frame.shelters[i*2u];
+        let extent = frame.shelters[i*2u + 1u];
+        let offset = p.xz - placement.xy;
+        let local = vec2<f32>(offset.x*placement.z - offset.y*placement.w,
+                              offset.x*placement.w + offset.y*placement.z);
+        if (all(abs(local) <= extent.xy) && p.y >= extent.z && p.y <= extent.w) {
+            return true;
+        }
+    }
+    return false;
+}
 
 const PI: f32 = 3.14159265;
 // A cinematic 1/30 s exposure draws each falling drop as a streak.
@@ -427,9 +449,17 @@ fn splashParticle(vertex: u32, index: u32) -> ParticleVertex {
     if (surface.a < 0.5) { return hiddenParticle(2u); }
     let view_distance = length(surface.xyz);
     if (!(view_distance >= 0.5 && view_distance <= 14.0)) { return hiddenParticle(2u); }
-    // G-buffer alpha stores snow to hundredths and grass in the residue.
-    let snow_mask = clamp(floor((surface.a - 1.0)*100.0 + 0.5)*0.01, 0.0, 1.0);
-    let grass_mask = clamp((surface.a - 1.0 - snow_mask)*10000.0, 0.0, 1.0);
+    // G-buffer alpha stores snow to hundredths and grass in the residue; from
+    // 3.0 up it is a building's, with the share of rain reaching it in the
+    // 1/4096ths (building.wgsl). No drop lands under a roof.
+    let building = surface.a > 2.5;
+    if (building) {
+        let packed = floor((surface.a - 3.0)*4096.0);
+        let rain_share = (packed - floor(packed/64.0)*64.0)/63.0;
+        if (rain_share < 0.5) { return hiddenParticle(2u); }
+    }
+    let snow_mask = select(clamp(floor((surface.a - 1.0)*100.0 + 0.5)*0.01, 0.0, 1.0), 0.0, building);
+    let grass_mask = select(clamp((surface.a - 1.0 - snow_mask)*10000.0, 0.0, 1.0), 0.0, building);
     // Drops also burst on grass blades, whose own normals point anywhere;
     // other surfaces must face the sky.
     var normal_world = vec3<f32>(0.0, 1.0, 0.0);
@@ -445,6 +475,7 @@ fn splashParticle(vertex: u32, index: u32) -> ParticleVertex {
     let ground = camera + viewToWorld(surface.xyz);
     // The ocean draws its own impact rings.
     if (frame.velocity.z > 0.5 && ground.y < 0.05) { return hiddenParticle(2u); }
+    if (sheltered(ground + vec3<f32>(0.0, 0.05, 0.0))) { return hiddenParticle(2u); }
     let precipitation = weatherPrecipitation(ground);
     let rain = precipitation.x;
     if (rain <= 0.01) { return hiddenParticle(2u); }
@@ -549,6 +580,10 @@ fn vs_particle(@builtin(vertex_index) vertex: u32,
     let center = vec3<f32>((f32(cell_x) + jitter.x)*cell_size + wind_shift.x + gust_sway.x,
                            (f32(cell_y) + jitter.y - phase)*cell_size,
                            (f32(cell_z) + jitter.z)*cell_size + wind_shift.y + gust_sway.y);
+    // Nothing falls inside a building or under its porch roof.
+    if (sheltered(center)) {
+        return hiddenParticle(kind);
+    }
     let offset = center - camera;
     var coverage = latticeFade(lattice, offset);
     // The far lattice fills in only where the dense near lattice fades out.

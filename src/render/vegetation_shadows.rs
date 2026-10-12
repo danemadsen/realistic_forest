@@ -235,6 +235,10 @@ pub struct ShadowTargets {
     pub cascade_views: [wgpu::TextureView; SHADOW_CASCADES],
     pub sampler: wgpu::Sampler,
     pub uniform: wgpu::Buffer,
+    /// The frame (`ExtractedForestView::frame`) the plants last cleared and
+    /// drew the cascades in: the buildings draw over them that frame, and
+    /// clear them themselves in any other.
+    pub drawn_frame: std::sync::atomic::AtomicU64,
 }
 
 /// Created once, before the post passes build the composite's bind group.
@@ -290,21 +294,25 @@ fn create_targets(device: &RenderDevice, resolutions: [u32; SHADOW_CASCADES]) ->
         cascade_views,
         sampler,
         uniform,
+        drawn_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
     }
 }
 
-/// Creates the targets on the first frame: full size when the scatter is on,
-/// a single texel per cascade when it was disabled at startup.
+/// Creates the targets on the first frame: full size when the scatter or the
+/// buildings are on, a single texel per cascade when both were disabled at
+/// startup.
 pub fn prepare_vegetation_shadow_maps(
     device: Res<RenderDevice>,
     queue: Res<bevy::render::renderer::RenderQueue>,
     extracted: Res<super::vegetation_node::ExtractedVegetation>,
+    buildings: Res<super::building_node::ExtractedBuildings>,
     mut maps: ResMut<VegetationShadowMaps>,
 ) {
     if maps.targets.is_some() {
         return;
     }
-    let resolutions = if extracted.enabled() { SHADOW_RESOLUTIONS } else { [1; SHADOW_CASCADES] };
+    let casters = extracted.enabled() || buildings.enabled();
+    let resolutions = if casters { SHADOW_RESOLUTIONS } else { [1; SHADOW_CASCADES] };
     let targets = create_targets(&device, resolutions);
     let initial_uniform = ShadowUniform::disabled();
     queue.write_buffer(&targets.uniform, 0, bytemuck::bytes_of(&initial_uniform));

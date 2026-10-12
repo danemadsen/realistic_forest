@@ -73,6 +73,15 @@ pub struct AutomationSettings {
     pub map_extent_set: bool,
     /// `--no-vegetation`: scatter and draw no plants, to price them.
     pub no_vegetation: bool,
+    /// `--no-buildings`: place, level and draw no buildings.
+    pub no_buildings: bool,
+    /// `--offscreen`: with `--shot`, render into an image with no window at
+    /// all, so a capture neither appears on screen nor takes the focus.
+    pub offscreen: bool,
+    /// `--open-doors`: every building's doors stand open, for captures.
+    pub open_doors: bool,
+    /// `--building-map path.png`: chart the settlements and exit.
+    pub building_map: Option<String>,
     /// `--river-map path.png`: chart the river network and exit.
     pub river_map: Option<String>,
     /// `--no-rivers`: generate and draw no rivers.
@@ -130,6 +139,10 @@ impl Default for AutomationSettings {
             map_extent: 1024.0,
             map_extent_set: false,
             no_vegetation: false,
+            no_buildings: false,
+            offscreen: false,
+            open_doors: false,
+            building_map: None,
             river_map: None,
             no_rivers: false,
             river_probe: None,
@@ -261,6 +274,15 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             }
             "--probe" => automation.probe = true,
             "--no-vegetation" => automation.no_vegetation = true,
+            "--no-buildings" => automation.no_buildings = true,
+            "--offscreen" => automation.offscreen = true,
+            "--open-doors" => automation.open_doors = true,
+            "--building-map" => {
+                if let Some(next) = next {
+                    index += 1;
+                    automation.building_map = Some(next.clone());
+                }
+            }
             "--no-rivers" => automation.no_rivers = true,
             "--river-probe" => {
                 if let Some(next) = next {

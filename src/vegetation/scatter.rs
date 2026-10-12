@@ -774,10 +774,52 @@ fn river_footing(catalog: &Catalog, model: u32, scale: f32) -> f32 {
 /// footing, metres.
 const FOOTING_MARGIN: f32 = 1.0;
 
+/// A building's footprint, which the plants keep off: a rectangle turned
+/// with the building, world space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Clearing {
+    pub centre: [f32; 2],
+    /// Cosine and sine of the building's turn about +Y.
+    pub axis: [f32; 2],
+    pub half: [f32; 2],
+}
+
+impl Clearing {
+    /// How far a point lies outside the footprint, zero inside it.
+    pub fn distance(&self, x: f64, z: f64) -> f32 {
+        let offset = [x as f32 - self.centre[0], z as f32 - self.centre[1]];
+        let local = [
+            offset[0] * self.axis[0] - offset[1] * self.axis[1],
+            offset[0] * self.axis[1] + offset[1] * self.axis[0],
+        ];
+        let beyond_x = (local[0].abs() - self.half[0]).max(0.0);
+        let beyond_z = (local[1].abs() - self.half[1]).max(0.0);
+        beyond_x.hypot(beyond_z)
+    }
+}
+
+/// How far from a building's walls each layer's stems stand at least: a
+/// settler cleared the trees well back from the house, their crowns off the
+/// roof, and kept the brush down around it; ground plants grow right up to
+/// the foundation.
+fn building_clearance(layer: Layer, reach: f32) -> f32 {
+    match layer {
+        Layer::Canopy => 10.0 + reach,
+        Layer::Regeneration => 6.0 + reach,
+        Layer::Shrub => 2.5 + reach * 0.6,
+        Layer::Herb | Layer::Lavender => 1.2,
+    }
+}
+
+/// How far around a chunk the buildings must be known for its plants to keep
+/// clear of them.
+pub const CLEARING_CONTEXT: f64 = TREE_CONTEXT + 60.0;
+
 pub fn generate_level(
     noise: &NoiseField,
     catalog: &Catalog,
     rivers: Option<&crate::rivers::network::RiverNetwork>,
+    clearings: &[Clearing],
     chunk: [i64; 2],
     level: u8,
 ) -> Vec<PlantInstance> {
@@ -785,8 +827,12 @@ pub fn generate_level(
     let canopy_margin = (CANOPY.overlap * 2.0 * MAX_CANOPY_REACH) as f64 + 2.0;
     let (outer_min, outer_max) = grow(minimum, maximum, TREE_CONTEXT + canopy_margin + 8.0);
     let sampler = SiteSampler::new(noise, outer_min, outer_max).with_rivers(rivers);
+    // Off the water's margin and out of the buildings' yards.
     let dry = |x: f64, z: f64, layer: Layer, model: u32, scale: f32| {
-        sampler.river_bank(x, z) >= RIVER_CLEARANCE[layer as usize].max(river_footing(catalog, model, scale))
+        let banked = sampler.river_bank(x, z) >= RIVER_CLEARANCE[layer as usize].max(river_footing(catalog, model, scale));
+        let reach = catalog.models[model as usize].crown_radius * scale;
+        let cleared = clearings.iter().all(|clearing| clearing.distance(x, z) >= building_clearance(layer, reach));
+        banked && cleared
     };
     let habitats = HabitatGrid::build(&sampler, outer_min, outer_max);
 

@@ -208,10 +208,15 @@ pub fn sample_eroded_height(
         }
     }
     // Erosion ran over the carved base; the channels hold over the result.
-    envelope.clamp(
+    let ground = envelope.clamp(
         envelope.clamp(crate::noise::base_height(noise, x, z))
             + delta * erosion_visibility(x, z, visibility_center),
-    )
+    );
+    // The buildings' pads level whatever the erosion made of their ground.
+    match &cache.buildings {
+        Some(pads) => pads.level(x, z, ground),
+        None => ground,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +578,9 @@ pub struct ErosionCache {
     /// The river network in force: tiles simulate over its carved channels
     /// and height queries hold its channels and banks.
     pub rivers: Option<Arc<crate::rivers::network::RiverNetwork>>,
+    /// The buildings' pads in force: height queries stand on the ground
+    /// they level, as the terrain draws it.
+    pub buildings: Option<Arc<crate::buildings::pads::PadIndex>>,
     /// Frames the live active tile has run without a finalize or failure
     /// event (armed at begin, incremented in [`apply_erosion_events`], tripping
     /// `mark_tile_failed` past `EROSION_WORKER_WATCHDOG_FRAMES`).
@@ -593,6 +601,7 @@ impl Default for ErosionCache {
             cache_dropped: false,
             force_reveal: None,
             rivers: None,
+            buildings: None,
             watchdog_frames: 0,
         }
     }

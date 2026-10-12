@@ -47,17 +47,21 @@ by naga at runtime either way.
 | Left click | Capture the cursor again |
 
 Movement is unbounded in both walking and flight modes. Walking is stopped by
-trees and lilacs (see [Colliding with trees](#colliding-with-trees)); flight
-passes through them, as it does the ground. Water too deep to stand in, the
-sea's, a lake's or a river's, is swum in (see [Wading and swimming](#wading-and-swimming)).
+trees and lilacs (see [Colliding with trees](#colliding-with-trees)) and by the
+walls of buildings, whose doors swing open as you walk into them (see
+[Walking through them](#walking-through-them)); flight passes through them, as
+it does the ground. Water too deep to stand in, the sea's, a lake's or a
+river's, is swum in (see [Wading and swimming](#wading-and-swimming)).
 
 The developer menu opens at the top left with 2 and leaves no launcher or
 overlay when closed. Its movement tools teleport to exact XYZ coordinates
 (automatically enabling flight), place the player on the ground at the entered
 XZ coordinates (ignoring Y), return to spawn, place the player on the ground
-here, or rise 100 m. Movement speed is adjustable from 0.1× to 20×, and **Copy
-XYZ** copies the current position. Rendering shortcuts sit alongside the weather
-and time controls; click **Advanced controls** to expand them inside the same menu.
+here, or rise 100 m. **Go to the nearest building** sets the player down a few
+metres out from the nearest building's front door, facing it. Movement speed is
+adjustable from 0.1× to 20×, and **Copy XYZ** copies the current position.
+Rendering shortcuts sit alongside the weather and time controls; click
+**Advanced controls** to expand them inside the same menu.
 
 3 independently toggles a passive, plain text overlay at the top left, outside
 the developer menu. It reports FPS and frame timing, player XYZ, view direction,
@@ -168,6 +172,10 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | `--cloud-base M` | Cloud base altitude in `[100, 6000]` metres; default `1300` |
 | `--cloud-thickness M` | Layer thickness in `[100, 4000]` metres; default `1200` |
 | `--no-vegetation` | Skip loading and scattering the trees, shrubs and flowers |
+| `--no-buildings` | Place, level and draw no buildings |
+| `--building-map path.png` | Chart the settlements over shaded relief from above (`--map-centre`, `--map-extent`, default `8192`), print the towns and the buildings nearest the centre with their exact poses, then exit |
+| `--offscreen` | With `--shot`, render into an image with no window at all: the capture neither appears on screen nor takes the focus. `--size` is then the capture's size in pixels |
+| `--open-doors` | Stand every building's doors most of the way open and keep them so, for captures |
 | `--no-rivers` | Generate, carve and draw no rivers |
 | `--river-map path.png` | Render the river network from above, print its statistics and the rivers and lakes nearest `--map-centre`, then exit |
 | `--river-probe x,z` | Sample the carved base ground (no erosion) and the river envelope over `--map-extent` metres (default `128`) around a point every `--probe-step` metres (default `0.5`), write them to `<--probe-out>.f32` (default `river-probe`; ten little-endian `f32` per sample: base, carved, upper, lower, water, bank distance, lake, then the highest and lowest river ribbon and the lake sheet drawn over the point, or -10⁶ where none), print the river nodes, carve segments and lakes there, then exit |
@@ -551,6 +559,133 @@ The diagnostics panel's **Vegetation** section turns the plants and their
 shadows on and off, scales every LOD distance with **Plant detail distance**,
 and reports how many plants and chunks are streamed. `--no-vegetation` skips
 loading the library entirely.
+
+## Buildings
+
+The world is settled, sparsely, with the wild-west kit in `~/buildings`: seven
+houses (`house-a` to `house-g`, one and two storeys, porches, verandas,
+balconies, outside stairs, granny flats across breezeways and patios) and a
+sheriff's office with its jail. Each lives in `assets/models/buildings` as a
+GLB exported from its `.blend` by `scripts/export-buildings.sh`; all of them
+share one set of textures in `assets/textures/buildings`, referenced by
+relative URI rather than packed into every file. A GLB holds the building's
+parts (`part.*`), its doors (`door.*`, each with its node origin on its hinge)
+and the kit's own collision (`collision.*`: closed convex pieces, each face
+tagged with the loose part it belongs to). Every part and door vertex also
+carries, in `COLOR_0`, the share of the sky the surface sees past the building
+and the share of the rain that falls on it, ray-traced against the building
+when it is exported.
+
+### Where they stand
+
+Placement is a pure function of world position, read from the same uneroded,
+river-carved ground the erosion starts from (`src/buildings/placement.rs`), so
+a building stands where it stands however the world streams in, and the plant
+scatter, the terrain and the collision all agree on it.
+
+- **Homesteads.** Each 480 m cell may hold one house, more often where a broad
+  settlement field runs high. Up to six sites in the middle of the cell are
+  tried and the best kept. A site must be level over the house and its yard
+  (under 1.4 m of fall and a 7.5 % fitted slope), not a terrace on a
+  mountainside (the ground 35 m and 90 m around stays within 5 and 11 m of the
+  floor), between 4 and 75 m above the sea with no beach or sea within 90 m,
+  never in, over or beside a river's channel or a lake (35 m clear of the
+  water) and, within 160 m of water, at least 2.5 m above it, out of reach of
+  its floods. Water a short walk away makes a site better. A house near water
+  faces it; one away from water faces down the land's fall. Small, plain houses
+  are the common ones; the large two-storey places are rarer.
+- **Towns.** Each 3.2 km cell may hold a town where a broad flat (a 150 m
+  square under 5 % slope) lies within 700 m of a river or a lake but not on
+  it. Its main street runs along the contour, so both rows stand level, with
+  three to five buildings a side, their fronts on the street, and the
+  sheriff's office mid-row. A town with fewer than four sound lots is not
+  built. Homesteads keep 420 m clear of a town.
+
+The 8 km square around spawn holds 19 homesteads and 2 towns, the nearest
+town 1.35 km from spawn, about (1108, 773). `--building-map` charts them, and
+the developer menu's **Go to the nearest building** button and the debug text
+find the nearest one.
+
+### The ground under them
+
+Each building stands on a pad (`src/buildings/pads.rs`, and its pasted shader
+copy `assets/shaders/building-pads.wgslinc`): the building's footprint and a
+2 m yard, levelled at the mean height of the ground under it, its foundation
+sunk a few centimetres. Around the pad the ground eases back into the land over
+a skirt, the pad's weight falling as a smootherstep of the distance from the
+rectangle, so the slope is continuous at both edges and the corners are round;
+the skirt is as wide as the cut or fill at the pad's edge needs to stay gentle,
+5 to 12 m. Pads are the last thing applied to the ground wherever it is
+measured: the clipmap, the lighting and shore heightfields, the grass capture,
+the plants' rooting, the player's footing and the snow, all through the same
+function on the CPU and the GPU (a test holds the CPU and the uploaded grid to
+the same heights). Erosion simulates the land as it was; the pad overrides what
+it made of the ground under the building, and the skirt blends the eroded
+ground into it.
+
+The ground around a building is trodden: worn through to the soil along its
+walls and porch and patchy across its yard, and a town's main street is a dirt
+road from porch to porch. Grass does not grow on a building's floor or within a
+couple of metres of its walls. Trees stand well back, a settler's clearing:
+canopy trees 10 m plus their crown from the walls, saplings 6 m, shrubs a few
+metres, ground plants just off the foundation, and nothing grows in a town's
+street.
+
+### Drawing them
+
+The buildings join the G-buffer between the terrain and the plants
+(`src/render/building_node.rs`, `assets/shaders/building.wgsl`), instanced per
+model, with their doors drawn at their current swing. Rooms, stairs and ceiling
+joists are drawn only within 140 m, where they can be seen through a window or
+a door; the shells to 1800 m. Window glass stays out of the G-buffer, so a
+window shows the room behind it and lets the sun in; it is blended over the
+lit scene after the composite instead, depth-tested against the G-buffer, as a
+faint reflection of the sky that strengthens toward a glancing view, as Fresnel
+has it, dimmer under a porch roof and barely there from inside the room. The
+buildings are drawn depth-only into
+the plants' sun and moon shadow cascades after the plants, so roofs shade the
+rooms under them and houses shade the ground, the plants and each other.
+
+The G-buffer position's alpha marks a building's pixels and carries the sky and
+rain shares baked into its vertices. The composite lights a surface from the
+sky only as far as it sees it, with a floor for the light the room passes on,
+and adds sunlight let in through the windows and scattered off the floor and
+walls, warm rather than the canopy's green outdoors. Floors, decks and steps
+under a roof stay dry in rain and take no snow dusting, rain does not fall
+inside a building or under its porch roof, and no splash lands there. Stepping
+indoors the eye adapts: the exposure eases up over a second or so, more than
+three times on a building's floor under its ceiling and a little on a covered
+porch, and back down outside.
+
+### Walking through them
+
+Walls, windows, railings, posts and stair stringers are solid to a walker
+(`src/buildings/collision.rs`): each convex piece's cross-section between a
+step over the feet and the top of the head is pushed out of, in stretches of
+10 cm, so a walk into a wall slides along it. Floors, decks, steps and stair
+treads are stood on: the highest top under the body, read at its centre and
+four points around it, no more than 0.5 m over its feet, so porches are stepped
+onto and stairs climbed a tread at a time (the terrain's own 1.25 m step still
+holds outdoors). Ceilings stop a jump.
+
+Doors are hinged boards, swung by the body as in open-world games: a body
+walking into one turns it away as far as it would have to move, within the
+swing the door's frame and the rooms around it leave it (worked out from the
+collision when the library loads; a cell door opens outward only). The door
+swings on at the speed it was pushed, slows, and a second and a half after the
+last push its closer eases it shut until it latches. Pushed at the hinge or
+against its stop, a door is a wall. Tests walk a body in through every front
+door from its yard and up house-c's stairs, inside and out.
+
+### Re-exporting the kit
+
+`scripts/export-buildings.sh [kit directory] [blender binary]` runs
+`scripts/export-buildings.py` in headless Blender over each building; the
+`.blend` files are only read. Each material's Mapping node (its UV scale and
+turn) is baked into the exported UVs, faces longer than 1.25 m are cut so the
+baked sky has corners to vary over, and the packed images are written out once,
+byte for byte (16-bit PNGs stay 16-bit). The lantern and wagon-wheel props are
+not part of the building kit and are not exported.
 
 ## Fidelity of the noise substitution
 
@@ -1435,15 +1570,17 @@ quality or disable clouds independently if the frame rate becomes too low.
 ## Render pipeline
 
 The renderer writes view position, view normal, and albedo to a three-target
-G-buffer: the terrain first, then the plants (after their cull pass), then the
-grass. The plants also draw their three shadow cascades. SSAO is evaluated at half resolution with a 24-sample rotated
+G-buffer: the terrain first, then the buildings, then the plants (after their
+cull pass), then the grass. The plants draw their three shadow cascades and
+the buildings draw into them after. SSAO is evaluated at half resolution with a 24-sample rotated
 hemisphere kernel, followed by a depth/normal-aware bilateral blur. A separate
 half-resolution atmosphere pass supplies combined fog/cloud scattering and
 transmittance to the lighting composite, which also evaluates terrain, cloud
 and plant shadows and the celestial sky. A cloud sky probe supplies reflection directions
 outside the current view, and the cloud shadow map supplies sunlight
 occlusion for fog in the atmosphere and water passes.
-The water surface then samples the opaque scene for refraction and raymarched
+The buildings' window glass is then blended over the lit scene, tested against
+the G-buffer's depth without writing it. The water surface then samples the opaque scene for refraction and raymarched
 reflections, followed by underwater effects where applicable. The sea and the
 rivers and lakes depth-test against the G-buffer's own depth buffer in hardware, ahead
 of their shaders, so water hidden behind terrain or plants is never shaded;

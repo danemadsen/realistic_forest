@@ -746,13 +746,13 @@ fn trunk_radius(bark: &[[f32; 3]], top: f32, species: Species) -> f32 {
 // Texture preparation
 // ---------------------------------------------------------------------------
 
-struct Image {
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
+pub(crate) struct Image {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgba: Vec<u8>,
 }
 
-fn decode(path: &Path) -> Result<Image, String> {
+pub(crate) fn decode(path: &Path) -> Result<Image, String> {
     let image = image::open(path)
         .map_err(|e| format!("loading texture {}: {e}", path.display()))?
         .into_rgba8();
@@ -862,7 +862,7 @@ fn key_label(key: &TextureKey) -> Option<String> {
 /// occlusion (glTF R) in one RGBA8 texture at the normal map's resolution.
 /// Missing maps contribute a flat normal, full roughness and no occlusion,
 /// the glTF defaults, and the material factors are applied in the shader.
-fn pack_detail(normal: Option<&Image>, roughness: Option<&Image>, occlusion: Option<&Image>) -> Image {
+pub(crate) fn pack_detail(normal: Option<&Image>, roughness: Option<&Image>, occlusion: Option<&Image>) -> Image {
     let normal_size = normal.map(|n| (n.width, n.height));
     let roughness_size = roughness.map(|r| (r.width, r.height));
     let occlusion_size = occlusion.map(|o| (o.width, o.height));
@@ -889,10 +889,10 @@ fn pack_detail(normal: Option<&Image>, roughness: Option<&Image>, occlusion: Opt
     Image { width, height, rgba }
 }
 
-struct Level {
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
+pub(crate) struct Level {
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgba: Vec<u8>,
 }
 
 fn srgb_decode_table() -> &'static [f32; 256] {
@@ -1085,7 +1085,7 @@ fn fill_transparent(level: &mut Level) {
     }
 }
 
-fn base_color_chain(image: &Image, cap: u32, cutoff: Option<f32>) -> Vec<Level> {
+pub(crate) fn base_color_chain(image: &Image, cap: u32, cutoff: Option<f32>) -> Vec<Level> {
     let mut top = Level {
         width: image.width,
         height: image.height,
@@ -1112,7 +1112,7 @@ fn base_color_chain(image: &Image, cap: u32, cutoff: Option<f32>) -> Vec<Level> 
     levels
 }
 
-fn linear_chain(image: Image, cap: u32) -> Vec<Level> {
+pub(crate) fn linear_chain(image: Image, cap: u32) -> Vec<Level> {
     let mut top = Level {
         width: image.width,
         height: image.height,

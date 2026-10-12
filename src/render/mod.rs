@@ -7,6 +7,7 @@
 //! `spawn_scene` points the camera at it with
 //! `CameraRenderGraph::new(ForestRender)`.
 
+pub mod building_node;
 pub mod erosion_node;
 pub mod cloud_node;
 pub mod gpu_textures;
@@ -49,18 +50,22 @@ pub struct ForestRender;
 /// The ordered stages of the forest pipeline. Mirrors the render order the
 /// port's render graph used to encode with node edges: erosion -> terrain ->
 /// SSAO -> blur -> clouds -> composite -> water -> FXAA -> egui -> upscale,
-/// with the scattered vegetation and then the grass joining the terrain
-/// G-buffer before SSAO.
+/// with the buildings, the scattered vegetation and then the grass joining
+/// the terrain G-buffer before SSAO, and the buildings drawn into the plants'
+/// shadow cascades once the plants are.
 #[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone)]
 pub enum ForestRenderSystems {
     Erosion,
     Terrain,
+    Buildings,
     Vegetation,
+    BuildingShadows,
     Grass,
     Ssao,
     Blur,
     Clouds,
     Composite,
+    BuildingGlass,
     WaterSurface,
     WaterUnderwater,
     Lightning,
@@ -80,12 +85,15 @@ impl ForestRender {
             (
                 Erosion,
                 Terrain,
+                Buildings,
                 Vegetation,
+                BuildingShadows,
                 Grass,
                 Ssao,
                 Blur,
                 Clouds,
                 Composite,
+                BuildingGlass,
                 WaterSurface,
                 WaterUnderwater,
                 Lightning,
@@ -122,6 +130,9 @@ pub struct ExtractedForestView {
     pub snow_pixels: std::sync::Arc<[u8]>,
     pub snow_revision: u64,
     pub frame: u64,
+    /// The eye's adaptation to the light it stands in, multiplying the
+    /// exposure: 1 outdoors, more inside a building.
+    pub exposure_adaptation: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +458,7 @@ pub struct ForestShaderHandles {
     pub grass_ground_average: Handle<Shader>,
     pub vegetation: Handle<Shader>,
     pub vegetation_cull: Handle<Shader>,
+    pub building: Handle<Shader>,
     // The five erosion sim shaders deliberately have no handles here: their
     // pipelines compile on the worker thread (src/erosion_worker.rs), which
     // takes the WGSL text itself from the main world's publisher system
@@ -497,6 +509,7 @@ impl Plugin for ForestRenderPlugin {
                 grass_ground_average: asset_server.load::<Shader>("shaders/grass-ground-average.wgsl"),
                 vegetation: asset_server.load::<Shader>("shaders/vegetation.wgsl"),
                 vegetation_cull: asset_server.load::<Shader>("shaders/vegetation-cull.wgsl"),
+                building: asset_server.load::<Shader>("shaders/building.wgsl"),
                 ssao: asset_server.load::<Shader>("shaders/ssao.wgsl"),
                 ssao_blur: asset_server.load::<Shader>("shaders/ssao-blur.wgsl"),
                 composite: asset_server.load::<Shader>("shaders/composite.wgsl"),
@@ -536,6 +549,7 @@ impl Plugin for ForestRenderPlugin {
         }
         render_app.insert_resource(grass_readiness);
         grass_node::register_grass_systems(render_app);
+        building_node::register_building_systems(render_app);
         vegetation_node::register_vegetation_systems(render_app);
         render_app.insert_resource(bridge);
         render_app.insert_resource(self.noise_field.clone());
@@ -574,12 +588,15 @@ impl Plugin for ForestRenderPlugin {
         let forest_passes = (
             erosion_node::forest_erosion_pass.in_set(ForestRenderSystems::Erosion),
             terrain_node::forest_terrain_pass.in_set(ForestRenderSystems::Terrain),
+            building_node::forest_building_pass.in_set(ForestRenderSystems::Buildings),
             vegetation_node::forest_vegetation_pass.in_set(ForestRenderSystems::Vegetation),
+            building_node::forest_building_shadow_pass.in_set(ForestRenderSystems::BuildingShadows),
             grass_node::forest_grass_pass.in_set(ForestRenderSystems::Grass),
             post_nodes::forest_ssao_pass.in_set(ForestRenderSystems::Ssao),
             post_nodes::forest_blur_pass.in_set(ForestRenderSystems::Blur),
             cloud_node::cloud_probe_pass.in_set(ForestRenderSystems::Clouds),
             post_nodes::forest_composite_pass.in_set(ForestRenderSystems::Composite),
+            building_node::forest_building_glass_pass.in_set(ForestRenderSystems::BuildingGlass),
             water_node::forest_water_surface_pass.in_set(ForestRenderSystems::WaterSurface),
             water_node::forest_underwater_pass.in_set(ForestRenderSystems::WaterUnderwater),
             lightning_node::forest_lightning_pass.in_set(ForestRenderSystems::Lightning),
@@ -623,6 +640,9 @@ fn extract_forest_view(
     if let Ok((window,)) = world.query_filtered::<(&Window,), With<PrimaryWindow>>().single(world) {
         view.physical_width = window.physical_width();
         view.physical_height = window.physical_height();
+    } else if let Some(offscreen) = world.get_resource::<crate::OffscreenCapture>() {
+        view.physical_width = offscreen.size[0];
+        view.physical_height = offscreen.size[1];
     }
 
     view.settings = *world.resource::<AppSettings>();
@@ -636,7 +656,7 @@ fn extract_forest_view(
     view.draw_ocean = world.resource::<WorldOptions>().draw_ocean;
     let cache = world.resource::<ErosionCache>();
     view.lookup_minimum = (cache.lookup_minimum.x, cache.lookup_minimum.z);
-    if view.settings.vegetation_enabled && view.settings.vegetation_shadows {
+    if view.settings.vegetation_shadows {
         let noise = world.resource::<NoiseField>();
         let eye = view.player_position;
         view.shadow_receiver_heights = vegetation_shadows::receiver_height_bounds(eye, |x, z| {
@@ -647,6 +667,9 @@ fn extract_forest_view(
     view.snow_mapping = snow.mapping();
     view.snow_pixels = snow.pixels();
     view.snow_revision = snow.revision();
+    view.exposure_adaptation = world
+        .get_resource::<crate::buildings::EyeAdaptation>()
+        .map_or(1.0, |adaptation| adaptation.exposure);
     view.frame += 1;
 }
 
@@ -705,7 +728,7 @@ pub fn prepare_forest_globals(
             // Fog extinction is sampled by world position in the shader.
             view.settings.fog_density,
             FAR_PLANE,
-            view.settings.exposure,
+            view.settings.exposure * view.exposure_adaptation.max(1.0),
             view.settings.ssao_enabled as u32 as f32,
         ],
         settings_a: [

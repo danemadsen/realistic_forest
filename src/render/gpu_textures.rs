@@ -449,6 +449,10 @@ pub struct GpuWorldTextures {
     /// network is written over the old (see `river_node::upload_rivers`).
     pub river_grid: wgpu::Buffer,
     pub river_segments: wgpu::Buffer,
+    /// The buildings' pads, as building-pads.wgslinc reads them: fixed
+    /// capacity too, rewritten whenever the pads or the grid's centre move
+    /// (see `building_node::upload_pads`). Zeroed, it holds no pads.
+    pub building_pads: wgpu::Buffer,
 }
 
 pub const SSAO_NOISE_WIDTH: u32 = 4;
@@ -852,6 +856,7 @@ pub fn prepare_gpu_textures(
         device.wgpu_device().create_buffer(&river_descriptor)
     };
     let river_grid = river_buffer("river_grid", crate::rivers::GPU_GRID_WORDS * 4);
+    let building_pads = river_buffer("building_pads", crate::buildings::pads::GPU_WORDS * 4);
     let river_segments = river_buffer(
         "river_segments",
         crate::rivers::GPU_SEGMENTS * std::mem::size_of::<crate::rivers::carve::RiverSegment>(),
@@ -871,6 +876,7 @@ pub fn prepare_gpu_textures(
         ssao_noise_view,
         river_grid,
         river_segments,
+        building_pads,
     };
     option.0 = Some(Box::new(world_textures));
 }

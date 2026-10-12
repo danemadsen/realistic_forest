@@ -1010,6 +1010,33 @@ fn encodeOutput(radiance: vec3<f32>) -> vec4<f32> {
                               vec3<f32>(1.0/2.2)), 1.0);
 }
 
+// A building's surface (G-buffer position alpha 3.0 and up, building.wgsl):
+// the share of the sky it sees past the building and of the rain that falls
+// on it, each in 63 steps. Anything else sees all of both.
+fn buildingShelter(alpha: f32) -> vec2<f32> {
+    if (alpha < 2.5) { return vec2<f32>(1.0); }
+    let packed = floor((alpha - 3.0)*4096.0);
+    let sky = floor(packed/64.0);
+    return vec2<f32>(sky, packed - sky*64.0)/63.0;
+}
+
+// How much of the open sky's fill light reaches a building's surface: the
+// share of the sky it sees, with a floor for the light the rooms pass on from
+// their windows and doors, which no surface sees directly.
+const INDOOR_SKY_FLOOR: f32 = 0.3;
+fn buildingSkyLight(sky: f32) -> f32 {
+    return mix(INDOOR_SKY_FLOOR, 1.0, smoothstep(0.0, 0.6, sky));
+}
+
+// Sunlight let in by a room's windows and doors and scattered off its floor
+// and walls: a share of the sun outside, for the surfaces inside a building
+// (those that see little sky), more near an opening.
+const INDOOR_BOUNCE: f32 = 0.07;
+fn buildingBounce(sky: f32) -> f32 {
+    let indoors = 1.0 - smoothstep(0.25, 0.6, sky);
+    return INDOOR_BOUNCE*indoors*mix(0.45, 1.0, smoothstep(0.0, 0.3, sky));
+}
+
 fn groundHash(cell: vec2<i32>) -> f32 {
     var value = bitcast<u32>(cell.x)*0x8da6b343u ^ bitcast<u32>(cell.y)*0xd8163841u;
     value ^= value >> 16u;
@@ -1143,9 +1170,13 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     if (is_sky) {
         return encodeOutput(skyRadiance(world_ray)*fog.a + fog.rgb);
     }
-    // G-buffer alpha stores snow to hundredths and grass in the residue.
-    let snow_mask = clamp(floor((packed_position.a - 1.0)*100.0 + 0.5)*0.01, 0.0, 1.0);
-    let grass_mask = clamp((packed_position.a - 1.0 - snow_mask)*10000.0, 0.0, 1.0);
+    // G-buffer alpha stores snow to hundredths and grass in the residue on
+    // the ground; from 3.0 up it is a building's, which holds neither and
+    // keeps its shelter from the sky and the rain instead.
+    let building = packed_position.a > 2.5;
+    let shelter = buildingShelter(packed_position.a);
+    let snow_mask = select(clamp(floor((packed_position.a - 1.0)*100.0 + 0.5)*0.01, 0.0, 1.0), 0.0, building);
+    let grass_mask = select(clamp((packed_position.a - 1.0 - snow_mask)*10000.0, 0.0, 1.0), 0.0, building);
     let normal_view = normalize(normal_sample.xyz*2.0 - 1.0);
     let normal_world = normalize(viewToWorld(normal_view));
     let world_position = globals.camera_position.xyz + viewToWorld(packed_position.xyz);
@@ -1165,9 +1196,10 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         lingering_rain = earlier_storm.x*(1.0 - earlier_storm.y)*0.62;
     }
     let soak = max(local_precipitation.x, lingering_rain);
-    let wetness = soak*upward*mix(1.0, 0.32, grass_mask);
+    // Floors, decks and steps under a roof stay dry.
+    let wetness = soak*upward*mix(1.0, 0.32, grass_mask)*shelter.y;
     let falling_snow = local_precipitation.y*upward*mix(1.0, 0.25, grass_mask)
-                       *(1.0 - snow_mask);
+                       *(1.0 - snow_mask)*shelter.y;
     // Rain pools on level ground outside the grass: a broad pattern of
     // hollows fills as the ground stays wet, so puddles spread through a
     // downpour and shrink again once the cell has passed. Water ignores the
@@ -1186,7 +1218,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let puddle = smoothstep(0.66 - 0.14*soak, 0.72 - 0.14*soak, hollows)
                  *level*smoothstep(0.25, 0.6, soak)
                  *(1.0 - grass_mask)*(1.0 - snow_mask)
-                 *smoothstep(0.2, 0.6, world_position.y);
+                 *smoothstep(0.2, 0.6, world_position.y)
+                 *select(1.0, 0.0, building);
     let roughness = mix(mix(clamp(normal_sample.a, 0.06, 1.0), 0.22, wetness*0.55),
                         0.02, puddle);
     var albedo = albedo_sample.rgb*albedo_sample.rgb*2.5;
@@ -1245,9 +1278,21 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
            *mix(1.0, 0.42, local_precipitation.z)
            *max(dot(normal_world, to_moon), 0.0)*moon_visibility*ao_factor;
     let ambient = skyAmbient(normal_world, world_position);
-    let ambient_colour = mix(ambient*vec3<f32>(0.80, 1.00, 0.68),
+    // Outdoors the fill is tinted by the canopy and the turf it bounces off;
+    // indoors by the boards of the room.
+    let fill_tint = select(vec3<f32>(0.80, 1.00, 0.68), vec3<f32>(1.0, 0.94, 0.84), building);
+    let ambient_colour = mix(ambient*fill_tint,
                              ambient*vec3<f32>(0.865, 0.955, 1.189), snow_mask);
-    lit += albedo*ambient_colour*mix(0.22, 0.42, snow_mask)*ao_factor;
+    // Indoors the sky lights a room only through its windows and doors, and
+    // the sun outside lights it again off its floor and walls.
+    let sky_light = select(1.0, buildingSkyLight(shelter.x), building);
+    lit += albedo*ambient_colour*mix(0.22, 0.42, snow_mask)*ao_factor*sky_light;
+    if (building) {
+        let sun_outside = globals.sun_colour.rgb*globals.settings_a.x
+                          *weatherSunMultiplier(local_weather)
+                          *mix(1.0, 0.11, local_precipitation.z);
+        lit += (albedo/PI)*sun_outside*buildingBounce(shelter.x)*ao_factor;
+    }
     if (globals.lightning.w > 0.001) {
         let source = vec3<f32>(globals.lightning.x,
                                mix(globals.lightning.y, globals.lightning_meta.z, 0.58),
@@ -1263,7 +1308,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
         let wet_glint = pow(max(dot(reflect(-direction, normal_world), -world_ray), 0.0),
                             mix(28.0, 120.0, water));
         lit += flash_colour*((albedo/PI)*incidence*ao_factor
-                             + wet_glint*water*1.6);
+                             + wet_glint*water*1.6)*sky_light;
     }
     // Wet films and puddles mirror the sky. Ripples from falling drops break
     // up the image in a puddle; a film on rough ground only adds a sheen.

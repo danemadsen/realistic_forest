@@ -56,8 +56,12 @@ struct PrecipitationFrameGpu {
     rain_far: [f32; 4],
     snow: [f32; 4],
     splash: [f32; 4],
+    /// x the number of roof boxes in `shelters`.
+    shelter: [f32; 4],
+    /// The roofs rain keeps off, two vec4 each (see `BuildingShelters`).
+    shelters: [[f32; 4]; 2 * super::building_node::MAX_SHELTERS],
 }
-const _: () = assert!(std::mem::size_of::<PrecipitationFrameGpu>() == 80);
+const _: () = assert!(std::mem::size_of::<PrecipitationFrameGpu>() == 1120);
 
 impl PrecipitationFrameGpu {
     /// Lays the instance range out as near rain, far rain, snow, then splashes.
@@ -79,7 +83,20 @@ impl PrecipitationFrameGpu {
                 0.0,
                 PARTICLE_INSTANCES as f32,
             ],
+            shelter: [0.0; 4],
+            shelters: [[0.0; 4]; 2 * super::building_node::MAX_SHELTERS],
         }
+    }
+
+    /// Hand the rain the roofs it falls outside.
+    fn with_shelters(mut self, boxes: &[[[f32; 4]; 2]]) -> Self {
+        let count = boxes.len().min(super::building_node::MAX_SHELTERS);
+        for (index, shelter) in boxes.iter().take(count).enumerate() {
+            self.shelters[index * 2] = shelter[0];
+            self.shelters[index * 2 + 1] = shelter[1];
+        }
+        self.shelter[0] = count as f32;
+        self
     }
 }
 
@@ -104,6 +121,7 @@ fn prepare_precipitation(
     globals: Res<ForestGlobals>,
     view: Res<ExtractedForestView>,
     water: Res<super::water_node::ExtractedWater>,
+    shelters: Res<super::building_node::BuildingShelters>,
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
     cache: Res<PipelineCache>,
@@ -193,7 +211,8 @@ fn prepare_precipitation(
         let frame = PrecipitationFrameGpu::new([
             speed * direction.cos(), speed * direction.sin(),
             water.draw as u32 as f32, view.weather.local_precipitation.gust,
-        ]);
+        ])
+        .with_shelters(&shelters.boxes);
         queue.write_buffer(buffer, 0, bytemuck::bytes_of(&frame));
     }
 }
@@ -204,7 +223,8 @@ pub fn register_precipitation_systems(render_app: &mut bevy::app::SubApp) {
         bevy::render::Render,
         prepare_precipitation
             .in_set(bevy::render::RenderSystems::Prepare)
-            .after(super::prepare_forest_globals),
+            .after(super::prepare_forest_globals)
+            .after(super::building_node::prepare_buildings),
     );
 }
 

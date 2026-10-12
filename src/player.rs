@@ -1,6 +1,8 @@
 //! First-person player controller, ported from the C++ `Player` and
 //! `UpdatePlayer` / `PlayerCamera`.
 
+use crate::buildings::BuildingField;
+use crate::buildings::collision::{self as building_collision, NearBuilding};
 use crate::constants::*;
 use crate::erosion::ErosionCache;
 use crate::noise::NoiseField;
@@ -262,6 +264,7 @@ pub fn update_player_system(
     noise: Res<NoiseField>,
     mut snow: ResMut<SnowState>,
     vegetation: Res<VegetationField>,
+    mut buildings: ResMut<BuildingField>,
     ui_wants_input: Res<UiWantsInput>,
     automation: Option<Res<crate::automation::AutomationSettings>>,
 ) {
@@ -380,11 +383,19 @@ pub fn update_player_system(
         // Trunks and lilac stems are solid. Flight passes through them, as it
         // does the ground.
         collide_with_trunks(&mut player, &mut candidate, &vegetation, &erosion, &noise);
+        // So are the buildings' walls, and their doors swing open from the
+        // body that walks into them.
+        let travel = visibility_center.distance(Vec2::new(candidate.x, candidate.z));
+        let mut near = buildings.near_mut(visibility_center, PLAYER_RADIUS + travel + 1.0);
+        collide_with_buildings(&mut player, &mut candidate, &mut near, dt);
         // Water too deep to stand in is swum in: the body floats, head out,
         // until the player dives. A swimmer crouched under standing height
-        // stands up. The ground is what walking stands on, snow and all.
-        let ground = snow::sample_surface(&erosion, &noise, visibility_center, visibility_center.to_array())
+        // stands up. The ground is what walking stands on, snow and all, or
+        // a building's floor.
+        let feet = player.position.y - EYE_HEIGHT;
+        let terrain = snow::sample_surface(&erosion, &noise, visibility_center, visibility_center.to_array())
             .height(&snow, visibility_center);
+        let ground = footing(terrain, &near, visibility_center, feet);
         let swimming = swims(water, ground, player.position.y, player.vertical_velocity, player.swimming);
         let jump = keys.just_pressed(KeyCode::Space) && !ui_wants_input;
         let at_surface = kicks_off(water, player.position.y);
@@ -437,6 +448,7 @@ pub fn update_player_system(
                 &erosion,
                 &noise,
                 &mut snow,
+                &near,
                 jump,
                 afloat,
                 dt,
@@ -531,10 +543,38 @@ fn collide_with_trunks(
     }
 }
 
+/// Slide the step from the player's position to `candidate` along the walls
+/// of the buildings near it, pushing their doors open, and take from the
+/// player's velocity what pressed into a wall.
+fn collide_with_buildings(player: &mut Player, candidate: &mut Vec3, near: &mut [NearBuilding<'_>], dt: f32) {
+    if near.is_empty() {
+        return;
+    }
+    let from = Vec2::new(player.position.x, player.position.z);
+    let to = Vec2::new(candidate.x, candidate.z);
+    let feet = player.position.y - EYE_HEIGHT;
+    let slid = building_collision::slide(near, from, to, feet, PLAYER_RADIUS, dt);
+    candidate.x = slid.position.x;
+    candidate.z = slid.position.y;
+    let pressing = player.velocity.dot(slid.normal);
+    if pressing < 0.0 {
+        player.velocity -= slid.normal * pressing;
+    }
+}
+
+/// What a body whose feet are at `feet` stands on at `point`: the ground,
+/// or a building's floor, deck or stair tread a step or less above its feet.
+fn footing(terrain: f32, near: &[NearBuilding<'_>], point: Vec2, feet: f32) -> f32 {
+    let floor = building_collision::floor_under(near, point, feet);
+    floor.map_or(terrain, |floor| floor.max(terrain))
+}
+
 /// Resolve against the puffed surface first, then compact only the contact
 /// segment and seat the player's feet on the newly flattened snow. Returns
 /// whether the body is still a swimmer's (`Player::swimming`): kicked up out
 /// of the water and still rising, or landed crouched on a bank, to stand up.
+/// A building's floors are stood on as the ground is, and its ceilings stop
+/// a jump.
 #[allow(clippy::too_many_arguments)]
 fn update_walking_ground(
     player: &mut Player,
@@ -542,17 +582,19 @@ fn update_walking_ground(
     erosion: &ErosionCache,
     noise: &NoiseField,
     snow: &mut SnowState,
+    near: &[NearBuilding<'_>],
     jump_requested: bool,
     afloat: Option<f32>,
     dt: f32,
 ) -> bool {
     let previous_xz = Vec2::new(player.position.x, player.position.z);
     let visibility_center = previous_xz.to_array();
+    let feet = player.position.y - EYE_HEIGHT;
     let old_surface = snow::sample_surface(erosion, noise, previous_xz, visibility_center);
-    let old_ground = old_surface.height(snow, previous_xz);
+    let old_ground = footing(old_surface.height(snow, previous_xz), near, previous_xz, feet);
     let mut next_xz = Vec2::new(candidate.x, candidate.z);
     let mut next_surface = snow::sample_surface(erosion, noise, next_xz, visibility_center);
-    let next_ground = next_surface.height(snow, next_xz);
+    let next_ground = footing(next_surface.height(snow, next_xz), near, next_xz, feet);
     if step_blocked(next_ground, old_ground, player.position.y, player.vertical_velocity, afloat, player.leapt) {
         candidate.x = player.position.x;
         candidate.z = player.position.z;
@@ -568,10 +610,23 @@ fn update_walking_ground(
     }
     let swimmer = kicked(afloat, player.vertical_velocity, player.swimming);
     (candidate.y, player.vertical_velocity) = fall(candidate.y, player.vertical_velocity, grounded_before && !jumping, dt);
-    let ground_before_stamp = next_surface.height(snow, next_xz) + EYE_HEIGHT;
+    // A jump inside a building stops at its ceiling.
+    if player.vertical_velocity > 0.0
+        && let Some(ceiling) = building_collision::ceiling_over(near, next_xz, feet)
+    {
+        let highest_eye = ceiling - (building_collision::BODY_HEIGHT - EYE_HEIGHT);
+        if candidate.y > highest_eye {
+            candidate.y = highest_eye.max(player.position.y.min(highest_eye));
+            player.vertical_velocity = 0.0;
+        }
+    }
+    let floor = building_collision::floor_under(near, next_xz, feet);
+    let on_floor = floor.is_some_and(|floor| floor >= next_surface.height(snow, next_xz));
+    let ground_before_stamp = footing(next_surface.height(snow, next_xz), near, next_xz, feet) + EYE_HEIGHT;
     let touching = candidate.y <= ground_before_stamp && player.vertical_velocity <= 0.0;
     if touching {
-        if !jumping && next_surface.coverage > 0.0 {
+        // Snow is trodden only where the feet are on it, not on a porch.
+        if !jumping && next_surface.coverage > 0.0 && !on_floor {
             if grounded_before && next_xz.distance_squared(previous_xz) > 0.000001 {
                 // Both endpoints are actual contacts in this update. There
                 // is no stored segment to bridge jumps or camera teleports.
@@ -581,7 +636,8 @@ fn update_walking_ground(
             }
         }
         let crouched;
-        (candidate.y, crouched) = lands(candidate.y, next_surface.height(snow, next_xz), swimmer);
+        let standing_on = floor.map_or(next_surface.height(snow, next_xz), |floor| floor.max(next_surface.height(snow, next_xz)));
+        (candidate.y, crouched) = lands(candidate.y, standing_on, swimmer);
         player.vertical_velocity = 0.0;
         player.leapt = false;
         return crouched;
@@ -931,6 +987,7 @@ mod tests {
             &erosion,
             &noise,
             &mut snow,
+            &[],
             false,
             None,
             0.02,
@@ -953,6 +1010,7 @@ mod tests {
             &erosion,
             &noise,
             &mut snow,
+            &[],
             true,
             None,
             0.02,
@@ -967,6 +1025,7 @@ mod tests {
             &erosion,
             &noise,
             &mut snow,
+            &[],
             false,
             None,
             0.02,
@@ -987,6 +1046,7 @@ mod tests {
             &erosion,
             &noise,
             &mut snow,
+            &[],
             false,
             None,
             0.05,

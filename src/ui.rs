@@ -64,9 +64,10 @@ pub fn draw_diagnostics_ui(
     mut players: Query<&mut Player>,
     automation: Res<AutomationSettings>,
     mut rerun: ResMut<RerunErosion>,
-    (vegetation, rivers): (
+    (vegetation, rivers, buildings): (
         Option<Res<crate::vegetation::VegetationField>>,
         Option<Res<crate::rivers::RiverField>>,
+        Option<Res<crate::buildings::BuildingField>>,
     ),
     mut snow: ResMut<SnowState>,
     mut trainer: Local<TrainerState>,
@@ -90,6 +91,7 @@ pub fn draw_diagnostics_ui(
             &snow,
             &player,
             vegetation.as_deref(),
+            buildings.as_deref(),
         )
     } else {
         0.0
@@ -112,6 +114,7 @@ pub fn draw_diagnostics_ui(
             &mut trainer,
             &mut rerun,
             rivers.as_deref(),
+            buildings.as_deref(),
         );
         if !settings.show_trainer && automation.shot_path.is_none() {
             if let Ok(mut cursor) = cursors.single_mut() {
@@ -169,6 +172,7 @@ fn draw_debug_overlay(
     snow: &SnowState,
     player: &Player,
     vegetation: Option<&crate::vegetation::VegetationField>,
+    buildings: Option<&crate::buildings::BuildingField>,
 ) -> f32 {
     let dt = ctx.input(|input| input.stable_dt).max(f32::EPSILON);
     let forward = player.forward();
@@ -197,6 +201,19 @@ fn draw_debug_overlay(
             )
         },
     );
+    let houses = buildings.filter(|field| field.enabled()).map_or_else(
+        || "Buildings: none placed".to_owned(),
+        |field| match field.nearest(xz) {
+            Some(nearest) => format!(
+                "Buildings: {} placed  |  Nearest: {} at {:.0} m",
+                field.building_count(),
+                nearest.name,
+                nearest.distance
+            ),
+            None => format!("Buildings: {} placed", field.building_count()),
+        },
+    );
+    let plants = format!("{plants}\n{houses}");
     let text = format!(
         "FPS: {:.0}  |  Frame: {:.2} ms\n\
          Player XYZ: {:.2}, {:.2}, {:.2}\n\
@@ -323,6 +340,7 @@ fn draw_player_tools(
     cache: &ErosionCache,
     noise: &NoiseField,
     snow: &SnowState,
+    buildings: Option<&crate::buildings::BuildingField>,
 ) {
     if !trainer.initialized {
         trainer.use_position(player.position);
@@ -412,6 +430,18 @@ fn draw_player_tools(
             player.movement_speed_multiplier = 1.0;
         }
     });
+    let nearest = buildings.and_then(|field| field.nearest(Vec2::new(player.position.x, player.position.z)));
+    if let Some(nearest) = nearest
+        && ui.button(format!("Go to the nearest building ({}, {:.0} m)", nearest.name, nearest.distance)).clicked()
+    {
+        let spot = Vec3::new(nearest.approach.x, 0.0, nearest.approach.y);
+        teleport(player, ground_position(spot, cache, noise, snow), cache, noise);
+        player.flying = false;
+        player.yaw = nearest.facing.x.atan2(-nearest.facing.y);
+        player.pitch = -0.05;
+        trainer.use_position(player.position);
+        trainer.status = Some(format!("At the front door of a {}.", nearest.name));
+    }
     if let Some(status) = &trainer.status {
         ui.small(status);
     }
@@ -435,6 +465,7 @@ fn draw_trainer_window(
     trainer: &mut TrainerState,
     rerun: &mut RerunErosion,
     rivers: Option<&crate::rivers::RiverField>,
+    buildings: Option<&crate::buildings::BuildingField>,
 ) {
     let mut open = settings.show_trainer;
     let previous_position = player.position;
@@ -444,7 +475,7 @@ fn draw_trainer_window(
         ctx.content_rect().top() + 12.0
     };
     let trainer_panels = |ui: &mut egui::Ui| {
-        draw_player_tools(ui, player, trainer, cache, noise, snow);
+        draw_player_tools(ui, player, trainer, cache, noise, snow, buildings);
         separator_text(ui, "Weather here");
         let selected = weather
             .trainer_preset
@@ -518,6 +549,7 @@ fn draw_trainer_window(
                 &mut settings.vegetation_enabled,
                 "Trees, shrubs and flowers",
             );
+            ui.checkbox(&mut settings.buildings_visible, "Buildings");
             ui.checkbox(&mut settings.clouds_enabled, "Clouds");
             ui.checkbox(&mut settings.ssao_enabled, "SSAO");
             ui.checkbox(&mut settings.flow_debug, "Flow visualization");
@@ -539,6 +571,7 @@ fn draw_trainer_window(
                 player,
                 rerun,
                 rivers,
+                buildings,
             );
         }
         ui.small("2 close menu  |  3 debug text  |  F12 screenshot");
@@ -574,6 +607,7 @@ fn draw_advanced_controls(
     player: &Player,
     rerun: &mut RerunErosion,
     rivers: Option<&crate::rivers::RiverField>,
+    buildings: Option<&crate::buildings::BuildingField>,
 ) {
     separator_text(ui, "Weather");
     ui.checkbox(&mut weather.automatic, "Moving weather fronts");
@@ -814,6 +848,20 @@ fn draw_advanced_controls(
         }
         None => {
             ui.label("Rivers disabled (--no-rivers)");
+        }
+    }
+
+    separator_text(ui, "Buildings");
+    ui.checkbox(&mut settings.buildings_visible, "Draw buildings");
+    match buildings.filter(|field| field.enabled()) {
+        Some(field) => {
+            ui.label(format!("{} buildings placed within 2.4 km", field.building_count()));
+            if let Some(nearest) = field.nearest(Vec2::new(player.position.x, player.position.z)) {
+                ui.label(format!("Nearest: {} at {:.0} m", nearest.name, nearest.distance));
+            }
+        }
+        None => {
+            ui.label("Buildings disabled (--no-buildings) or the kit failed to load");
         }
     }
 
@@ -1274,6 +1322,7 @@ mod tests {
             &SnowState::default(),
             &Player::default(),
             None,
+            None,
         );
         let mut output = ctx.end_pass();
         output.textures_delta.clear(); // Headless checks do not upload font textures.
@@ -1326,7 +1375,7 @@ mod tests {
                 });
                 let bottom = if debug_visible {
                     draw_debug_overlay(
-                        &ctx, &settings, &day_night, &weather, &cache, &noise, &snow, &player, None,
+                        &ctx, &settings, &day_night, &weather, &cache, &noise, &snow, &player, None, None,
                     )
                 } else {
                     0.0
@@ -1346,6 +1395,7 @@ mod tests {
                     &mut player,
                     &mut trainer,
                     &mut rerun,
+                    None,
                     None,
                 );
                 let mut output = ctx.end_pass();
