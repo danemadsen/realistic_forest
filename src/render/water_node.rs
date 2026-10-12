@@ -2250,28 +2250,33 @@ mod shading_tests {
     /// landed on it, so the shore was drawn again across the water at every
     /// tap's distance from it as a line between rougher and calmer water. Here
     /// a straight shore runs across the wind, its forest broken by clearings,
-    /// once from the waterline back and once from 60 m back behind a meadow.
-    /// The water is walked away from it down the wind and along it across the
-    /// wind in 10 cm steps, and neither the shelter nor the fetch may change
-    /// much over any one of them.
+    /// once from the waterline back and once from 60 m back behind a meadow,
+    /// and then with a spit running 120 m out from it down the wind, behind
+    /// which a single line upwind found the spit's end on one side of its
+    /// edge and the far shore on the other. The water is walked away from
+    /// the shore down the wind and along it across the wind in 10 cm steps,
+    /// and neither the shelter nor the fetch may change much over any one of
+    /// them.
     #[test]
     fn the_wind_on_a_lake_changes_in_gradients_not_lines() {
         let heads = [
             "fn smoothstepf(", "fn hash21(", "const CANOPY_HEIGHT:", "struct WindExposure", "const LEE_WIND:",
             "const WIND_WALK_TAPS:", "const WIND_WALK_REACH:", "const FETCH_LOSS:", "const FETCH_LOSS_RISE:",
-            "const STAND_SAMPLES:", "fn standCover(", "fn fetchLoss(", "fn walkFade(", "fn fetchAcross(",
-            "fn standTop(", "fn windExposure(",
+            "const STAND_SAMPLES:", "const WIND_LANE:", "fn standCover(", "fn fetchLoss(", "fn walkFade(",
+            "fn fetchAcross(", "fn standTop(", "fn upwindRay(", "fn windExposure(",
         ];
         // The lake's level is 0 and the wind blows toward +x. Upwind of x = 0
         // the bank rises 3 m over 10 m and then gently; the bed falls away to
         // 6 m. The crowns stand from `forest_edge` metres back, on a canopy
-        // capture of 2/3 m texels, a quarter of it open in 4 m clearings.
+        // capture of 2/3 m texels, a quarter of it open in 4 m clearings. With
+        // `spit` set, the land also runs out to x = 120 m wherever z < -5.
         let prelude = "
             var<private> forest_edge: f32;
+            var<private> spit: f32;
             fn riverGround(p: vec2<f32>) -> vec2<f32> {
-                let inland = -p.x;
+                let inland = max(-p.x, select(-1.0e4, min(120.0 - p.x, -5.0 - p.y), spit > 0.5));
                 let land = select(3.0 + 0.05*(inland - 10.0), 0.3*inland, inland < 10.0);
-                return vec2<f32>(select(-min(0.2*p.x, 6.0), land, inland > 0.0), 1.0);
+                return vec2<f32>(select(-min(-0.2*inland, 6.0), land, inland > 0.0), 1.0);
             }
             fn openAt(texel: vec2<f32>) -> f32 {
                 let centre = (texel + 0.5)*(2.0/3.0);
@@ -2287,6 +2292,7 @@ mod shading_tests {
             }";
         let body = "
             forest_edge = input.z;
+            spit = input.w;
             let exposure = windExposure(input.xy, 0.0, vec2<f32>(-1.0, 0.0), 1.0, 0.0, 0.0, 0.0,
                                         vec2<f32>(0.0, 1.0), 1.0);
             samples[id.x] = vec4<f32>(exposure.shelter, exposure.fetch, 0.0, 0.0);";
@@ -2300,6 +2306,14 @@ mod shading_tests {
                 let walk = (-1500..1500).map(|i| [x, i as f32 * 0.1, edge, 0.0]).collect();
                 lines.push((format!("across the wind at x = {x}, crowns {edge} m back"), walk));
             }
+        }
+        for x in [160.0f32, 200.0, 300.0] {
+            let walk = (-1000..1000).map(|i| [x, i as f32 * 0.1, 6.0, 1.0]).collect();
+            lines.push((format!("across the wind behind the spit at x = {x}"), walk));
+        }
+        for z in [-17.0f32, 7.0] {
+            let walk = (1205..5000).map(|i| [i as f32 * 0.1, z, 6.0, 1.0]).collect();
+            lines.push((format!("down the wind past the spit at z = {z}"), walk));
         }
         let inputs: Vec<[f32; 4]> = lines.iter().flat_map(|(_, walk)| walk.iter().copied()).collect();
         let Some(values) = evaluate_with(prelude, &heads, body, &inputs) else {

@@ -2005,6 +2005,8 @@ const FETCH_LOSS: f32 = 2.0;
 const FETCH_LOSS_RISE: f32 = 0.5;
 // Samples of the stand on the upwind bank.
 const STAND_SAMPLES: u32 = 12u;
+// Metres across the wind between the lines the wind is walked along.
+const WIND_LANE: f32 = 24.0;
 
 // Crown cover over a stand about `width` across around `p`: a forest edge
 // shelters as a porous belt, not as the one crown or gap a single point
@@ -2049,9 +2051,11 @@ fn standTop(rise: f32, open: f32) -> f32
     return max(rise, 0.0) + (1.0 - open)*CANOPY_HEIGHT*smoothstepf(-0.15, 0.25, rise);
 }
 
-fn windExposure(xz: vec2<f32>, level: f32, upwind: vec2<f32>, open_sky: f32, sea: f32,
-                across: f32, half_width: f32, cross_stream: vec2<f32>, still: f32) -> WindExposure
+// The fetch (x) and the upwind horizon (y) along the one line upwind from
+// `origin`.
+fn upwindRay(origin: vec2<f32>, level: f32, upwind: vec2<f32>, sea: f32) -> vec2<f32>
 {
+    let xz = origin;
     // Walk upwind to the bank. The ground between two taps is taken to run
     // straight from one to the next, and where it comes up out of the water
     // is found by halving the stretch five times, so the bank lies where the
@@ -2061,10 +2065,9 @@ fn windExposure(xz: vec2<f32>, level: f32, upwind: vec2<f32>, open_sky: f32, sea
     // from it as a line between rougher and calmer water. Two runs are kept:
     // the fetch, in which the walk's far end fades out, and how far the wind
     // runs before the bank stops it (`bank`), in which it does not.
-    let here = riverGround(xz);
     var rises: array<f32, WIND_WALK_TAPS>;
     var near = 0.0;
-    var near_rise = min(here.x - level, 0.0);
+    var near_rise = min(riverGround(xz).x - level, 0.0);
     var kept = 1.0;
     var fetch = 0.0;
     var bank_kept = 1.0;
@@ -2183,6 +2186,38 @@ fn windExposure(xz: vec2<f32>, level: f32, upwind: vec2<f32>, open_sky: f32, sea
             horizon = max(horizon, standTop(rises[i], open)/reach*beyond);
         }
     }
+    return vec2<f32>(fetch, horizon);
+}
+
+fn windExposure(xz: vec2<f32>, level: f32, upwind: vec2<f32>, open_sky: f32, sea: f32,
+                across: f32, half_width: f32, cross_stream: vec2<f32>, still: f32) -> WindExposure
+{
+    // A single line upwind passes a headland or an island by, or clips it,
+    // as the water moves across the wind, and the fetch and the lee behind
+    // it flip from the one to the other across a line down the wind. Over
+    // still water and the sea the wind is walked instead along two lines a
+    // lane apart, on lanes fixed in the world, and the water blends them by
+    // where it lies between: across the wind it changes over a lane's width,
+    // as the edge of a real lee spreads, and never in a step. A river keeps
+    // its own line, which a lane beside it would start on its banks.
+    let lanes = max(clamp(still, 0.0, 1.0), sea);
+    var ray = vec2<f32>(0.0);
+    if (lanes < 1.0)
+    {
+        ray = upwindRay(xz, level, upwind, sea);
+    }
+    if (lanes > 0.0)
+    {
+        let side = vec2<f32>(-upwind.y, upwind.x);
+        let between = fract(dot(xz, side)/WIND_LANE);
+        let first = xz - side*(between*WIND_LANE);
+        let lane = mix(upwindRay(first, level, upwind, sea),
+                       upwindRay(first + side*WIND_LANE, level, upwind, sea), between);
+        ray = mix(ray, lane, lanes);
+    }
+    var fetch = ray.x;
+    var horizon = ray.y;
+    let here = riverGround(xz);
     // A channel's own cut stands in for its banks only where the one-metre
     // map cannot show them, and never where the channel's water has already
     // become a lake's or the sea's: an outlet beside an open pond feels the
@@ -2617,21 +2652,23 @@ const OPEN_GROUND: vec4<f32> = vec4<f32>(0.10, 0.12, 0.06, 1.0);
 // creek's own cut.
 fn riverGround(world_xz: vec2<f32>) -> vec2<f32>
 {
+    let uv = (world_xz - stage.shore_map.xy)/max(stage.shore_map.z, 1.0) + vec2<f32>(0.5);
+    let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
+    let weight = select(0.0, smoothstepf(0.0, 0.03, edge), stage.shore_map.z >= 1.0);
+    // The wind's walk upwind reads the ground dozens of times a pixel: the
+    // lighting map only where the one-metre map does not cover it all.
     var coarse = -1.0e4;
-    if (globals.heightfield.z >= 1.0)
+    if (weight < 1.0 && globals.heightfield.z >= 1.0)
     {
         coarse = terrainHeightAt(world_xz);
     }
-    if (stage.shore_map.z < 1.0)
+    if (weight <= 0.0)
     {
         return vec2<f32>(coarse, 0.0);
     }
-    let uv = (world_xz - stage.shore_map.xy)/stage.shore_map.z + vec2<f32>(0.5);
-    let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
-    let weight = smoothstepf(0.0, 0.03, edge);
     let fine = textureSampleLevel(shoreline_heightfield, shoreline_sampler,
                                   clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).r;
-    return vec2<f32>(mix(coarse, fine, weight), weight);
+    return vec2<f32>(select(mix(coarse, fine, weight), fine, weight >= 1.0), weight);
 }
 
 // The ground's colour (rgb) and the share of open sky the tree crowns leave

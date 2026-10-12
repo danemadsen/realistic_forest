@@ -1224,6 +1224,12 @@ to the next:
   are read off a lattice fixed in the world and blended between its
   corners, so a forest edge comes into a lee over tens of metres. A bar or
   an island takes the fetch away by how far it stands out of the water.
+  Over a lake or the sea the wind is walked along two lines 24 m apart
+  across it, on lanes fixed in the world, and the water blends the two by
+  where it lies between them: a single line slipped past a headland or
+  clipped it as the water moved across the wind, so the lee behind it,
+  and the long fetch beside it, ended in a line down the wind; now they
+  spread across a lane's width. A river keeps its own line.
   A pond ringed by forest, or a creek in its cut under the crowns, lies
   calmer but never glassy: the mean wind drops faster in a lee than its
   gusts, so cat's paws still cross it, patches drawn out three times as
