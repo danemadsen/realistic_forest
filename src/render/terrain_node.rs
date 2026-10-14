@@ -75,11 +75,13 @@ const SHORE_HEIGHTFIELD_SNAP: f32 = SHORE_HEIGHTFIELD_SPAN / SHORE_HEIGHTFIELD_S
 
 // The shore capture is kept while the player walks about inside its snap, so
 // the erosion fade it was rendered with must be flat over every texel it
-// holds: the window's far corner plus the snap, with room to spare, lies well
-// inside the radius where erosion is at full strength. The lighting map
-// reaches far past the fade, so its key holds the fade's centre instead.
+// holds: the window's far corner plus the snap and the fade anchor's offset
+// from the player, with room to spare, lies well inside the radius where
+// erosion is at full strength. The lighting map reaches far past the fade,
+// so its key holds the fade's centre instead.
 const _: () = assert!(
-    (SHORE_HEIGHTFIELD_SPAN / 2.0 + SHORE_HEIGHTFIELD_SNAP) * 1.5 < EROSION_VISIBILITY_FULL_RADIUS,
+    (SHORE_HEIGHTFIELD_SPAN / 2.0 + SHORE_HEIGHTFIELD_SNAP + crate::erosion::EROSION_FADE_SNAP) * 1.5
+        < EROSION_VISIBILITY_FULL_RADIUS,
     "the shore heightfield window must sit inside the full-strength erosion radius"
 );
 
@@ -103,10 +105,12 @@ pub fn grass_habitat_mapping(position: [f32; 3]) -> [f32; 4] {
 
 // The capture is kept across frames and the player walks off its centre, so
 // the erosion fade it was rendered with must be flat over every texel it
-// holds: the window's far corner plus the 8 m snap, with room to spare, lies
-// well inside the radius where erosion is at full strength.
+// holds: the window's far corner plus the 8 m snap and the fade anchor's
+// offset from the player, with room to spare, lies well inside the radius
+// where erosion is at full strength.
 const _: () = assert!(
-    (GRASS_HABITAT_SPAN / 2.0 + 8.0) * 1.5 < EROSION_VISIBILITY_FULL_RADIUS,
+    (GRASS_HABITAT_SPAN / 2.0 + 8.0 + crate::erosion::EROSION_FADE_SNAP) * 1.5
+        < EROSION_VISIBILITY_FULL_RADIUS,
     "the grass habitat window must sit inside the full-strength erosion radius"
 );
 
@@ -273,8 +277,8 @@ struct HeightfieldKey {
     /// The captured window (`globals.heightfield` layout), as bit patterns so
     /// equality is exact.
     mapping: [u32; 4],
-    /// The erosion fade's centre, the player's XZ, for a window the fade
-    /// reaches into. `None` for a window wholly at full strength.
+    /// The erosion fade's centre, the player's fade anchor, for a window the
+    /// fade reaches into. `None` for a window wholly at full strength.
     fade_centre: Option<[u32; 2]>,
     lookup_minimum: (i64, i64),
     /// Erosion lookup, atlas and river contents, see `TerrainRevision`.
@@ -282,8 +286,9 @@ struct HeightfieldKey {
 }
 
 impl HeightfieldKey {
-    /// The lighting map reaches far past the erosion fade, so every step the
-    /// player takes moves the faded ring of erosion across it.
+    /// The lighting map reaches far past the erosion fade, so every move of
+    /// the fade's anchor (`erosion_fade_anchor`, which follows the player 8 m
+    /// at a time) moves the faded ring of erosion across it.
     fn lighting(
         mapping: [f32; 4],
         fade_centre: [f32; 2],
@@ -519,9 +524,13 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         resources.snow_revision.store(view.snow_revision, Ordering::Relaxed);
     }
 
-    // DrawClipmap: uErosionVisibilityCenter is the player's XZ and every
-    // level shares it (SetTerrainSharedUniforms runs once per frame).
-    let visibility_center = [view.player_position[0], view.player_position[2]];
+    // DrawClipmap: every level shares uErosionVisibilityCenter
+    // (SetTerrainSharedUniforms runs once per frame). The C++ set the
+    // player's XZ; here it is that snapped to the fade's lattice, as every
+    // other consumer of the fade has it, so the lighting map below is kept
+    // while the player walks about inside one lattice cell.
+    let visibility_center =
+        crate::erosion::erosion_fade_anchor([view.player_position[0], view.player_position[2]]);
     let level_uniforms: [TerrainStageUniforms; CLIP_LEVELS] = std::array::from_fn(|level| {
         TerrainStageUniforms::build(
             // The C++ hands MatrixIdentity() to DrawMesh for every level:
@@ -552,8 +561,9 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
     // height readback. The capture is a function of the inputs in
     // `HeightfieldKey`; it is redone when one of them changes (the window
     // moving on, a tile streaming in or revealing, a new river network, the
-    // player stepping, which moves the erosion fade across the map) and kept
-    // otherwise, so standing still costs nothing.
+    // player crossing into the next cell of the fade's lattice, which moves
+    // the erosion fade across the map) and kept otherwise, so standing still
+    // or walking about inside one cell costs nothing.
     if view.settings.raymarched_shadows
         && let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.heightfield_pipeline)
     {
@@ -2421,11 +2431,18 @@ mod heightfield_cache_tests {
                 let fade = crate::erosion::erosion_visibility(
                     x + dx * span,
                     z + dz * span,
-                    [position[0], position[2]],
+                    crate::erosion::erosion_fade_anchor([position[0], position[2]]),
                 );
                 assert_eq!(fade, 1.0, "{position:?}");
             }
         }
+    }
+
+    /// The lighting key of a player at `player`'s XZ, as the terrain pass
+    /// takes it: the fade centred on the player's anchor.
+    fn lighting_key(player: [f32; 2]) -> HeightfieldKey {
+        let mapping = [0.0, 0.0, LIGHTING_HEIGHTFIELD_SPAN, 12.0];
+        HeightfieldKey::lighting(mapping, crate::erosion::erosion_fade_anchor(player), (0, 0), 0)
     }
 
     #[test]
@@ -2437,22 +2454,54 @@ mod heightfield_cache_tests {
     }
 
     #[test]
-    fn any_step_retakes_the_lighting_map_but_not_the_shore() {
-        // A centimetre, inside one lighting window and one shore snap.
+    fn a_step_inside_one_fade_cell_keeps_the_lighting_map() {
+        // Steps between the corners and the middle of the cell [4, 12) x
+        // [20, 28), whose anchor is (8, 24), and of the cell round the origin.
+        let steps = [
+            ([10.0, 20.0], [10.01, 20.0]),
+            ([4.0, 20.0], [11.99, 27.99]),
+            ([8.0, 24.0], [4.0, 27.99]),
+            ([-4.0, -4.0], [3.99, 3.99]),
+        ];
+        for (from, to) in steps {
+            assert_eq!(lighting_key(from), lighting_key(to), "{from:?} -> {to:?}");
+            // The faded erosion is the same everywhere in the map, out
+            // through the band 1.35 km away where it falls.
+            let far = [from[0] + 1350.0, from[1]];
+            let fade = |player| {
+                crate::erosion::erosion_visibility(far[0], far[1], crate::erosion::erosion_fade_anchor(player))
+            };
+            assert_eq!(fade(from), fade(to));
+        }
+        // The shore map stays too, inside its own snap.
         let (from, to) = ([10.0, 20.0], [10.01, 20.0]);
-        let mapping = [0.0, 0.0, LIGHTING_HEIGHTFIELD_SPAN, 12.0];
-        assert_ne!(
-            HeightfieldKey::lighting(mapping, from, (0, 0), 0),
-            HeightfieldKey::lighting(mapping, to, (0, 0), 0)
-        );
-        // Because the step moves the erosion drawn far out in the map: 1.35 km
-        // away, well inside the 12 km window, the fade is partway down its ramp.
-        let far = [from[0] + 1350.0, from[1]];
-        assert_ne!(
-            crate::erosion::erosion_visibility(far[0], far[1], from),
-            crate::erosion::erosion_visibility(far[0], far[1], to)
-        );
         assert_eq!(shore_key([from[0], 5.0, from[1]]), shore_key([to[0], 5.0, to[1]]));
+    }
+
+    #[test]
+    fn crossing_a_fade_cell_retakes_the_lighting_map() {
+        // A centimetre over the line between the anchors 8 and 16 m east.
+        let (from, to) = ([11.995, 20.0], [12.005, 20.0]);
+        assert_ne!(lighting_key(from), lighting_key(to));
+        // Because the anchor's step moves the erosion drawn far out in the
+        // map: 1.35 km away, well inside the 12 km window, the fade is
+        // partway down its ramp.
+        let far = [from[0] + 1350.0, from[1]];
+        let fade = |player| {
+            crate::erosion::erosion_visibility(far[0], far[1], crate::erosion::erosion_fade_anchor(player))
+        };
+        assert_ne!(fade(from), fade(to));
+        // The shore's snap lines lie between the fade's, so it stays.
+        assert_eq!(shore_key([from[0], 5.0, from[1]]), shore_key([to[0], 5.0, to[1]]));
+        // Walking 100 m east at 10 m/s retakes the map as the anchor steps,
+        // a dozen times rather than on each of the 600 frames.
+        let retakes = (1..=600)
+            .filter(|&frame| {
+                let at = |frame: i32| [5.0 + frame as f32 / 6.0, 20.0];
+                lighting_key(at(frame)) != lighting_key(at(frame - 1))
+            })
+            .count();
+        assert_eq!(retakes, 12);
     }
 
     #[test]

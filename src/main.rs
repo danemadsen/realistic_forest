@@ -588,7 +588,8 @@ fn setup_cursor_and_player(
             player.pitch = automation.pitch;
             player.flying = true;
         } else {
-            player.position.y = erosion::sample_eroded_height(&cache, &noise, 0.0, 0.0, [0.0, 0.0]) + EYE_HEIGHT;
+            let fade_anchor = erosion::erosion_fade_anchor([0.0, 0.0]);
+            player.position.y = erosion::sample_eroded_height(&cache, &noise, 0.0, 0.0, fade_anchor) + EYE_HEIGHT;
         }
         player.mouse_captured = false;
         log::info!(
@@ -628,7 +629,7 @@ fn setup_cursor_and_player(
     // Ground-level spawn, matching the C++ pre-loop player placement.
     if !automation.has_camera {
         player.position.y = erosion::sample_eroded_height(
-            &cache, &noise, 0.0, 0.0, [0.0, 0.0],
+            &cache, &noise, 0.0, 0.0, erosion::erosion_fade_anchor([0.0, 0.0]),
         ) + EYE_HEIGHT;
         // `if (automation.shotPath == nullptr) DisableCursor();` (main.cpp:2261)
         // is the whole of the C++'s cursor special-casing for automation, and

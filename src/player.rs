@@ -4,7 +4,7 @@
 use crate::buildings::BuildingField;
 use crate::buildings::collision::{self as building_collision, NearBuilding};
 use crate::constants::*;
-use crate::erosion::ErosionCache;
+use crate::erosion::{ErosionCache, erosion_fade_anchor};
 use crate::noise::NoiseField;
 use crate::snow::{self, SnowState};
 use crate::vegetation::VegetationField;
@@ -273,9 +273,12 @@ pub fn update_player_system(
     };
     snow.recenter(Vec2::new(player.position.x, player.position.z));
     // The water at the eye, which the renderer needs whether or not the
-    // player can move.
-    let visibility_center = Vec2::new(player.position.x, player.position.z);
-    let water = water_at(&erosion, &noise, player.position.x, player.position.z, visibility_center.to_array());
+    // player can move. The ground under it is the terrain pass's, its erosion
+    // faded round the same anchor; within a kilometre of the player the fade
+    // is whole either way.
+    let here = Vec2::new(player.position.x, player.position.z);
+    let fade_anchor = erosion_fade_anchor(here.to_array());
+    let water = water_at(&erosion, &noise, player.position.x, player.position.z, fade_anchor);
     player.water = water;
     // A pinned --camera capture holds its pose: a click or keystroke that
     // lands on the window while it renders must not move the shot.
@@ -385,17 +388,16 @@ pub fn update_player_system(
         collide_with_trunks(&mut player, &mut candidate, &vegetation, &erosion, &noise);
         // So are the buildings' walls, and their doors swing open from the
         // body that walks into them.
-        let travel = visibility_center.distance(Vec2::new(candidate.x, candidate.z));
-        let mut near = buildings.near_mut(visibility_center, PLAYER_RADIUS + travel + 1.0);
+        let travel = here.distance(Vec2::new(candidate.x, candidate.z));
+        let mut near = buildings.near_mut(here, PLAYER_RADIUS + travel + 1.0);
         collide_with_buildings(&mut player, &mut candidate, &mut near, dt);
         // Water too deep to stand in is swum in: the body floats, head out,
         // until the player dives. A swimmer crouched under standing height
         // stands up. The ground is what walking stands on, snow and all, or
         // a building's floor.
         let feet = player.position.y - EYE_HEIGHT;
-        let terrain = snow::sample_surface(&erosion, &noise, visibility_center, visibility_center.to_array())
-            .height(&snow, visibility_center);
-        let ground = footing(terrain, &near, visibility_center, feet);
+        let terrain = snow::sample_surface(&erosion, &noise, here, fade_anchor).height(&snow, here);
+        let ground = footing(terrain, &near, here, feet);
         let swimming = swims(water, ground, player.position.y, player.vertical_velocity, player.swimming);
         let jump = keys.just_pressed(KeyCode::Space) && !ui_wants_input;
         let at_surface = kicks_off(water, player.position.y);
@@ -411,7 +413,7 @@ pub fn update_player_system(
                     / (1.0 - SWIM_PITCH_DEAD_ZONE),
             };
             let candidate_xz = Vec2::new(candidate.x, candidate.z);
-            let there = snow::sample_surface(&erosion, &noise, candidate_xz, visibility_center.to_array());
+            let there = snow::sample_surface(&erosion, &noise, candidate_xz, fade_anchor);
             let mut bed = there.height(&snow, candidate_xz);
             // A bank is as solid to a swimmer as to a walker.
             if too_high_to_step(bed, ground, player.position.y) {
@@ -421,10 +423,10 @@ pub fn update_player_system(
             }
             // Crouched on dry ground, standing up, the feet tread the snow as
             // a walker's do.
-            if water.is_none() && there.coverage > 0.0 && candidate_xz.distance_squared(visibility_center) > 0.000001
+            if water.is_none() && there.coverage > 0.0 && candidate_xz.distance_squared(here) > 0.000001
                 && candidate_xz == Vec2::new(candidate.x, candidate.z)
             {
-                snow.stamp_segment(visibility_center, candidate_xz);
+                snow.stamp_segment(here, candidate_xz);
                 bed = there.height(&snow, candidate_xz);
             }
             let (y, vertical_velocity) = swim_vertical(player.position.y, player.vertical_velocity, stroke,
@@ -457,7 +459,8 @@ pub fn update_player_system(
             // water the step ends over takes the fall there and the swim
             // takes over.
             let landing = if candidate.x != player.position.x || candidate.z != player.position.z {
-                water_at(&erosion, &noise, candidate.x, candidate.z, [candidate.x, candidate.z])
+                let fade_anchor = erosion_fade_anchor([candidate.x, candidate.z]);
+                water_at(&erosion, &noise, candidate.x, candidate.z, fade_anchor)
             } else {
                 water
             };
@@ -477,7 +480,7 @@ pub fn update_player_system(
     player.water = match landed {
         Some(landing) => landing,
         None if candidate.x != player.position.x || candidate.z != player.position.z => {
-            water_at(&erosion, &noise, candidate.x, candidate.z, [candidate.x, candidate.z])
+            water_at(&erosion, &noise, candidate.x, candidate.z, erosion_fade_anchor([candidate.x, candidate.z]))
         }
         None => water,
     };
@@ -529,9 +532,10 @@ fn collide_with_trunks(
         return;
     }
     // A tree the GPU would not draw is not there to walk into.
+    let fade_anchor = Vec2::from(erosion_fade_anchor(from.to_array()));
     let trunks: Vec<collision::Trunk> = solids
         .iter()
-        .filter_map(|solid| solid.stand(erosion, noise, from))
+        .filter_map(|solid| solid.stand(erosion, noise, fade_anchor))
         .collect();
     let feet = player.position.y - EYE_HEIGHT;
     let slid = collision::slide(&trunks, from, to, feet);
@@ -588,12 +592,12 @@ fn update_walking_ground(
     dt: f32,
 ) -> bool {
     let previous_xz = Vec2::new(player.position.x, player.position.z);
-    let visibility_center = previous_xz.to_array();
+    let fade_anchor = erosion_fade_anchor(previous_xz.to_array());
     let feet = player.position.y - EYE_HEIGHT;
-    let old_surface = snow::sample_surface(erosion, noise, previous_xz, visibility_center);
+    let old_surface = snow::sample_surface(erosion, noise, previous_xz, fade_anchor);
     let old_ground = footing(old_surface.height(snow, previous_xz), near, previous_xz, feet);
     let mut next_xz = Vec2::new(candidate.x, candidate.z);
-    let mut next_surface = snow::sample_surface(erosion, noise, next_xz, visibility_center);
+    let mut next_surface = snow::sample_surface(erosion, noise, next_xz, fade_anchor);
     let next_ground = footing(next_surface.height(snow, next_xz), near, next_xz, feet);
     if step_blocked(next_ground, old_ground, player.position.y, player.vertical_velocity, afloat, player.leapt) {
         candidate.x = player.position.x;

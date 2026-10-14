@@ -837,8 +837,12 @@ procedural base terrain rather than amplifying the others. The initial four-pass
 quartet is prewarmed at spawn. Beyond 1100 metres from the player, one shared C1
 radial visibility field fades height and flow and material evidence back to the
 procedural base terrain, reaching zero by 1600 metres — safely before the
-nearest exact-four support edge of the 9×9 pass cache. CPU collision and both
-terrain shaders use the same lattice, weights, centre, and radii. Past the zero
+nearest exact-four support edge of the 9×9 pass cache. The fade is centred on
+the player's position snapped to an eight-metre lattice, at most 5.7 metres
+from the player; that changes the faded erosion by at most 1.7% of its
+height change, 0.19 metres of the largest at 11 metres, and leaves everything
+within 1094 metres at full strength. CPU collision, the plant roots and both terrain
+shaders use the same lattice, weights, centre, and radii. Past the zero
 radius the fade is exactly zero, so no consumer samples a tile there at all:
 the clipmap, the lighting heightfield, the plants' roots, the material shader
 and the CPU skip the masks, lookups and atlas fetches that would only be
@@ -1546,8 +1550,11 @@ changing the visibility computed by the original terrain shadow march.
 The lighting heightfield, its maximum-height reduction, and the 512×512 shoreline
 heightfield are cached until their terrain inputs or world mappings change.
 Erosion tile uploads and reveals, lookup shifts, and river updates invalidate
-both maps. Moving the player also invalidates the lighting map because erosion
-fades with distance from the player. The shoreline map stays entirely inside
+both maps. Moving the player into the next cell of the erosion fade's
+eight-metre lattice also invalidates the lighting map, because the fade
+reaches across it: walking retakes the map about once every eight metres, 12
+times over a 100-metre walk instead of on every one of its 600 frames, and
+movement inside a cell retakes nothing. The shoreline map stays entirely inside
 the full-strength erosion radius, so it can be reused within its eight-metre
 mapping snap. Stationary frames after streaming settles reuse both captures and
 copy the cached maximum into the frame's lighting uniforms.

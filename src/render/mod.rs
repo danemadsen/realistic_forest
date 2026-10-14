@@ -659,8 +659,9 @@ fn extract_forest_view(
     if view.settings.vegetation_shadows {
         let noise = world.resource::<NoiseField>();
         let eye = view.player_position;
+        let fade_anchor = crate::erosion::erosion_fade_anchor([eye[0], eye[2]]);
         view.shadow_receiver_heights = vegetation_shadows::receiver_height_bounds(eye, |x, z| {
-            crate::erosion::sample_eroded_height(cache, noise, x, z, [eye[0], eye[2]])
+            crate::erosion::sample_eroded_height(cache, noise, x, z, fade_anchor)
         });
     }
     let snow = world.resource::<crate::snow::SnowState>();

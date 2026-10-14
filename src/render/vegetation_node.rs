@@ -1220,12 +1220,14 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
         }
     }
     queue.write_buffer(&library.cull_buffer, 0, bytemuck::bytes_of(&cull));
+    // The roots seat on the ground the clipmap draws, its erosion faded
+    // round the same anchor.
     let stage = TerrainStageUniforms::build(
         bevy::math::Mat4::IDENTITY.to_cols_array(),
         0,
         eye,
         view.lookup_minimum,
-        [eye[0], eye[2]],
+        crate::erosion::erosion_fade_anchor([eye[0], eye[2]]),
     );
     queue.write_buffer(&library.stage_buffer, 0, bytemuck::bytes_of(&stage));
     let elapsed = world

@@ -955,7 +955,7 @@ pub fn advance_weather(
         let [x, _, z] = weather.lightning.position;
         let terrain = if let (Some(cache), Some(field)) = (erosion, noise) {
             crate::erosion::sample_eroded_height(
-                &cache, &field, x, z, [world_position[0], world_position[2]],
+                &cache, &field, x, z, crate::erosion::erosion_fade_anchor([world_position[0], world_position[2]]),
             )
         } else { crate::constants::SEA_LEVEL };
         let contact = terrain.max(crate::constants::SEA_LEVEL);
