@@ -86,6 +86,14 @@ const EROSION_GUARD_BAND_PIXELS: f32 = 16.0;
 /// `uBrushStrength` in erosion-terrain.fs.
 const EROSION_BRUSH_STRENGTH: f32 = 0.35;
 
+/// The simulation states' format: four f32 channels per cell.
+const SIM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
+/// The routing normaliser is one sum per cell; the water pass writes a vec4
+/// and the single channel keeps its R, which is all the terrain pass reads.
+const ROUTING_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+/// The static field holds two values per cell, the runoff's broad and fine
+/// path noise; the init pass writes a vec4 and the target keeps R and G.
+const STATIC_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Float;
 /// One RGBA32F texel of the simulation domain.
 const SIM_TEXEL_BYTES: u32 = 16;
 /// 480 * 16 = 7680, already 256-byte aligned, so the reads need no padding.
@@ -123,6 +131,19 @@ struct ReadbackSlots {
     drainage: Option<HalfResult>,
 }
 
+/// The GPU time of a tile whose whole simulation one command set recorded
+/// (the prewarm): when its first submission went in, and when the queue
+/// reported every submission up to its last iteration done. The completion
+/// callback fires inside a `device.poll` on the worker thread, which polls
+/// every millisecond while the tile's readback is outstanding, so the stamp
+/// trails the GPU by at most about one poll interval.
+struct SimulationTiming {
+    key: TileKey,
+    iterations: usize,
+    started: std::time::Instant,
+    finished: Arc<Mutex<Option<std::time::Instant>>>,
+}
+
 /// What a complete readback cycle produced for the worker loop.
 enum ReadbackOutcome {
     /// Nothing landed yet (a plane is still in flight).
@@ -145,6 +166,8 @@ struct WorkerErosionSim {
     queue: wgpu::Queue,
 
     init_pipeline: wgpu::RenderPipeline,
+    /// The init shader again, into the static field's two-channel format.
+    static_pipeline: wgpu::RenderPipeline,
     flux_pipeline: wgpu::RenderPipeline,
     water_pipeline: wgpu::RenderPipeline,
     terrain_pipeline: wgpu::RenderPipeline,
@@ -156,12 +179,12 @@ struct WorkerErosionSim {
     /// unchanged on the worker's device.
     globals: wgpu::BindGroup,
 
-    /// `uMode` 0, 1 and 2 init uniforms (one per mode: `queue.write_buffer`
+    /// `uMode` 0, 1, 2 and 3 init uniforms (one per mode: `queue.write_buffer`
     /// is ordered before the whole submission, so one buffer cannot hold
     /// `uMode` 0 for the terrain pass and `uMode` 1 for the water/flux passes
     /// of the same frame).
-    init_stage_buffers: [wgpu::Buffer; 3],
-    init_stage_groups: [wgpu::BindGroup; 3],
+    init_stage_buffers: [wgpu::Buffer; 4],
+    init_stage_groups: [wgpu::BindGroup; 4],
     flux_stage_buffer: wgpu::Buffer,
     flux_stage_group: wgpu::BindGroup,
     water_stage_buffer: wgpu::Buffer,
@@ -191,14 +214,20 @@ struct WorkerErosionSim {
     flux_targets: [wgpu::Texture; 2],
     drainage_targets: [wgpu::Texture; 2],
     /// Written by every water pass and read by the terrain pass right after,
-    /// so it needs no ping-pong partner.
+    /// so it needs no ping-pong partner. One channel (R32Float): the routing
+    /// normaliser is a single sum.
     #[allow(dead_code)]
     routing_target: wgpu::Texture,
+    /// The runoff path noise the terrain pass reads, stamped once per tile
+    /// by the init pass's `uMode` 3 and only read after that.
+    #[allow(dead_code)]
+    static_target: wgpu::Texture,
     terrain_views: [wgpu::TextureView; 2],
     water_views: [wgpu::TextureView; 2],
     flux_views: [wgpu::TextureView; 2],
     drainage_views: [wgpu::TextureView; 2],
     routing_view: wgpu::TextureView,
+    static_view: wgpu::TextureView,
 
     /// `terrainIndex`, `waterIndex`, `fluxIndex`, plus the drainage state.
     terrain_index: usize,
@@ -213,6 +242,8 @@ struct WorkerErosionSim {
     /// the frame-time phase attribution (zero unless a tile finalized just
     /// now).
     last_finalize_us: u64,
+    /// The active tile's GPU timing, when it is being timed.
+    timing: Option<SimulationTiming>,
     /// Erosion settings in force (`appliedErosionSettings`).
     settings: ErosionSettings,
 
@@ -310,7 +341,7 @@ impl WorkerErosionSim {
         let init_inputs_layout = sim_inputs_layout(device, "erosion_init_inputs_layout", 1);
         let flux_inputs_layout = sim_inputs_layout(device, "erosion_flux_inputs_layout", 3);
         let water_inputs_layout = sim_inputs_layout(device, "erosion_water_inputs_layout", 3);
-        let terrain_inputs_layout = sim_inputs_layout(device, "erosion_terrain_inputs_layout", 4);
+        let terrain_inputs_layout = sim_inputs_layout(device, "erosion_terrain_inputs_layout", 5);
         let thermal_inputs_layout = sim_inputs_layout(device, "erosion_thermal_inputs_layout", 2);
 
         // The C++ sets TEXTURE_FILTER_POINT on the base map and keeps every
@@ -338,7 +369,9 @@ impl WorkerErosionSim {
             sim_texture(device, "erosion_sim_drainage_0"),
             sim_texture(device, "erosion_sim_drainage_1"),
         ];
-        let routing_target = sim_texture(device, "erosion_sim_routing");
+        let routing_target =
+            sim_texture_with_format(device, "erosion_sim_routing", ROUTING_FORMAT);
+        let static_target = sim_texture_with_format(device, "erosion_sim_static", STATIC_FORMAT);
         let terrain_views = [
             terrain_targets[0].create_view(&Default::default()),
             terrain_targets[1].create_view(&Default::default()),
@@ -356,6 +389,7 @@ impl WorkerErosionSim {
             drainage_targets[1].create_view(&Default::default()),
         ];
         let routing_view = routing_target.create_view(&Default::default());
+        let static_view = static_target.create_view(&Default::default());
 
         let base_texture_descriptor = wgpu::TextureDescriptor {
             label: Some("erosion_base_height"),
@@ -383,8 +417,9 @@ impl WorkerErosionSim {
 
         // `RunErosionIterations` feeds each pass the state it must read: flux
         // takes (flux, terrain, water), water takes (water, flux, terrain) —
-        // after the flux flip — terrain takes (terrain, water, drainage) and
-        // thermal takes the terrain and drainage the terrain pass just wrote
+        // after the flux flip — terrain takes (terrain, water, drainage, plus
+        // the routing normaliser and the tile's static field) and thermal
+        // takes the terrain and drainage the terrain pass just wrote
         // (drainage B carries each cell's bedrock resistance).
         let flux_inputs = std::array::from_fn(|flux_index| {
             std::array::from_fn(|terrain_index| {
@@ -432,6 +467,7 @@ impl WorkerErosionSim {
                             &water_views[water_index],
                             &drainage_views[drainage_index],
                             &routing_view,
+                            &static_view,
                         ],
                         &sampler,
                     )
@@ -457,6 +493,7 @@ impl WorkerErosionSim {
             stage_buffer(device, "erosion_init_mode_0"),
             stage_buffer(device, "erosion_init_mode_1"),
             stage_buffer(device, "erosion_init_mode_2"),
+            stage_buffer(device, "erosion_init_mode_3"),
         ];
         let init_stage_groups = [
             make_stage_group(
@@ -476,6 +513,12 @@ impl WorkerErosionSim {
                 "erosion_worker_init_stage_2",
                 &stage_layout,
                 &init_stage_buffers[2],
+            ),
+            make_stage_group(
+                device,
+                "erosion_worker_init_stage_3",
+                &stage_layout,
+                &init_stage_buffers[3],
             ),
         ];
         let flux_stage_buffer = stage_buffer(device, "erosion_flux_stage");
@@ -514,14 +557,21 @@ impl WorkerErosionSim {
             "erosion_init_pipeline",
             &init_module,
             &[&globals_layout, &init_inputs_layout, &stage_layout],
-            1,
+            &[SIM_FORMAT],
+        );
+        let static_pipeline = make_pipeline(
+            device,
+            "erosion_static_pipeline",
+            &init_module,
+            &[&globals_layout, &init_inputs_layout, &stage_layout],
+            &[STATIC_FORMAT],
         );
         let flux_pipeline = make_pipeline(
             device,
             "erosion_flux_pipeline",
             &flux_module,
             &[&globals_layout, &flux_inputs_layout, &stage_layout],
-            1,
+            &[SIM_FORMAT],
         );
         // Water and the routing normaliser.
         let water_pipeline = make_pipeline(
@@ -529,7 +579,7 @@ impl WorkerErosionSim {
             "erosion_water_pipeline",
             &water_module,
             &[&globals_layout, &water_inputs_layout, &stage_layout],
-            2,
+            &[SIM_FORMAT, ROUTING_FORMAT],
         );
         // Terrain and drainage states.
         let terrain_pipeline = make_pipeline(
@@ -537,20 +587,21 @@ impl WorkerErosionSim {
             "erosion_terrain_pipeline",
             &terrain_module,
             &[&globals_layout, &terrain_inputs_layout, &stage_layout],
-            2,
+            &[SIM_FORMAT, SIM_FORMAT],
         );
         let thermal_pipeline = make_pipeline(
             device,
             "erosion_thermal_pipeline",
             &thermal_module,
             &[&globals_layout, &thermal_inputs_layout, &stage_layout],
-            1,
+            &[SIM_FORMAT],
         );
 
         Ok(Self {
             device: device.clone(),
             queue: queue.clone(),
             init_pipeline,
+            static_pipeline,
             flux_pipeline,
             water_pipeline,
             terrain_pipeline,
@@ -577,11 +628,13 @@ impl WorkerErosionSim {
             flux_targets,
             drainage_targets,
             routing_target,
+            static_target,
             terrain_views,
             water_views,
             flux_views,
             drainage_views,
             routing_view,
+            static_view,
             terrain_index: 0,
             water_index: 0,
             flux_index: 0,
@@ -589,6 +642,7 @@ impl WorkerErosionSim {
             active_tile: None,
             active_iterations: 0,
             last_finalize_us: 0,
+            timing: None,
             settings: ErosionSettings::default(),
             delivered: None,
             readback: Arc::new(Mutex::new(ReadbackSlots::default())),
@@ -597,8 +651,8 @@ impl WorkerErosionSim {
         })
     }
 
-    /// `uMode` 0, 1 and 2 init uniforms, the base height and drainage upload
-    /// and the eight init passes (`InitializeErosionTextures`), recorded into
+    /// `uMode` 0 to 3 init uniforms, the base height and drainage upload, the
+    /// static field and the eight init passes (`InitializeErosionTextures`), recorded into
     /// the caller's encoder. Queue-level writes (texture, uniforms) are
     /// ordered before the submission of everything recorded after them.
     fn initialize_tile(
@@ -658,6 +712,20 @@ impl WorkerErosionSim {
         uniforms.mode = 2;
         self.queue
             .write_buffer(&self.init_stage_buffers[2], 0, bytemuck::bytes_of(&uniforms));
+        uniforms.mode = 3;
+        self.queue
+            .write_buffer(&self.init_stage_buffers[3], 0, bytemuck::bytes_of(&uniforms));
+
+        // The path noise the terrain pass reads every iteration depends on
+        // the tile alone, so it is stamped once here.
+        record_erosion_pass(
+            encoder,
+            &self.static_pipeline,
+            &self.globals,
+            &self.init_inputs,
+            &self.init_stage_groups[3],
+            &self.static_view,
+        );
 
         // for (int i = 0; i < 2; ++i): terrain keeps the stamped state, water
         // and flux are cleared, drainage takes the routed base catchments,
@@ -876,7 +944,14 @@ impl WorkerErosionSim {
 
         self.write_stage_uniforms(commands.sim_min);
 
+        // A set that both begins and finalizes a tile (the prewarm) submits
+        // its whole simulation back to back, so the time from its first
+        // submission until the queue drains is the GPU's time for the tile.
+        // A streamed tile spreads over many frames and is not timed.
+        let timed = commands.init.is_some() && commands.finalize;
+        let mut started = std::time::Instant::now();
         if let Some(init) = &commands.init {
+            self.timing = None;
             let mut encoder = self.device.create_command_encoder(
                 &wgpu::CommandEncoderDescriptor {
                     label: Some("erosion_init_frame"),
@@ -890,7 +965,9 @@ impl WorkerErosionSim {
                 commands.sim_min,
                 &mut encoder,
             );
-            self.queue.submit(Some(encoder.finish()));
+            let command_buffer = encoder.finish();
+            started = std::time::Instant::now();
+            self.queue.submit(Some(command_buffer));
         }
 
         let count = self.iteration_count(commands);
@@ -905,9 +982,46 @@ impl WorkerErosionSim {
             self.queue.submit(Some(encoder.finish()));
         }
 
+        if timed && let Some(key) = self.active_tile {
+            let finished = Arc::new(Mutex::new(None));
+            let stamp = finished.clone();
+            self.queue.on_submitted_work_done(move || {
+                if let Ok(mut slot) = stamp.lock() {
+                    *slot = Some(std::time::Instant::now());
+                }
+            });
+            self.timing = Some(SimulationTiming {
+                key,
+                iterations: count,
+                started,
+                finished,
+            });
+        }
+
         if commands.finalize {
             self.issue_readback();
         }
+    }
+
+    /// Milliseconds the GPU spent on `key`'s timed simulation, logged with
+    /// its iteration count; 0 when the tile was not timed, or when the
+    /// queue's completion has not been seen.
+    fn take_simulation_ms(&mut self, key: TileKey) -> f32 {
+        let Some(timing) = self.timing.take().filter(|timing| timing.key == key) else {
+            return 0.0;
+        };
+        let Some(finished) = timing.finished.lock().ok().and_then(|slot| *slot) else {
+            return 0.0;
+        };
+        let milliseconds = finished.duration_since(timing.started).as_secs_f32() * 1000.0;
+        log::info!(
+            "EROSION: tile ({}, {}) ran {} iterations on the GPU in {:.0} ms",
+            key.x,
+            key.z,
+            timing.iterations,
+            milliseconds
+        );
+        milliseconds
     }
 
     /// Records the finalize copies (`rlReadTexturePixels`' three planes) and
@@ -1053,15 +1167,17 @@ impl WorkerErosionSim {
                     && drainage.len() == SIM_PIXELS * 4 =>
             {
                 let started_at = std::time::Instant::now();
-                let (tile, atlas_height, atlas_flow) =
+                let (mut tile, atlas_height, atlas_flow) =
                     finalize_erosion_tile(key, &terrain, &water, &drainage);
                 self.last_finalize_us = started_at.elapsed().as_micros() as u64;
+                tile.stats.simulation_ms = self.take_simulation_ms(key);
                 self.delivered = Some(key);
                 ReadbackOutcome::Finalized(tile, atlas_height, atlas_flow)
             }
             _ => {
                 // A failed or short readback: the C++ counts it and requeues
                 // the tile, which the main world does from the event.
+                self.timing = None;
                 self.delivered = Some(key);
                 ReadbackOutcome::Failed(key)
             }
@@ -1341,6 +1457,16 @@ fn create_sim_module(
 /// One RGBA32F simulation target, as `InitializeErosionTextures` created them
 /// (RENDER_ATTACHMENT | TEXTURE_BINDING | COPY_SRC).
 fn sim_texture(device: &wgpu::Device, label: &'static str) -> wgpu::Texture {
+    sim_texture_with_format(device, label, SIM_FORMAT)
+}
+
+/// A simulation target in another float format, for state that needs fewer
+/// channels.
+fn sim_texture_with_format(
+    device: &wgpu::Device,
+    label: &'static str,
+    format: wgpu::TextureFormat,
+) -> wgpu::Texture {
     let texture_descriptor = wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -1351,7 +1477,7 @@ fn sim_texture(device: &wgpu::Device, label: &'static str) -> wgpu::Texture {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Float,
+        format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC,
@@ -1461,16 +1587,16 @@ fn make_stage_group(
     device.create_bind_group(&bind_group_descriptor)
 }
 
-/// Builds one simulation pipeline: a full-screen triangle into `targets`
-/// Rgba32Float targets, no vertex buffers, no depth, no blending (the C++
-/// calls `rlDisableColorBlend` because alpha carries loose cover, flux or
-/// discharge).
+/// Builds one simulation pipeline: a full-screen triangle into one target of
+/// each format in `targets`, in `@location` order, with no vertex buffers, no
+/// depth and no blending (the C++ calls `rlDisableColorBlend` because alpha
+/// carries loose cover, flux or discharge).
 fn make_pipeline(
     device: &wgpu::Device,
     label: &'static str,
     module: &wgpu::ShaderModule,
     layouts: &[&wgpu::BindGroupLayout],
-    targets: usize,
+    targets: &[wgpu::TextureFormat],
 ) -> wgpu::RenderPipeline {
     // wgpu 29 moved push constants to `immediate_size` (the sim uses none)
     // and takes optional layout entries.
@@ -1480,10 +1606,11 @@ fn make_pipeline(
         bind_group_layouts: &bind_group_layouts,
         immediate_size: 0,
     });
-    let target_states: Vec<Option<wgpu::ColorTargetState>> = (0..targets)
-        .map(|_| {
+    let target_states: Vec<Option<wgpu::ColorTargetState>> = targets
+        .iter()
+        .map(|format| {
             Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba32Float,
+                format: *format,
                 blend: None,
                 write_mask: wgpu::ColorWrites::ALL,
             })
@@ -1661,6 +1788,132 @@ mod worker_tests {
         }
     }
 
+    /// One sim shader, parsed as the worker compiles it.
+    fn sim_module(name: &str) -> naga::Module {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let path = manifest.join(format!("assets/shaders/erosion-{name}.wgsl"));
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+        naga::front::wgsl::parse_str(&source)
+            .unwrap_or_else(|error| panic!("{}: {}", path.display(), error.emit_to_string(&source)))
+    }
+
+    fn fragment_stage(module: &naga::Module) -> &naga::Function {
+        let entry = module.entry_points.iter().find(|entry| entry.name == "fs_main");
+        &entry.expect("every sim shader has an fs_main").function
+    }
+
+    /// Every call a block makes, once per call site, however deeply nested.
+    fn call_sites(block: &naga::Block, found: &mut Vec<naga::Handle<naga::Function>>) {
+        for statement in block.iter() {
+            match statement {
+                naga::Statement::Call { function, .. } => found.push(*function),
+                naga::Statement::Block(inner) => call_sites(inner, found),
+                naga::Statement::If { accept, reject, .. } => {
+                    call_sites(accept, found);
+                    call_sites(reject, found);
+                }
+                naga::Statement::Switch { cases, .. } => {
+                    for case in cases {
+                        call_sites(&case.body, found);
+                    }
+                }
+                naga::Statement::Loop { body, continuing, .. } => {
+                    call_sites(body, found);
+                    call_sites(continuing, found);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The texel loads a function's text performs: its own, plus a callee's
+    /// for every site that calls it. A loop body counts once.
+    fn texel_loads(module: &naga::Module, function: &naga::Function) -> usize {
+        let own = function
+            .expressions
+            .iter()
+            .filter(|(_, expression)| matches!(expression, naga::Expression::ImageLoad { .. }))
+            .count();
+        let mut called = Vec::new();
+        call_sites(&function.body, &mut called);
+        own + called
+            .into_iter()
+            .map(|handle| texel_loads(module, &module.functions[handle]))
+            .sum::<usize>()
+    }
+
+    /// The names of the functions `function` reaches (itself included) that
+    /// call `callee` directly.
+    fn callers_of(module: &naga::Module, function: &naga::Function, callee: &str)
+                  -> std::collections::BTreeSet<String> {
+        let mut callers = std::collections::BTreeSet::new();
+        let mut pending = vec![function];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(function) = pending.pop() {
+            let mut called = Vec::new();
+            call_sites(&function.body, &mut called);
+            for handle in called {
+                let target = &module.functions[handle];
+                let name = target.name.clone().unwrap_or_default();
+                if name == callee {
+                    callers.insert(function.name.clone().unwrap_or_default());
+                }
+                if seen.insert(name) {
+                    pending.push(target);
+                }
+            }
+        }
+        callers
+    }
+
+    /// The terrain pass runs 140 times a tile, and the runoff's path noise
+    /// does not change between iterations: it reads it from the static field
+    /// the init pass stamps once, so the only world noise it still evaluates
+    /// is the geology's, which depends on the evolving bedrock. The stamp
+    /// builds the cell centre and cell coordinate exactly as the pass does.
+    #[test]
+    fn terrain_pass_reads_its_path_noise_from_the_static_field() {
+        let module = sim_module("terrain");
+        let noisy = callers_of(&module, fragment_stage(&module), "geologyNoise");
+        assert_eq!(noisy.into_iter().collect::<Vec<_>>(), ["geologyResistance"],
+                   "only the geology evaluates noise in the terrain pass");
+
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let read = |name: &str| {
+            let text = std::fs::read_to_string(manifest.join(format!("assets/shaders/erosion-{name}.wgsl")))
+                .unwrap();
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let (init, terrain) = (read("init"), read("terrain"));
+        for shared in [
+            "let cell_size = max(stage.cell_size, 0.0001);",
+            "let world_position = stage.world_min + (vec2<f32>(coord) + vec2<f32>(0.5)) * cell_size;",
+            "let world_cell = world_position / cell_size;",
+        ] {
+            assert!(init.contains(shared) && terrain.contains(shared), "`{shared}` differs");
+        }
+        assert!(init.contains(
+            "return vec4<f32>(geologyNoise(world_cell * 0.16 + vec2<f32>(17.13, -9.71)), \
+             geologyNoise(world_cell * 0.43 + vec2<f32>(-31.7, 22.9)), 0.0, 0.0);"
+        ), "the static field holds the broad and fine path noise");
+        assert!(terrain.contains("let broad_path_noise = path_noises.r; let fine_path_noise = path_noises.g;"));
+    }
+
+    /// Each pass loads every texel of its neighbourhood once. Counted from
+    /// the shader text, per call site: the terrain pass's eight donor calls
+    /// each hold the two loads a draining donor needs, and the thermal
+    /// pass's loop body counts once. The counts before every pass loaded
+    /// its neighbourhood once were 29, 35, 34 and 6.
+    #[test]
+    fn erosion_passes_respect_texel_load_budgets() {
+        for (name, budget) in [("flux", 19), ("water", 23), ("terrain", 48), ("thermal", 4)] {
+            let module = sim_module(name);
+            let loads = texel_loads(&module, fragment_stage(&module));
+            assert!(loads <= budget, "erosion-{name} loads {loads} texels, over its budget of {budget}");
+        }
+    }
+
     #[test]
     fn chunk_plan_preserves_the_iteration_total() {
         assert!(chunk_plan(0).is_empty());
@@ -1679,8 +1932,10 @@ mod worker_tests {
 
     /// One command set — the app's prewarm shape: init and finalize in the
     /// same frame — driven through the real thread, its own device, the
-    /// full 140-iteration chunked submission and the readback maps. The tile
-    /// must finalize with finite diagnostics and land one atlas patch.
+    /// full 140-iteration chunked submission and the readback maps. The tile,
+    /// a 20 % slope rippled by 3 m swells so that water runs and cuts, must
+    /// finalize with finite diagnostics, report the GPU time it took and land
+    /// one atlas patch. `--nocapture` prints the diagnostics.
     #[ignore = "requires a GPU adapter"]
     #[test]
     fn worker_delivers_a_tile_end_to_end() {
@@ -1708,12 +1963,24 @@ mod worker_tests {
         ));
 
         let key = tile(1, 2);
+        let base_height: Vec<f32> = (0..SIM_PIXELS)
+            .map(|cell| {
+                let x = (cell % EROSION_RESOLUTION) as f32;
+                let z = (cell / EROSION_RESOLUTION) as f32;
+                10.0 + 0.2 * EROSION_CELL_SIZE * z + 3.0 * (x * 0.21).sin() * (z * 0.17).cos()
+            })
+            .collect();
+        let drainage_area = crate::erosion::route_base_drainage(
+            &base_height,
+            EROSION_RESOLUTION,
+            EROSION_CELL_SIZE,
+        );
         let frame_commands = ErosionFrameCommands {
             sim_min: tile_simulation_minimum(key),
             init: Some(InitTileCommand {
                 key,
-                base_height: vec![24.0; SIM_PIXELS],
-                drainage_area: vec![1.0; SIM_PIXELS],
+                base_height,
+                drainage_area,
                 river: vec![0.0; SIM_PIXELS],
             }),
             iterate: None,
@@ -1746,9 +2013,13 @@ mod worker_tests {
                     tile.stats.maximum_drainage,
                     tile.stats.bedrock_exposure,
                     tile.stats.mean_loose_cover,
+                    tile.stats.simulation_ms,
                 ] {
                     assert!(value.is_finite(), "{value} is not finite");
                 }
+                eprintln!("{:?}", tile.stats);
+                assert!(tile.stats.simulation_ms > 0.0, "the prewarm-shaped tile is timed");
+                assert!(tile.stats.maximum_incision > 0.0, "the slope's runoff cuts");
                 let patches = bridge.drain_patches();
                 assert_eq!(patches.len(), 1);
                 assert_eq!(patches[0].key, key);

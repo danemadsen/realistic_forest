@@ -77,55 +77,52 @@ fn gridSize() -> vec2<i32>
     return min(texture_resolution, max(vec2<i32>(stage.resolution + vec2<f32>(0.5)), vec2<i32>(1)));
 }
 
-fn clampCoord(coord: vec2<i32>) -> vec2<i32>
+// The grid size (`gridSize()`, read once per fragment) is passed to every
+// helper below rather than re-derived inside each texel load.
+fn clampCoord(coord: vec2<i32>, size: vec2<i32>) -> vec2<i32>
 {
-    return clamp(coord, vec2<i32>(0), gridSize() - vec2<i32>(1));
+    return clamp(coord, vec2<i32>(0), size - vec2<i32>(1));
 }
 
-fn fragmentCoord(frag_position: vec4<f32>) -> vec2<i32>
+fn fragmentCoord(frag_position: vec4<f32>, size: vec2<i32>) -> vec2<i32>
 {
-    let resolution = select(vec2<f32>(gridSize()), stage.resolution,
+    let resolution = select(vec2<f32>(size), stage.resolution,
         stage.resolution.x >= 1.0 && stage.resolution.y >= 1.0);
     let uv = frag_position.xy / resolution;
-    return clampCoord(vec2<i32>(floor(uv * vec2<f32>(gridSize()))));
+    return clampCoord(vec2<i32>(floor(uv * vec2<f32>(size))), size);
 }
 
-fn fetchFlux(coord: vec2<i32>) -> vec4<f32>
+fn fetchFlux(coord: vec2<i32>, size: vec2<i32>) -> vec4<f32>
 {
-    return textureLoad(texture0, clampCoord(coord), 0);
+    return textureLoad(texture0, clampCoord(coord, size), 0);
 }
 
-fn fetchTerrain(coord: vec2<i32>) -> vec4<f32>
+fn fetchTerrain(coord: vec2<i32>, size: vec2<i32>) -> vec4<f32>
 {
-    return textureLoad(terrain_state, clampCoord(coord), 0);
+    return textureLoad(terrain_state, clampCoord(coord, size), 0);
 }
 
-fn fetchWater(coord: vec2<i32>) -> vec4<f32>
+fn fetchWater(coord: vec2<i32>, size: vec2<i32>) -> vec4<f32>
 {
-    return textureLoad(water_state, clampCoord(coord), 0);
+    return textureLoad(water_state, clampCoord(coord, size), 0);
 }
 
-fn totalHeight(coord: vec2<i32>) -> f32
+fn totalHeight(coord: vec2<i32>, size: vec2<i32>) -> f32
 {
-    let safe_coord = clampCoord(coord);
-    return fetchTerrain(safe_coord).r + max(fetchWater(safe_coord).r, 0.0);
+    let safe_coord = clampCoord(coord, size);
+    return fetchTerrain(safe_coord, size).r + max(fetchWater(safe_coord, size).r, 0.0);
 }
 
-fn hydraulicGradient(coord: vec2<i32>, cell_size: f32) -> vec2<f32>
+// The surface heights of the 3x3 around a cell, by position: `lower` is the
+// row at y - 1 and `left` the column at x - 1.
+fn hydraulicGradient(lower_left: f32, left: f32, upper_left: f32, lower: f32,
+                     upper: f32, lower_right: f32, right: f32, upper_right: f32,
+                     cell_size: f32) -> vec2<f32>
 {
     // A Scharr derivative is much more rotationally symmetric than the four
     // cardinal differences used by the pipe model.  In particular, a valley
     // crossing a texel diagonally produces a diagonal downhill vector instead
     // of alternately choosing horizontal and vertical faces.
-    let lower_left  = totalHeight(coord + vec2<i32>(-1,-1));
-    let left        = totalHeight(coord + vec2<i32>(-1, 0));
-    let upper_left  = totalHeight(coord + vec2<i32>(-1, 1));
-    let lower       = totalHeight(coord + vec2<i32>( 0,-1));
-    let upper       = totalHeight(coord + vec2<i32>( 0, 1));
-    let lower_right = totalHeight(coord + vec2<i32>( 1,-1));
-    let right       = totalHeight(coord + vec2<i32>( 1, 0));
-    let upper_right = totalHeight(coord + vec2<i32>( 1, 1));
-
     let derivative = vec2<f32>(
         3.0*(upper_right - upper_left) + 10.0*(right - left)
             + 3.0*(lower_right - lower_left),
@@ -144,21 +141,33 @@ fn safeDirection(vector: vec2<f32>) -> vec2<f32>
 @fragment
 fn fs_main(@builtin(position) frag_position: vec4<f32>) -> FsOutput
 {
-    let coord = fragmentCoord(frag_position);
     let size = gridSize();
+    let coord = fragmentCoord(frag_position, size);
 
     let dt = max(stage.delta_time, 0.0);
     let cell_size = max(stage.cell_size, 0.0001);
     let gravity = max(stage.gravity, 0.0);
-    let water_depth = max(fetchWater(coord).r, 0.0);
-    let center_height = totalHeight(coord);
+    let water = fetchWater(coord, size);
+    let water_depth = max(water.r, 0.0);
+    let center_height = fetchTerrain(coord, size).r + water_depth;
 
-    let previous_flux = max(fetchFlux(coord), vec4<f32>(0.0));
+    // The 3x3 of surface heights, loaded once: the four face heads and the
+    // Scharr gradient read the same cells.
+    let lower_left  = totalHeight(coord + vec2<i32>(-1,-1), size);
+    let left        = totalHeight(coord + vec2<i32>(-1, 0), size);
+    let upper_left  = totalHeight(coord + vec2<i32>(-1, 1), size);
+    let lower       = totalHeight(coord + vec2<i32>( 0,-1), size);
+    let upper       = totalHeight(coord + vec2<i32>( 0, 1), size);
+    let lower_right = totalHeight(coord + vec2<i32>( 1,-1), size);
+    let right       = totalHeight(coord + vec2<i32>( 1, 0), size);
+    let upper_right = totalHeight(coord + vec2<i32>( 1, 1), size);
+
+    let previous_flux = max(fetchFlux(coord, size), vec4<f32>(0.0));
     let cardinal_difference = vec4<f32>(
-        center_height - totalHeight(coord + vec2<i32>(-1, 0)),
-        center_height - totalHeight(coord + vec2<i32>( 1, 0)),
-        center_height - totalHeight(coord + vec2<i32>( 0,-1)),
-        center_height - totalHeight(coord + vec2<i32>( 0, 1))
+        center_height - left,
+        center_height - right,
+        center_height - lower,
+        center_height - upper
     );
 
     // Nerthus droplets follow a continuous terrain gradient while retaining a
@@ -166,9 +175,10 @@ fn fs_main(@builtin(position) frag_position: vec4<f32>) -> FsOutput
     // pipe storage, but project that continuous direction onto its faces.  A
     // diagonal direction therefore feeds two faces rather than stair-stepping
     // down whichever cardinal neighbour happens to be lowest.
-    let gradient = hydraulicGradient(coord, cell_size);
+    let gradient = hydraulicGradient(lower_left, left, upper_left, lower,
+                                     upper, lower_right, right, upper_right, cell_size);
     let downhill_direction = safeDirection(-gradient);
-    let previous_direction = safeDirection(fetchWater(coord).gb);
+    let previous_direction = safeDirection(water.gb);
     const DIRECTION_INERTIA = 0.12;
     let steered_direction = safeDirection(
         downhill_direction*(1.0 - DIRECTION_INERTIA) +

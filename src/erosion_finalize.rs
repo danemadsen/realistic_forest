@@ -176,6 +176,8 @@ pub fn finalize_erosion_tile(
         maximum_drainage,
         bedrock_exposure: 100.0 * bare_cells as f32 / land_cells.max(1) as f32,
         mean_loose_cover: (loose_total / land_cells.max(1) as f64) as f32,
+        // The worker stamps its own GPU timing on the tiles it timed.
+        simulation_ms: 0.0,
     };
 
     let tile = FinalizedTile {

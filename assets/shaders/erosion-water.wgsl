@@ -80,76 +80,116 @@ fn gridSize() -> vec2<i32>
     return min(texture_resolution, max(vec2<i32>(stage.resolution + vec2<f32>(0.5)), vec2<i32>(1)));
 }
 
-fn clampCoord(coord: vec2<i32>) -> vec2<i32>
+// The grid size (`gridSize()`, read once per fragment) is passed to every
+// helper below rather than re-derived inside each texel load.
+fn clampCoord(coord: vec2<i32>, size: vec2<i32>) -> vec2<i32>
 {
-    return clamp(coord, vec2<i32>(0), gridSize() - vec2<i32>(1));
+    return clamp(coord, vec2<i32>(0), size - vec2<i32>(1));
 }
 
-fn fragmentCoord(frag_coord: vec2<f32>) -> vec2<i32>
+fn fragmentCoord(frag_coord: vec2<f32>, size: vec2<i32>) -> vec2<i32>
 {
     let resolution = select(
-        vec2<f32>(gridSize()),
+        vec2<f32>(size),
         stage.resolution,
         (stage.resolution.x >= 1.0 && stage.resolution.y >= 1.0)
     );
     let uv = frag_coord / resolution;
-    return clampCoord(vec2<i32>(floor(uv * vec2<f32>(gridSize()))));
+    return clampCoord(vec2<i32>(floor(uv * vec2<f32>(size))), size);
 }
 
-fn fetchWater(coord: vec2<i32>) -> vec4<f32>
+fn fetchWater(coord: vec2<i32>, size: vec2<i32>) -> vec4<f32>
 {
-    return textureLoad(texture0, clampCoord(coord), 0);
+    return textureLoad(texture0, clampCoord(coord, size), 0);
 }
 
-fn fetchFlux(coord: vec2<i32>) -> vec4<f32>
+fn fetchFlux(coord: vec2<i32>, size: vec2<i32>) -> vec4<f32>
 {
-    return max(textureLoad(uFluxState, clampCoord(coord), 0), vec4<f32>(0.0));
+    return max(textureLoad(uFluxState, clampCoord(coord, size), 0), vec4<f32>(0.0));
 }
 
-fn fetchTerrain(coord: vec2<i32>) -> vec4<f32>
+fn fetchTerrain(coord: vec2<i32>, size: vec2<i32>) -> vec4<f32>
 {
-    return textureLoad(uTerrainState, clampCoord(coord), 0);
+    return textureLoad(uTerrainState, clampCoord(coord, size), 0);
 }
 
-fn surfaceHeight(coord: vec2<i32>) -> f32
+// A cell's bed (x) and water surface (y): the bed routes drainage, the
+// surface drives the water.
+fn bedAndSurface(coord: vec2<i32>, size: vec2<i32>) -> vec2<f32>
 {
-    let safe_coord = clampCoord(coord);
-    return fetchTerrain(safe_coord).r + max(fetchWater(safe_coord).r, 0.0);
+    let safe_coord = clampCoord(coord, size);
+    let bed = fetchTerrain(safe_coord, size).r;
+    return vec2<f32>(bed, bed + max(fetchWater(safe_coord, size).r, 0.0));
 }
 
-fn sampleSurface(texel_position: vec2<f32>) -> f32
+// Nine values over a cell's 3x3 neighbourhood, loaded once per fragment.
+// `lower` is the row at y - 1 and `left` the column at x - 1.
+struct Neighbourhood {
+    lower_left: f32, lower: f32, lower_right: f32,
+    left: f32, center: f32, right: f32,
+    upper_left: f32, upper: f32, upper_right: f32,
+};
+
+// The value at a texel offset of -1, 0 or 1 along each axis; a larger
+// offset reads the nearer neighbour.
+fn neighbourhoodAt(values: Neighbourhood, offset: vec2<i32>) -> f32
 {
-    let position = clamp(texel_position, vec2<f32>(0.0), vec2<f32>(gridSize() - vec2<i32>(1)));
+    let lower_row = select(select(values.lower, values.lower_right, offset.x > 0),
+                           values.lower_left, offset.x < 0);
+    let middle_row = select(select(values.center, values.right, offset.x > 0),
+                            values.left, offset.x < 0);
+    let upper_row = select(select(values.upper, values.upper_right, offset.x > 0),
+                           values.upper_left, offset.x < 0);
+    return select(select(middle_row, upper_row, offset.y > 0), lower_row, offset.y < 0);
+}
+
+// The bilinear water surface one step from `coord`, read from the 3x3 the
+// pass already holds rather than from four more pairs of loads. The position,
+// its floor and its fraction are computed as a full sample computes them, so
+// the weights are the same floats. Every tap lies in the 3x3 unless a
+// direction component overshoots +-1 or lands exactly on it; that tap's
+// weight is then zero (or a rounding sliver of a normalised direction) and
+// the neighbour next to it stands in.
+fn sampleSurfaceNear(surface: Neighbourhood, coord: vec2<i32>, texel_position: vec2<f32>,
+                     size: vec2<i32>) -> f32
+{
+    let position = clamp(texel_position, vec2<f32>(0.0), vec2<f32>(size - vec2<i32>(1)));
     let lower = vec2<i32>(floor(position));
-    let upper = clampCoord(lower + vec2<i32>(1));
+    let upper = clampCoord(lower + vec2<i32>(1), size);
     let fraction = fract(position);
 
-    let height00 = surfaceHeight(lower);
-    let height10 = surfaceHeight(vec2<i32>(upper.x, lower.y));
-    let height01 = surfaceHeight(vec2<i32>(lower.x, upper.y));
-    let height11 = surfaceHeight(upper);
+    let lower_offset = lower - coord;
+    let upper_offset = upper - coord;
+    let height00 = neighbourhoodAt(surface, lower_offset);
+    let height10 = neighbourhoodAt(surface, vec2<i32>(upper_offset.x, lower_offset.y));
+    let height01 = neighbourhoodAt(surface, vec2<i32>(lower_offset.x, upper_offset.y));
+    let height11 = neighbourhoodAt(surface, upper_offset);
     return mix(mix(height00, height10, fraction.x),
                mix(height01, height11, fraction.x), fraction.y);
 }
 
-fn hydraulicGradient(coord: vec2<i32>, cellSize: f32) -> vec2<f32>
+fn hydraulicGradient(surface: Neighbourhood, cellSize: f32) -> vec2<f32>
 {
-    let lower_left  = surfaceHeight(coord + vec2<i32>(-1,-1));
-    let left        = surfaceHeight(coord + vec2<i32>(-1, 0));
-    let upper_left  = surfaceHeight(coord + vec2<i32>(-1, 1));
-    let lower       = surfaceHeight(coord + vec2<i32>( 0,-1));
-    let upper       = surfaceHeight(coord + vec2<i32>( 0, 1));
-    let lower_right = surfaceHeight(coord + vec2<i32>( 1,-1));
-    let right       = surfaceHeight(coord + vec2<i32>( 1, 0));
-    let upper_right = surfaceHeight(coord + vec2<i32>( 1, 1));
-
     let derivative = vec2<f32>(
-        3.0*(upper_right - upper_left) + 10.0*(right - left)
-            + 3.0*(lower_right - lower_left),
-        3.0*(upper_left - lower_left) + 10.0*(upper - lower)
-            + 3.0*(upper_right - lower_right)
+        3.0*(surface.upper_right - surface.upper_left) + 10.0*(surface.right - surface.left)
+            + 3.0*(surface.lower_right - surface.lower_left),
+        3.0*(surface.upper_left - surface.lower_left) + 10.0*(surface.upper - surface.lower)
+            + 3.0*(surface.upper_right - surface.lower_right)
     );
     return derivative/(32.0*cellSize);
+}
+
+// One receiver's term of the routing normaliser: the squared slope from
+// this cell's bed down to an in-grid neighbour's, if it falls. Called for the
+// eight neighbours in one fixed order, which the float sum depends on.
+fn addRoutingShare(share_total: ptr<function, f32>, routing_bed: f32, receiver_bed: f32,
+                   step: vec2<i32>, coord: vec2<i32>, size: vec2<i32>, cell_size: f32)
+{
+    let receiver_coord = coord + step;
+    if (any(receiver_coord < vec2<i32>(0)) || any(receiver_coord >= size)) { return; }
+    let receiver_slope = (routing_bed - receiver_bed)
+        / (cell_size * select(1.0, 1.41421356, step.x != 0 && step.y != 0));
+    if (receiver_slope > 0.0) { *share_total += receiver_slope * receiver_slope; }
 }
 
 fn safeDirection(vector: vec2<f32>) -> vec2<f32>
@@ -177,18 +217,34 @@ struct FragmentOutput {
 
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput {
-    let coord = fragmentCoord(position.xy);
     let size = gridSize();
+    let coord = fragmentCoord(position.xy, size);
 
     // Simulate the complete padded domain. The retained footprint is only
     // a readback crop, never a hydraulic or erosion boundary.
-    let old_water = fetchWater(coord);
-    let outgoing = fetchFlux(coord);
+    let old_water = fetchWater(coord, size);
+    let outgoing = fetchFlux(coord, size);
 
-    let left_flux  = fetchFlux(coord + vec2<i32>(-1, 0));
-    let right_flux = fetchFlux(coord + vec2<i32>( 1, 0));
-    let down_flux  = fetchFlux(coord + vec2<i32>( 0,-1));
-    let up_flux    = fetchFlux(coord + vec2<i32>( 0, 1));
+    let left_flux  = fetchFlux(coord + vec2<i32>(-1, 0), size);
+    let right_flux = fetchFlux(coord + vec2<i32>( 1, 0), size);
+    let down_flux  = fetchFlux(coord + vec2<i32>( 0,-1), size);
+    let up_flux    = fetchFlux(coord + vec2<i32>( 0, 1), size);
+
+    // The 3x3 of beds (x) and water surfaces (y), loaded once: the gradient,
+    // the surface one step downstream and the routing normaliser all read it.
+    let center_terrain = fetchTerrain(coord, size);
+    let lower_left  = bedAndSurface(coord + vec2<i32>(-1,-1), size);
+    let lower       = bedAndSurface(coord + vec2<i32>( 0,-1), size);
+    let lower_right = bedAndSurface(coord + vec2<i32>( 1,-1), size);
+    let left        = bedAndSurface(coord + vec2<i32>(-1, 0), size);
+    let right       = bedAndSurface(coord + vec2<i32>( 1, 0), size);
+    let upper_left  = bedAndSurface(coord + vec2<i32>(-1, 1), size);
+    let upper       = bedAndSurface(coord + vec2<i32>( 0, 1), size);
+    let upper_right = bedAndSurface(coord + vec2<i32>( 1, 1), size);
+    let surface = Neighbourhood(
+        lower_left.y, lower.y, lower_right.y,
+        left.y, center_terrain.r + max(old_water.r, 0.0), right.y,
+        upper_left.y, upper.y, upper_right.y);
 
     // The neighbor channel facing this cell is its contribution to our inflow.
     let from_left  = select(0.0, left_flux.g,  coord.x > 0);
@@ -217,7 +273,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput {
     // Follow Nerthus's low-inertia continuous-gradient steering.  Flux remains
     // exactly conservative, while this arbitrary-angle velocity is retained in
     // the water state and used by the sediment backtrace in the next pass.
-    let downhill_direction = safeDirection(-hydraulicGradient(coord, cell_size));
+    let downhill_direction = safeDirection(-hydraulicGradient(surface, cell_size));
     let flux_direction = safeDirection(flux_velocity);
     let previous_direction = safeDirection(old_water.gb);
     var target_direction = safeDirection(
@@ -233,8 +289,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput {
     // prevents vanishingly shallow water from reporting enormous velocities,
     // which otherwise causes narrow channels to excavate far too deeply.
     let previous_speed = length(old_water.gb);
-    let next_surface = sampleSurface(vec2<f32>(coord) + target_direction);
-    let height_change = next_surface - surfaceHeight(coord);
+    let next_surface = sampleSurfaceNear(surface, coord, vec2<f32>(coord) + target_direction, size);
+    let height_change = next_surface - surface.center;
     const gravity: f32 = 9.81;
     let energy_speed = sqrt(max(0.0,
         previous_speed*previous_speed - 2.0*gravity*height_change));
@@ -253,7 +309,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput {
 
     // The visible ocean is supplied separately at sea level. Simulation water
     // reaching an ocean-bed cell is therefore a sink instead of accumulating.
-    let base_height = fetchTerrain(coord).b;
+    let base_height = center_terrain.b;
     if (base_height < stage.sea_level)
     {
         depth = 0.0;
@@ -265,19 +321,17 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput {
     // the total each of its receivers divides its own share by. No pass
     // between this one and the terrain pass moves a bed, so this is the very
     // total that pass used to rebuild from a 5x5 window at every receiver;
-    // the arithmetic and its order are unchanged.
-    let routing_bed = fetchTerrain(coord).r;
+    // the arithmetic and its order (row by row from (-1, -1)) are unchanged.
+    let routing_bed = center_terrain.r;
     var share_total = 0.0;
-    for (var receiver = 0; receiver < 9; receiver++)
-    {
-        if (receiver == 4) { continue; }
-        let step = vec2<i32>(receiver % 3 - 1, receiver / 3 - 1);
-        let receiver_coord = coord + step;
-        if (any(receiver_coord < vec2<i32>(0)) || any(receiver_coord >= size)) { continue; }
-        let receiver_slope = (routing_bed - fetchTerrain(receiver_coord).r)
-            / (cell_size * select(1.0, 1.41421356, step.x != 0 && step.y != 0));
-        if (receiver_slope > 0.0) { share_total += receiver_slope * receiver_slope; }
-    }
+    addRoutingShare(&share_total, routing_bed, lower_left.x, vec2<i32>(-1,-1), coord, size, cell_size);
+    addRoutingShare(&share_total, routing_bed, lower.x, vec2<i32>( 0,-1), coord, size, cell_size);
+    addRoutingShare(&share_total, routing_bed, lower_right.x, vec2<i32>( 1,-1), coord, size, cell_size);
+    addRoutingShare(&share_total, routing_bed, left.x, vec2<i32>(-1, 0), coord, size, cell_size);
+    addRoutingShare(&share_total, routing_bed, right.x, vec2<i32>( 1, 0), coord, size, cell_size);
+    addRoutingShare(&share_total, routing_bed, upper_left.x, vec2<i32>(-1, 1), coord, size, cell_size);
+    addRoutingShare(&share_total, routing_bed, upper.x, vec2<i32>( 0, 1), coord, size, cell_size);
+    addRoutingShare(&share_total, routing_bed, upper_right.x, vec2<i32>( 1, 1), coord, size, cell_size);
 
     return FragmentOutput(vec4<f32>(depth, velocity, accumulated_discharge),
                           vec4<f32>(share_total, 0.0, 0.0, 0.0));
@@ -292,3 +346,5 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput {
 //   evaporation: f32       — uEvaporation: evaporation rate per second (shader clamps to >= 0)
 //   sea_level:   f32       — uSeaLevel: ocean level; bed cells below it zero depth and velocity
 // Pack in this field order for bytemuck (vec2 then 5 x f32).
+// Outputs: @location(0) = water state (RGBA32F); @location(1) = routing
+// normaliser, of which the R32Float target keeps R.

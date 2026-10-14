@@ -653,6 +653,10 @@ pub struct TileDiagnostics {
     pub bedrock_exposure: f32,
     /// Mean loose cover over land cells, metres.
     pub mean_loose_cover: f32,
+    /// Wall-clock milliseconds the GPU took to initialize the tile and run
+    /// all its iterations, measured only where one command set does both
+    /// (the prewarm) and 0 for a tile streamed over many frames.
+    pub simulation_ms: f32,
 }
 
 /// CPU-side erosion tile cache: keys, readiness, reveal progress, and the
@@ -1303,8 +1307,13 @@ pub fn apply_erosion_events(cache: &mut ErosionCache, bridge: &ErosionBridge) {
                         cache.force_reveal = None;
                     }
                     cache.stats = finalized.stats;
+                    let simulated = if finalized.stats.simulation_ms > 0.0 {
+                        format!(", simulated in {:.0} ms", finalized.stats.simulation_ms)
+                    } else {
+                        String::new()
+                    };
                     log::info!(
-                        "EROSION: independent pass ({}, {}) ready, range {:.1}..{:.1} m, incision {:.2} m, deposition {:.2} m, detail {:.3}, axis {:.3}, drainage {:.0} cells, bedrock {:.1}%, cover {:.2} m",
+                        "EROSION: independent pass ({}, {}) ready, range {:.1}..{:.1} m, incision {:.2} m, deposition {:.2} m, detail {:.3}, axis {:.3}, drainage {:.0} cells, bedrock {:.1}%, cover {:.2} m{}",
                         key.x, key.z,
                         finalized.stats.minimum_height,
                         finalized.stats.maximum_height,
@@ -1315,6 +1324,7 @@ pub fn apply_erosion_events(cache: &mut ErosionCache, bridge: &ErosionBridge) {
                         finalized.stats.maximum_drainage,
                         finalized.stats.bedrock_exposure,
                         finalized.stats.mean_loose_cover,
+                        simulated,
                     );
                 }
                 cache.has_active_tile = false;

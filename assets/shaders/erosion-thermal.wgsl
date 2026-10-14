@@ -86,44 +86,44 @@ fn gridSize() -> vec2<i32>
     return min(texture_resolution, max(vec2<i32>(stage.resolution + vec2<f32>(0.5)), vec2<i32>(1)));
 }
 
-fn clampCoord(coord: vec2<i32>) -> vec2<i32>
+fn clampCoord(coord: vec2<i32>, size: vec2<i32>) -> vec2<i32>
 {
-    return clamp(coord, vec2<i32>(0), gridSize() - vec2<i32>(1));
+    return clamp(coord, vec2<i32>(0), size - vec2<i32>(1));
 }
 
-fn fragmentCoord(position: vec4<f32>) -> vec2<i32>
+fn fragmentCoord(position: vec4<f32>, size: vec2<i32>) -> vec2<i32>
 {
-    let resolution = select(vec2<f32>(gridSize()), stage.resolution,
+    let resolution = select(vec2<f32>(size), stage.resolution,
         stage.resolution.x >= 1.0 && stage.resolution.y >= 1.0);
     let uv = position.xy / resolution;
-    return clampCoord(vec2<i32>(floor(uv * vec2<f32>(gridSize()))));
+    return clampCoord(vec2<i32>(floor(uv * vec2<f32>(size))), size);
 }
 
-// Steepest stable face for the bedrock exposed in a cell. The terrain pass
-// evaluated the shared geology at this very bedrock surface and left the
-// resistance in drainage B, so no cell re-derives it per neighbour.
-fn rockSlopeLimit(coord: vec2<i32>) -> f32
+// Steepest stable face for the bedrock exposed in a cell, from the
+// resistance in its drainage B: the terrain pass evaluated the shared geology
+// at this very bedrock surface, so no cell re-derives it per neighbour.
+fn rockSlopeLimit(resistance: f32) -> f32
 {
-    let resistance = clamp(textureLoad(uDrainage, coord, 0).b, 0.0, 1.0);
-    return mix(stage.soft_rock_slope, stage.hard_rock_slope, resistance);
+    return mix(stage.soft_rock_slope, stage.hard_rock_slope, clamp(resistance, 0.0, 1.0));
 }
 
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
 {
-    let coord = fragmentCoord(position);
     let size = gridSize();
+    let coord = fragmentCoord(position, size);
     let center = textureLoad(texture0, coord, 0);
+    let center_drainage = textureLoad(uDrainage, coord, 0);
     // Ocean beds are immutable; the sea carries off anything shed into it,
     // so coastal faces exchange nothing with them. River beds likewise.
-    if (center.b < stage.sea_level || textureLoad(uDrainage, coord, 0).a > 0.5)
+    if (center.b < stage.sea_level || center_drainage.a > 0.5)
     {
         return center;
     }
 
     let cell_size = max(stage.cell_size, 0.0001);
     let center_loose = max(center.a, 0.0);
-    let center_rock_limit = rockSlopeLimit(coord);
+    let center_rock_limit = rockSlopeLimit(center_drainage.b);
     let loose_rate = clamp(stage.loose_rate, 0.0, 0.0625);
     let rock_rate = clamp(stage.rock_rate, 0.0, 0.0625);
 
@@ -138,7 +138,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
         // edge cell with itself or double-count a real neighbour.
         if (any(neighbour_coord < vec2<i32>(0)) || any(neighbour_coord >= size)) { continue; }
         let neighbour = textureLoad(texture0, neighbour_coord, 0);
-        if (neighbour.b < stage.sea_level || textureLoad(uDrainage, neighbour_coord, 0).a > 0.5) { continue; }
+        let neighbour_drainage = textureLoad(uDrainage, neighbour_coord, 0);
+        if (neighbour.b < stage.sea_level || neighbour_drainage.a > 0.5) { continue; }
 
         let diagonal = offset.x != 0 && offset.y != 0;
         let distance = cell_size * select(1.0, 1.41421356, diagonal);
@@ -149,7 +150,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
         // Both cells of the pair pick the same source: the higher one.
         let center_is_source = drop > 0.0;
         let source_loose = select(max(neighbour.a, 0.0), center_loose, center_is_source);
-        let source_rock_limit = select(rockSlopeLimit(neighbour_coord),
+        let source_rock_limit = select(rockSlopeLimit(neighbour_drainage.b),
                                        center_rock_limit, center_is_source);
 
         // Loose cover sheds first and can only give what it has; a face

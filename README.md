@@ -783,6 +783,19 @@ target:
    bedrock resistance for the thermal pass.
 4. Thermal (talus) relaxation of over-steepened slopes.
 
+Each pass loads its 3×3 neighbourhood once, and the runoff's path noise, which
+depends on world position alone, is evaluated once per tile by the
+initialisation into a static field that the terrain pass reads on each of its
+140 iterations. The routing normaliser is a single-channel target. With the
+same arithmetic in the same order, the simulation is unchanged to the last bit,
+and on llvmpipe a tile takes about a quarter less GPU time (4.4 s against
+5.9 s). The geology is still evaluated in the terrain pass: it depends on the
+evolving bedrock, and splitting it around a stored value compiles to different
+last bits on llvmpipe, which the routing amplifies until a tile's largest
+catchment moves by tens of percent, for only 5 percent more speed. A prewarmed
+tile's ready line in the log reports the GPU time its initialisation and
+iterations took (`simulated in N ms`).
+
 The runoff solver adapts the useful physics from the hydraulic erosion shader
 in `~/nerthus` without depending on its WebGPU compute atomics. Runoff retains
 inertia and follows a bilinearly sampled downhill direction; excavation is
