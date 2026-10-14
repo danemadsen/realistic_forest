@@ -35,6 +35,7 @@
 //! cell, so two regions that both contain a whole catchment agree on it.
 
 use super::carve::{BANK_REACH, CARVE_ROUNDING, GRID_CELL, RiverSegment, SegmentGrid, bank_run};
+use super::{FastMap, FastSet};
 use crate::constants::SEA_LEVEL;
 use crate::noise::{NoiseField, base_height};
 use crate::vegetation::ecology::{cell_key, noise2 as field_noise};
@@ -1142,7 +1143,7 @@ fn flow_path(corridor: &Corridor, outlets: &Outlets, head: [f64; 2]) -> Option<F
 #[derive(Default)]
 struct Lakes {
     lakes: Vec<Lake>,
-    cells: std::collections::HashMap<[i64; 2], u32>,
+    cells: FastMap<[i64; 2], u32>,
 }
 
 impl Lakes {
@@ -1166,7 +1167,7 @@ impl Lakes {
         if self.cells.contains_key(&start) {
             return Filled::Lake;
         }
-        let mut heights: std::collections::HashMap<[i64; 2], f32> = Default::default();
+        let mut heights: FastMap<[i64; 2], f32> = Default::default();
         let mut ground = |cell: [i64; 2]| -> f32 {
             *heights.entry(cell).or_insert_with(|| {
                 corridor.inside(cell).map_or_else(
@@ -1181,7 +1182,7 @@ impl Lakes {
         if ground(start) >= level {
             return Filled::NotBasin;
         }
-        let mut inside = std::collections::HashSet::new();
+        let mut inside = FastSet::default();
         let mut queue = std::collections::VecDeque::new();
         let mut cells = Vec::new();
         let mut drowned = std::collections::BTreeSet::new();
@@ -1206,9 +1207,14 @@ impl Lakes {
                 let height = ground(next);
                 // Water that reaches the open sea was never held in a basin;
                 // what the fill crossed is its way there. A hollow just under
-                // the sea level is part of the basin, like any other.
+                // the sea level is part of the basin, like any other. The way
+                // is every cell the fill took (those it has stepped from, and
+                // those still queued) in the order it took them: the corridor
+                // it widens lays its blocks out in that order, and the flood
+                // over it breaks ties by their storage, so the order must not
+                // depend on how a set happens to be walked.
                 if height < SEA_LEVEL - OPEN_SEA_DEPTH {
-                    let mut way: Vec<[i64; 2]> = inside.into_iter().collect();
+                    let mut way: Vec<[i64; 2]> = cells.iter().chain(&queue).copied().collect();
                     way.push(next);
                     return Filled::ToSea(way);
                 }
@@ -1255,6 +1261,47 @@ impl Lakes {
     }
 }
 
+/// A basin's or a lake's flow cells as a bitmap over their bounding box: the
+/// metre-by-metre floods around it ask of every sample's neighbours whether
+/// they lie in it, millions of times a region, and a bit costs no hashing.
+/// A lake covers at most `MAX_LAKE_CELLS`, so the box stays a few megabytes
+/// at worst.
+struct CellMask {
+    first: [i64; 2],
+    size: [usize; 2],
+    bits: Vec<bool>,
+}
+
+impl CellMask {
+    fn new(cells: &[[i64; 2]]) -> Self {
+        let (mut first, mut last) = ([i64::MAX; 2], [i64::MIN; 2]);
+        for cell in cells {
+            for axis in 0..2 {
+                first[axis] = first[axis].min(cell[axis]);
+                last[axis] = last[axis].max(cell[axis]);
+            }
+        }
+        if cells.is_empty() {
+            return Self { first: [0; 2], size: [0; 2], bits: Vec::new() };
+        }
+        let size = [(last[0] - first[0] + 1) as usize, (last[1] - first[1] + 1) as usize];
+        let mut bits = vec![false; size[0] * size[1]];
+        for cell in cells {
+            bits[(cell[1] - first[1]) as usize * size[0] + (cell[0] - first[0]) as usize] = true;
+        }
+        Self { first, size, bits }
+    }
+
+    fn contains(&self, cell: [i64; 2]) -> bool {
+        let (x, z) = (cell[0] - self.first[0], cell[1] - self.first[1]);
+        x >= 0
+            && z >= 0
+            && (x as usize) < self.size[0]
+            && (z as usize) < self.size[1]
+            && self.bits[z as usize * self.size[0] + x as usize]
+    }
+}
+
 /// Samples across a flow cell when a basin's rim is checked.
 const RIM_SAMPLES_PER_CELL: i64 = 4;
 /// How far past a basin's cells, in samples along the way, water under its
@@ -1273,15 +1320,15 @@ const RIM_REACH: u32 = 256;
 fn spill(noise: &NoiseField, cells: &[[i64; 2]], level: f32) -> Option<f32> {
     let per = RIM_SAMPLES_PER_CELL;
     let step = FLOW_CELL as f32 / per as f32;
-    let inside: std::collections::HashSet<[i64; 2]> = cells.iter().copied().collect();
-    let in_basin = |s: [i64; 2]| inside.contains(&[s[0].div_euclid(per), s[1].div_euclid(per)]);
+    let inside = CellMask::new(cells);
+    let in_basin = |s: [i64; 2]| inside.contains([s[0].div_euclid(per), s[1].div_euclid(per)]);
     let ground = |s: [i64; 2]| base_height(noise, (s[0] as f32 + 0.5) * step, (s[1] as f32 + 0.5) * step);
     let key = |height: f32| (height * 1000.0).round() as i64;
     let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(i64, u32, [i64; 2])>> = Default::default();
-    let mut seen: std::collections::HashSet<[i64; 2]> = Default::default();
+    let mut seen: FastSet<[i64; 2]> = Default::default();
     // From the samples of the basin's edge cells under the level.
     for c in cells {
-        if NEIGHBOURS.iter().all(|&(dx, dz)| inside.contains(&[c[0] + dx, c[1] + dz])) {
+        if NEIGHBOURS.iter().all(|&(dx, dz)| inside.contains([c[0] + dx, c[1] + dz])) {
             continue;
         }
         for j in 0..per {
@@ -1383,7 +1430,7 @@ impl Lakes {
         if self.cells.contains_key(&start) || ground(start) >= level {
             return;
         }
-        let mut inside = std::collections::HashSet::from([start]);
+        let mut inside = FastSet::from_iter([start]);
         let mut queue = std::collections::VecDeque::from([start]);
         let mut cells = Vec::new();
         while let Some(cell) = queue.pop_front() {
@@ -2821,13 +2868,70 @@ pub struct RiverNetwork {
     pub surface: super::surface::SurfaceMesh,
     /// Seconds the generation took.
     pub build_seconds: f32,
+    /// And where they went.
+    pub timings: BuildTimings,
+}
+
+/// Seconds each stage of a region's build took, for the build log: which
+/// stage a change made faster or slower, without a profiler.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BuildTimings {
+    /// The 32 m routing and the channels taken from it.
+    pub routing: f32,
+    /// The ground along every river's coarse path, sampled in parallel.
+    pub corridors: f32,
+    /// Each river's course down its corridor, river after river, the two
+    /// stages below included.
+    pub courses: f32,
+    /// Raising lakes in the basins the courses cross, and flooding their
+    /// backwater.
+    pub lakes: f32,
+    /// Sampling the wider corridors a river is routed again through.
+    pub reroutes: f32,
+    /// The carve segments.
+    pub segments: f32,
+    /// The grid that looks them up.
+    pub grid: f32,
+    /// Each lake's shore, sunk edge, current and surface field, and the
+    /// surfaces laid over the grid.
+    pub lake_sheets: f32,
+    /// The water surface mesh.
+    pub surface: f32,
+}
+
+impl std::fmt::Display for BuildTimings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "routing {:.2} s, corridors {:.2} s, courses {:.2} s (lakes {:.2} s, rerouted corridors {:.2} s), \
+             segments {:.2} s, grid {:.2} s, lake sheets {:.2} s, surface {:.2} s",
+            self.routing,
+            self.corridors,
+            self.courses,
+            self.lakes,
+            self.reroutes,
+            self.segments,
+            self.grid,
+            self.lake_sheets,
+            self.surface
+        )
+    }
 }
 
 /// Generate the rivers of a region.
 pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
     let start = std::time::Instant::now();
+    let mut timings = BuildTimings::default();
+    // Seconds since the last stage ended, and a new one begins.
+    let mut stage = std::time::Instant::now();
+    let mut lap = || {
+        let seconds = stage.elapsed().as_secs_f32();
+        stage = std::time::Instant::now();
+        seconds
+    };
     let routing = route(noise, region);
     let paths = extract_paths(&routing, region);
+    timings.routing = lap();
 
     // Parents before their tributaries.
     let mut order: Vec<usize> = Vec::with_capacity(paths.len());
@@ -2857,12 +2961,13 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
         Corridor::new(noise, &points, FLOW_CORRIDOR, &[])
     };
     let corridors: Vec<Corridor> = parallel_map(&paths, corridor_of);
+    timings.corridors = lap();
 
     // Tributaries read their parent's finished centreline.
     let mut rivers: Vec<Option<River>> = vec![None; paths.len()];
     let mut lakes = Lakes::default();
     // The rivers built so far, node by node, by `JOIN_CELL` cell.
-    let mut built: std::collections::HashMap<[i64; 2], Vec<(usize, usize)>> = Default::default();
+    let mut built: FastMap<[i64; 2], Vec<(usize, usize)>> = Default::default();
     for &index in &order {
         let path = &paths[index];
         let mut coarse: Vec<PathPoint> = path
@@ -2914,7 +3019,7 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
             let mut reached = Outlets::none(&corridors[index]);
             reached.channel(&corridors[index], parent_river);
             if !reached.any() {
-                wider = Some(Corridor::new(noise, &route, FLOW_CORRIDOR, &[]));
+                wider = Some(timed(&mut timings.reroutes, || Corridor::new(noise, &route, FLOW_CORRIDOR, &[])));
             }
         }
         // Where the water seems held in a basin it can in fact leave (a
@@ -2934,15 +3039,15 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
             let Some(flow) = flow_path(corridor, &outlets, coarse[0].p) else {
                 break None;
             };
-            match raise_lakes(noise, corridor, &flow, &mut lakes) {
+            match timed(&mut timings.lakes, || raise_lakes(noise, corridor, &flow, &mut lakes)) {
                 None => break Some(flow),
                 // The water's real way down: out through the gap to the sea.
                 Some(Filled::ToSea(way)) if !to_sea => {
-                    wider = Some(Corridor::new(noise, &route, FLOW_CORRIDOR, &way));
+                    wider = Some(timed(&mut timings.reroutes, || Corridor::new(noise, &route, FLOW_CORRIDOR, &way)));
                     to_sea = true;
                 }
                 Some(_) => match reaches.next() {
-                    Some(reach) => wider = Some(Corridor::new(noise, &route, reach, &[])),
+                    Some(reach) => wider = Some(timed(&mut timings.reroutes, || Corridor::new(noise, &route, reach, &[]))),
                     None => break Some(flow),
                 },
             }
@@ -2952,7 +3057,9 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
         let Some(flow) = flow else {
             continue;
         };
-        flood_backwater(noise, wider.as_ref().unwrap_or(&corridors[index]), &flow, &mut lakes);
+        timed(&mut timings.lakes, || {
+            flood_backwater(noise, wider.as_ref().unwrap_or(&corridors[index]), &flow, &mut lakes)
+        });
         // Each point of the flow path takes its catchment from the coarse
         // path beside it.
         let mut points: Vec<PathPoint> = Vec::with_capacity(flow.path.len() + 1);
@@ -3033,7 +3140,7 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
                 lakes.cells.get(&Corridor::cell_of([node.position[0] as f64, node.position[1] as f64])).copied()
             };
             let first = (0..=last).rev().take_while(|&k| nodes[k].lake).last().unwrap_or(last);
-            let crossed: std::collections::HashSet<u32> = nodes[first..=last].iter().filter_map(lake_of).collect();
+            let crossed: FastSet<u32> = nodes[first..=last].iter().filter_map(lake_of).collect();
             if parent_river.nodes.iter().any(|node| node.lake && lake_of(node).is_some_and(|lake| crossed.contains(&lake))) {
                 nodes.truncate(last + 1);
                 if nodes.len() < 2 {
@@ -3102,6 +3209,8 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
         });
     }
 
+    timings.courses = lap();
+
     // Compact, remapping confluences.
     let mut remap = vec![usize::MAX; rivers.len()];
     let mut finished = Vec::new();
@@ -3122,10 +3231,12 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
     }
 
     let segments = build_segments(&finished, noise, &lakes);
+    timings.segments = lap();
     let origin = routing_origin(region);
     let resolution = ((REGION_SIZE + 2.0 * ROUTING_MARGIN) / GRID_CELL as f64).ceil() as usize;
     let grid_origin = [origin[0] as f32, origin[1] as f32];
     let mut grid = SegmentGrid::build(grid_origin, resolution, &segments);
+    timings.grid = lap();
     let lakes = lakes.lakes;
     let lake_with_surface = |lake: &Lake| -> Lake {
         let mut lake = lake.clone();
@@ -3138,8 +3249,8 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
     // The lakes' surfaces: a drawn sheet's corner wherever there is one (the
     // highest sheet's where two meet), and past the sheets the highest field.
     let surfaces = parallel_map(&lakes, |lake| lake_surface(noise, &segments, &grid, lake));
-    let mut corners: std::collections::HashMap<[i32; 2], f32> = Default::default();
-    let mut sheets: std::collections::HashSet<[i32; 2]> = Default::default();
+    let mut corners: FastMap<[i32; 2], f32> = Default::default();
+    let mut sheets: FastSet<[i32; 2]> = Default::default();
     for (sheet, _) in &surfaces {
         for &(corner, height) in sheet {
             sheets.insert(corner);
@@ -3156,6 +3267,7 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
         }
     }
     grid.set_lakes(&corners, FLOW_CELL as f32);
+    timings.lake_sheets = lap();
     // The ground beside the channels as the rivers carve it, where it is dry
     // land: neither in a channel, nor under a lake's water or the sea. The
     // ribbons' outer strips round down onto it wherever it lies lower than
@@ -3166,6 +3278,7 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
         (envelope.bank_distance > 0.0 && ground > envelope.lake && ground > SEA_LEVEL).then_some(ground)
     };
     let surface = super::surface::build(&finished, &lakes, &dry_ground);
+    timings.surface = lap();
     RiverNetwork {
         region,
         rivers: finished,
@@ -3174,7 +3287,16 @@ pub fn generate(noise: &NoiseField, region: [i64; 2]) -> RiverNetwork {
         lakes,
         surface,
         build_seconds: start.elapsed().as_secs_f32(),
+        timings,
     }
+}
+
+/// `work()`, adding the seconds it takes to `total`.
+fn timed<R>(total: &mut f32, work: impl FnOnce() -> R) -> R {
+    let start = std::time::Instant::now();
+    let result = work();
+    *total += start.elapsed().as_secs_f32();
+    result
 }
 
 /// The ground around a lake as the rivers carve it, cell by cell (at cell
@@ -3186,7 +3308,7 @@ struct LakeGround<'a> {
     segments: &'a [RiverSegment],
     grid: &'a SegmentGrid,
     level: f32,
-    cells: std::collections::HashMap<[i64; 2], CellGround>,
+    cells: FastMap<[i64; 2], CellGround>,
 }
 
 #[derive(Clone, Copy)]
@@ -3288,13 +3410,14 @@ enum Basin {
 /// closed hollows beside it, which fill to the same level. Never ground in a
 /// channel, whose own water is drawn there, nor ground falling away down a
 /// channel running away below the level.
-fn basin_samples(noise: &NoiseField, segments: &[RiverSegment], grid: &SegmentGrid, lake: &Lake) -> std::collections::HashSet<[i64; 2]> {
+fn basin_samples(noise: &NoiseField, segments: &[RiverSegment], grid: &SegmentGrid, lake: &Lake) -> FastSet<[i64; 2]> {
     const SIDES: [(i64, i64); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
     let per = BASIN_SAMPLES_PER_CELL;
     let step = FLOW_CELL as f32 / per as f32;
-    let cells: std::collections::HashSet<[i64; 2]> = lake.cells.iter().map(|c| [c[0] as i64, c[1] as i64]).collect();
-    let in_lake = |s: [i64; 2]| cells.contains(&[s[0].div_euclid(per), s[1].div_euclid(per)]);
-    let mut kinds: std::collections::HashMap<[i64; 2], Basin> = Default::default();
+    let cells: Vec<[i64; 2]> = lake.cells.iter().map(|c| [c[0] as i64, c[1] as i64]).collect();
+    let lake_cells = CellMask::new(&cells);
+    let in_lake = |s: [i64; 2]| lake_cells.contains([s[0].div_euclid(per), s[1].div_euclid(per)]);
+    let mut kinds: FastMap<[i64; 2], Basin> = Default::default();
     let mut classify = |s: [i64; 2]| -> Basin {
         *kinds.entry(s).or_insert_with(|| {
             let p = [(s[0] as f32 + 0.5) * step, (s[1] as f32 + 0.5) * step];
@@ -3326,7 +3449,7 @@ fn basin_samples(noise: &NoiseField, segments: &[RiverSegment], grid: &SegmentGr
     // Out from the samples of the lake's edge cells.
     let mut edge: Vec<[i64; 2]> = Vec::new();
     for c in &cells {
-        if NEIGHBOURS.iter().any(|&(dx, dz)| !cells.contains(&[c[0] + dx, c[1] + dz])) {
+        if NEIGHBOURS.iter().any(|&(dx, dz)| !lake_cells.contains([c[0] + dx, c[1] + dz])) {
             for j in 0..per {
                 for i in 0..per {
                     edge.push([c[0] * per + i, c[1] * per + j]);
@@ -3334,7 +3457,7 @@ fn basin_samples(noise: &NoiseField, segments: &[RiverSegment], grid: &SegmentGr
             }
         }
     }
-    let mut wet: std::collections::HashSet<[i64; 2]> = Default::default();
+    let mut wet: FastSet<[i64; 2]> = Default::default();
     let mut frontier = edge.clone();
     for _ in 0..BASIN_SPREAD {
         let mut next = Vec::new();
@@ -3356,8 +3479,8 @@ fn basin_samples(noise: &NoiseField, segments: &[RiverSegment], grid: &SegmentGr
     // a patch of ground below it that nowhere runs away and is not too big.
     // Each is flooded whole; a patch found open marks all of it so, and any
     // later patch that reaches it is open too.
-    let mut done: std::collections::HashSet<[i64; 2]> = Default::default();
-    let mut open_ground: std::collections::HashSet<[i64; 2]> = Default::default();
+    let mut done: FastSet<[i64; 2]> = Default::default();
+    let mut open_ground: FastSet<[i64; 2]> = Default::default();
     let shore: Vec<[i64; 2]> = edge.iter().chain(wet.iter()).copied().collect();
     let mut filled = Vec::new();
     for s in shore {
@@ -3416,7 +3539,7 @@ fn basin_samples(noise: &NoiseField, segments: &[RiverSegment], grid: &SegmentGr
 /// own surface is drawn there.
 fn shore_cells(noise: &NoiseField, segments: &[RiverSegment], grid: &SegmentGrid, lake: &Lake) -> Vec<[i32; 2]> {
     let mut ground = LakeGround::new(noise, segments, grid, lake.level);
-    let mut wet: std::collections::HashSet<[i64; 2]> =
+    let mut wet: FastSet<[i64; 2]> =
         lake.cells.iter().map(|c| [c[0] as i64, c[1] as i64]).collect();
     let mut shore = Vec::new();
     for sample in basin_samples(noise, segments, grid, lake) {
@@ -3477,8 +3600,8 @@ fn lake_surface(
     lake: &Lake,
 ) -> (LakeCorners, LakeCorners) {
     let cell = FLOW_CELL as f32;
-    let sunk: std::collections::HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
-    let mut surface: std::collections::HashMap<[i32; 2], f32> = Default::default();
+    let sunk: FastMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
+    let mut surface: FastMap<[i32; 2], f32> = Default::default();
     for &[x, z] in lake.cells.iter().chain(&lake.shore) {
         for corner in [[x, z], [x + 1, z], [x, z + 1], [x + 1, z + 1]] {
             surface.insert(corner, sunk.get(&corner).map_or(lake.level, |&h| h.min(lake.level)));
@@ -3487,11 +3610,11 @@ fn lake_surface(
     // Out from the sheet ring by ring, each corner keeping the sheet corner
     // nearest it, which it measures its distance from.
     let reach = (LAKE_FIELD_REACH / cell).ceil() as i32 + 1;
-    let mut nearest: std::collections::HashMap<[i32; 2], [i32; 2]> = surface.keys().map(|&c| (c, c)).collect();
+    let mut nearest: FastMap<[i32; 2], [i32; 2]> = surface.keys().map(|&c| (c, c)).collect();
     let mut frontier: Vec<[i32; 2]> = surface.keys().copied().collect();
     let mut field = Vec::new();
     for _ in 0..reach {
-        let mut next: std::collections::HashMap<[i32; 2], [i32; 2]> = Default::default();
+        let mut next: FastMap<[i32; 2], [i32; 2]> = Default::default();
         for corner in &frontier {
             let seed = nearest[corner];
             for (dx, dz) in NEIGHBOURS {
@@ -3564,7 +3687,7 @@ const SHEET_UNDER_RIBBON: f32 = 0.06;
 fn sheet_edge(noise: &NoiseField, segments: &[RiverSegment], grid: &SegmentGrid, lake: &Lake) -> Vec<([i32; 2], f32)> {
     const SAMPLES: usize = 16;
     let ground = LakeGround::new(noise, segments, grid, lake.level);
-    let sheet: std::collections::HashSet<[i32; 2]> = lake.cells.iter().chain(&lake.shore).copied().collect();
+    let sheet: FastSet<[i32; 2]> = lake.cells.iter().chain(&lake.shore).copied().collect();
     let mut cells: Vec<[i32; 2]> = sheet.iter().copied().collect();
     cells.sort_unstable();
     let cell = FLOW_CELL as f32;
@@ -3666,7 +3789,7 @@ const JOIN_REACH: f64 = 1.5;
 fn joins_early(
     points: &[PathPoint],
     rivers: &[Option<River>],
-    built: &std::collections::HashMap<[i64; 2], Vec<(usize, usize)>>,
+    built: &FastMap<[i64; 2], Vec<(usize, usize)>>,
     own: usize,
     lake_at: impl Fn([f64; 2]) -> f64,
 ) -> Option<(usize, usize)> {
@@ -4220,6 +4343,78 @@ impl RiverNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A region built again comes out the same to the bit, down to the order
+    /// of every list in it: no map or set the build walks is keyed per
+    /// process, so streaming a region back in, or building it on another
+    /// machine, gives the rivers the player saw before.
+    #[test]
+    fn region_build_is_deterministic() {
+        let (noise, shared) = crate::rivers::spawn_network();
+        let again = generate(&noise, [0, 0]);
+        let bytes = |segments: &[RiverSegment]| bytemuck::cast_slice::<RiverSegment, u8>(segments).to_vec();
+        assert!(bytes(&again.segments) == bytes(&shared.segments), "carve segments differ");
+        assert_eq!(again.rivers.len(), shared.rivers.len());
+        for (index, (a, b)) in again.rivers.iter().zip(&shared.rivers).enumerate() {
+            assert!(a.nodes == b.nodes && a.end == b.end && a.surface_end == b.surface_end, "river {index} differs");
+        }
+        assert_eq!(again.lakes.len(), shared.lakes.len());
+        for (index, (a, b)) in again.lakes.iter().zip(&shared.lakes).enumerate() {
+            assert!(a == b, "lake {index} differs");
+        }
+        assert!(again.grid.cells == shared.grid.cells && again.grid.indices == shared.grid.indices, "segment grid differs");
+        assert!(again.grid.lakes == shared.grid.lakes, "lake records differ");
+        let vertices = |mesh: &super::super::surface::SurfaceMesh| bytemuck::cast_slice::<_, u8>(&mesh.vertices).to_vec();
+        assert!(vertices(&again.surface) == vertices(&shared.surface), "surface vertices differ");
+        assert!(again.surface.indices == shared.surface.indices && again.surface.chunks == shared.surface.chunks);
+    }
+
+    /// When a basin's fill finds the sea, the way it reports is every cell
+    /// it took in the order the flood took them, from the start out to the
+    /// sea: the corridor it widens lays its blocks out in that order, so the
+    /// reroute's course must not hang on how a set happens to be walked.
+    #[test]
+    fn escape_way_lists_the_flood_in_order() {
+        // One corridor block: a bowl 13 cells across, floored a metre or two
+        // up, inside a rim ten metres high that a cell of open sea breaks
+        // just east of the bowl.
+        const CENTRE: i64 = 16;
+        let sea = [CENTRE + 7, CENTRE];
+        let ground = |cell: [i64; 2]| -> f32 {
+            let (dx, dz) = (cell[0] - CENTRE, cell[1] - CENTRE);
+            if cell == sea {
+                SEA_LEVEL - 2.0
+            } else if dx.abs() <= 6 && dz.abs() <= 6 {
+                1.0 + 0.01 * (dx * dx + dz * dz) as f32
+            } else {
+                10.0
+            }
+        };
+        let corridor = Corridor {
+            first: [0, 0],
+            blocks: [1, 1],
+            slot: vec![0],
+            block_origin: vec![[0, 0]],
+            ground: (0..BLOCK * BLOCK).map(|i| ground([(i % BLOCK) as i64, (i / BLOCK) as i64])).collect(),
+        };
+        // Every cell the fill reads lies in the corridor; the noise is never
+        // sampled.
+        let noise = NoiseField::new();
+        let start = [CENTRE, CENTRE];
+        let fill = || match Lakes::default().fill(&noise, &corridor, start, 3.0) {
+            Filled::ToSea(way) => way,
+            _ => panic!("the bowl should drain to the sea"),
+        };
+        let way = fill();
+        assert_eq!(way, fill());
+        assert_eq!(way[0], start);
+        assert_eq!(*way.last().unwrap(), sea);
+        assert_eq!(way.iter().collect::<std::collections::BTreeSet<_>>().len(), way.len(), "a cell listed twice");
+        assert!(way[..way.len() - 1].iter().all(|&cell| ground(cell) < 3.0));
+        // Breadth first from the start: never nearer it than the cell before.
+        let steps = |cell: &[i64; 2]| (cell[0] - start[0]).abs() + (cell[1] - start[1]).abs();
+        assert!(way.windows(2).all(|pair| steps(&pair[0]) <= steps(&pair[1])), "{way:?}");
+    }
 
     #[test]
     fn reported_pond_outlets_keep_their_full_opening_through_the_rim() {

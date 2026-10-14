@@ -1072,7 +1072,16 @@ extension is projected across a curved shore.
 Every choice is keyed by world position or by a river's head cell, so two
 regions that both see a whole catchment agree on it; when the player moves
 on, the next region is built on the async compute pool (about a second) and
-swapped in. The first region is built before anything streams.
+swapped in. The first region is built before anything streams. The build's
+maps and sets of grid cells hash with a fixed key (foldhash, where std's
+SipHash draws a new key in every process), so a region comes out the same to
+the bit in every run, down to the order of its lists, and the build does
+over a third less work than it did with SipHash (51 rather than 80 billion
+instructions for the spawn region in a debug build). The `RIVERS:` log line
+and `--river-map` say how long each stage of a build took: the routing, the
+corridors' ground, the courses (and within them the lakes and the wider
+corridors of rerouted rivers), the carve segments and their grid, the lake
+sheets and the water surface.
 
 `--river-map path.png` charts a region from above (shaded relief, channels
 and lakes) and prints its statistics, how well the channels fit the land (how

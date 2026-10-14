@@ -669,7 +669,7 @@ impl SegmentGrid {
     /// (corner `c` at `c * cell_size` metres; `cell_size` is
     /// GRID_CELL / LAKE_CELLS_ACROSS and the grid's origin lies on a corner).
     /// A corner on a cell's border belongs to every cell sharing it.
-    pub fn set_lakes(&mut self, corners: &std::collections::HashMap<[i32; 2], f32>, cell_size: f32) {
+    pub fn set_lakes(&mut self, corners: &super::FastMap<[i32; 2], f32>, cell_size: f32) {
         let across = LAKE_CELLS_ACROSS as i64;
         let mut heights: std::collections::BTreeMap<u32, [f32; LAKE_CORNERS]> = Default::default();
         for (&corner, &height) in corners {

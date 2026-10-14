@@ -2,6 +2,7 @@
 //! all, with the statistics that matter for tuning it, without a window.
 
 use super::carve::Envelope;
+use super::{FastMap, FastSet};
 use super::network::{self, RiverEnd, RiverNetwork};
 use super::surface::SurfaceVertex;
 use crate::constants::SEA_LEVEL;
@@ -190,7 +191,7 @@ pub fn report(network: &RiverNetwork) -> Vec<String> {
         lake_areas.iter().sum::<f32>(),
         lake_areas.iter().copied().fold(0.0f32, f32::max)
     ));
-    lines.push(format!("built in {:.2} s", network.build_seconds));
+    lines.push(format!("built in {:.2} s: {}", network.build_seconds, network.timings));
     lines
 }
 
@@ -295,8 +296,8 @@ pub fn lake_edges(noise: &NoiseField, network: &RiverNetwork) -> LakeEdges {
     let cell = network::FLOW_CELL as f32;
     let mut edges = LakeEdges { samples: 0, exposed: 0, lakes: Vec::new() };
     for lake in &network.lakes {
-        let sheet: std::collections::HashSet<[i32; 2]> = lake.cells.iter().chain(&lake.shore).copied().collect();
-        let sunk: std::collections::HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
+        let sheet: FastSet<[i32; 2]> = lake.cells.iter().chain(&lake.shore).copied().collect();
+        let sunk: FastMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
         let height = |corner: [i32; 2]| sunk.get(&corner).map_or(lake.level, |&h| h.min(lake.level));
         let (mut exposed, mut gap, mut at) = (0usize, 0.0f32, [0.0f32; 2]);
         for &[x, z] in &sheet {
@@ -497,7 +498,7 @@ pub struct SurfaceIndex<'a> {
     first_lake: usize,
     /// The first vertex of each lake's sheet after the first.
     lake_starts: Vec<usize>,
-    buckets: std::collections::HashMap<[i32; 2], Vec<u32>>,
+    buckets: FastMap<[i32; 2], Vec<u32>>,
 }
 
 const SURFACE_BUCKET: f32 = 8.0;
@@ -512,7 +513,7 @@ impl<'a> SurfaceIndex<'a> {
             Some(*start)
         };
         let lake_starts: Vec<usize> = counts.iter().scan(first_lake, advance_start).collect();
-        let mut buckets: std::collections::HashMap<[i32; 2], Vec<u32>> = Default::default();
+        let mut buckets: FastMap<[i32; 2], Vec<u32>> = Default::default();
         for (t, triangle) in mesh.indices.chunks(3).enumerate() {
             let v: [[f32; 3]; 3] = [0, 1, 2].map(|k| mesh.vertices[triangle[k] as usize].position);
             let bucket = |value: f32| (value / SURFACE_BUCKET).floor() as i32;
@@ -971,7 +972,7 @@ pub struct BankFit {
 pub fn bank_checks(noise: &NoiseField, network: &RiverNetwork) -> BankFit {
     const CELL: f32 = 16.0;
     let mut fit = BankFit { samples: 0, under: 0, cells: Vec::new() };
-    let mut cells: std::collections::HashMap<[i32; 2], usize> = Default::default();
+    let mut cells: FastMap<[i32; 2], usize> = Default::default();
     for river in &network.rivers {
         let drawn = &river.nodes[..=river.surface_end.min(river.nodes.len() - 1)];
         for node in drawn.iter().filter(|node| !node.lake) {
@@ -1143,7 +1144,7 @@ pub fn run_map(noise: &NoiseField, path: &str, centre: [f64; 2], extent: f64) {
         );
         // Where rivers run into and out of it, and the yaw looking
         // downstream there.
-        let inside: std::collections::HashSet<[i32; 2]> = lake.cells.iter().copied().collect();
+        let inside: FastSet<[i32; 2]> = lake.cells.iter().copied().collect();
         let holds = |p: [f32; 2]| inside.contains(&[(p[0] / cell).floor() as i32, (p[1] / cell).floor() as i32]);
         for river in &network.rivers {
             for pair in river.nodes.windows(2) {
@@ -1478,7 +1479,7 @@ mod tests {
     fn spawn_region_lake_mouths_leave_no_dry_pit_under_the_lake() {
         let (noise, network) = crate::rivers::spawn_network();
         let index = SurfaceIndex::new(&network);
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = FastSet::default();
         let mut samples = 0;
         let mut worst = (0usize, [0.0f32; 2]);
         for river in &network.rivers {

@@ -26,6 +26,14 @@ use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 use network::RiverNetwork;
 use std::sync::Arc;
 
+/// Maps and sets keyed by grid cells in the region build: foldhash with a
+/// fixed seed (bevy's `FixedHasher`) rather than std's SipHash with a key
+/// drawn per process. Hashing the 4 m and 1 m cells was close to half of the
+/// build's instructions, and with a fixed key every map and set is walked in
+/// the same order in every process and every region.
+pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, bevy::platform::hash::FixedHasher>;
+pub(crate) type FastSet<T> = std::collections::HashSet<T, bevy::platform::hash::FixedHasher>;
+
 /// GPU capacities: the uploaded grid words and carve segments. A network
 /// that needs more keeps what lies nearest its region's centre.
 pub const GPU_GRID_WORDS: usize = 2_621_440;
@@ -116,13 +124,14 @@ impl RiverField {
 
     fn install(&mut self, network: RiverNetwork) {
         log::info!(
-            "RIVERS: region ({}, {}) has {} rivers, {:.1} km of channel and {} lakes, built in {:.2} s",
+            "RIVERS: region ({}, {}) has {} rivers, {:.1} km of channel and {} lakes, built in {:.2} s ({})",
             network.region[0],
             network.region[1],
             network.rivers.len(),
             network.total_length_km(),
             network.lakes.len(),
-            network.build_seconds
+            network.build_seconds,
+            network.timings
         );
         self.current = Some(Arc::new(network));
         self.generation += 1;
