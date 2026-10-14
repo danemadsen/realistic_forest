@@ -195,14 +195,14 @@ fn blend_tiles(cache: &ErosionCache, x: f32, z: f32, field: fn(&ErosionTile) -> 
     if total_weight > 0.000001 {
         let inverse_weight = 1.0 / total_weight;
         for (index, key) in candidates.iter().enumerate() {
-            if let Some(found) = cache.tiles.get(key) {
-                if found.state == ErosionTileState::Ready {
-                    let reveal = found.reveal.clamp(0.0, 1.0);
-                    blended += masks[index]
-                        * inverse_weight
-                        * reveal
-                        * sample_tile_field(found.key, field(found), x, z);
-                }
+            if let Some(found) = cache.tiles.get(key)
+                && found.state == ErosionTileState::Ready
+            {
+                let reveal = found.reveal.clamp(0.0, 1.0);
+                blended += masks[index]
+                    * inverse_weight
+                    * reveal
+                    * sample_tile_field(found.key, field(found), x, z);
             }
         }
     }
