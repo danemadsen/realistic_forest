@@ -800,10 +800,17 @@ multiple-flow-direction shares proportional to the squared slope, so every
 channel knows its whole catchment within the tile's 1920-metre domain; the CPU
 routes the base surface before a tile starts, so this holds from the first
 iteration. That routing releases each cell once every higher neighbour draining
-into it has passed its area on, which keeps it linear in the tile size, and in
-interactive play the base heights and routing are built on a background task so
-a starting tile never stalls a frame (prewarm and screenshot runs build them
-inline, keeping captures deterministic). A stream-power capacity proportional to √A·S then detaches bed where
+into it has passed its area on, which keeps it linear in the tile size. In
+interactive play the next tile's base heights and routing are built on one
+background thread while the current tile simulates, so a starting tile never
+stalls a frame and usually begins the frame the one before it finishes, rather
+than a preparation later; a tile whose rivers changed while it was prepared is
+built again. Prewarm and screenshot runs build them inline, keeping captures
+deterministic, and share the base heights' rows among every core: a tile's
+inputs take about 65–95 ms there instead of 100–160 ms on one core (a
+development build on a busy four-core machine). Every way gives the same bits,
+and the log reports each tile's time as `EROSION: tile (x, z) inputs in N ms`.
+A stream-power capacity proportional to √A·S then detaches bed where
 the routed sediment flux is below capacity and deposits where the flux exceeds
 it: steep, well-fed channels incise, slope breaks build fans, and valley floors
 and closed hollows fill with alluvium. Channels initiate above a few hundred

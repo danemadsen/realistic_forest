@@ -239,34 +239,64 @@ pub fn grass_line_height(noise: &NoiseField, x: f32, z: f32, height: f32) -> f32
 /// The second map flags the cells a river's water covers: the simulation
 /// holds them fixed and lets them drain what reaches them, since the river
 /// carries it away.
+///
+/// Every cell is a pure function of its world position, so `workers` threads
+/// splitting the rows between them write exactly the bits one thread does.
+/// The rows are dealt out in turn rather than in blocks, which spreads the
+/// costly cells beside the channels over every thread.
 pub fn create_base_height_map(
     noise: &NoiseField,
     tile: crate::erosion::TileKey,
     rivers: Option<&crate::rivers::network::RiverNetwork>,
+    workers: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     let world_minimum = crate::erosion::tile_simulation_minimum(tile);
     let mut height = vec![0.0f32; EROSION_RESOLUTION * EROSION_RESOLUTION];
     let mut river = vec![0.0f32; EROSION_RESOLUTION * EROSION_RESOLUTION];
-    for z in 0..EROSION_RESOLUTION {
+    let fill_row = |z: usize, height: &mut [f32], river: &mut [f32]| {
         let wz = world_minimum[1] + (z as f32 + 0.5) * EROSION_CELL_SIZE;
         for x in 0..EROSION_RESOLUTION {
             let wx = world_minimum[0] + (x as f32 + 0.5) * EROSION_CELL_SIZE;
-            let index = z * EROSION_RESOLUTION + x;
-            height[index] = base_height(noise, wx, wz);
+            height[x] = base_height(noise, wx, wz);
             if let Some(network) = rivers {
                 let envelope = network.envelope(wx, wz);
-                height[index] = envelope.clamp(height[index]);
+                height[x] = envelope.clamp(height[x]);
                 // A cell whose middle the water covers belongs to the river,
                 // or to a lake: the erosion drains both and leaves their beds.
                 // A lake's shore up to 2.5 m over its surface stays as it
                 // is too, so no gully cuts below the water there, nor down
                 // through the surface its shore is measured from.
-                let on_lake = envelope.lake > height[index] - 2.5;
-                if on_lake || envelope.water_over(height[index]).is_some_and(|water| height[index] < water) {
-                    river[index] = 1.0;
+                let on_lake = envelope.lake > height[x] - 2.5;
+                if on_lake || envelope.water_over(height[x]).is_some_and(|water| height[x] < water) {
+                    river[x] = 1.0;
                 }
             }
         }
+    };
+    let rows = height
+        .chunks_mut(EROSION_RESOLUTION)
+        .zip(river.chunks_mut(EROSION_RESOLUTION))
+        .enumerate();
+    let workers = workers.clamp(1, EROSION_RESOLUTION);
+    if workers == 1 {
+        for (z, (height, river)) in rows {
+            fill_row(z, height, river);
+        }
+    } else {
+        let mut shares: Vec<Vec<_>> = (0..workers).map(|_| Vec::new()).collect();
+        for (z, row) in rows {
+            shares[z % workers].push((z, row));
+        }
+        std::thread::scope(|scope| {
+            for share in shares {
+                let fill_row = &fill_row;
+                scope.spawn(move || {
+                    for (z, (height, river)) in share {
+                        fill_row(z, height, river);
+                    }
+                });
+            }
+        });
     }
     (height, river)
 }

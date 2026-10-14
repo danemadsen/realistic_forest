@@ -828,15 +828,18 @@ pub fn route_base_drainage(heights: &[f32], resolution: usize, cell_size: f32) -
     // donors and releasing cells as their count reaches zero (Kahn's
     // ordering) gives the same partial order as visiting cells highest first,
     // without sorting the whole tile on the main thread as each one begins.
+    //
+    // Each cell counts its own donors, the higher land cells around it: the
+    // neighbour relation is symmetric, so that is the very integer the donors
+    // used to add to it one by one, and the release order below is unchanged.
+    let steps = interior_steps(resolution);
     let mut waiting = vec![0u8; count];
-    for cell in 0..count {
+    for (cell, donors) in waiting.iter_mut().enumerate() {
         let height = heights[cell];
-        if height < SEA_LEVEL {
-            continue;
-        }
-        for_each_neighbour(cell, resolution, |neighbour, _| {
-            if heights[neighbour] < height {
-                waiting[neighbour] += 1;
+        for_each_neighbour_fast(cell, resolution, &steps, |neighbour, _| {
+            let donor = heights[neighbour];
+            if height < donor && donor >= SEA_LEVEL {
+                *donors += 1;
             }
         });
     }
@@ -853,7 +856,7 @@ pub fn route_base_drainage(heights: &[f32], resolution: usize, cell_size: f32) -
         let mut shares = [(0usize, 0.0f32); 8];
         let mut receivers = 0;
         let mut share_total = 0.0f32;
-        for_each_neighbour(cell, resolution, |neighbour, diagonal_step| {
+        for_each_neighbour_fast(cell, resolution, &steps, |neighbour, diagonal_step| {
             let distance = if diagonal_step { diagonal } else { cell_size };
             let slope = (height - heights[neighbour]) / distance;
             if slope > 0.0 {
@@ -881,11 +884,39 @@ pub fn route_base_drainage(heights: &[f32], resolution: usize, cell_size: f32) -
     area
 }
 
+/// The eight steps to a cell's neighbours, in the order every visit takes
+/// them; the routing's float sums depend on it.
+const NEIGHBOURS: [(i64, i64); 8] =
+    [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
+
+/// [`NEIGHBOURS`] as index offsets on a grid `resolution` cells wide, with
+/// whether each step is diagonal.
+fn interior_steps(resolution: usize) -> [(isize, bool); 8] {
+    NEIGHBOURS.map(|(dx, dz)| ((dz * resolution as i64 + dx) as isize, dx != 0 && dz != 0))
+}
+
+/// [`for_each_neighbour`] without its bounds tests away from the grid's
+/// edge, where all eight neighbours exist and each is a fixed index offset
+/// (`steps`, from [`interior_steps`]). The visits come in the same order.
+fn for_each_neighbour_fast(
+    cell: usize,
+    resolution: usize,
+    steps: &[(isize, bool); 8],
+    mut visit: impl FnMut(usize, bool),
+) {
+    let (x, z) = (cell % resolution, cell / resolution);
+    if x == 0 || z == 0 || x + 1 == resolution || z + 1 == resolution {
+        for_each_neighbour(cell, resolution, visit);
+        return;
+    }
+    for &(offset, diagonal) in steps {
+        visit(cell.wrapping_add_signed(offset), diagonal);
+    }
+}
+
 /// Calls `visit(neighbour, diagonal)` for each in-grid cell of the eight
 /// surrounding `cell`; the grid edge is a closed wall.
 fn for_each_neighbour(cell: usize, resolution: usize, mut visit: impl FnMut(usize, bool)) {
-    const NEIGHBOURS: [(i64, i64); 8] =
-        [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)];
     let x = (cell % resolution) as i64;
     let z = (cell / resolution) as i64;
     for (dx, dz) in NEIGHBOURS {
@@ -906,13 +937,26 @@ pub struct PreparedTile {
     pub river: Vec<f32>,
 }
 
+/// Builds a tile's simulation inputs: its base heights with the rivers
+/// carved in, and their routed drainage. `workers` threads share the height
+/// map (the routing is serial); the result is the same for any count.
 pub fn prepare_tile(
     noise: &NoiseField,
     rivers: Option<&crate::rivers::network::RiverNetwork>,
     key: TileKey,
+    workers: usize,
 ) -> PreparedTile {
-    let (base_height, river) = crate::noise::create_base_height_map(noise, key, rivers);
+    let started = std::time::Instant::now();
+    let (base_height, river) = crate::noise::create_base_height_map(noise, key, rivers, workers);
     let drainage_area = route_base_drainage(&base_height, EROSION_RESOLUTION, EROSION_CELL_SIZE);
+    log::info!(
+        "EROSION: tile ({}, {}) inputs in {:.0} ms on {} thread{}",
+        key.x,
+        key.z,
+        started.elapsed().as_secs_f64() * 1000.0,
+        workers,
+        if workers == 1 { "" } else { "s" }
+    );
     PreparedTile {
         key,
         base_height,
@@ -921,15 +965,35 @@ pub fn prepare_tile(
     }
 }
 
+/// Threads for a tile prepared inline (the prewarm, screenshot runs and the
+/// overlap measurement), where the frame waits for it: every core.
+fn inline_preparation_workers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 16)
+}
+
+/// Inputs being built on the task pool, with the river network they carve:
+/// `Arc::as_ptr` of the network in force when the task began, or 0 for none.
+struct PendingTile {
+    key: TileKey,
+    rivers: usize,
+    task: Task<PreparedTile>,
+}
+
+fn rivers_tag(rivers: &Option<Arc<crate::rivers::network::RiverNetwork>>) -> usize {
+    rivers.as_ref().map_or(0, |network| Arc::as_ptr(network) as usize)
+}
+
 /// Builds the next tile's inputs on the async compute pool. Base heights and
 /// their drainage routing take tens of milliseconds per tile, several times
 /// that in a debug build, and a tile begins every couple of dozen frames while
-/// the cache streams; done inline they stalled the frame each time. A tile
-/// starts a frame or two after it is chosen instead.
+/// the cache streams; done inline they stalled the frame each time. They are
+/// built while the tile before simulates, so the next one can usually begin
+/// the frame that one finalizes. One thread builds them, which leaves the
+/// other cores to the main and render threads.
 #[derive(Resource)]
 pub struct TilePreparation {
     noise: Arc<NoiseField>,
-    pending: Option<(TileKey, Task<PreparedTile>)>,
+    pending: Option<PendingTile>,
 }
 
 impl TilePreparation {
@@ -940,30 +1004,56 @@ impl TilePreparation {
         }
     }
 
-    /// The prepared inputs of a tile still queued in `cache`, once they are
-    /// ready. Starts preparing `next` when nothing is in flight; work for a
-    /// tile that has meanwhile left the queue is dropped.
-    fn poll(&mut self, cache: &ErosionCache, next: TileKey) -> Option<PreparedTile> {
+    /// Drops work that can no longer be begun: its tile has left the queue,
+    /// or the rivers changed under it (a region switch), so its heights carve
+    /// channels the tile would no longer simulate over.
+    fn discard_stale(&mut self, cache: &ErosionCache) {
         let still_queued = |key: &TileKey| {
             cache
                 .tiles
                 .get(key)
                 .is_some_and(|tile| tile.state == ErosionTileState::Queued)
         };
-        if self.pending.as_ref().is_some_and(|(key, _)| !still_queued(key)) {
+        let stale = |pending: &PendingTile| {
+            !still_queued(&pending.key) || pending.rivers != rivers_tag(&cache.rivers)
+        };
+        if self.pending.as_ref().is_some_and(stale) {
             self.pending = None;
         }
-        let Some((key, mut task)) = self.pending.take() else {
-            let noise = self.noise.clone();
-            let rivers = cache.rivers.clone();
-            let task = AsyncComputeTaskPool::get()
-                .spawn(async move { prepare_tile(&noise, rivers.as_deref(), next) });
-            self.pending = Some((next, task));
+    }
+
+    /// Starts building `key`'s inputs unless current work is in flight.
+    fn start(&mut self, cache: &ErosionCache, key: TileKey) {
+        self.discard_stale(cache);
+        if self.pending.is_some() {
+            return;
+        }
+        let noise = self.noise.clone();
+        let rivers = cache.rivers.clone();
+        let tag = rivers_tag(&rivers);
+        let task = AsyncComputeTaskPool::get()
+            .spawn(async move { prepare_tile(&noise, rivers.as_deref(), key, 1) });
+        self.pending = Some(PendingTile {
+            key,
+            rivers: tag,
+            task,
+        });
+    }
+
+    /// The prepared inputs of a tile still queued in `cache`, once they are
+    /// ready. Starts preparing `next` when nothing is in flight; work for a
+    /// tile that has meanwhile left the queue, or that carves rivers no
+    /// longer in force, is dropped. Work for a tile other than `next` that is
+    /// still queued is kept and begun.
+    fn poll(&mut self, cache: &ErosionCache, next: TileKey) -> Option<PreparedTile> {
+        self.discard_stale(cache);
+        let Some(mut pending) = self.pending.take() else {
+            self.start(cache, next);
             return None;
         };
-        let prepared = block_on(poll_once(&mut task));
+        let prepared = block_on(poll_once(&mut pending.task));
         if prepared.is_none() {
-            self.pending = Some((key, task));
+            self.pending = Some(pending);
         }
         prepared
     }
@@ -982,7 +1072,7 @@ pub fn begin_tile(
     if !cache.tiles.contains_key(&key) {
         return;
     }
-    let prepared = prepare_tile(noise, cache.rivers.as_deref(), key);
+    let prepared = prepare_tile(noise, cache.rivers.as_deref(), key, inline_preparation_workers());
     begin_prepared_tile(cache, commands, prepared);
 }
 
@@ -1073,13 +1163,14 @@ pub fn advance_active_tile(
 /// Returns whether a tile was begun this frame: the C++ prewarm loop runs one
 /// full-budget pass per tile, so the caller counts down its four passes here.
 /// With `preparation`, the next tile's inputs are built off the main thread
-/// and it begins once they are ready; without, it begins in this frame.
+/// while the active tile simulates, and it begins once they are ready;
+/// without, it begins in this frame.
 #[allow(clippy::too_many_arguments)]
 pub fn update_erosion_cache(
     cache: &mut ErosionCache,
     bridge: &ErosionBridge,
     noise: &NoiseField,
-    preparation: Option<&mut TilePreparation>,
+    mut preparation: Option<&mut TilePreparation>,
     settings: &ErosionSettings,
     player_position: [f32; 3],
     iteration_budget: usize,
@@ -1112,23 +1203,32 @@ pub fn update_erosion_cache(
     };
 
     let mut began_tile = false;
-    if !cache.has_active_tile {
-        if let Some(next) = choose_next_erosion_tile(cache, player_tile, player_minimum) {
-            match preparation {
-                Some(preparation) => {
-                    if let Some(prepared) = preparation.poll(cache, next) {
-                        begin_prepared_tile(cache, &mut commands, prepared);
-                        began_tile = true;
-                    }
-                }
-                None => {
-                    begin_tile(cache, &mut commands, noise, next);
+    if !cache.has_active_tile
+        && let Some(next) = choose_next_erosion_tile(cache, player_tile, player_minimum)
+    {
+        match preparation.as_deref_mut() {
+            Some(preparation) => {
+                if let Some(prepared) = preparation.poll(cache, next) {
+                    begin_prepared_tile(cache, &mut commands, prepared);
                     began_tile = true;
                 }
+            }
+            None => {
+                begin_tile(cache, &mut commands, noise, next);
+                began_tile = true;
             }
         }
     }
     advance_active_tile(cache, &mut commands, settings, iteration_budget, reveal_immediately);
+    // The active tile is simulating, so the queue's best tile is the one
+    // after it: build its inputs now, and it can begin as soon as this one
+    // finalizes rather than a preparation later.
+    if cache.has_active_tile
+        && let Some(preparation) = preparation
+        && let Some(next) = choose_next_erosion_tile(cache, player_tile, player_minimum)
+    {
+        preparation.start(cache, next);
+    }
     bridge.set_frame(commands, Some(erosion_lookup_records(cache)));
     began_tile
 }
@@ -1475,11 +1575,8 @@ mod tests {
         assert!(area[(resolution - 1) * resolution + 4] == 0.0);
     }
 
-    /// The donor-count ordering routes exactly what visiting cells highest
-    /// first did, on rough ground with flats, pits, plateaus and a sea.
-    #[test]
-    fn base_drainage_matches_highest_first_routing() {
-        let resolution = 96;
+    /// Rough ground with flats, pits, plateaus and a sea.
+    fn rough_ground(resolution: usize) -> Vec<f32> {
         let mut seed = 0x2545_f491u32;
         let quantized_height = |cell| {
             seed ^= seed << 13;
@@ -1491,7 +1588,15 @@ mod tests {
             // Quantised noise leaves exact ties (flats) between neighbours.
             ((relief + (seed % 3) as f32 * 0.1) * 4.0).round() * 0.25
         };
-        let heights: Vec<f32> = (0..resolution * resolution).map(quantized_height).collect();
+        (0..resolution * resolution).map(quantized_height).collect()
+    }
+
+    /// The donor-count ordering routes exactly what visiting cells highest
+    /// first did, on rough ground with flats, pits, plateaus and a sea.
+    #[test]
+    fn base_drainage_matches_highest_first_routing() {
+        let resolution = 96;
+        let heights = rough_ground(resolution);
         let routed = route_base_drainage(&heights, resolution, 4.0);
         let reference = highest_first_drainage(&heights, resolution, 4.0);
         for (cell, (a, b)) in routed.iter().zip(&reference).enumerate() {
@@ -1531,6 +1636,207 @@ mod tests {
             }
         }
         area
+    }
+
+    /// `route_base_drainage` as it was before each cell counted its own
+    /// donors: every donor added itself to its receivers' counts, and every
+    /// neighbour visit tested the grid's bounds.
+    fn scatter_reference_drainage(heights: &[f32], resolution: usize, cell_size: f32) -> Vec<f32> {
+        let count = resolution * resolution;
+        let mut area = vec![1.0f32; count.min(heights.len())];
+        if area.len() != count {
+            return area;
+        }
+        let mut waiting = vec![0u8; count];
+        for cell in 0..count {
+            let height = heights[cell];
+            if height < SEA_LEVEL {
+                continue;
+            }
+            for_each_neighbour(cell, resolution, |neighbour, _| {
+                if heights[neighbour] < height {
+                    waiting[neighbour] += 1;
+                }
+            });
+        }
+        let mut ready: Vec<u32> = (0..count as u32)
+            .filter(|&cell| waiting[cell as usize] == 0)
+            .collect();
+        let diagonal = cell_size * std::f32::consts::SQRT_2;
+        while let Some(cell) = ready.pop() {
+            let cell = cell as usize;
+            let height = heights[cell];
+            if height < SEA_LEVEL {
+                continue;
+            }
+            let mut shares = [(0usize, 0.0f32); 8];
+            let mut receivers = 0;
+            let mut share_total = 0.0f32;
+            for_each_neighbour(cell, resolution, |neighbour, diagonal_step| {
+                let distance = if diagonal_step { diagonal } else { cell_size };
+                let slope = (height - heights[neighbour]) / distance;
+                if slope > 0.0 {
+                    shares[receivers] = (neighbour, slope * slope);
+                    receivers += 1;
+                    share_total += slope * slope;
+                }
+            });
+            let passed = area[cell];
+            for &(neighbour, share) in &shares[..receivers] {
+                if share_total > 0.0 {
+                    area[neighbour] += passed * share / share_total;
+                }
+                waiting[neighbour] -= 1;
+                if waiting[neighbour] == 0 {
+                    ready.push(neighbour as u32);
+                }
+            }
+        }
+        for (cell, height) in heights.iter().enumerate() {
+            if *height < SEA_LEVEL {
+                area[cell] = 0.0;
+            }
+        }
+        area
+    }
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    /// Each cell counting its own donors, and the bounds tests skipped inside
+    /// the grid, leave the routing exactly as the donors' scatter had it: the
+    /// same release order and the same float sums, bit for bit. Checked on
+    /// small grids whose edges are most of the cells, on rough ground with
+    /// flats, pits and a sea, and on three real tiles.
+    #[test]
+    fn drainage_matches_the_scatter_reference_bit_for_bit() {
+        let plane = |resolution: usize| -> Vec<f32> {
+            (0..resolution * resolution)
+                .map(|cell| 100.0 - (cell / resolution) as f32 * 2.0 + (cell % 3) as f32 * 0.1)
+                .collect()
+        };
+        let mut grids = vec![
+            (plane(1), 1),
+            (plane(2), 2),
+            (plane(3), 3),
+            (plane(8), 8),
+            (rough_ground(96), 96),
+            (rough_ground(131), 131),
+        ];
+        let noise = NoiseField::new();
+        for key in [tile(0, 0), tile(-1, 2), tile(3, -5)] {
+            let (heights, _) = crate::noise::create_base_height_map(&noise, key, None, 4);
+            grids.push((heights, EROSION_RESOLUTION));
+        }
+        let mut largest = 0.0f32;
+        for (heights, resolution) in &grids {
+            let routed = route_base_drainage(heights, *resolution, EROSION_CELL_SIZE);
+            let reference = scatter_reference_drainage(heights, *resolution, EROSION_CELL_SIZE);
+            assert!(bits(&routed) == bits(&reference), "{resolution}-cell grid routes differently");
+            largest = routed.into_iter().fold(largest, f32::max);
+        }
+        assert!(largest > 1000.0, "real tiles gather catchments, largest {largest} cells");
+    }
+
+    /// Rows dealt out to several threads change nothing: a tile's base
+    /// heights, river cells and routed drainage are the same bits from one
+    /// thread as from four, over the spawn region's rivers.
+    #[test]
+    fn prepared_tiles_are_bit_identical_across_worker_counts() {
+        let noise = NoiseField::new();
+        let network = crate::rivers::network::generate(&noise, [0, 0]);
+        let mut river_cells = 0;
+        for key in [tile(0, 0), tile(-1, 2), tile(3, -5)] {
+            let serial = prepare_tile(&noise, Some(&network), key, 1);
+            let parallel = prepare_tile(&noise, Some(&network), key, 4);
+            assert!(bits(&serial.base_height) == bits(&parallel.base_height), "{key:?} heights");
+            assert!(bits(&serial.river) == bits(&parallel.river), "{key:?} river cells");
+            assert!(bits(&serial.drainage_area) == bits(&parallel.drainage_area), "{key:?} drainage");
+            river_cells += serial.river.iter().filter(|cell| **cell > 0.5).count();
+        }
+        assert!(river_cells > 0, "the tiles cross the rivers, so the carving is compared too");
+    }
+
+    /// Waits for the tile preparation's work in flight, if any, to finish.
+    fn wait_for_preparation(preparation: &TilePreparation) {
+        let started = std::time::Instant::now();
+        while preparation.pending.as_ref().is_some_and(|pending| !pending.task.is_finished()) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(300), "the preparation never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// While one tile simulates, the next one's inputs build on the task
+    /// pool, so it begins the very frame the first one finalizes, with the
+    /// inputs an inline preparation gives.
+    #[test]
+    fn the_next_tile_is_prepared_while_one_simulates() {
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::new);
+        let noise = Arc::new(NoiseField::new());
+        let mut preparation = TilePreparation::new(noise.clone());
+        let mut cache = ErosionCache::default();
+        let bridge = ErosionBridge::default();
+        let settings = ErosionSettings::default();
+        let frame = |cache: &mut ErosionCache, preparation: &mut TilePreparation| {
+            update_erosion_cache(cache, &bridge, &noise, Some(preparation), &settings,
+                                 [10.0, 0.0, 10.0], EROSION_ITERATIONS_PER_FRAME, false, 1.0 / 60.0)
+        };
+
+        // Nothing simulates yet, so the first tile waits for its own inputs.
+        while !frame(&mut cache, &mut preparation) {
+            wait_for_preparation(&preparation);
+        }
+        let first = cache.active_tile;
+        let next = preparation.pending.as_ref().expect("the next tile is being prepared").key;
+        assert_ne!(next, first);
+        assert_eq!(cache.tiles[&next].state, ErosionTileState::Queued);
+
+        // Its inputs are ready long before the first tile finishes, and are
+        // held until it does.
+        wait_for_preparation(&preparation);
+        assert!(!frame(&mut cache, &mut preparation));
+        assert_eq!(cache.active_tile, first);
+
+        // The first tile's finalize lands, as `apply_erosion_events` applies it.
+        cache.tiles.get_mut(&first).expect("the first tile").state = ErosionTileState::Ready;
+        cache.has_active_tile = false;
+        bridge.take_commands();
+        assert!(frame(&mut cache, &mut preparation), "the next tile begins in the same frame");
+        assert_eq!(cache.active_tile, next);
+        let init = bridge.take_commands().and_then(|commands| commands.init).expect("an init");
+        let inline = prepare_tile(&noise, None, next, 1);
+        assert!(bits(&init.base_height) == bits(&inline.base_height));
+        assert!(bits(&init.drainage_area) == bits(&inline.drainage_area));
+        assert!(bits(&init.river) == bits(&inline.river));
+    }
+
+    /// A prefetch carves the rivers in force when it began. If the network
+    /// is replaced while it builds or waits (a region switch), the work is
+    /// dropped, never begun, and the tile's inputs are built again over the
+    /// network now in force.
+    #[test]
+    fn a_prefetch_built_for_other_rivers_is_dropped() {
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::new);
+        let noise = Arc::new(NoiseField::new());
+        let mut preparation = TilePreparation::new(noise);
+        let mut cache = ErosionCache::default();
+        ensure_erosion_cache(&mut cache, tile(0, 0));
+        let next = tile(1, 0);
+        preparation.start(&cache, next);
+        wait_for_preparation(&preparation);
+        let pending = preparation.pending.as_mut().expect("the prefetch");
+        assert_eq!(pending.rivers, 0, "built without rivers");
+
+        // Stand in for a network since replaced: the finished work no longer
+        // carves the rivers in force.
+        pending.rivers = 0x5eed;
+        assert!(preparation.poll(&cache, next).is_none(), "stale inputs are never handed out");
+        let pending = preparation.pending.as_ref().expect("the inputs are built again");
+        assert_eq!(pending.rivers, rivers_tag(&cache.rivers));
+        wait_for_preparation(&preparation);
+        let prepared = preparation.poll(&cache, next).expect("the rebuilt inputs");
+        assert_eq!(prepared.key, next);
     }
 
     /// The ordinary path: a frame that is consumed leaves nothing behind.
