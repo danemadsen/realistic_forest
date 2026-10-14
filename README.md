@@ -274,12 +274,26 @@ near the camera; farther out the interval widens continuously with distance,
 tracking the clipmap's vertex spacing, so distant coverage is prefiltered
 instead of aliasing into rows of triangles along snow and rock margins.
 
-Snow006 forms a uniform white pack above the climate snowline
-(`SNOWLINE_ALTITUDE`, 112 metres). A broad altitude transition and modest
-spring-sun aspect shift keep the edge smooth. Snow thins past about 39 degrees
-and sheds by 55, leaving steep rock faces exposed. Scan contrast and wind
-relief are restrained, while fine grain, roughness and glints still respond
-to the light; only the thinning fringe keeps a faint sediment stain.
+Snow006 forms a continuous white pack above the climate snowline
+(`SNOWLINE_ALTITUDE`, 112 metres), settled the way Gaea's snowfall settles it,
+in closed form (`snow-functions.wgslinc`). A broad altitude transition and
+modest spring-sun aspect shift keep the edge smooth. The terrain shapes the
+pack in proportion to its depth, as Gaea restores fine relief under a coarse
+pack: hollows and gullies hold it a few metres lower and noses and crests lose
+it a few metres higher (2.6 m and 3.7 m at the median in the band), so white
+tongues run down the gullies and ridges go grey first, yet no snow lies below
+the band and no hole opens above it on ground the pack holds. A slope keeps
+only what it can hold, and a thin margin clings to steeper ground than a deep
+pack: snow thins past about 39 degrees and sheds by 55, leaving steep rock
+faces exposed. The slope is tested tilted toward the prevailing wind (it blows
+toward 70 degrees), so lee faces, which are mostly the shaded ones, carry a
+white plaster up to about 58 degrees while windward faces shed theirs from
+about 33. No noise moves the pack: every input is the terrain itself, near the
+player the eroded bed's own 12 m relief and far away the same measure taken
+over the material interval, so a margin stays put as the camera approaches.
+Scan contrast and wind relief are restrained, while fine grain, roughness and
+glints still respond to the light; only the thinning fringe keeps a faint
+sediment stain.
 
 Fully covered snow rises 32 centimetres above the underlying terrain. Walking
 compresses that raised layer back to the terrain surface, leaving a continuous
@@ -801,7 +815,11 @@ quartet is prewarmed at spawn. Beyond 1100 metres from the player, one shared C1
 radial visibility field fades height and flow and material evidence back to the
 procedural base terrain, reaching zero by 1600 metres — safely before the
 nearest exact-four support edge of the 9×9 pass cache. CPU collision and both
-terrain shaders use the same lattice, weights, centre, and radii.
+terrain shaders use the same lattice, weights, centre, and radii. Past the zero
+radius the fade is exactly zero, so no consumer samples a tile there at all:
+the clipmap, the lighting heightfield, the plants' roots, the material shader
+and the CPU skip the masks, lookups and atlas fetches that would only be
+multiplied by it, and the ground they find is the base terrain bit for bit.
 
 The retained RGBA flow atlas is available to the terrain shader and the
 diagnostics view with this per-texel contract:
@@ -814,7 +832,8 @@ diagnostics view with this per-texel contract:
 | A | Routed contributing area, in 4×4-metre cells |
 
 The RGBA surface atlas retains signed height displacement in R for the vertex
-shader and collision. G stores local concavity in metres; B stores the positive
+shader and collision. G stores local concavity in metres, which the snow pack
+also reads (the CPU keeps a copy for the footing on snow); B stores the positive
 log2 concentration of contributing area relative to a surrounding 12-metre
 ring, which finds each channel's thalweg; A stores the loose cover left above
 bedrock, in metres. These fields are derived at tile completion using the

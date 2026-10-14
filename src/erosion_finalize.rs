@@ -24,6 +24,7 @@ pub fn finalize_erosion_tile(
     let output_pixels = output_resolution * output_resolution;
 
     let mut cpu_delta = vec![0.0f32; output_pixels];
+    let mut cpu_concavity = vec![0.0f32; output_pixels];
     let mut output_height = vec![0.0f32; output_pixels * 4];
     let mut output_flow = vec![0.0f32; output_pixels * 4];
 
@@ -78,8 +79,11 @@ pub fn finalize_erosion_tile(
             surrounding_height *= 0.125;
             surrounding_drainage *= 0.125;
             let drainage_area = drainage_rgba[source * 4].max(0.0);
+            // One value for the atlas and the CPU's copy, so the snow the
+            // player stands on reads the relief the shaders draw it over.
+            cpu_concavity[destination] = surrounding_height - height;
             output_height[destination * 4] = delta;
-            output_height[destination * 4 + 1] = surrounding_height - height;
+            output_height[destination * 4 + 1] = cpu_concavity[destination];
             output_height[destination * 4 + 2] = ((drainage_area + DRAINAGE_EPSILON)
                 / (surrounding_drainage + DRAINAGE_EPSILON))
                 .log2()
@@ -177,6 +181,7 @@ pub fn finalize_erosion_tile(
     let tile = FinalizedTile {
         key,
         cpu_delta,
+        cpu_concavity,
         stats,
     };
     (tile, atlas_height, atlas_flow)
@@ -273,5 +278,38 @@ mod cast_slice_parity_tests {
         }
         assert_eq!(tile.1.len(), EROSION_ATLAS_PITCH * EROSION_ATLAS_PITCH * 4);
         assert_eq!(tile.2.len(), EROSION_ATLAS_PITCH * EROSION_ATLAS_PITCH * 4);
+    }
+    /// The snow pack reads the concavity from the CPU copy under the player
+    /// and from the atlas everywhere else: they must be one value. On a
+    /// paraboloid h = k r^2 / 2 the 12 m ring (axial 12 m, diagonal 17 m)
+    /// averages 108 k of relief over the point.
+    #[test]
+    fn finalize_keeps_the_concavity_it_uploads() {
+        let resolution = EROSION_RESOLUTION;
+        let curvature = 0.01f32;
+        let centre = resolution as f32 * 0.5 * EROSION_CELL_SIZE;
+        let mut terrain = vec![0.0f32; resolution * resolution * 4];
+        for z in 0..resolution {
+            for x in 0..resolution {
+                let dx = x as f32 * EROSION_CELL_SIZE - centre;
+                let dz = z as f32 * EROSION_CELL_SIZE - centre;
+                let index = (z * resolution + x) * 4;
+                terrain[index] = 0.5 * curvature * (dx * dx + dz * dz);
+                terrain[index + 2] = terrain[index];
+            }
+        }
+        let zeros = vec![0.0; resolution * resolution * 4];
+        let (tile, atlas_height, _) =
+            finalize_erosion_tile(crate::erosion::tile(0, 0), &terrain, &zeros, &zeros);
+        let output = EROSION_OUTPUT_RESOLUTION;
+        assert_eq!(tile.cpu_concavity.len(), output * output);
+        for z in 0..output {
+            for x in 0..output {
+                let atlas = (z + EROSION_ATLAS_GUTTER) * EROSION_ATLAS_PITCH + x + EROSION_ATLAS_GUTTER;
+                let concavity = tile.cpu_concavity[z * output + x];
+                assert_eq!(concavity.to_bits(), atlas_height[atlas * 4 + 1].to_bits());
+                assert!((concavity - 108.0 * curvature).abs() < 2.0e-3, "{concavity}");
+            }
+        }
     }
 }

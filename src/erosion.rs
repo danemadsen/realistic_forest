@@ -69,6 +69,10 @@ pub struct ErosionTile {
     /// This is the independent result for one hydraulic pass. It deliberately
     /// remains distinct from its three overlapping neighbours.
     pub cpu_delta: Vec<f32>,
+    /// The finished bed's 12 m ring concavity per retained texel, metres (+ in
+    /// hollows): the surface atlas's G, which the snow pack reads, so the
+    /// player's footing on snow matches the pack the terrain draws.
+    pub cpu_concavity: Vec<f32>,
 }
 
 impl ErosionTile {
@@ -81,6 +85,7 @@ impl ErosionTile {
             reveal: 0.0,
             state: ErosionTileState::Queued,
             cpu_delta: Vec::new(),
+            cpu_concavity: Vec::new(),
         }
     }
 }
@@ -128,16 +133,19 @@ pub fn sample_erosion_blend_mask(mask: &[f32], key: TileKey, x: f32, z: f32) -> 
     lerp(lerp(at(x0, z0), at(x1, z0), tx), lerp(at(x0, z1), at(x1, z1), tx), tz)
 }
 
-pub fn sample_tile_delta(tile: &ErosionTile, x: f32, z: f32) -> f32 {
-    if tile.cpu_delta.is_empty() {
+/// One of a tile's retained per-texel fields at a world position, bilinear
+/// between texel centres and clamped at the footprint's edge, as the shaders
+/// sample its atlas patch.
+fn sample_tile_field(key: TileKey, field: &[f32], x: f32, z: f32) -> f32 {
+    if field.is_empty() {
         return 0.0;
     }
     // The C++ widens only the lattice product to double before narrowing:
     // `static_cast<float>(static_cast<double>(tile.key.x) * kErosionTileStride
     // - kErosionFootprintSize * 0.5)`; every later step is f32.
-    let support_x = (tile.key.x as f64 * EROSION_TILE_STRIDE as f64
+    let support_x = (key.x as f64 * EROSION_TILE_STRIDE as f64
         - EROSION_FOOTPRINT_SIZE as f64 * 0.5) as f32;
-    let support_z = (tile.key.z as f64 * EROSION_TILE_STRIDE as f64
+    let support_z = (key.z as f64 * EROSION_TILE_STRIDE as f64
         - EROSION_FOOTPRINT_SIZE as f64 * 0.5) as f32;
     let pixel_x = (x - support_x) / EROSION_CELL_SIZE - 0.5;
     let pixel_z = (z - support_z) / EROSION_CELL_SIZE - 0.5;
@@ -150,7 +158,7 @@ pub fn sample_tile_delta(tile: &ErosionTile, x: f32, z: f32) -> f32 {
     let z1 = clamp_i(raw_z + 1, EROSION_OUTPUT_RESOLUTION - 1);
     let tx = (pixel_x - pixel_x.floor()).clamp(0.0, 1.0);
     let tz = (pixel_z - pixel_z.floor()).clamp(0.0, 1.0);
-    let at = |px: usize, pz: usize| tile.cpu_delta[pz * EROSION_OUTPUT_RESOLUTION + px];
+    let at = |px: usize, pz: usize| field[pz * EROSION_OUTPUT_RESOLUTION + px];
     lerp(lerp(at(x0, z0), at(x1, z0), tx), lerp(at(x0, z1), at(x1, z1), tx), tz)
 }
 
@@ -163,17 +171,12 @@ pub fn erosion_visibility(x: f32, z: f32, center: [f32; 2]) -> f32 {
                      (dx * dx + dz * dz).sqrt())
 }
 
-/// Sample the blended eroded surface height at a world position. Four fixed
-/// spatial candidate masks are normalized independently of readiness so a
-/// missing/streaming pass contributes zero erosion (the procedural base) and
-/// fades in with its own C1 mask, avoiding 512 m quartet-availability steps.
-pub fn sample_eroded_height(
-    cache: &ErosionCache,
-    noise: &NoiseField,
-    x: f32,
-    z: f32,
-    visibility_center: [f32; 2],
-) -> f32 {
+/// One per-tile field blended over the four candidate passes at a world
+/// position, as the shaders' erosionSurface blends the atlas: four fixed
+/// spatial candidate masks are normalized independently of readiness, so a
+/// missing or streaming pass contributes zero (the procedural base) and fades
+/// in with its own C1 mask, avoiding 512 m quartet-availability steps.
+fn blend_tiles(cache: &ErosionCache, x: f32, z: f32, field: fn(&ErosionTile) -> &[f32]) -> f32 {
     let lower = erosion_candidate_minimum(x, z);
     let candidates = [
         lower,
@@ -188,34 +191,63 @@ pub fn sample_eroded_height(
         total_weight += masks[index];
     }
 
-    let envelope = cache
-        .rivers
-        .as_ref()
-        .map_or(crate::rivers::carve::Envelope::NONE, |network| network.envelope(x, z));
-    let mut delta = 0.0f32;
+    let mut blended = 0.0f32;
     if total_weight > 0.000001 {
         let inverse_weight = 1.0 / total_weight;
         for (index, key) in candidates.iter().enumerate() {
             if let Some(found) = cache.tiles.get(key) {
                 if found.state == ErosionTileState::Ready {
                     let reveal = found.reveal.clamp(0.0, 1.0);
-                    delta += masks[index]
+                    blended += masks[index]
                         * inverse_weight
                         * reveal
-                        * sample_tile_delta(found, x, z);
+                        * sample_tile_field(found.key, field(found), x, z);
                 }
             }
         }
     }
+    blended
+}
+
+/// Sample the blended eroded surface height at a world position, as the
+/// shaders' terrainHeight draws it.
+pub fn sample_eroded_height(
+    cache: &ErosionCache,
+    noise: &NoiseField,
+    x: f32,
+    z: f32,
+    visibility_center: [f32; 2],
+) -> f32 {
+    let envelope = cache
+        .rivers
+        .as_ref()
+        .map_or(crate::rivers::carve::Envelope::NONE, |network| network.envelope(x, z));
+    // Beyond the fade's zero radius the delta adds nothing, so its tiles are
+    // not sampled at all, as the shaders' fadedErosionSurface skips them.
+    let fade = erosion_visibility(x, z, visibility_center);
+    let faded_delta = if fade > 0.0 {
+        blend_tiles(cache, x, z, |found| &found.cpu_delta) * fade
+    } else {
+        0.0
+    };
     // Erosion ran over the carved base; the channels hold over the result.
-    let ground = envelope.clamp(
-        envelope.clamp(crate::noise::base_height(noise, x, z))
-            + delta * erosion_visibility(x, z, visibility_center),
-    );
+    let ground = envelope.clamp(envelope.clamp(crate::noise::base_height(noise, x, z)) + faded_delta);
     // The buildings' pads level whatever the erosion made of their ground.
     match &cache.buildings {
         Some(pads) => pads.level(x, z, ground),
         None => ground,
+    }
+}
+
+/// The eroded bed's 12 m ring concavity at a world position, metres (+ in
+/// hollows), blended and faded exactly as the shaders' fadedErosionSurface
+/// returns it: what the snow pack reads under the player.
+pub fn sample_eroded_concavity(cache: &ErosionCache, x: f32, z: f32, visibility_center: [f32; 2]) -> f32 {
+    let fade = erosion_visibility(x, z, visibility_center);
+    if fade > 0.0 {
+        blend_tiles(cache, x, z, |found| &found.cpu_concavity) * fade
+    } else {
+        0.0
     }
 }
 
@@ -295,6 +327,8 @@ pub struct FinalizedTile {
     pub key: TileKey,
     /// Signed displacement per retained texel, for CPU collision.
     pub cpu_delta: Vec<f32>,
+    /// The bed's 12 m ring concavity per retained texel (surface atlas G).
+    pub cpu_concavity: Vec<f32>,
     pub stats: TileDiagnostics,
 }
 
@@ -1101,6 +1135,7 @@ pub fn apply_erosion_events(cache: &mut ErosionCache, bridge: &ErosionBridge) {
                         0.0
                     };
                     existing.cpu_delta = finalized.cpu_delta;
+                    existing.cpu_concavity = finalized.cpu_concavity;
                     if cache.force_reveal == Some(key) {
                         cache.force_reveal = None;
                     }
@@ -1262,6 +1297,62 @@ mod tests {
         let taken = bridge.take_commands().expect("commands");
         assert!(!taken.finalize);
         assert_eq!(taken.iterate.expect("iterate").count, 6);
+    }
+
+    /// A cache whose four passes around (300, 300) are Ready with constant
+    /// fields: delta 1, 2, 3, 4 m and concavity 10, 20, 30, 40 m.
+    fn ready_quartet(reveal: f32) -> ErosionCache {
+        let mut cache = ErosionCache {
+            blend_mask_samples: crate::noise::erosion_blend_mask_samples(),
+            ..Default::default()
+        };
+        let lower = erosion_candidate_minimum(300.0, 300.0);
+        let pixels = EROSION_OUTPUT_RESOLUTION * EROSION_OUTPUT_RESOLUTION;
+        for (index, key) in [lower, tile(lower.x + 1, lower.z), tile(lower.x, lower.z + 1),
+                             tile(lower.x + 1, lower.z + 1)].into_iter().enumerate() {
+            let mut found = ErosionTile::new(key, index);
+            found.state = ErosionTileState::Ready;
+            found.reveal = reveal;
+            found.cpu_delta = vec![(index + 1) as f32; pixels];
+            found.cpu_concavity = vec![10.0 * (index + 1) as f32; pixels];
+            cache.tiles.insert(key, found);
+        }
+        cache
+    }
+
+    /// The snow reads the bed's concavity blended over the same four passes,
+    /// with the same partition, reveal and fade as the bed's change, so the
+    /// footing on snow matches the pack the shaders draw.
+    #[test]
+    fn concavity_blends_like_the_delta() {
+        let noise = NoiseField::new();
+        let cache = ready_quartet(0.5);
+        let centre = [300.0 - 1300.0, 300.0];
+        let fade = erosion_visibility(300.0, 300.0, centre);
+        assert!(fade > 0.0 && fade < 1.0);
+        let delta = sample_eroded_height(&cache, &noise, 300.0, 300.0, centre)
+            - crate::noise::base_height(&noise, 300.0, 300.0);
+        let concavity = sample_eroded_concavity(&cache, 300.0, 300.0, centre);
+        assert!(delta > 0.5 * fade && delta < 2.0 * fade, "{delta}");
+        assert!((concavity - 10.0 * delta).abs() < 1.0e-3, "{concavity} against {delta}");
+        assert_eq!(sample_eroded_concavity(&ErosionCache::default(), 300.0, 300.0, centre), 0.0);
+    }
+
+    /// Beyond the fade's zero radius no tile is sampled and the ground is
+    /// exactly the base landform, bit for bit, as the shaders draw it.
+    #[test]
+    fn eroded_height_beyond_the_fade_is_the_base_height() {
+        let noise = NoiseField::new();
+        let cache = ready_quartet(1.0);
+        let centre = [300.0 + EROSION_VISIBILITY_ZERO_RADIUS + 1.0, 300.0];
+        assert_eq!(erosion_visibility(300.0, 300.0, centre), 0.0);
+        assert_eq!(
+            sample_eroded_height(&cache, &noise, 300.0, 300.0, centre).to_bits(),
+            crate::noise::base_height(&noise, 300.0, 300.0).to_bits()
+        );
+        assert_eq!(sample_eroded_concavity(&cache, 300.0, 300.0, centre), 0.0);
+        let near = sample_eroded_height(&cache, &noise, 300.0, 300.0, [300.0, 300.0]);
+        assert!(near > crate::noise::base_height(&noise, 300.0, 300.0) + 0.5);
     }
 
     /// An inclined plane drains down its slope: every row passes everything

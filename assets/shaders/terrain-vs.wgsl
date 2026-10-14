@@ -325,19 +325,22 @@ fn erosionAtlasUV(worldXZ: vec2<f32>, tileCoordinate: vec2<f32>, atlasSlot: vec2
 }
 
 fn accumulateErosionTile(worldXZ: vec2<f32>, tileCoordinate: vec2<f32>, spatialWeight: f32,
-                         weightedDelta: ptr<function, f32>)
+                         weighted: ptr<function, vec2<f32>>)
 {
     if (spatialWeight <= 0.0) { return; }
 
     var record = vec4<f32>(0.0);
     if (!lookupErosionTile(tileCoordinate, &record)) { return; }
     let reveal = clamp(record.z*record.a, 0.0, 1.0);
-    let heightDelta = textureSampleLevel(tex1, tex1_sampler,
-        erosionAtlasUV(worldXZ, tileCoordinate, record.xy), 0.0).r;
-    *weightedDelta += spatialWeight*reveal*heightDelta;
+    // R: the bed's signed change, metres. G: the eroded bed's 12 m ring
+    // concavity, metres (+ in hollows), which the snow pack reads too. One
+    // fetch carries both.
+    let surface = textureSampleLevel(tex1, tex1_sampler,
+        erosionAtlasUV(worldXZ, tileCoordinate, record.xy), 0.0).rg;
+    *weighted += spatialWeight*reveal*surface;
 }
 
-fn erosionDelta(worldXZ: vec2<f32>) -> f32
+fn erosionSurface(worldXZ: vec2<f32>) -> vec2<f32>
 {
     // Pass centres lie on a half-footprint lattice. Between two adjacent
     // centres, the raylib-derived Hermite tents are complementary; their
@@ -354,18 +357,18 @@ fn erosionDelta(worldXZ: vec2<f32>) -> f32
                                    erosionTileMask(worldXZ, tile01),
                                    erosionTileMask(worldXZ, tile11));
     let geometricSum = dot(spatialWeights, vec4<f32>(1.0));
-    if (geometricSum <= 0.000001) { return 0.0; }
+    if (geometricSum <= 0.000001) { return vec2<f32>(0.0); }
     spatialWeights /= geometricSum;
 
     // Only this fixed geometric partition is normalized. Readiness never
     // changes its denominator: a missing pass contributes zero erosion (the
     // base surface) and its reveal brings it in without amplifying neighbours.
-    var weightedDelta = 0.0;
-    accumulateErosionTile(worldXZ, tile00, spatialWeights.x, &weightedDelta);
-    accumulateErosionTile(worldXZ, tile10, spatialWeights.y, &weightedDelta);
-    accumulateErosionTile(worldXZ, tile01, spatialWeights.z, &weightedDelta);
-    accumulateErosionTile(worldXZ, tile11, spatialWeights.w, &weightedDelta);
-    return weightedDelta;
+    var weighted = vec2<f32>(0.0);
+    accumulateErosionTile(worldXZ, tile00, spatialWeights.x, &weighted);
+    accumulateErosionTile(worldXZ, tile10, spatialWeights.y, &weighted);
+    accumulateErosionTile(worldXZ, tile01, spatialWeights.z, &weighted);
+    accumulateErosionTile(worldXZ, tile11, spatialWeights.w, &weighted);
+    return weighted;
 }
 
 fn erosionVisibility(worldXZ: vec2<f32>) -> f32
@@ -373,6 +376,17 @@ fn erosionVisibility(worldXZ: vec2<f32>) -> f32
     return 1.0 - smoothHermite(stage.erosion_visibility_full_radius,
                                stage.erosion_visibility_zero_radius,
                                length(worldXZ - stage.erosion_visibility_center));
+}
+
+// The streamed erosion as the landform adds it: the four-pass delta (x) and
+// the bed's 12 m concavity (y), faded with distance from the player. Beyond
+// the zero radius the fade is exactly 0 and the values it scales add nothing,
+// so their 4 mask samples, 4 lookups and 4 atlas samples are skipped.
+fn fadedErosionSurface(worldXZ: vec2<f32>) -> vec2<f32>
+{
+    let visibility = erosionVisibility(worldXZ);
+    if (visibility <= 0.0) { return vec2<f32>(0.0); }
+    return erosionSurface(worldXZ)*visibility;
 }
 
 fn terrainHeight(worldXZ: vec2<f32>) -> f32
@@ -386,24 +400,54 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
     // same ground whatever the erosion did under it (building-pads.wgslinc).
     let river = riverEnvelope(worldXZ);
     let ground = riverClamp(river, riverClamp(river, baseHeight(worldXZ))
-                                   + erosionDelta(worldXZ)*erosionVisibility(worldXZ));
+                                   + fadedErosionSurface(worldXZ).x);
     return buildingPadHeight(worldXZ, ground);
 }
 // END SHARED TERRAIN HEIGHT
 
 // BEGIN SHARED SNOW COVERAGE
-// A continuous pack above the climate snowline. Aspect moves only the broad
-// transition, while steep walls shed snow. Geometry and material use this
-// same field so the raised snow surface always matches its white coverage.
-fn snowCoverage(height: f32, normal: vec3<f32>) -> f32
+// Late-season snow as Gaea's snowfall settles it (nerthus cs/engine.rs), in
+// closed form, so the raised pack, its white material and the player's footing
+// (snow.rs snow_coverage) read one field. The climate pack deepens through the
+// snowline band, moved by the spring sun's aspect. Hollows hold more of it and
+// noses less, in proportion to its depth (Gaea's restore of fine relief under
+// a coarse pack), so no snow lies below the band and no hole opens above it on
+// ground the pack holds. A slope keeps only what it can hold, and deeper snow
+// slips at gentler slopes (hold = 1 - depth/2A). The slope is tested tilted
+// toward the prevailing wind (Snowfield's direction tilt), so lee faces keep
+// steep snow that windward faces shed. No noise: every input is terrain.
+const SNOW_BAND: f32 = 13.0;        // m, half-width of the snowline band
+const SNOW_MELT_ASPECT: f32 = 12.0; // m of snowline per unit of spring-sun exposure
+const SNOW_BURIAL: f32 = 12.0;      // m, scale of the concavity ring (Gaea's coarse cell)
+const SNOW_HOLD: f32 = 1.45/0.65;   // 2A/D in band depths: a full pack holds to tan 0.80
+const SNOW_SLIP_TAN: f32 = 1.45;    // tan of the slip-off angle a vanishing pack holds (55.4 deg)
+const SNOW_WIND_TILT: f32 = 0.15;   // rise per metre toward the lee (8.5 deg)
+const SNOW_WIND_TO: vec2<f32> = vec2<f32>(0.34202, 0.93969); // the wind blows toward 70 deg
+const SNOW_SMOOTH: f32 = 0.2;       // smooth-minimum width, band depths
+
+// Below this height above the sea no slope, aspect or hollow holds snow.
+fn snowFloor() -> f32
+{
+    return stage.snowline_altitude - SNOW_BAND - 0.62*SNOW_MELT_ASPECT;
+}
+
+// concavity: the mean height of a 12 m ring minus the point, metres
+// (+ in hollows, - on noses), as the erosion's surface atlas records it.
+fn snowCoverage(height: f32, normal: vec3<f32>, concavity: f32) -> f32
 {
     let meltSun = normalize(vec3<f32>(-0.22, 0.62, -0.76));
-    let aspectShift = (0.62 - max(dot(normal, meltSun), 0.0)) * 12.0;
-    let snowLine = smoothHermite(stage.snowline_altitude - 13.0,
-                                 stage.snowline_altitude + 13.0,
-                                 height - stage.sea_level + aspectShift);
-    let steepness = length(normal.xz) / max(normal.y, 0.001);
-    return snowLine * (1.0 - smoothHermite(0.80, 1.45, steepness));
+    let aspectShift = (0.62 - max(dot(normal, meltSun), 0.0))*SNOW_MELT_ASPECT;
+    // The climate pack in band depths: 0 at the foot of the band, 1 at its top.
+    let pack = (height - stage.sea_level + aspectShift - stage.snowline_altitude + SNOW_BAND)
+             / (2.0*SNOW_BAND);
+    // Restore: d_fine = d_coarse*(1 + G/c) while the pack is shallower than c.
+    let depth = pack*clamp(1.0 + concavity/SNOW_BURIAL, 0.5, 1.5);
+    // Slip-off: the depth a slope holds, on the wind-tilted slope.
+    let gradient = -normal.xz/max(normal.y, 0.001);
+    let held = SNOW_HOLD*(1.0 - length(gradient + SNOW_WIND_TILT*SNOW_WIND_TO)/SNOW_SLIP_TAN);
+    // A polynomial smooth minimum keeps the lift's normal free of a crease.
+    let blend = max(SNOW_SMOOTH - abs(depth - held), 0.0)/SNOW_SMOOTH;
+    return smoothHermite(0.0, 1.0, min(depth, held) - blend*blend*SNOW_SMOOTH*0.25);
 }
 // END SHARED SNOW COVERAGE
 
@@ -421,8 +465,8 @@ fn snowCompression(worldXZ: vec2<f32>) -> f32 {
     return textureSampleLevel(snow_compression, snow_sampler, uv, 0.0).r;
 }
 
-fn snowLift(worldXZ: vec2<f32>, height: f32, materialNormal: vec3<f32>) -> f32 {
-    return snowCoverage(height, materialNormal) * snow.mapping.w * (1.0 - snowCompression(worldXZ));
+fn snowLift(worldXZ: vec2<f32>, height: f32, materialNormal: vec3<f32>, concavity: f32) -> f32 {
+    return snowCoverage(height, materialNormal, concavity) * snow.mapping.w * (1.0 - snowCompression(worldXZ));
 }
 
 // BEGIN SHARED RIVERS
@@ -1143,6 +1187,11 @@ struct VsOutput {
     // coordinate of the terrain's bank band (riverShoreRun): negative under
     // water, 40 near none.
     @location(9) frag_river_shore: f32,
+    // Relief, as the mean height of a 12 m ring minus the point, metres
+    // (+ in hollows): x is what the snow pack reads (the erosion atlas's near
+    // the camera, the material ring's far from it), y the material ring's
+    // alone, handed in only where one sample per vertex cannot alias.
+    @location(10) frag_concavity: vec2<f32>,
 };
 
 fn terrainVertex(vertexPosition: vec3<f32>, deformSnow: bool) -> VsOutput
@@ -1162,7 +1211,8 @@ fn terrainVertex(vertexPosition: vec3<f32>, deformSnow: bool) -> VsOutput
     // Expose the blended erosion contribution for the fragment-stage debug
     // overlay. Compute it once here instead of calling terrainHeight() so the
     // delta is not evaluated twice for the primary vertex.
-    let erosionContribution = erosionDelta(worldXZ)*erosionVisibility(worldXZ);
+    let erosionHere = fadedErosionSurface(worldXZ);
+    let erosionContribution = erosionHere.x;
     // The same carve terrainHeight applies, with the river looked up once.
     let river = riverEnvelope(worldXZ);
     var height = buildingPadHeight(worldXZ, riverClamp(river, riverClamp(river, baseHeight(worldXZ)) + erosionContribution));
@@ -1208,6 +1258,7 @@ fn terrainVertex(vertexPosition: vec3<f32>, deformSnow: bool) -> VsOutput
     let cameraDistance = length(worldXZ - globals.camera_position.xz);
     let materialStep = clamp(cameraDistance / 48.0, 4.0, 96.0);
     var materialNormal = localNormal;
+    var ringSum = heightLeft + heightRight + heightBack + heightFront;
     if (abs(normalStep - materialStep) > 0.0001) {
         let materialLeft = terrainHeight(worldXZ - vec2<f32>(materialStep, 0.0));
         let materialRight = terrainHeight(worldXZ + vec2<f32>(materialStep, 0.0));
@@ -1216,23 +1267,44 @@ fn terrainVertex(vertexPosition: vec3<f32>, deformSnow: bool) -> VsOutput
         materialNormal = normalize(vec3<f32>(materialLeft - materialRight,
                                              2.0*materialStep,
                                              materialBack - materialFront));
+        ringSum = materialLeft + materialRight + materialBack + materialFront;
     }
+
+    // The relief the material ring spans, in the units of the erosion atlas's
+    // 12 m ring. A 4-point cross at radius r averages r^2/4 of the Laplacian
+    // and the atlas's 8-point ring at 12 m averages 54 of it, so 216/r^2
+    // turns one into the other on any quadratic relief, and finer relief is
+    // prefiltered as the material slope is. Under a 12-20 m interval (576-960
+    // m away) one sample per vertex would alias 4 m relief, so the ring takes
+    // over from the atlas only past it. The ground here is still the bare
+    // ground: the snow lift below has not been added yet.
+    let ringConcavity = 216.0*(0.25*ringSum - height)/(materialStep*materialStep);
+    let farRelief = smoothHermite(12.0, 20.0, materialStep);
+    let snowConcavity = mix(erosionHere.y, ringConcavity, farRelief);
+    output.frag_concavity = vec2<f32>(snowConcavity, ringConcavity*farRelief);
 
     if (deformSnow) {
         // Placement reads the underlying terrain, so the sides of a trail
         // remain snow-covered. Only the geometry and lighting normals deform.
         let compression = snowCompression(worldXZ);
         output.frag_snow_compaction = compression;
-        // Snow lies on dry ground only: the pack thins to nothing at a
-        // river's or lake's waterline (snow.rs sample_surface likewise), so
-        // no bed stands above its own water.
-        let dry = smoothHermite(0.0, 1.0, bank);
-        height += dry * snowCoverage(height, materialNormal) * snow.mapping.w * (1.0 - compression);
-        let left = heightLeft + dry * snowLift(worldXZ - vec2<f32>(normalStep, 0.0), heightLeft, materialNormal);
-        let right = heightRight + dry * snowLift(worldXZ + vec2<f32>(normalStep, 0.0), heightRight, materialNormal);
-        let back = heightBack + dry * snowLift(worldXZ - vec2<f32>(0.0, normalStep), heightBack, materialNormal);
-        let front = heightFront + dry * snowLift(worldXZ + vec2<f32>(0.0, normalStep), heightFront, materialNormal);
-        localNormal = normalize(vec3<f32>(left - right, 2.0 * normalStep, back - front));
+        // No pack lies below the snow floor whatever the slope, aspect or
+        // relief, so where all five heights are under it the lift is exactly
+        // zero and the ground and its normal stand as they are: most of the
+        // world skips the five coverages and four compression samples.
+        let highest = max(max(height, max(heightLeft, heightRight)), max(heightBack, heightFront));
+        if (highest - stage.sea_level >= snowFloor()) {
+            // Snow lies on dry ground only: the pack thins to nothing at a
+            // river's or lake's waterline (snow.rs sample_surface likewise),
+            // so no bed stands above its own water.
+            let dry = smoothHermite(0.0, 1.0, bank);
+            height += dry * snowCoverage(height, materialNormal, snowConcavity) * snow.mapping.w * (1.0 - compression);
+            let left = heightLeft + dry * snowLift(worldXZ - vec2<f32>(normalStep, 0.0), heightLeft, materialNormal, snowConcavity);
+            let right = heightRight + dry * snowLift(worldXZ + vec2<f32>(normalStep, 0.0), heightRight, materialNormal, snowConcavity);
+            let back = heightBack + dry * snowLift(worldXZ - vec2<f32>(0.0, normalStep), heightBack, materialNormal, snowConcavity);
+            let front = heightFront + dry * snowLift(worldXZ + vec2<f32>(0.0, normalStep), heightFront, materialNormal, snowConcavity);
+            localNormal = normalize(vec3<f32>(left - right, 2.0 * normalStep, back - front));
+        }
     }
 
     let worldPosition4 = stage.model*vec4<f32>(worldXZ.x, height, worldXZ.y, 1.0);
@@ -1330,5 +1402,7 @@ fn vs_main(@location(0) vertexPosition: vec3<f32>) -> VsOutput {
 // slope/aspect: a 4 m interval near the camera, widening with horizontal
 // camera distance to track the vertex spacing, independent of the LOD rings).
 // @location(8) frag_river (bank distance, bend side, whitewater, flow speed),
-// @location(9) frag_river_shore (metres up the nearest shore, riverShoreRun).
+// @location(9) frag_river_shore (metres up the nearest shore, riverShoreRun),
+// @location(10) frag_concavity (12 m-ring relief: x for the snow pack, y the
+// far material ring's).
 // group 0 binding 0 = shared GlobalUniforms.

@@ -304,19 +304,22 @@ fn erosionAtlasUV(worldXZ: vec2<f32>, tileCoordinate: vec2<f32>, atlasSlot: vec2
 }
 
 fn accumulateErosionTile(worldXZ: vec2<f32>, tileCoordinate: vec2<f32>, spatialWeight: f32,
-                         weightedDelta: ptr<function, f32>)
+                         weighted: ptr<function, vec2<f32>>)
 {
     if (spatialWeight <= 0.0) { return; }
 
     var record = vec4<f32>(0.0);
     if (!lookupErosionTile(tileCoordinate, &record)) { return; }
     let reveal = clamp(record.z*record.a, 0.0, 1.0);
-    let heightDelta = textureSampleLevel(tex1, tex1_sampler,
-        erosionAtlasUV(worldXZ, tileCoordinate, record.xy), 0.0).r;
-    *weightedDelta += spatialWeight*reveal*heightDelta;
+    // R: the bed's signed change, metres. G: the eroded bed's 12 m ring
+    // concavity, metres (+ in hollows), which the snow pack reads too. One
+    // fetch carries both.
+    let surface = textureSampleLevel(tex1, tex1_sampler,
+        erosionAtlasUV(worldXZ, tileCoordinate, record.xy), 0.0).rg;
+    *weighted += spatialWeight*reveal*surface;
 }
 
-fn erosionDelta(worldXZ: vec2<f32>) -> f32
+fn erosionSurface(worldXZ: vec2<f32>) -> vec2<f32>
 {
     // Pass centres lie on a half-footprint lattice. Between two adjacent
     // centres, the raylib-derived Hermite tents are complementary; their
@@ -333,18 +336,18 @@ fn erosionDelta(worldXZ: vec2<f32>) -> f32
                                    erosionTileMask(worldXZ, tile01),
                                    erosionTileMask(worldXZ, tile11));
     let geometricSum = dot(spatialWeights, vec4<f32>(1.0));
-    if (geometricSum <= 0.000001) { return 0.0; }
+    if (geometricSum <= 0.000001) { return vec2<f32>(0.0); }
     spatialWeights /= geometricSum;
 
     // Only this fixed geometric partition is normalized. Readiness never
     // changes its denominator: a missing pass contributes zero erosion (the
     // base surface) and its reveal brings it in without amplifying neighbours.
-    var weightedDelta = 0.0;
-    accumulateErosionTile(worldXZ, tile00, spatialWeights.x, &weightedDelta);
-    accumulateErosionTile(worldXZ, tile10, spatialWeights.y, &weightedDelta);
-    accumulateErosionTile(worldXZ, tile01, spatialWeights.z, &weightedDelta);
-    accumulateErosionTile(worldXZ, tile11, spatialWeights.w, &weightedDelta);
-    return weightedDelta;
+    var weighted = vec2<f32>(0.0);
+    accumulateErosionTile(worldXZ, tile00, spatialWeights.x, &weighted);
+    accumulateErosionTile(worldXZ, tile10, spatialWeights.y, &weighted);
+    accumulateErosionTile(worldXZ, tile01, spatialWeights.z, &weighted);
+    accumulateErosionTile(worldXZ, tile11, spatialWeights.w, &weighted);
+    return weighted;
 }
 
 fn erosionVisibility(worldXZ: vec2<f32>) -> f32
@@ -352,6 +355,17 @@ fn erosionVisibility(worldXZ: vec2<f32>) -> f32
     return 1.0 - smoothHermite(stage.erosion_visibility_full_radius,
                                stage.erosion_visibility_zero_radius,
                                length(worldXZ - stage.erosion_visibility_center));
+}
+
+// The streamed erosion as the landform adds it: the four-pass delta (x) and
+// the bed's 12 m concavity (y), faded with distance from the player. Beyond
+// the zero radius the fade is exactly 0 and the values it scales add nothing,
+// so their 4 mask samples, 4 lookups and 4 atlas samples are skipped.
+fn fadedErosionSurface(worldXZ: vec2<f32>) -> vec2<f32>
+{
+    let visibility = erosionVisibility(worldXZ);
+    if (visibility <= 0.0) { return vec2<f32>(0.0); }
+    return erosionSurface(worldXZ)*visibility;
 }
 
 fn terrainHeight(worldXZ: vec2<f32>) -> f32
@@ -365,7 +379,7 @@ fn terrainHeight(worldXZ: vec2<f32>) -> f32
     // same ground whatever the erosion did under it (building-pads.wgslinc).
     let river = riverEnvelope(worldXZ);
     let ground = riverClamp(river, riverClamp(river, baseHeight(worldXZ))
-                                   + erosionDelta(worldXZ)*erosionVisibility(worldXZ));
+                                   + fadedErosionSurface(worldXZ).x);
     return buildingPadHeight(worldXZ, ground);
 }
 // END SHARED TERRAIN HEIGHT
