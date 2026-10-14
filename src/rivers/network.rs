@@ -1264,8 +1264,10 @@ impl Lakes {
 /// A basin's or a lake's flow cells as a bitmap over their bounding box: the
 /// metre-by-metre floods around it ask of every sample's neighbours whether
 /// they lie in it, millions of times a region, and a bit costs no hashing.
-/// A lake covers at most `MAX_LAKE_CELLS`, so the box stays a few megabytes
-/// at worst.
+/// `MAX_LAKE_CELLS` caps the cells, not the box: a long, thin basin lying
+/// diagonally would need a box far larger than its cells. Basins here are
+/// compact (the largest box across eight regions is 113 KB for 33 000
+/// cells), so the bitmap stays small in practice.
 struct CellMask {
     first: [i64; 2],
     size: [usize; 2],

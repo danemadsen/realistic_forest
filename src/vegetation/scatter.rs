@@ -80,6 +80,9 @@ pub struct CatalogModel {
 /// The model metrics the scatter needs, in model-table order.
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
+    /// Read-only once built: `Catalog::new` derives `forms` from these, so a
+    /// later edit would leave `choose` picking from the old table. Build a
+    /// new catalogue instead.
     pub models: Vec<CatalogModel>,
     /// Each species' growth forms (`Species as usize`), worked out once:
     /// the lavender layer alone asks for a model a hundred thousand times a

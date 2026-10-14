@@ -1093,10 +1093,12 @@ on, the next region is built on the async compute pool (about a second) and
 swapped in. The first region is built before anything streams. The build's
 maps and sets of grid cells hash with a fixed key (foldhash, where std's
 SipHash draws a new key in every process), so a region comes out the same to
-the bit in every run, down to the order of its lists, and the build does
-over a third less work than it did with SipHash (51 rather than 80 billion
-instructions for the spawn region in a debug build). The `RIVERS:` log line
-and `--river-map` say how long each stage of a build took: the routing, the
+the bit in every run, down to the order of its lists. With that hashing, a
+bitmap for the cells of each basin and a lake-sheet lookup made once per
+ribbon vertex instead of three times, the build does over a third less work
+than it did (51 rather than 80 billion instructions for the spawn region in
+the dev profile). The `RIVERS:` lines, at startup and for every region
+streamed in, and `--river-map` say how long each stage of a build took: the
 corridors' ground, the courses (and within them the lakes and the wider
 corridors of rerouted rivers), the carve segments and their grid, the lake
 sheets and the water surface.
