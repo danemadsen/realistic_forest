@@ -2046,8 +2046,7 @@ mod tests {
     /// downstream.
     #[test]
     fn ribbons_carry_their_current_downstream() {
-        let noise = crate::noise::NoiseField::new();
-        let network = crate::rivers::network::generate(&noise, [0, 0]);
+        let (_, network) = crate::rivers::spawn_network();
         let mesh = &network.surface;
         let (mut total, mut reversed, mut askew) = (0.0f64, 0.0f64, 0.0f64);
         for triangle in mesh.indices.chunks_exact(3) {

@@ -129,6 +129,19 @@ impl RiverField {
     }
 }
 
+/// The spawn region's network, built once for every test that reads it.
+/// A build takes seconds, and some twenty tests across the rivers and the
+/// buildings read this one region; none changes it, so they share one.
+#[cfg(test)]
+pub(crate) fn spawn_network() -> (Arc<NoiseField>, Arc<RiverNetwork>) {
+    static SPAWN: std::sync::LazyLock<(Arc<NoiseField>, Arc<RiverNetwork>)> = std::sync::LazyLock::new(|| {
+        let noise = Arc::new(NoiseField::new());
+        let network = Arc::new(network::generate(&noise, [0, 0]));
+        (noise, network)
+    });
+    (SPAWN.0.clone(), SPAWN.1.clone())
+}
+
 /// Start building the next region once the player is nearer its centre, and
 /// install it when done.
 pub fn stream_rivers(mut field: ResMut<RiverField>, players: Query<&Player>) {

@@ -1261,8 +1261,7 @@ mod tests {
 
     #[test]
     fn broader_junction_shoulders_fit_the_segment_lookup_budget() {
-        let noise = crate::noise::NoiseField::new();
-        let network = crate::rivers::network::generate(&noise, [0, 0]);
+        let (_, network) = crate::rivers::spawn_network();
         let busiest = network.grid.cells.iter().map(|cell| cell[1] as usize).max().unwrap_or(0);
         assert!(busiest <= MAX_CANDIDATES, "junction support needs {busiest} candidates, lookup handles {MAX_CANDIDATES}");
     }
@@ -1352,8 +1351,7 @@ mod gpu_tests {
     #[test]
     #[ignore = "requires a GPU adapter"]
     fn river_block_matches_cpu() {
-        let noise = crate::noise::NoiseField::new();
-        let network = crate::rivers::network::generate(&noise, [0, 0]);
+        let (_, network) = crate::rivers::spawn_network();
         let payload = network.gpu_payload();
         let instance = wgpu::Instance::default();
         let adapter = block_on(instance.request_adapter(&Default::default())).expect("adapter");

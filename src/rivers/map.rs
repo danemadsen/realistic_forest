@@ -1264,8 +1264,7 @@ mod tests {
     /// is held below the water, and the GPU payload finds the same segments.
     #[test]
     fn spawn_region_channels_are_carved() {
-        let noise = NoiseField::new();
-        let network = network::generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         let node = network.rivers.iter().flat_map(|r| &r.nodes).find(|n| n.depth > 0.3 && n.water > 2.0 && !n.lake).unwrap();
         let (x, z) = (node.position[0], node.position[1]);
         let envelope = network.envelope(x, z);
@@ -1295,8 +1294,7 @@ mod tests {
     /// all the way round.
     #[test]
     fn spawn_region_lake_sheets_meet_their_shores() {
-        let noise = NoiseField::new();
-        let network = network::generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         assert!(!network.lakes.is_empty());
         let edges = lake_edges(&noise, &network);
         assert!(edges.samples > 1000);
@@ -1308,8 +1306,7 @@ mod tests {
     /// straight back into it.
     #[test]
     fn spawn_region_rivers_meet_still_water_cleanly() {
-        let noise = NoiseField::new();
-        let network = network::generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         let j = junctions(&noise, &network);
         assert!(j.mouths > 50);
         assert!(j.cut_off_mouths.len() * 20 <= j.mouths, "{:?}", j.cut_off_mouths);
@@ -1323,8 +1320,7 @@ mod tests {
     /// not by how near it is, hold a cascade's water right down to the lake.
     #[test]
     fn spawn_region_ribbons_sit_in_their_channels() {
-        let noise = NoiseField::new();
-        let network = network::generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         let fit = ribbon_checks(&noise, &network);
         assert!(fit.samples > 500_000, "{}", fit.samples);
         assert!(fit.perched * 4000 <= fit.samples, "{} of {} perched", fit.perched, fit.samples);
@@ -1340,8 +1336,7 @@ mod tests {
     /// water follows its parent's.
     #[test]
     fn spawn_region_ribbon_edges_never_end_in_the_air() {
-        let noise = NoiseField::new();
-        let network = network::generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         let edges = edge_checks(&noise, &network);
         assert!(edges.edges > 20_000, "{}", edges.edges);
         assert!(edges.over * 500 <= edges.edges, "{} of {} edges over the ground", edges.over, edges.edges);
@@ -1355,8 +1350,7 @@ mod tests {
     /// the reach before them on the inside of a steep bend.
     #[test]
     fn spawn_region_banks_hold_their_water() {
-        let noise = NoiseField::new();
-        let network = network::generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         let banks = bank_checks(&noise, &network);
         assert!(banks.samples > 500_000, "{}", banks.samples);
         assert!(banks.under * 100 <= banks.samples, "{} of {} under the water", banks.under, banks.samples);
@@ -1397,8 +1391,8 @@ mod tests {
     /// metre higher where the two channels first opened into each other.
     #[test]
     fn reported_steep_confluence_meets_its_parents_water() {
-        let noise = NoiseField::new();
-        let network = network::generate(&noise, network::region_of(496.1, 1516.9));
+        let (noise, network) = crate::rivers::spawn_network();
+        assert_eq!(network.region, network::region_of(496.1, 1516.9));
         let (samples, under, _) = ribbons_around(&noise, &network, [496.0, 1507.0], 16.0);
         assert!(samples > 200, "{samples}");
         assert!(under < 0.25, "the creek's water shows {under} m under the river's");
@@ -1411,8 +1405,7 @@ mod tests {
     /// paints under it.
     #[test]
     fn spawn_region_confluences_join_without_a_seam() {
-        let noise = NoiseField::new();
-        let network = network::generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         let seams = junction_seams(&noise, &network);
         assert!(seams.junctions >= 20 && seams.samples > 20_000, "{} junctions, {} samples", seams.junctions, seams.samples);
         // Seams per 10,000 samples of water: what is left lies mostly where
@@ -1439,8 +1432,8 @@ mod tests {
     /// creek's gravel along another.
     #[test]
     fn reported_steep_confluence_joins_without_a_seam() {
-        let noise = NoiseField::new();
-        let network = network::generate(&noise, network::region_of(501.5, 1504.5));
+        let (noise, network) = crate::rivers::spawn_network();
+        assert_eq!(network.region, network::region_of(501.5, 1504.5));
         let index = SurfaceIndex::new(&network);
         let mut seams = JunctionSeams::default();
         seams_around(&noise, &network, &index, [497.0, 1506.0], 24.0, &mut seams);
@@ -1483,8 +1476,7 @@ mod tests {
     /// alone.
     #[test]
     fn spawn_region_lake_mouths_leave_no_dry_pit_under_the_lake() {
-        let noise = NoiseField::new();
-        let network = network::generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         let index = SurfaceIndex::new(&network);
         let mut seen = std::collections::HashSet::new();
         let mut samples = 0;
@@ -1536,8 +1528,7 @@ mod tests {
     /// by more than half a metre.
     #[test]
     fn spawn_region_levees_never_raise_a_lakes_bed_over_its_water() {
-        let noise = NoiseField::new();
-        let network = network::generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         let index = SurfaceIndex::new(&network);
         let cell = network::FLOW_CELL as f32;
         let (mut wet, mut raised, mut worst) = (0usize, 0usize, (0.0f32, [0.0f32; 2]));
@@ -1582,8 +1573,7 @@ mod tests {
     /// ends on an edge the terrain's shading would show.
     #[test]
     fn spawn_region_lake_surface_is_the_drawn_water() {
-        let noise = NoiseField::new();
-        let network = network::generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         let index = SurfaceIndex::new(&network);
         let cell = network::FLOW_CELL as f32;
         let (mut samples, mut above) = (0usize, 0usize);

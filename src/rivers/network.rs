@@ -4223,8 +4223,7 @@ mod tests {
 
     #[test]
     fn reported_pond_outlets_keep_their_full_opening_through_the_rim() {
-        let noise = NoiseField::new();
-        let network = generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         for target in [[-765.3, 941.7], [757.7, 1335.2], [710.0, 1256.9]] {
             let candidates = network.rivers.iter().flat_map(|river| {
                 river.nodes.windows(2).enumerate()
@@ -4273,8 +4272,7 @@ mod tests {
 
     #[test]
     fn pond_outlets_with_interior_room_keep_their_shore_connectors_open() {
-        let noise = NoiseField::new();
-        let network = generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         let mut checked = 0;
         let mut above_water = 0;
         for river in &network.rivers {
@@ -4365,8 +4363,7 @@ mod tests {
     /// as the lake's, not as a river held up between dikes.
     #[test]
     fn a_lakes_backwater_floods_the_hollows_below_its_level() {
-        let noise = NoiseField::new();
-        let network = generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         let mut backed = 0;
         for river in &network.rivers {
             let (mut level, mut shore) = (f32::NEG_INFINITY, 0.0);
@@ -4685,8 +4682,7 @@ mod tests {
     /// rim.
     #[test]
     fn every_lake_in_the_spawn_region_is_held_by_its_sill() {
-        let noise = NoiseField::new();
-        let network = generate(&noise, [0, 0]);
+        let (_, network) = crate::rivers::spawn_network();
         let mut outlets = 0;
         for river in &network.rivers {
             // Where a tributary's water becomes its parent's, its bed
