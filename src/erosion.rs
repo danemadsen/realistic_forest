@@ -1402,18 +1402,24 @@ mod tests {
     }
 
     /// Beyond the fade's zero radius no tile is sampled and the ground is
-    /// exactly the base landform, bit for bit, as the shaders draw it.
+    /// exactly the base landform, bit for bit, as the shaders draw it. The
+    /// tiles hold NaN there: sampling one at all would poison the result.
     #[test]
     fn eroded_height_beyond_the_fade_is_the_base_height() {
         let noise = NoiseField::new();
-        let cache = ready_quartet(1.0);
+        let mut poisoned = ready_quartet(1.0);
+        for found in poisoned.tiles.values_mut() {
+            found.cpu_delta.fill(f32::NAN);
+            found.cpu_concavity.fill(f32::NAN);
+        }
         let centre = [300.0 + EROSION_VISIBILITY_ZERO_RADIUS + 1.0, 300.0];
         assert_eq!(erosion_visibility(300.0, 300.0, centre), 0.0);
         assert_eq!(
-            sample_eroded_height(&cache, &noise, 300.0, 300.0, centre).to_bits(),
+            sample_eroded_height(&poisoned, &noise, 300.0, 300.0, centre).to_bits(),
             crate::noise::base_height(&noise, 300.0, 300.0).to_bits()
         );
-        assert_eq!(sample_eroded_concavity(&cache, 300.0, 300.0, centre), 0.0);
+        assert_eq!(sample_eroded_concavity(&poisoned, 300.0, 300.0, centre), 0.0);
+        let cache = ready_quartet(1.0);
         let near = sample_eroded_height(&cache, &noise, 300.0, 300.0, [300.0, 300.0]);
         assert!(near > crate::noise::base_height(&noise, 300.0, 300.0) + 0.5);
     }

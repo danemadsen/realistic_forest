@@ -862,6 +862,33 @@ mod tests {
         }
     }
 
+    /// The drawn pack must read the concavity the player's footing reads
+    /// (snow.rs sample_surface: the atlas G, faded) near the camera, handing
+    /// over to the material ring's 216/r^2 term far out, at the lifted
+    /// height and at all four neighbours that shape its normal, and hand the
+    /// same value to the fragment stage's white.
+    #[test]
+    fn the_drawn_pack_reads_the_footings_concavity() {
+        let vertex = include_str!("../../assets/shaders/terrain-vs.wgsl");
+        for line in [
+            "let erosionHere = fadedErosionSurface(worldXZ);",
+            "let ringConcavity = 216.0*(0.25*ringSum - height)/(materialStep*materialStep);",
+            "let farRelief = smoothHermite(12.0, 20.0, materialStep);",
+            "let snowConcavity = mix(erosionHere.y, ringConcavity, farRelief);",
+            "output.frag_concavity = vec2<f32>(snowConcavity, ringConcavity*farRelief);",
+            "height += dry * snowCoverage(height, materialNormal, snowConcavity)",
+        ] {
+            assert!(vertex.contains(line), "terrain-vs.wgsl lost `{line}`");
+        }
+        assert_eq!(vertex.matches("materialNormal, snowConcavity);").count(), 4,
+                   "all four lift neighbours must read the footing's concavity");
+        let fragment = include_str!("../../assets/shaders/terrain-fs.wgsl");
+        assert!(fragment.contains(
+            "let fSnow = snowCoverage(height, materialNormal, input.frag_concavity.x);"));
+        assert!(fragment.contains("@location(10) frag_concavity: vec2<f32>,"));
+        assert!(vertex.contains("@location(10) frag_concavity: vec2<f32>,"));
+    }
+
     #[test]
     fn snow_detail_preserves_the_clipmap_horizon_and_anchor() {
         use crate::constants::*;

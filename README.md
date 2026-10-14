@@ -452,12 +452,14 @@ smooth fields describe the forest:
 
 - **Forest stands** follow a broad mosaic, with ragged edges and small
   glades, and stop at the coast, on faces too steep to hold soil, and at a
-  treeline that rises on sunny slopes. Nor do they climb into the late-lying
-  snow, as Gaea's trees take a settled snow mask as dead zones: trees and the
-  saplings and shrubs of their margins thin where the pack the terrain draws
-  reaches 0.35 cover and are gone by 0.75, so on a warm spur the forest stops
-  at the snow's edge and follows it down the gullies it fills. Wet valley
-  floors and exposed crests stay meadow.
+  treeline that rises on sunny slopes. That treeline already ends the forest
+  below the late-lying snow; as a backstop, the way Gaea's trees take a
+  settled snow mask as dead zones, trees and the saplings and shrubs of their
+  margins also thin where the closed-form pack on the base landform reaches
+  0.35 cover and are gone by 0.75. With today's snowline and treeline it
+  trims well under a thousandth of the forest above the snow floor; it binds
+  the forest to the snow should either be moved. Wet valley floors and
+  exposed crests stay meadow.
 - **Fir and pine** grow in single-species stands, about three firs to every
   pine. Pine takes warm, dry, well-drained ground and sandy lowlands, and a
   sharp disturbance-history field makes the stands mostly one species,

@@ -279,10 +279,10 @@ mod cast_slice_parity_tests {
         assert_eq!(tile.1.len(), EROSION_ATLAS_PITCH * EROSION_ATLAS_PITCH * 4);
         assert_eq!(tile.2.len(), EROSION_ATLAS_PITCH * EROSION_ATLAS_PITCH * 4);
     }
-    /// The snow pack reads the concavity from the CPU copy under the player
-    /// and from the atlas everywhere else: they must be one value. On a
-    /// paraboloid h = k r^2 / 2 the 12 m ring (axial 12 m, diagonal 17 m)
-    /// averages 108 k of relief over the point.
+    /// The snow pack reads the eroded bed's concavity from the CPU copy under
+    /// the player and from the atlas everywhere else: they must be one value.
+    /// On a paraboloid h = k r^2 / 2 the 12 m ring (axial 12 m, diagonal
+    /// 17 m) averages 108 k of relief over the point.
     #[test]
     fn finalize_keeps_the_concavity_it_uploads() {
         let resolution = EROSION_RESOLUTION;
@@ -295,7 +295,9 @@ mod cast_slice_parity_tests {
                 let dz = z as f32 * EROSION_CELL_SIZE - centre;
                 let index = (z * resolution + x) * 4;
                 terrain[index] = 0.5 * curvature * (dx * dx + dz * dz);
-                terrain[index + 2] = terrain[index];
+                // The base under it is flat: only a ring over the eroded bed
+                // (channel 0) finds the paraboloid's relief.
+                terrain[index + 2] = 0.0;
             }
         }
         let zeros = vec![0.0; resolution * resolution * 4];

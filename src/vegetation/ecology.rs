@@ -133,8 +133,9 @@ pub struct Site {
     /// `RIVER_SEARCH` where no river is near.
     pub river: f32,
     /// Cover of the late-season snow pack here, 0 to 1: the shared closed
-    /// form the terrain draws (snow.rs `snow_coverage`), on the base landform
-    /// with its 12 m square-ring relief.
+    /// form (snow.rs `snow_coverage`) on the base landform, with its 12 m
+    /// square-ring relief. The terrain draws it over the eroded bed instead,
+    /// a little deeper in its incised hollows.
     pub snow: f32,
 }
 
@@ -466,9 +467,10 @@ pub const TREELINE: f32 = 96.0;
 
 /// Late-lying snow: the pack's cover at which trees begin to thin and above
 /// which none establishes (Gaea's Trees take a settled snow mask as dead
-/// zones). The thermal treeline governs where its noise keeps it low; this
-/// trims the warm excursions that would run up into the pack the terrain
-/// draws, on any aspect, and follows the pack down its hollows.
+/// zones). With today's TREELINE and SNOWLINE_ALTITUDE the thermal treeline
+/// already ends the forest below the pack almost everywhere, so this is a
+/// backstop: it trims the rare warm excursion that reaches the pack, and it
+/// keeps the forest out of the snow on any aspect should either be moved.
 pub const SNOW_TREES_THIN: f32 = 0.35;
 pub const SNOW_TREES_GONE: f32 = 0.75;
 
@@ -731,6 +733,46 @@ mod tests {
             assert!(buried.shrubs <= bare.shrubs);
         }
         assert!(forested > 40, "the test sites must hold forest without snow: {forested}");
+    }
+
+    /// The sampler's snow is the shared closed-form pack on the base
+    /// landform: the 8 m-interval gradient and the 12 m square ring, at the
+    /// absolute height, and nothing below the snow floor.
+    #[test]
+    fn site_snow_reads_the_square_ring_on_the_base_landform() {
+        let noise = NoiseField::new();
+        // The flank of the highest ground near spawn (base 254 m at -300, 1850).
+        let centre = [-240.0, 1872.0];
+        let (minimum, maximum) =
+            ([centre[0] - 128.0, centre[1] - 128.0], [centre[0] + 128.0, centre[1] + 128.0]);
+        let sampler = SiteSampler::new(&noise, minimum, maximum);
+        let h = |x: f64, z: f64| base_height(&noise, x as f32, z as f32);
+        let (mut above, mut partial) = (0, 0);
+        for iz in 0..64 {
+            for ix in 0..64 {
+                let (x, z) = (minimum[0] + ix as f64 * 4.0, minimum[1] + iz as f64 * 4.0);
+                let height = h(x, z);
+                let expected = if height - SEA_LEVEL >= crate::snow::SNOW_FLOOR {
+                    above += 1;
+                    let gradient = bevy::math::Vec2::new(
+                        h(x + 4.0, z) - h(x - 4.0, z),
+                        h(x, z + 4.0) - h(x, z - 4.0),
+                    ) / 8.0;
+                    let mut ring = 0.0;
+                    for (dx, dz) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0),
+                                     (1.0, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)] {
+                        ring += h(x + dx * 12.0, z + dz * 12.0);
+                    }
+                    crate::snow::snow_coverage(height, gradient, ring / 8.0 - height)
+                } else {
+                    0.0
+                };
+                partial += usize::from(expected > 0.05 && expected < 0.95);
+                let site = sampler.site(x, z);
+                assert!((site.snow - expected).abs() < 1e-4, "{x}, {z}: {} against {expected}", site.snow);
+            }
+        }
+        assert!(above > 500 && partial > 100, "{above} above the floor, {partial} partly covered");
     }
 
     #[test]
