@@ -92,6 +92,15 @@ pub const EROSION_ITERATIONS_PER_FRAME: usize = 6;
 pub const EROSION_LOOSE_REPOSE: f32 = 0.67;
 pub const EROSION_SOFT_ROCK_SLOPE: f32 = 1.1;
 pub const EROSION_HARD_ROCK_SLOPE: f32 = 2.5;
+// Bedrock weathering (`ErosionSettings::weathering_rate`). Rock steeper than
+// ~24 degrees breaks down in place into loose debris, and the cover above it
+// shields it, exponentially with its depth (soil production, Heimsath et al.
+// 1997): the cover's e-folding depth is 0.30 m on slopes below repose, where
+// a regolith stays, and 0.05 m on faces above it, where debris sheds as fast
+// as it forms and only a skin can shield the rock.
+pub const EROSION_WEATHERING_COVER: f32 = 0.30;
+pub const EROSION_WEATHERING_COVER_STEEP: f32 = 0.05;
+pub const EROSION_WEATHERING_SLOPE: f32 = 0.45;
 // Fluvial stream power saturates for catchments larger than this many cells
 // (~6.4 ha). A tile routes only its own domain, so overlapping tiles truncate
 // big rivers differently; beyond the saturation they cut alike.
@@ -184,6 +193,10 @@ pub struct ErosionSettings {
     pub talus_rate: f32,
     /// The same for over-steepened bedrock faces (rockfall).
     pub rockfall_rate: f32,
+    /// Metres of bare, weak bedrock broken into loose cover per step on
+    /// slopes steeper than `EROSION_WEATHERING_SLOPE`; 0 leaves rock below
+    /// its rockfall limit untouched.
+    pub weathering_rate: f32,
 }
 
 impl Default for ErosionSettings {
@@ -203,6 +216,7 @@ impl Default for ErosionSettings {
             maximum_incision: 12.0,
             talus_rate: 0.05,
             rockfall_rate: 0.0075,
+            weathering_rate: 0.0,
         }
     }
 }

@@ -17,14 +17,14 @@
 //    no restructuring anywhere. Comments below keep the GL spelling
 //    "textureGrad" where they describe the history; the ported calls read
 //    textureSampleGrad.
-// 2. Hoisted samples: the three implicit texture() calls inside the erosion
-//    helpers (erosionTileMask -> texture4; accumulateFlowTile -> texture2 and
-//    texture1) sit behind early-return guards in the GLSL. WGSL forbids
-//    textureSample in non-uniform control flow and naga's analysis poisons
-//    statements after a conditional return, so each sample is pre-sampled
-//    unconditionally (uniform flow) ahead of the guards and the guards select
-//    the identical value afterwards. Values used are unchanged; the skipped
-//    fetches merely execute and are discarded.
+// 2. Explicit-level samples: the three implicit texture() calls inside the
+//    erosion helpers (erosionTileMask -> texture4; accumulateFlowTile ->
+//    texture2 and texture1) sit behind early-return guards in the GLSL. WGSL
+//    forbids textureSample in non-uniform control flow, so they are
+//    textureSampleLevel at level 0: the mask and both atlases have exactly one
+//    mip and plain linear samplers, so the values are the implicit samples'
+//    own, and the fetches stay behind their guards (and behind blendedFlow's
+//    return beyond the erosion fade) instead of executing and being discarded.
 // 3. uFlowDebug / uErosionDebug are GL ints; they travel in
 //    globals.settings_b.z / globals.settings_b.w as f32 (1/0) and are tested
 //    `!= 0.0` per the spec's bool-condition rule.
@@ -166,6 +166,10 @@ struct FsInput {
     // How far up the nearest river's or lake's shore the ground lies
     // (riverShoreRun, terrain-vs): negative under water, 40 near none.
     @location(9) frag_river_shore: f32,
+    // Relief as a 12 m ring's mean height minus the point, metres (+ in
+    // hollows): x what the snow pack reads, y the far material ring's
+    // (terrain-vs frag_concavity).
+    @location(10) frag_concavity: vec2<f32>,
 };
 
 // G-buffer outputs, locations preserved from the GLSL layout qualifiers.
@@ -187,18 +191,48 @@ fn smoothHermite(edge0: f32, edge1: f32, value: f32) -> f32
 }
 
 // BEGIN SHARED SNOW COVERAGE
-// A continuous pack above the climate snowline. Aspect moves only the broad
-// transition, while steep walls shed snow. Geometry and material use this
-// same field so the raised snow surface always matches its white coverage.
-fn snowCoverage(height: f32, normal: vec3<f32>) -> f32
+// Late-season snow as Gaea's snowfall settles it (nerthus cs/engine.rs), in
+// closed form, so the raised pack, its white material and the player's footing
+// (snow.rs snow_coverage) read one field. The climate pack deepens through the
+// snowline band, moved by the spring sun's aspect. Hollows hold more of it and
+// noses less, in proportion to its depth (Gaea's restore of fine relief under
+// a coarse pack), so no snow lies below the band and no hole opens above it on
+// ground the pack holds. A slope keeps only what it can hold, and deeper snow
+// slips at gentler slopes (hold = 1 - depth/2A). The slope is tested tilted
+// toward the prevailing wind (Snowfield's direction tilt), so lee faces keep
+// steep snow that windward faces shed. No noise: every input is terrain.
+const SNOW_BAND: f32 = 13.0;        // m, half-width of the snowline band
+const SNOW_MELT_ASPECT: f32 = 12.0; // m of snowline per unit of spring-sun exposure
+const SNOW_BURIAL: f32 = 12.0;      // m, scale of the concavity ring (Gaea's coarse cell)
+const SNOW_HOLD: f32 = 1.45/0.65;   // 2A/D in band depths: a full pack holds to tan 0.80
+const SNOW_SLIP_TAN: f32 = 1.45;    // tan of the slip-off angle a vanishing pack holds (55.4 deg)
+const SNOW_WIND_TILT: f32 = 0.15;   // rise per metre toward the lee (8.5 deg)
+const SNOW_WIND_TO: vec2<f32> = vec2<f32>(0.34202, 0.93969); // the wind blows toward 70 deg
+const SNOW_SMOOTH: f32 = 0.2;       // smooth-minimum width, band depths
+
+// Below this height above the sea no slope, aspect or hollow holds snow.
+fn snowFloor() -> f32
+{
+    return stage.snowline_altitude - SNOW_BAND - 0.62*SNOW_MELT_ASPECT;
+}
+
+// concavity: the mean height of a 12 m ring minus the point, metres
+// (+ in hollows, - on noses), as the erosion's surface atlas records it.
+fn snowCoverage(height: f32, normal: vec3<f32>, concavity: f32) -> f32
 {
     let meltSun = normalize(vec3<f32>(-0.22, 0.62, -0.76));
-    let aspectShift = (0.62 - max(dot(normal, meltSun), 0.0)) * 12.0;
-    let snowLine = smoothHermite(stage.snowline_altitude - 13.0,
-                                 stage.snowline_altitude + 13.0,
-                                 height - stage.sea_level + aspectShift);
-    let steepness = length(normal.xz) / max(normal.y, 0.001);
-    return snowLine * (1.0 - smoothHermite(0.80, 1.45, steepness));
+    let aspectShift = (0.62 - max(dot(normal, meltSun), 0.0))*SNOW_MELT_ASPECT;
+    // The climate pack in band depths: 0 at the foot of the band, 1 at its top.
+    let pack = (height - stage.sea_level + aspectShift - stage.snowline_altitude + SNOW_BAND)
+             / (2.0*SNOW_BAND);
+    // Restore: d_fine = d_coarse*(1 + G/c) while the pack is shallower than c.
+    let depth = pack*clamp(1.0 + concavity/SNOW_BURIAL, 0.5, 1.5);
+    // Slip-off: the depth a slope holds, on the wind-tilted slope.
+    let gradient = -normal.xz/max(normal.y, 0.001);
+    let held = SNOW_HOLD*(1.0 - length(gradient + SNOW_WIND_TILT*SNOW_WIND_TO)/SNOW_SLIP_TAN);
+    // A polynomial smooth minimum keeps the lift's normal free of a crease.
+    let blend = max(SNOW_SMOOTH - abs(depth - held), 0.0)/SNOW_SMOOTH;
+    return smoothHermite(0.0, 1.0, min(depth, held) - blend*blend*SNOW_SMOOTH*0.25);
 }
 // END SHARED SNOW COVERAGE
 
@@ -239,13 +273,12 @@ fn erosionSupportUV(worldXZ: vec2<f32>, tile_coordinate: vec2<f32>) -> vec2<f32>
 fn erosionTileMask(worldXZ: vec2<f32>, tile_coordinate: vec2<f32>) -> f32
 {
     let tileUV = erosionSupportUV(worldXZ, tile_coordinate);
-    // PORT: the GLSL samples texture4 only after the range guard below; the
-    // sample is hoisted here (uniform control flow, see PORT NOTES 2) and the
-    // guard selects the identical value.
-    let mask_sample = textureSample(texture4, texture4_sampler, tileUV).r;
     if (any(tileUV < vec2<f32>(0.0)) ||
         any(tileUV > vec2<f32>(1.0))) { return 0.0; }
-    return max(mask_sample, 0.0);
+    // The mask has one mip and a plain linear sampler, so the explicit level
+    // reads exactly what an implicit-derivative sample would, and may sit
+    // behind the guard (blendedFlow returns early beyond the fade).
+    return max(textureSampleLevel(texture4, texture4_sampler, tileUV, 0.0).r, 0.0);
 }
 
 fn erosionAtlasUV(worldXZ: vec2<f32>, tile_coordinate: vec2<f32>, atlas_slot: vec2<f32>) -> vec2<f32>
@@ -264,18 +297,15 @@ fn accumulateFlowTile(worldXZ: vec2<f32>, tile_coordinate: vec2<f32>, spatial_we
                       discharge: ptr<function, f32>, revealed_weight: ptr<function, f32>,
                       surface: ptr<function, vec4<f32>>)
 {
-    // PORT: the GLSL samples the two atlas textures only after the spatial
-    // weight and lookup-record guards below; both samples are hoisted here
-    // (uniform control flow, see PORT NOTES 2) and the guards select the
-    // original contributions verbatim.
-    var record = vec4<f32>(0.0);
-    let record_valid = lookupErosionTile(tile_coordinate, &record);
-    let atlas_uv = erosionAtlasUV(worldXZ, tile_coordinate, record.xy);
-    let tile_flow = textureSample(texture2, texture2_sampler, atlas_uv);
-    let surface_sample = textureSample(texture1, texture1_sampler, atlas_uv);
-
+    // Both atlases have one mip and plain linear samplers, so the explicit
+    // level reads exactly what an implicit-derivative sample would, and the
+    // fetches wait behind the guards, as the GLSL had them.
     if (spatial_weight <= 0.0) { return; }
-    if (!record_valid) { return; }
+    var record = vec4<f32>(0.0);
+    if (!lookupErosionTile(tile_coordinate, &record)) { return; }
+    let atlas_uv = erosionAtlasUV(worldXZ, tile_coordinate, record.xy);
+    let tile_flow = textureSampleLevel(texture2, texture2_sampler, atlas_uv, 0.0);
+    let surface_sample = textureSampleLevel(texture1, texture1_sampler, atlas_uv, 0.0);
     let reveal = clamp(record.z * record.a, 0.0, 1.0);
     let contribution = spatial_weight * reveal;
     (*surface) += contribution * surface_sample;
@@ -290,6 +320,17 @@ fn blendedFlow(worldXZ: vec2<f32>, coverage: ptr<function, f32>,
                surface: ptr<function, vec4<f32>>) -> vec4<f32>
 {
     (*surface) = vec4<f32>(0.0);
+    // Beyond the zero radius the fade is exactly 0: every faded output is 0,
+    // and the velocity, the one left unfaded, is read only through terms
+    // that water depth or coverage zero there. The 16 fetches are skipped.
+    let visibility = 1.0 - smoothHermite(stage.erosion_visibility_full_radius,
+                                         stage.erosion_visibility_zero_radius,
+                                         length(worldXZ - stage.erosion_visibility_center));
+    if (visibility <= 0.0)
+    {
+        (*coverage) = 0.0;
+        return vec4<f32>(0.0);
+    }
     let stride = max(stage.erosion_tile_stride, 0.0001);
     let minimum_tile = floor(worldXZ / stride);
     let tile00 = minimum_tile;
@@ -327,9 +368,6 @@ fn blendedFlow(worldXZ: vec2<f32>, coverage: ptr<function, f32>,
     // the amount of water carrying it.
     let velocity = select(vec2<f32>(0.0), momentum / depth, depth > 0.00001);
 
-    let visibility = 1.0 - smoothHermite(stage.erosion_visibility_full_radius,
-                                         stage.erosion_visibility_zero_radius,
-                                         length(worldXZ - stage.erosion_visibility_center));
     depth = depth * visibility;
     discharge = discharge * visibility;
     (*surface) = (*surface) * visibility;
@@ -1614,9 +1652,15 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let deposition = 1.0 - exp(-max(surface.r - 0.004, 0.0) * 12.0);
     // Ring concavity re-anchored to the field's real scales: the 12 m-ring
     // relief of a common swale is 0.1-0.5 m, so (0.05, 1.2) puts a 0.3 m swale
-    // at ~0.12 and saturates at 1.2 m bowls.
-    let hollow = smoothHermite(0.05, 1.2, surface.g);
-    let ridge = smoothHermite(0.05, 1.2, -surface.g);
+    // at ~0.12 and saturates at 1.2 m bowls. The simulation records it near
+    // the player (atlas G); where the simulation is faded out or not yet
+    // revealed, the same measure taken over the material ring stands in
+    // (Gaea's Soil, at the scale the distance resolves), so hollows keep
+    // their soil and noses their stone at any distance instead of switching
+    // off at the erosion radius.
+    let reliefConcavity = surface.g + (1.0 - flowDomain)*input.frag_concavity.y;
+    let hollow = smoothHermite(0.05, 1.2, reliefConcavity);
+    let ridge = smoothHermite(0.05, 1.2, -reliefConcavity);
 
     // Low-frequency drift lets the grass boundary with the beach breathe a
     // few metres instead of tracing one deterministic contour. Frequency
@@ -1725,7 +1769,8 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // the rock's own exposure field just short of bare rock, so it widens
     // where a face wanes gradually into its base; thick footslope deposits
     // (not channel fill) extend it as colluvial aprons. Beyond the simulated
-    // radius, where neither side is known, only the faint rim remains.
+    // radius no deposits are known, but the far relief still tells the
+    // concave footslope from the convex crest, so the band follows it there.
     // The band's outer edge is ragged at two scales, so grass islands
     // survive in the debris and dirt bays reach into the turf over a few
     // metres instead of meeting along one line.
@@ -1794,10 +1839,12 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let grassSoilBlend = clamp(1.0 - (1.0 - backgroundSoil) * (1.0 - disturbedSoil)
                                    * (1.0 - thinSoil * 0.55) * (1.0 - alpine * 0.30)
                                    * (1.0 - rockFringe * 0.90), 0.0, 1.0);
-    // Keep the pack continuous across cold ground. Coverage follows the same
-    // climate and slope field as the raised snow geometry; erosion, drift
-    // noise and melt channels no longer punch isolated holes into it.
-    let fSnow = snowCoverage(height, materialNormal);
+    // Coverage follows the same climate, slope, wind and relief field as the
+    // raised snow geometry, over the same interpolated relief, so the white
+    // lies exactly on the lifted pack. The relief only deepens or thins the
+    // pack in proportion to its depth: it cannot put snow below the band or
+    // open a hole above it, and no noise punches holes into it.
+    let fSnow = snowCoverage(height, materialNormal, input.frag_concavity.x);
     let snowLine = fSnow;
 
     // Rivers, creeks and lakes (src/rivers). The bed under the water sorts

@@ -662,6 +662,11 @@ pub fn prepare_gpu_textures(
 
     // Erosion atlases: RGBA32F, bilinear (the C++ leaves wrap at raylib's
     // REPEAT default). Initial content zero, patched later from readbacks.
+    // One mip: the terrain shaders sample them at an explicit level 0 behind
+    // their guards, which reads exactly what an implicit sample would only
+    // while there is no other level.
+    const EROSION_ATLAS_MIPS: u32 = 1;
+    const _: () = assert!(EROSION_ATLAS_MIPS == 1);
     let zero_atlas: Vec<u8> = vec![0u8; atlas_size as usize * atlas_size as usize * 16];
     let make_atlas = |label: &str| {
         let texture = float_texture(
@@ -670,10 +675,11 @@ pub fn prepare_gpu_textures(
             atlas_size,
             atlas_size,
             wgpu::TextureFormat::Rgba32Float,
-            1,
+            EROSION_ATLAS_MIPS,
             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         );
-        // 2640 * 16 = 42240 bytes per row, already 256-aligned.
+        // queue.write_texture takes any bytes_per_row (2600 * 16 = 41600 is
+        // not 256-aligned; only buffer-to-texture copies need that).
         queue.write_texture(
             texture.as_image_copy(),
             &zero_atlas,
@@ -716,7 +722,8 @@ pub fn prepare_gpu_textures(
         EROSION_OUTPUT_RESOLUTION as u32,
         EROSION_OUTPUT_RESOLUTION as u32,
         wgpu::TextureFormat::R32Float,
-        1,
+        // One mip, as the atlases: sampled at an explicit level 0.
+        EROSION_ATLAS_MIPS,
         wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
     );
     {

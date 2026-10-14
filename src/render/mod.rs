@@ -416,9 +416,13 @@ pub struct ErosionThermalStageUniforms {
     pub loose_repose: f32,      // 32
     pub soft_rock_slope: f32,   // 36
     pub hard_rock_slope: f32,   // 40
-    _end_pad: f32,              // 44
+    pub weathering_rate: f32,   // 44
+    pub weathering_cover: f32,  // 48
+    pub weathering_cover_steep: f32, // 52
+    pub weathering_slope: f32,  // 56
+    _end_pad: f32,              // 60 (uniform size rounds to 64)
 }
-const _: () = assert!(std::mem::size_of::<ErosionThermalStageUniforms>() == 48);
+const _: () = assert!(std::mem::size_of::<ErosionThermalStageUniforms>() == 64);
 
 /// The group(0) bind group layout every pass shares: one uniform buffer.
 ///
@@ -659,8 +663,9 @@ fn extract_forest_view(
     if view.settings.vegetation_shadows {
         let noise = world.resource::<NoiseField>();
         let eye = view.player_position;
+        let fade_anchor = crate::erosion::erosion_fade_anchor([eye[0], eye[2]]);
         view.shadow_receiver_heights = vegetation_shadows::receiver_height_bounds(eye, |x, z| {
-            crate::erosion::sample_eroded_height(cache, noise, x, z, [eye[0], eye[2]])
+            crate::erosion::sample_eroded_height(cache, noise, x, z, fade_anchor)
         });
     }
     let snow = world.resource::<crate::snow::SnowState>();
@@ -861,6 +866,33 @@ mod tests {
         }
     }
 
+    /// The drawn pack must read the concavity the player's footing reads
+    /// (snow.rs sample_surface: the atlas G, faded) near the camera, handing
+    /// over to the material ring's 216/r^2 term far out, at the lifted
+    /// height and at all four neighbours that shape its normal, and hand the
+    /// same value to the fragment stage's white.
+    #[test]
+    fn the_drawn_pack_reads_the_footings_concavity() {
+        let vertex = include_str!("../../assets/shaders/terrain-vs.wgsl");
+        for line in [
+            "let erosionHere = fadedErosionSurface(worldXZ);",
+            "let ringConcavity = 216.0*(0.25*ringSum - height)/(materialStep*materialStep);",
+            "let farRelief = smoothHermite(12.0, 20.0, materialStep);",
+            "let snowConcavity = mix(erosionHere.y, ringConcavity, farRelief);",
+            "output.frag_concavity = vec2<f32>(snowConcavity, ringConcavity*farRelief);",
+            "height += dry * snowCoverage(height, materialNormal, snowConcavity)",
+        ] {
+            assert!(vertex.contains(line), "terrain-vs.wgsl lost `{line}`");
+        }
+        assert_eq!(vertex.matches("materialNormal, snowConcavity);").count(), 4,
+                   "all four lift neighbours must read the footing's concavity");
+        let fragment = include_str!("../../assets/shaders/terrain-fs.wgsl");
+        assert!(fragment.contains(
+            "let fSnow = snowCoverage(height, materialNormal, input.frag_concavity.x);"));
+        assert!(fragment.contains("@location(10) frag_concavity: vec2<f32>,"));
+        assert!(vertex.contains("@location(10) frag_concavity: vec2<f32>,"));
+    }
+
     #[test]
     fn snow_detail_preserves_the_clipmap_horizon_and_anchor() {
         use crate::constants::*;
@@ -898,6 +930,30 @@ mod tests {
         }
     }
 
+    /// Every draw that fades the erosion centres the fade on the player's
+    /// eight-metre lattice point, as the CPU's footing does: a stage built
+    /// round the raw player position would shift the 1.1-1.6 km band against
+    /// the collision and make the lighting map's key stale.
+    #[test]
+    fn every_terrain_stage_fades_round_the_anchor() {
+        for (name, source) in [
+            ("terrain_node.rs", include_str!("terrain_node.rs")),
+            ("vegetation_node.rs", include_str!("vegetation_node.rs")),
+        ] {
+            let code = source.split("#[cfg(test)]").next().unwrap();
+            let mut calls = 0;
+            for (at, _) in code.match_indices("TerrainStageUniforms::build(") {
+                calls += 1;
+                let window = &code[at.saturating_sub(600)..(at + 600).min(code.len())];
+                assert!(
+                    window.contains("erosion_fade_anchor("),
+                    "{name}: a terrain stage near byte {at} is built without the fade anchor"
+                );
+            }
+            assert!(calls > 0, "{name} builds no terrain stage any more; update this test");
+        }
+    }
+
     #[test]
     fn erosion_and_materials_share_one_geology() {
         let common = include_str!("../../assets/shaders/geology-functions.wgslinc").trim();
@@ -907,6 +963,100 @@ mod tests {
             include_str!("../../assets/shaders/terrain-fs.wgsl"),
         ] {
             assert!(source.contains(common), "erosion and material geology diverged");
+        }
+    }
+
+    /// The erosion stage uniforms are written from Rust structs and read
+    /// by the WGSL; a member out of place reads its neighbour's value. Check
+    /// every named member's offset against the struct the worker writes, in
+    /// both directions, and that each struct fits the 128-byte stage buffer.
+    #[test]
+    fn erosion_stage_uniforms_match_wgsl_layout() {
+        use super::{
+            ErosionFluxStageUniforms, ErosionInitStageUniforms, ErosionTerrainStageUniforms,
+            ErosionThermalStageUniforms, ErosionWaterStageUniforms,
+        };
+        use std::mem::{offset_of, size_of};
+        // A shader, the size of the Rust struct it is fed, and that struct's
+        // named fields with their offsets, in declaration order.
+        type Layout = (&'static str, usize, Vec<(&'static str, usize)>);
+        let layouts: [Layout; 5] = [
+            ("erosion-init", size_of::<ErosionInitStageUniforms>(), vec![
+                ("mode", offset_of!(ErosionInitStageUniforms, mode)),
+                ("world_min", offset_of!(ErosionInitStageUniforms, world_min)),
+                ("cell_size", offset_of!(ErosionInitStageUniforms, cell_size)),
+            ]),
+            ("erosion-flux", size_of::<ErosionFluxStageUniforms>(), vec![
+                ("resolution", offset_of!(ErosionFluxStageUniforms, resolution)),
+                ("delta_time", offset_of!(ErosionFluxStageUniforms, delta_time)),
+                ("cell_size", offset_of!(ErosionFluxStageUniforms, cell_size)),
+                ("gravity", offset_of!(ErosionFluxStageUniforms, gravity)),
+            ]),
+            ("erosion-water", size_of::<ErosionWaterStageUniforms>(), vec![
+                ("resolution", offset_of!(ErosionWaterStageUniforms, resolution)),
+                ("delta_time", offset_of!(ErosionWaterStageUniforms, delta_time)),
+                ("cell_size", offset_of!(ErosionWaterStageUniforms, cell_size)),
+                ("rain", offset_of!(ErosionWaterStageUniforms, rain)),
+                ("evaporation", offset_of!(ErosionWaterStageUniforms, evaporation)),
+                ("sea_level", offset_of!(ErosionWaterStageUniforms, sea_level)),
+            ]),
+            ("erosion-terrain", size_of::<ErosionTerrainStageUniforms>(), vec![
+                ("resolution", offset_of!(ErosionTerrainStageUniforms, resolution)),
+                ("delta_time", offset_of!(ErosionTerrainStageUniforms, delta_time)),
+                ("cell_size", offset_of!(ErosionTerrainStageUniforms, cell_size)),
+                ("sea_level", offset_of!(ErosionTerrainStageUniforms, sea_level)),
+                ("erosion_rate", offset_of!(ErosionTerrainStageUniforms, erosion_rate)),
+                ("deposition_rate", offset_of!(ErosionTerrainStageUniforms, deposition_rate)),
+                ("sediment_capacity", offset_of!(ErosionTerrainStageUniforms, sediment_capacity)),
+                ("minimum_slope", offset_of!(ErosionTerrainStageUniforms, minimum_slope)),
+                ("maximum_erosion", offset_of!(ErosionTerrainStageUniforms, maximum_erosion)),
+                ("transport_rate", offset_of!(ErosionTerrainStageUniforms, transport_rate)),
+                ("guard_band_pixels", offset_of!(ErosionTerrainStageUniforms, guard_band_pixels)),
+                ("brush_strength", offset_of!(ErosionTerrainStageUniforms, brush_strength)),
+                ("world_min", offset_of!(ErosionTerrainStageUniforms, world_min)),
+                ("fluvial_capacity", offset_of!(ErosionTerrainStageUniforms, fluvial_capacity)),
+                ("fluvial_erosion", offset_of!(ErosionTerrainStageUniforms, fluvial_erosion)),
+                ("fluvial_deposition", offset_of!(ErosionTerrainStageUniforms, fluvial_deposition)),
+                ("maximum_incision", offset_of!(ErosionTerrainStageUniforms, maximum_incision)),
+                ("drainage_saturation", offset_of!(ErosionTerrainStageUniforms, drainage_saturation)),
+            ]),
+            ("erosion-thermal", size_of::<ErosionThermalStageUniforms>(), vec![
+                ("resolution", offset_of!(ErosionThermalStageUniforms, resolution)),
+                ("cell_size", offset_of!(ErosionThermalStageUniforms, cell_size)),
+                ("sea_level", offset_of!(ErosionThermalStageUniforms, sea_level)),
+                ("world_min", offset_of!(ErosionThermalStageUniforms, world_min)),
+                ("loose_rate", offset_of!(ErosionThermalStageUniforms, loose_rate)),
+                ("rock_rate", offset_of!(ErosionThermalStageUniforms, rock_rate)),
+                ("loose_repose", offset_of!(ErosionThermalStageUniforms, loose_repose)),
+                ("soft_rock_slope", offset_of!(ErosionThermalStageUniforms, soft_rock_slope)),
+                ("hard_rock_slope", offset_of!(ErosionThermalStageUniforms, hard_rock_slope)),
+                ("weathering_rate", offset_of!(ErosionThermalStageUniforms, weathering_rate)),
+                ("weathering_cover", offset_of!(ErosionThermalStageUniforms, weathering_cover)),
+                ("weathering_cover_steep",
+                 offset_of!(ErosionThermalStageUniforms, weathering_cover_steep)),
+                ("weathering_slope", offset_of!(ErosionThermalStageUniforms, weathering_slope)),
+            ]),
+        ];
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");
+        for (name, rust_size, rust) in layouts {
+            let path = directory.join(format!("{name}.wgsl"));
+            let source = std::fs::read_to_string(&path).unwrap();
+            let module = naga::front::wgsl::parse_str(&source)
+                .unwrap_or_else(|error| panic!("{}: {}", path.display(), error.emit_to_string(&source)));
+            let stage = module.types.iter().find(|(_, ty)| ty.name.as_deref() == Some("StageUniforms"));
+            let Some((_, stage)) = stage else { panic!("{name} declares no StageUniforms") };
+            let naga::TypeInner::Struct { members, span } = &stage.inner else {
+                panic!("{name}: StageUniforms must be a struct");
+            };
+            // Padding members carry a leading underscore on either side.
+            let wgsl: Vec<(&str, usize)> = members
+                .iter()
+                .filter_map(|member| member.name.as_deref().map(|field| (field, member.offset as usize)))
+                .filter(|(field, _)| !field.starts_with('_'))
+                .collect();
+            assert_eq!(wgsl, rust, "{name}: the WGSL members and the Rust fields disagree");
+            assert!(rust_size >= *span as usize, "{name}: Rust writes {rust_size} B of a {span} B struct");
+            assert!(rust_size <= 128, "{name}: {rust_size} B overflows the 128 B stage buffer");
         }
     }
 

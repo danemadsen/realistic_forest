@@ -140,7 +140,8 @@ group 1. Binding numbers EQUAL the GL texture unit the C++ assigned:
 | erosion-init | texture0 (base height RGBA32F) | 0 |
 | erosion-flux | texture0 (flux being updated) 0, uTerrainState 1, uWaterState 2 | — |
 | erosion-water | texture0 (water being updated) 0, uFluxState 1, uTerrainState 2 | — |
-| erosion-terrain | texture0 (terrain being updated) 0, uWaterState 1 | — |
+| erosion-terrain | texture0 (terrain being updated) 0, uWaterState 1, uDrainage 2, uRouting 3 (R32Float routing normaliser), uStatic 4 (RG32Float per-tile runoff path noise, init `uMode` 3) | — |
+| erosion-thermal | texture0 (terrain being relaxed) 0, uDrainage 1 | — |
 
 Sampler declarations: `@group(1) @binding(8) var tex0_sampler: sampler;` etc.
 Filtering mode comes from the GL comments in the shader (point-filtered lookups
@@ -229,7 +230,11 @@ a texture that was rendered in the same frame), DROP the flip and note it in
   branches that depend on per-pixel data, restructure to pre-sample before the
   branch; verify the branch's condition truly needs the restructure.
 - Loop bounds and iteration ORDER (e.g. erosion neighbor accumulation order)
-  must be identical — floating-point sums are order-sensitive.
+  must be identical — floating-point sums are order-sensitive. The erosion
+  passes now load each 3x3 neighbourhood once and unroll their neighbour
+  loops into one helper call per neighbour, in the loops' old order (row by
+  row from (-1, -1) to (1, 1)); a texel-load budget test guards against
+  reloading a neighbour.
 - Output channels: preserve which output location holds which G-buffer channel
   (position/normal/albedo order), including alpha conventions (sky=0 flags).
 - sRGB: the GLSL writes gamma-encoded byte values through linear-space

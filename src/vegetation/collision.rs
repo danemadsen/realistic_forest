@@ -86,8 +86,8 @@ impl Solid {
 
     /// The trunk the plant stands as on the ground the terrain pass draws, or
     /// `None` where the GPU cull refuses its root and so never draws it.
-    /// `visibility_center` is the player, whose surroundings the erosion is
-    /// faded in around.
+    /// `visibility_center` is the player's `erosion_fade_anchor`, round which
+    /// the terrain pass fades the erosion in.
     pub fn stand(
         &self,
         erosion: &ErosionCache,
@@ -302,15 +302,13 @@ mod tests {
     }
 
     fn catalog_of(species: Species) -> Catalog {
-        Catalog {
-            models: vec![scatter::CatalogModel {
-                species,
-                form: String::new(),
-                height: 10.0,
-                crown_radius: 2.0,
-                trunk_radius: 0.25,
-            }],
-        }
+        Catalog::new(vec![scatter::CatalogModel {
+            species,
+            form: String::new(),
+            height: 10.0,
+            crown_radius: 2.0,
+            trunk_radius: 0.25,
+        }])
     }
 
     fn plant(scale: f32) -> PlantInstance {

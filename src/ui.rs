@@ -177,7 +177,8 @@ fn draw_debug_overlay(
     let dt = ctx.input(|input| input.stable_dt).max(f32::EPSILON);
     let forward = player.forward();
     let xz = Vec2::new(player.position.x, player.position.z);
-    let ground = snow::sample_surface(cache, noise, xz, xz.to_array()).height(snow, xz);
+    let fade_anchor = erosion::erosion_fade_anchor(xz.to_array());
+    let ground = snow::sample_surface(cache, noise, xz, fade_anchor).height(snow, xz);
     let ready = cache
         .tiles
         .values()
@@ -315,10 +316,13 @@ fn ground_position(
     snow: &SnowState,
 ) -> Vec3 {
     let xz = Vec2::new(position.x, position.z);
-    let y = snow::sample_surface(cache, noise, xz, xz.to_array()).height(snow, xz) + EYE_HEIGHT;
+    // The ground the player will stand on there, its erosion faded round
+    // the anchor the terrain pass will draw it with.
+    let fade_anchor = erosion::erosion_fade_anchor(xz.to_array());
+    let y = snow::sample_surface(cache, noise, xz, fade_anchor).height(snow, xz) + EYE_HEIGHT;
     // Over water too deep to stand in, the player is set afloat on it, not
     // on its bed.
-    let afloat = crate::player::water_at(cache, noise, position.x, position.z, xz.to_array())
+    let afloat = crate::player::water_at(cache, noise, position.x, position.z, fade_anchor)
         .and_then(|water| water.float_eye());
     Vec3::new(position.x, afloat.map_or(y, |eye| eye.max(y)), position.z)
 }
@@ -328,7 +332,8 @@ fn ground_position(
 fn teleport(player: &mut Player, position: Vec3, cache: &ErosionCache, noise: &NoiseField) -> bool {
     let moved = player.teleport(position);
     if moved {
-        player.water = crate::player::water_at(cache, noise, position.x, position.z, [position.x, position.z]);
+        let fade_anchor = erosion::erosion_fade_anchor([position.x, position.z]);
+        player.water = crate::player::water_at(cache, noise, position.x, position.z, fade_anchor);
     }
     moved
 }
@@ -951,6 +956,7 @@ fn draw_advanced_controls(
     ui.add(max_incision_slider);
     ui.add(egui::Slider::new(&mut erosion_settings.talus_rate, 0.0..=0.0625).text("Talus slide"));
     ui.add(egui::Slider::new(&mut erosion_settings.rockfall_rate, 0.0..=0.0625).text("Rockfall"));
+    ui.add(egui::Slider::new(&mut erosion_settings.weathering_rate, 0.0..=0.05).text("Weathering"));
     ui.horizontal(|ui| {
         if ui.button("Regenerate erosion cache").clicked() {
             rerun.0 = true;
@@ -999,7 +1005,9 @@ fn draw_erosion_lattice(
     let view = matrices::view_matrix(camera.position, camera.target, camera.up);
     let projection = matrices::perspective(camera.fov_y, aspect, NEAR_PLANE, FAR_PLANE);
 
-    let visibility_center = [player.position.x, player.position.z];
+    // The lines lie on the terrain as drawn, its erosion faded round the
+    // player's anchor.
+    let visibility_center = erosion::erosion_fade_anchor([player.position.x, player.position.z]);
     let base_x = (player.position.x / EROSION_TILE_STRIDE).round() * EROSION_TILE_STRIDE;
     let base_z = (player.position.z / EROSION_TILE_STRIDE).round() * EROSION_TILE_STRIDE;
     let stroke = egui::Stroke::new(

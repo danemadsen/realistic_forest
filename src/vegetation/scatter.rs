@@ -80,8 +80,40 @@ pub struct CatalogModel {
 /// The model metrics the scatter needs, in model-table order.
 #[derive(Clone, Debug, Default)]
 pub struct Catalog {
+    /// Read-only once built: `Catalog::new` derives `forms` from these, so a
+    /// later edit would leave `choose` picking from the old table. Build a
+    /// new catalogue instead.
     pub models: Vec<CatalogModel>,
+    /// Each species' growth forms (`Species as usize`), worked out once:
+    /// the lavender layer alone asks for a model a hundred thousand times a
+    /// chunk, before most of its candidates fail their roll.
+    forms: [SpeciesForms; Species::ALL.len()],
 }
+
+/// A species' growth forms in `FORMS` order, and the heights they span.
+#[derive(Clone, Debug, Default)]
+struct SpeciesForms {
+    low: f32,
+    high: f32,
+    bands: Vec<FormBand>,
+}
+
+/// One growth form's height band, and its models in model-table order.
+#[derive(Clone, Debug, Default)]
+struct FormBand {
+    low: f32,
+    high: f32,
+    variants: Vec<u32>,
+}
+
+// `Species::ALL[i] as usize == i`, so a species indexes its own forms.
+const _: () = {
+    let mut i = 0;
+    while i < Species::ALL.len() {
+        assert!(Species::ALL[i] as usize == i);
+        i += 1;
+    }
+};
 
 /// Height bands (metres) a growth form is used for. Firs are scaled up: the
 /// pack's firs are young, 9 m trees, but they dominate this forest, so its
@@ -123,9 +155,31 @@ const MAX_SCALE: f32 = 2.6;
 const MIN_LAVENDER_SCALE: f32 = 0.25;
 
 impl Catalog {
+    pub fn new(models: Vec<CatalogModel>) -> Self {
+        let forms = Species::ALL.map(|species| {
+            let bands: Vec<FormBand> = FORMS
+                .iter()
+                .filter(|band| band.0 == species)
+                .map(|&(_, form, low, high)| FormBand {
+                    low,
+                    high,
+                    variants: (0..models.len() as u32)
+                        .filter(|&index| models[index as usize].species == species && models[index as usize].form == form)
+                        .collect(),
+                })
+                .collect();
+            SpeciesForms {
+                low: bands.iter().map(|band| band.low).fold(f32::INFINITY, f32::min),
+                high: bands.iter().map(|band| band.high).fold(0.0, f32::max),
+                bands,
+            }
+        });
+        Self { models, forms }
+    }
+
     pub fn from_assets(assets: &VegetationAssets) -> Self {
-        Self {
-            models: assets
+        Self::new(
+            assets
                 .models
                 .iter()
                 .map(|model| CatalogModel {
@@ -136,13 +190,35 @@ impl Catalog {
                     trunk_radius: model.trunk_radius,
                 })
                 .collect(),
-        }
+        )
     }
 
     /// A model of `species` for a plant `height` metres tall, and the scale
     /// that gives it that height. Among the forms whose band holds the height
     /// one is chosen at random, then a variant.
     pub fn choose(&self, species: Species, height: f32, key: u64) -> Option<(u32, f32)> {
+        let forms = &self.forms[species as usize];
+        if forms.bands.is_empty() {
+            return None;
+        }
+        let height = height.clamp(forms.low, forms.high);
+        let fits = |band: &&FormBand| height >= band.low && height <= band.high;
+        let fitting = forms.bands.iter().filter(fits).count();
+        let pick = ((random(key, 40) * fitting as f32) as usize).min(fitting.saturating_sub(1));
+        let variants = &forms.bands.iter().filter(fits).nth(pick)?.variants;
+        if variants.is_empty() {
+            return None;
+        }
+        let model = variants[((random(key, 41) * variants.len() as f32) as usize).min(variants.len() - 1)];
+        let smallest = if species == Species::Lavender { MIN_LAVENDER_SCALE } else { MIN_SCALE };
+        let scale = (height / self.models[model as usize].height).clamp(smallest, MAX_SCALE);
+        Some((model, scale))
+    }
+
+    /// `choose` as it was before the forms were worked out ahead, which
+    /// allocated three lists on every call; it must choose the same.
+    #[cfg(test)]
+    fn choose_reference(&self, species: Species, height: f32, key: u64) -> Option<(u32, f32)> {
         let bands: Vec<&(Species, &str, f32, f32)> =
             FORMS.iter().filter(|band| band.0 == species).collect();
         if bands.is_empty() {
@@ -240,6 +316,7 @@ fn lerp_habitat(a: &Habitat, b: &Habitat, t: f32) -> Habitat {
             turf: l(a.site.turf, b.site.turf),
             shore: l(a.site.shore, b.site.shore),
             river: l(a.site.river, b.site.river),
+            snow: l(a.site.snow, b.site.snow),
         },
         forest: l(a.forest, b.forest),
         edge: l(a.edge, b.edge),
@@ -281,7 +358,7 @@ const LAVENDER: LayerSpec = LayerSpec { spacing: 0.7, salt: 0xC4_0005, overlap: 
 pub const LAVENDER_OVERLAP: f32 = 1.15;
 
 /// Widest lavender tuft (a 0.95 m tuft of the 2 m, 1 m-wide model): bounds
-/// the tufts' conflict search.
+/// the tufts' conflict search, and the roll that passes most over early.
 const MAX_LAVENDER_REACH: f32 = 0.5;
 
 /// Lowest ground above the sea a shore plant roots in; the grass habitat on
@@ -289,7 +366,8 @@ const MAX_LAVENDER_REACH: f32 = 0.5;
 const LOWEST_SHORE_ROOT: f32 = 1.2;
 
 /// Widest broadleaf plant (0.65 m of the smallest model, scaled up):
-/// bounds the shore plants' conflict search.
+/// bounds the shore plants' conflict search, and the roll that passes most
+/// over early.
 const MAX_BROADLEAF_REACH: f32 = 0.95;
 
 /// Largest crown reach any canopy tree reaches (a 30 m oak at full scale),
@@ -499,16 +577,36 @@ impl Occupancy {
 // Layer rules
 // ---------------------------------------------------------------------------
 
+/// The most of its packing limit a layer is asked to reach.
+const PACKING_CAP: f32 = 0.97;
+
 /// Probability that a lattice cell of `area` m² holds an eligible candidate,
 /// so that a hard-core process of conflict area `conflict` reaches
 /// `fraction` of its packing limit (inverting `(1 - e^(-λA)) / A`).
 fn eligibility(fraction: f32, conflict_area: f32, cell_area: f32) -> f32 {
-    let fraction = fraction.clamp(0.0, 0.97);
+    let fraction = fraction.clamp(0.0, PACKING_CAP);
     if fraction <= 0.0 {
         return 0.0;
     }
     let intensity = -(1.0 - fraction).ln() / conflict_area.max(0.5);
     (intensity * cell_area).clamp(0.0, 1.0)
+}
+
+/// The most likely a candidate of a layer whose plants claim `density` of
+/// the ground is to be eligible, whatever model it draws: the largest
+/// `eligibility(density * conflict, conflict, cell_area)` over every conflict
+/// area a plant of crown reach up to `widest` has. It rises with the area
+/// until the fraction reaches the cap (and below the 0.5 m² floor the area
+/// only raises the fraction), and falls past it, so the largest lies at the
+/// cap or at the widest plant's area. A roll at or over it fails for any
+/// model, and the candidate needs none chosen. The margin is many times the
+/// f32 rounding of either evaluation (a few parts in ten million, or a few
+/// ten-millionths where `1 - fraction` rounds), so the bound never falls
+/// under the eligibility it stands for.
+fn eligibility_bound(density: f32, overlap: f32, widest: f32, cell_area: f32) -> f32 {
+    let largest = std::f32::consts::PI * (overlap * 2.0 * widest).powi(2);
+    let conflict = (PACKING_CAP / density).min(largest).max(0.5);
+    eligibility(density * conflict, conflict, cell_area) * (1.0 + 1e-4) + 1e-6
 }
 
 /// Conifers' and broadleaves' canopy heights for a stand of this age and
@@ -668,10 +766,23 @@ fn herb_candidate(
     if habitat.site.height < LOWEST_SHORE_ROOT || habitat.herbs <= 0.0 {
         return None;
     }
+    // Most candidates fail their roll whatever plant they would be; those
+    // are passed over before a model is chosen for them.
+    let cell_area = (HERB.spacing * HERB.spacing) as f32;
+    if random(key, 2) >= eligibility_bound(habitat.herbs, HERB.overlap, MAX_BROADLEAF_REACH, cell_area) {
+        return None;
+    }
+    herb_plant(catalog, &habitat, key)
+}
+
+/// The shore plant a candidate on the strip would be, if its roll passes.
+fn herb_plant(catalog: &Catalog, habitat: &Habitat, key: u64) -> Option<(f32, f32, u32, f32)> {
     // Knee-high, standing out of the turf around them.
     let height = 0.35 + 0.3 * random(key, 20).powf(0.7);
     let (model, scale) = catalog.choose(Species::Broadleaf, height, key)?;
     let reach = reach(catalog, model, scale);
+    // The conflict search and the roll's early bound both rest on this.
+    debug_assert!(reach <= MAX_BROADLEAF_REACH, "a broadleaf plant reaches {reach} m, past MAX_BROADLEAF_REACH");
     let conflict = std::f32::consts::PI * (HERB.overlap * 2.0 * reach).powi(2);
     let cell_area = (HERB.spacing * HERB.spacing) as f32;
     if random(key, 2) >= eligibility(habitat.herbs * conflict, conflict, cell_area) {
@@ -691,11 +802,24 @@ fn lavender_candidate(
     if habitat.lavender <= 0.0 {
         return None;
     }
+    // On a 0.7 m lattice most candidates fail their roll whatever tuft they
+    // would be; those are passed over before a model is chosen for them.
+    let cell_area = (LAVENDER.spacing * LAVENDER.spacing) as f32;
+    if random(key, 2) >= eligibility_bound(habitat.lavender, LAVENDER.overlap, MAX_LAVENDER_REACH, cell_area) {
+        return None;
+    }
+    lavender_tuft(catalog, &habitat, key)
+}
+
+/// The tuft a lavender candidate would be, if its roll passes.
+fn lavender_tuft(catalog: &Catalog, habitat: &Habitat, key: u64) -> Option<(f32, f32, u32, f32)> {
     // Tufts stand clear of the grass, from 0.6 m to their flower spikes'
     // full 0.95 m.
     let height = 0.6 + 0.35 * random(key, 20).powf(0.8);
     let (model, scale) = catalog.choose(Species::Lavender, height, key)?;
     let reach = reach(catalog, model, scale);
+    // The conflict search and the roll's early bound both rest on this.
+    debug_assert!(reach <= MAX_LAVENDER_REACH, "a lavender tuft reaches {reach} m, past MAX_LAVENDER_REACH");
     // Enough candidates that, once neighbours closer than the layer's
     // spacing have thinned them, the tufts left match the habitat's density.
     let conflict = std::f32::consts::PI * (LAVENDER.overlap * 2.0 * reach).powi(2);
@@ -815,6 +939,42 @@ fn building_clearance(layer: Layer, reach: f32) -> f32 {
 /// clear of them.
 pub const CLEARING_CONTEXT: f64 = TREE_CONTEXT + 60.0;
 
+/// Seconds the phases of generating chunk levels took, summed over the
+/// levels (and so over every thread that generated them).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScatterTimings {
+    /// Chunk levels generated.
+    pub levels: usize,
+    /// The landform's height and turf grids around each chunk.
+    pub sampler: f64,
+    /// The distance to the rivers' banks over them.
+    pub rivers: f64,
+    /// The ecology's fields every 4 m.
+    pub habitats: f64,
+    /// Every layer's candidates, their thinning and the plants kept.
+    pub candidates: f64,
+}
+
+impl std::ops::AddAssign for ScatterTimings {
+    fn add_assign(&mut self, other: Self) {
+        self.levels += other.levels;
+        self.sampler += other.sampler;
+        self.rivers += other.rivers;
+        self.habitats += other.habitats;
+        self.candidates += other.candidates;
+    }
+}
+
+impl std::fmt::Display for ScatterTimings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} chunk levels: sampler {:.2} s, river grid {:.2} s, habitat grid {:.2} s, candidates {:.2} s of CPU",
+            self.levels, self.sampler, self.rivers, self.habitats, self.candidates
+        )
+    }
+}
+
 pub fn generate_level(
     noise: &NoiseField,
     catalog: &Catalog,
@@ -823,10 +983,33 @@ pub fn generate_level(
     chunk: [i64; 2],
     level: u8,
 ) -> Vec<PlantInstance> {
+    generate_level_timed(noise, catalog, rivers, clearings, chunk, level).0
+}
+
+/// `generate_level`, and how long each of its phases took.
+pub fn generate_level_timed(
+    noise: &NoiseField,
+    catalog: &Catalog,
+    rivers: Option<&crate::rivers::network::RiverNetwork>,
+    clearings: &[Clearing],
+    chunk: [i64; 2],
+    level: u8,
+) -> (Vec<PlantInstance>, ScatterTimings) {
+    let mut timings = ScatterTimings { levels: 1, ..Default::default() };
+    // Seconds since the last phase ended, and a new one begins.
+    let mut phase = std::time::Instant::now();
+    let mut lap = || {
+        let seconds = phase.elapsed().as_secs_f64();
+        phase = std::time::Instant::now();
+        seconds
+    };
     let (minimum, maximum) = chunk_bounds(chunk);
     let canopy_margin = (CANOPY.overlap * 2.0 * MAX_CANOPY_REACH) as f64 + 2.0;
     let (outer_min, outer_max) = grow(minimum, maximum, TREE_CONTEXT + canopy_margin + 8.0);
-    let sampler = SiteSampler::new(noise, outer_min, outer_max).with_rivers(rivers);
+    let sampler = SiteSampler::new(noise, outer_min, outer_max);
+    timings.sampler = lap();
+    let sampler = sampler.with_rivers(rivers);
+    timings.rivers = lap();
     // Off the water's margin and out of the buildings' yards.
     let dry = |x: f64, z: f64, layer: Layer, model: u32, scale: f32| {
         let banked = sampler.river_bank(x, z) >= RIVER_CLEARANCE[layer as usize].max(river_footing(catalog, model, scale));
@@ -835,6 +1018,7 @@ pub fn generate_level(
         banked && cleared
     };
     let habitats = HabitatGrid::build(&sampler, outer_min, outer_max);
+    timings.habitats = lap();
 
     // Canopy, accepted out to the tree context around the chunk.
     let (canopy_min, canopy_max) = grow(minimum, maximum, TREE_CONTEXT + canopy_margin);
@@ -938,5 +1122,95 @@ pub fn generate_level(
             );
         }
     }
-    out
+    timings.candidates = lap();
+    (out, timings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The models the game loads.
+    fn catalog() -> Catalog {
+        let models = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/models");
+        Catalog::from_assets(&VegetationAssets::load_geometry(models).expect("plant geometry loads"))
+    }
+
+    /// Working the forms out ahead chooses exactly what scanning them on
+    /// every call did, model and scale to the bit, for every species at
+    /// every height from the ground to past the tallest band, and for a
+    /// catalogue whose only model fits no band at all.
+    #[test]
+    fn catalog_choice_is_unchanged() {
+        let formless = CatalogModel {
+            species: Species::Oak,
+            form: String::new(),
+            height: 8.0,
+            crown_radius: 2.0,
+            trunk_radius: 0.4,
+        };
+        let bits = |choice: Option<(u32, f32)>| choice.map(|(model, scale)| (model, scale.to_bits()));
+        for catalog in [catalog(), Catalog::new(vec![formless])] {
+            for species in Species::ALL {
+                for step in 0..=800 {
+                    let height = step as f32 * 0.05;
+                    for k in 0..64 {
+                        let key = cell_key(k, step, 0xC4_00FF);
+                        assert_eq!(
+                            bits(catalog.choose(species, height, key)),
+                            bits(catalog.choose_reference(species, height, key)),
+                            "{species:?} {height} m, key {key}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The shore plants and the lavender pass over a candidate before
+    /// choosing its model only where its roll fails for any model: every
+    /// candidate of both layers over a clearing and a river mouth by the
+    /// sea comes out the same as without the early bound, so every chunk
+    /// does. Most are passed over.
+    #[test]
+    fn ground_layers_pass_over_only_candidates_whose_roll_fails() {
+        let noise = NoiseField::new();
+        let catalog = catalog();
+        // Candidates, those passed over, and plants, per layer.
+        let (mut herbs, mut tufts) = ([0usize; 3], [0usize; 3]);
+        for chunk in [[-3, 2], [-2, 2], [-3, 3], [-2, 3]] {
+            let (minimum, maximum) = chunk_bounds(chunk);
+            let sampler = SiteSampler::new(&noise, minimum, maximum);
+            let habitats = HabitatGrid::build(&sampler, minimum, maximum);
+            CandidateGrid::build(&HERB, minimum, maximum, |x, z, key| {
+                let habitat = habitats.sample(x, z);
+                let shore = habitat.site.height >= LOWEST_SHORE_ROOT && habitat.herbs > 0.0;
+                let without_bound = shore.then(|| herb_plant(&catalog, &habitat, key)).flatten();
+                let plant = herb_candidate(&catalog, &habitats, x, z, key);
+                assert_eq!(plant, without_bound, "shore plant at {x}, {z}");
+                let cell_area = (HERB.spacing * HERB.spacing) as f32;
+                let bound = eligibility_bound(habitat.herbs, HERB.overlap, MAX_BROADLEAF_REACH, cell_area);
+                herbs[0] += usize::from(shore);
+                herbs[1] += usize::from(shore && random(key, 2) >= bound);
+                herbs[2] += usize::from(plant.is_some());
+                None
+            });
+            CandidateGrid::build(&LAVENDER, minimum, maximum, |x, z, key| {
+                let habitat = habitats.sample(x, z);
+                let meadow = habitat.lavender > 0.0;
+                let without_bound = meadow.then(|| lavender_tuft(&catalog, &habitat, key)).flatten();
+                let tuft = lavender_candidate(&catalog, &habitats, x, z, key);
+                assert_eq!(tuft, without_bound, "lavender at {x}, {z}");
+                let cell_area = (LAVENDER.spacing * LAVENDER.spacing) as f32;
+                let bound = eligibility_bound(habitat.lavender, LAVENDER.overlap, MAX_LAVENDER_REACH, cell_area);
+                tufts[0] += usize::from(meadow);
+                tufts[1] += usize::from(meadow && random(key, 2) >= bound);
+                tufts[2] += usize::from(tuft.is_some());
+                None
+            });
+        }
+        println!("shore plants: {herbs:?}, lavender: {tufts:?} (candidates, passed over, plants)");
+        assert!(herbs[2] > 50 && tufts[2] > 1000, "{herbs:?} {tufts:?}");
+        assert!(herbs[1] * 2 > herbs[0] && tufts[1] * 2 > tufts[0], "{herbs:?} {tufts:?}");
+    }
 }

@@ -132,6 +132,11 @@ pub struct Site {
     /// Metres past the nearest river's waterline (negative in the channel);
     /// `RIVER_SEARCH` where no river is near.
     pub river: f32,
+    /// Cover of the late-season snow pack here, 0 to 1: the shared closed
+    /// form (snow.rs `snow_coverage`) on the base landform, with its 12 m
+    /// square-ring relief. The terrain draws it over the eroded bed instead,
+    /// a little deeper in its incised hollows.
+    pub snow: f32,
 }
 
 /// How far from a river's waterline its banks shape the plants.
@@ -314,6 +319,21 @@ impl SiteSampler {
             }
             sum / 8.0
         };
+        // The snow reads the relief as the erosion atlas measures it: the
+        // mean of a square ring 12 m out (17 m on the diagonals) minus the
+        // point, which on the same ground reads 1.5 times the circular
+        // `hollow`. The slope is the 8 m interval the player's footing uses.
+        let snow = if height - SEA_LEVEL >= crate::snow::SNOW_FLOOR {
+            let mut square = 0.0;
+            for (dx, dz) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0),
+                             (1.0, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)] {
+                square += self.fine.sample(x + dx * HOLLOW_RADIUS, z + dz * HOLLOW_RADIUS);
+            }
+            let concavity = square / 8.0 - height;
+            crate::snow::snow_coverage(height, bevy::math::Vec2::new(gx, gz), concavity)
+        } else {
+            0.0
+        };
         Site {
             height: height - SEA_LEVEL,
             steepness,
@@ -323,6 +343,7 @@ impl SiteSampler {
             turf: self.turf.sample(x, z) - SEA_LEVEL,
             shore: self.shore_distance(x, z, height - SEA_LEVEL),
             river: self.river_bank(x, z),
+            snow,
         }
     }
 
@@ -444,6 +465,15 @@ const LAVENDER_SPREAD: f32 = 7.0;
 /// keeps snow from about 112 m; the forest gives out between the two.
 pub const TREELINE: f32 = 96.0;
 
+/// Late-lying snow: the pack's cover at which trees begin to thin and above
+/// which none establishes (Gaea's Trees take a settled snow mask as dead
+/// zones). With today's TREELINE and SNOWLINE_ALTITUDE the thermal treeline
+/// already ends the forest below the pack almost everywhere, so this is a
+/// backstop: it trims the rare warm excursion that reaches the pack, and it
+/// keeps the forest out of the snow on any aspect should either be moved.
+pub const SNOW_TREES_THIN: f32 = 0.35;
+pub const SNOW_TREES_GONE: f32 = 0.75;
+
 /// Warp the world point so every field's patches bend and stretch instead of
 /// sitting on noise blobs of one size.
 fn warped(p: [f64; 2]) -> [f64; 2] {
@@ -492,6 +522,10 @@ pub fn habitat_at(site: Site, p: [f64; 2]) -> Habitat {
         + site.insolation * 26.0
         - smoothstep(0.0, 8.0, -site.valley) * 6.0;
     let below_treeline = 1.0 - smoothstep(treeline - 30.0, treeline + 6.0, h);
+    // Neither trees nor the shrubs of their margins stand in a pack that
+    // lies into the growing season: the ecotone forms at the snow's edge.
+    let snow_free = 1.0 - smoothstep(SNOW_TREES_THIN, SNOW_TREES_GONE, site.snow);
+    let below_limit = below_treeline * snow_free;
     let soil = 1.0 - smoothstep(0.62, 1.05, site.steepness);
 
     // The stand mosaic. Broad and stand-scale noise decide where forest
@@ -509,13 +543,13 @@ pub fn habitat_at(site: Site, p: [f64; 2]) -> Habitat {
     const FOREST_THRESHOLD: f32 = 0.388;
     let forest_core = smoothstep(FOREST_THRESHOLD - 0.035, FOREST_THRESHOLD + 0.035, signal);
     let glade = smoothstep(0.70, 0.76, noise(q, 70.0, seed::GLADE)) * 0.9;
-    let forest = (forest_core * (1.0 - glade) * coast * below_treeline * soil).clamp(0.0, 1.0);
+    let forest = (forest_core * (1.0 - glade) * coast * below_limit * soil).clamp(0.0, 1.0);
     // Ecotone: strongest where the mosaic signal crosses its threshold, plus
     // the rims of glades, the coastal fringe and the treeline.
     let margin = 1.0 - smoothstep(0.0, 0.05, (signal - FOREST_THRESHOLD).abs());
     let edge = (margin.max(glade * (1.0 - glade) * 4.0 * forest_core)
         .max(coast * (1.0 - coast) * 4.0 * forest_core)
-        * below_treeline
+        * below_limit
         * smoothstep(3.0, 7.0, h)
         * soil)
         .clamp(0.0, 1.0);
@@ -546,7 +580,7 @@ pub fn habitat_at(site: Site, p: [f64; 2]) -> Habitat {
     let lowland = 1.0 - smoothstep(35.0, 70.0, h);
     let broadleaf = (0.012 + 0.035 * edge + 0.03 * lowland * moisture)
         * (0.5 + noise(q, 400.0, seed::BROADLEAF))
-        * below_treeline;
+        * below_limit;
     let oak = (0.55 + 0.35 * smoothstep(-0.05, 0.2, site.insolation) - 0.35 * moisture
         + 0.2 * (noise(q, 600.0, seed::OAK) - 0.5))
         .clamp(0.1, 0.9);
@@ -562,7 +596,7 @@ pub fn habitat_at(site: Site, p: [f64; 2]) -> Habitat {
         .clamp(0.30, 1.05);
 
     // Open ground that is not shore or alpine: meadows and clearings.
-    let open = (1.0 - forest) * coast * below_treeline * soil;
+    let open = (1.0 - forest) * coast * below_limit * soil;
     let parkland = open * (1.0 - wet_meadow * 0.7) * lowland.max(0.35);
 
     // Shrubs: a thin understory, dense belts along the forest edge,
@@ -662,6 +696,83 @@ mod tests {
         }
         let mean = sum / count;
         assert!((0.42..0.58).contains(&mean), "{mean}");
+    }
+
+    /// Trees and the shrubs of their margins keep out of a pack that lies
+    /// into the growing season, wherever the thermal treeline would let them
+    /// climb; thin snow leaves the habitat exactly as it was.
+    #[test]
+    fn trees_give_way_to_late_snow() {
+        let mut forested = 0;
+        for i in 0..400 {
+            let p = [i as f64 * 97.3 - 19_000.0, (i * 37 % 211) as f64 * 53.9 - 5_000.0];
+            let site = Site {
+                height: 60.0 + (i % 5) as f32 * 8.0,
+                steepness: 0.15,
+                insolation: 0.2,
+                hollow: 0.3,
+                valley: 1.0,
+                turf: 60.0,
+                shore: SHORE_SEARCH,
+                river: RIVER_SEARCH,
+                snow: 0.0,
+            };
+            let bare = habitat_at(site, p);
+            if bare.forest > 0.05 {
+                forested += 1;
+            }
+            let dusted = habitat_at(Site { snow: 0.2, ..site }, p);
+            assert_eq!(dusted.forest.to_bits(), bare.forest.to_bits());
+            assert_eq!(dusted.edge.to_bits(), bare.edge.to_bits());
+            assert_eq!(dusted.shrubs.to_bits(), bare.shrubs.to_bits());
+            let buried = habitat_at(Site { snow: 0.8, ..site }, p);
+            assert_eq!(buried.forest, 0.0);
+            assert_eq!(buried.edge, 0.0);
+            assert_eq!(buried.broadleaf, 0.0);
+            assert_eq!(buried.parkland, 0.0);
+            assert!(buried.shrubs <= bare.shrubs);
+        }
+        assert!(forested > 40, "the test sites must hold forest without snow: {forested}");
+    }
+
+    /// The sampler's snow is the shared closed-form pack on the base
+    /// landform: the 8 m-interval gradient and the 12 m square ring, at the
+    /// absolute height, and nothing below the snow floor.
+    #[test]
+    fn site_snow_reads_the_square_ring_on_the_base_landform() {
+        let noise = NoiseField::new();
+        // The flank of the highest ground near spawn (base 254 m at -300, 1850).
+        let centre = [-240.0, 1872.0];
+        let (minimum, maximum) =
+            ([centre[0] - 128.0, centre[1] - 128.0], [centre[0] + 128.0, centre[1] + 128.0]);
+        let sampler = SiteSampler::new(&noise, minimum, maximum);
+        let h = |x: f64, z: f64| base_height(&noise, x as f32, z as f32);
+        let (mut above, mut partial) = (0, 0);
+        for iz in 0..64 {
+            for ix in 0..64 {
+                let (x, z) = (minimum[0] + ix as f64 * 4.0, minimum[1] + iz as f64 * 4.0);
+                let height = h(x, z);
+                let expected = if height - SEA_LEVEL >= crate::snow::SNOW_FLOOR {
+                    above += 1;
+                    let gradient = bevy::math::Vec2::new(
+                        h(x + 4.0, z) - h(x - 4.0, z),
+                        h(x, z + 4.0) - h(x, z - 4.0),
+                    ) / 8.0;
+                    let mut ring = 0.0;
+                    for (dx, dz) in [(-1.0, -1.0), (0.0, -1.0), (1.0, -1.0), (-1.0, 0.0),
+                                     (1.0, 0.0), (-1.0, 1.0), (0.0, 1.0), (1.0, 1.0)] {
+                        ring += h(x + dx * 12.0, z + dz * 12.0);
+                    }
+                    crate::snow::snow_coverage(height, gradient, ring / 8.0 - height)
+                } else {
+                    0.0
+                };
+                partial += usize::from(expected > 0.05 && expected < 0.95);
+                let site = sampler.site(x, z);
+                assert!((site.snow - expected).abs() < 1e-4, "{x}, {z}: {} against {expected}", site.snow);
+            }
+        }
+        assert!(above > 500 && partial > 100, "{above} above the floor, {partial} partly covered");
     }
 
     #[test]

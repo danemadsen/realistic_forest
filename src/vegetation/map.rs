@@ -3,11 +3,17 @@
 
 use super::assets::{Species, VegetationAssets};
 use super::ecology::{self, SiteSampler};
-use super::scatter::{self, Catalog, Layer, PlantInstance};
+use super::scatter::{self, Catalog, Layer, PlantInstance, ScatterTimings};
 use crate::noise::NoiseField;
 
-/// Generate every level of every chunk overlapping the square, in parallel.
-pub fn scatter_region(noise: &NoiseField, catalog: &Catalog, minimum: [f64; 2], maximum: [f64; 2]) -> Vec<PlantInstance> {
+/// Generate every level of every chunk overlapping the square, in parallel,
+/// and how long the levels' phases took.
+pub fn scatter_region(
+    noise: &NoiseField,
+    catalog: &Catalog,
+    minimum: [f64; 2],
+    maximum: [f64; 2],
+) -> (Vec<PlantInstance>, ScatterTimings) {
     let low = scatter::chunk_of(minimum[0], minimum[1]);
     let high = scatter::chunk_of(maximum[0] - 1e-6, maximum[1] - 1e-6);
     let mut jobs = Vec::new();
@@ -20,14 +26,16 @@ pub fn scatter_region(noise: &NoiseField, catalog: &Catalog, minimum: [f64; 2], 
     }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results = std::sync::Mutex::new(Vec::new());
+    let timings = std::sync::Mutex::new(ScatterTimings::default());
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
     let worker = || loop {
         let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(&(chunk, level)) = jobs.get(index) else {
             break;
         };
-        let plants = scatter::generate_level(noise, catalog, None, &[], chunk, level);
+        let (plants, spent) = scatter::generate_level_timed(noise, catalog, None, &[], chunk, level);
         results.lock().unwrap().extend(plants);
+        *timings.lock().unwrap() += spent;
     };
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -46,7 +54,7 @@ pub fn scatter_region(noise: &NoiseField, catalog: &Catalog, minimum: [f64; 2], 
         (a.layer, a.position[0].to_bits(), a.position[2].to_bits())
             .cmp(&(b.layer, b.position[0].to_bits(), b.position[2].to_bits()))
     });
-    plants
+    (plants, timings.into_inner().unwrap())
 }
 
 fn species_colour(species: Species) -> [u8; 3] {
@@ -402,7 +410,7 @@ pub fn run_map(path: &str, centre: [f64; 2], extent: f64) {
     let noise = NoiseField::new();
     let minimum = [centre[0] - extent * 0.5, centre[1] - extent * 0.5];
     let maximum = [centre[0] + extent * 0.5, centre[1] + extent * 0.5];
-    let plants = scatter_region(&noise, &catalog, minimum, maximum);
+    let (plants, timings) = scatter_region(&noise, &catalog, minimum, maximum);
     let scattered = start.elapsed();
     for line in report(&noise, &catalog, &plants, minimum, maximum).lines {
         println!("{line}");
@@ -411,7 +419,7 @@ pub fn run_map(path: &str, centre: [f64; 2], extent: f64) {
     let image = render(&noise, &catalog, &plants, minimum, maximum, metres_per_pixel);
     match image.save(path) {
         Ok(()) => println!(
-            "VEGETATION: {} plants scattered in {:.1?}; map ({:.2} m/px) saved to {path}",
+            "VEGETATION: {} plants scattered in {:.1?} ({timings}); map ({:.2} m/px) saved to {path}",
             plants.len(),
             scattered,
             metres_per_pixel
@@ -525,7 +533,7 @@ mod tests {
         let noise = NoiseField::new();
         let catalog = catalog();
         let (minimum, maximum) = ([-1536.0, -1536.0], [1536.0, 1536.0]);
-        let plants = scatter_region(&noise, &catalog, minimum, maximum);
+        let (plants, _) = scatter_region(&noise, &catalog, minimum, maximum);
         let report = report(&noise, &catalog, &plants, minimum, maximum);
         for line in &report.lines {
             println!("{line}");

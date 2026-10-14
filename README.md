@@ -226,6 +226,17 @@ its normal sampling interval, which prevents cracks and greatly reduces LOD
 shimmer. A 5800-metre far plane bounds the finite render horizon while
 generation itself remains unbounded.
 
+Both meshes store their triangles in 28×28-quad blocks, each walked in
+seven-quad stripes, so a 32-vertex post-transform cache shades each vertex
+1.17 times instead of the twice that whole 224-quad rows cost. Each frame the
+terrain pass skips every block whose box lies wholly outside the view. The box
+spans the terrain's whole height range, −400 to 600 metres against a landform
+that stays within −310 and 514, and reaches past the block as far as the
+geomorph can move a vertex, so only off-screen triangles are dropped and the
+image is unchanged. Over 500 seeded views 57% of the blocks are drawn, and a
+view pitched no more than 45 degrees takes 2.3 draws per level on average and
+5 at most. The grass habitat capture still draws its five levels whole.
+
 Terrain uses triplanar PBR textures with a muted, earthy palette, placed from
 the erosion simulation's own record of the ground. The simulation tracks the
 loose cover (soil, colluvium, talus and alluvium) left above bedrock, and the
@@ -252,7 +263,12 @@ dirt bays reach into the turf, the turf thins and dries to olive before it
 gives way, and where turf and soil meet they mix in proportion, as tufts
 growing through soil do, instead of switching at a contact edge. Beyond the erosion radius
 the shader estimates the cover the simulation starts from, so material
-boundaries stay put with distance.
+boundaries stay put with distance. The relief the simulation measures goes on
+past that radius too, taken over the material interval below as Gaea's Soil
+mask takes concavity at several scales: hollows keep their soil and noses
+their stone, and footslopes their fringe, at any distance, thinning only as
+relief finer than a vertex is filtered away, instead of the far ranges
+reading as slope and noise alone.
 
 Grass004 covers ground with a few decimetres of soil. Ground103 soil, with
 subtle Ground106 variation, shows through thin, stony cover, in cut banks and
@@ -274,12 +290,26 @@ near the camera; farther out the interval widens continuously with distance,
 tracking the clipmap's vertex spacing, so distant coverage is prefiltered
 instead of aliasing into rows of triangles along snow and rock margins.
 
-Snow006 forms a uniform white pack above the climate snowline
-(`SNOWLINE_ALTITUDE`, 112 metres). A broad altitude transition and modest
-spring-sun aspect shift keep the edge smooth. Snow thins past about 39 degrees
-and sheds by 55, leaving steep rock faces exposed. Scan contrast and wind
-relief are restrained, while fine grain, roughness and glints still respond
-to the light; only the thinning fringe keeps a faint sediment stain.
+Snow006 forms a continuous white pack above the climate snowline
+(`SNOWLINE_ALTITUDE`, 112 metres), settled the way Gaea's snowfall settles it,
+in closed form (`snow-functions.wgslinc`). A broad altitude transition and
+modest spring-sun aspect shift keep the edge smooth. The terrain shapes the
+pack in proportion to its depth, as Gaea restores fine relief under a coarse
+pack: hollows and gullies hold it a few metres lower and noses and crests lose
+it a few metres higher (2.6 m and 3.7 m at the median in the band), so white
+tongues run down the gullies and ridges go grey first, yet no snow lies below
+the band and no hole opens above it on ground the pack holds. A slope keeps
+only what it can hold, and a thin margin clings to steeper ground than a deep
+pack: snow thins past about 39 degrees and sheds by 55, leaving steep rock
+faces exposed. The slope is tested tilted toward the prevailing wind (it blows
+toward 70 degrees), so lee faces, which are mostly the shaded ones, carry a
+white plaster up to about 58 degrees while windward faces shed theirs from
+about 33. No noise moves the pack: every input is the terrain itself, near the
+player the eroded bed's own 12 m relief and far away the same measure taken
+over the material interval, so a margin stays put as the camera approaches.
+Scan contrast and wind relief are restrained, while fine grain, roughness and
+glints still respond to the light; only the thinning fringe keeps a faint
+sediment stain.
 
 Fully covered snow rises 32 centimetres above the underlying terrain. Walking
 compresses that raised layer back to the terrain surface, leaving a continuous
@@ -422,8 +452,14 @@ smooth fields describe the forest:
 
 - **Forest stands** follow a broad mosaic, with ragged edges and small
   glades, and stop at the coast, on faces too steep to hold soil, and at a
-  treeline that rises on sunny slopes. Wet valley floors and exposed crests
-  stay meadow.
+  treeline that rises on sunny slopes. That treeline already ends the forest
+  below the late-lying snow; as a backstop, the way Gaea's trees take a
+  settled snow mask as dead zones, trees and the saplings and shrubs of their
+  margins also thin where the closed-form pack on the base landform reaches
+  0.35 cover and are gone by 0.75. With today's snowline and treeline it
+  trims well under a thousandth of the forest above the snow floor; it binds
+  the forest to the snow should either be moved. Wet valley floors and
+  exposed crests stay meadow.
 - **Fir and pine** grow in single-species stands, about three firs to every
   pine. Pine takes warm, dry, well-drained ground and sandy lowlands, and a
   sharp disturbance-history field makes the stands mostly one species,
@@ -471,7 +507,10 @@ player within a few seconds and is not regenerated when the player walks back
 and forth across a boundary.
 
 `--vegetation-map path.png` renders the scatter from above without opening a
-window and prints its statistics. `--map-centre x,z` and `--map-extent metres`
+window and prints its statistics, and how long the scatter took, with the
+CPU time its chunk levels spent in each phase: sampling the landform around
+each chunk, the distance to the rivers' banks, the habitat grid, and the
+candidates of every layer. `--map-centre x,z` and `--map-extent metres`
 (default `1024`) choose the area:
 
 ```sh
@@ -744,6 +783,22 @@ target:
    bedrock resistance for the thermal pass.
 4. Thermal (talus) relaxation of over-steepened slopes.
 
+Each pass loads its 3×3 neighbourhood once, and the runoff's path noise, which
+depends on world position alone, is evaluated once per tile by the
+initialisation into a static field that the terrain pass reads on each of its
+140 iterations. The routing normaliser is a single-channel target. With the
+same arithmetic in the same order, the simulation is unchanged to the last bit
+on llvmpipe (another driver may compile the reordered loads to different last
+bits, and match only statistically), and there a tile's simulation takes about
+a quarter less wall time from submission to completion (4.4 s against 5.9 s).
+The geology is still evaluated in the terrain pass: it depends on the
+evolving bedrock, and splitting it around a stored value compiles to different
+last bits on llvmpipe, which the routing amplifies until a tile's largest
+catchment moves by tens of percent, for only 5 percent more speed. A prewarmed
+tile's ready line in the log reports the wall time its initialisation and
+iterations took, from submission to the queue's completion (`simulated in N
+ms`).
+
 The runoff solver adapts the useful physics from the hydraulic erosion shader
 in `~/nerthus` without depending on its WebGPU compute atomics. Runoff retains
 inertia and follows a bilinearly sampled downhill direction; excavation is
@@ -761,10 +816,18 @@ multiple-flow-direction shares proportional to the squared slope, so every
 channel knows its whole catchment within the tile's 1920-metre domain; the CPU
 routes the base surface before a tile starts, so this holds from the first
 iteration. That routing releases each cell once every higher neighbour draining
-into it has passed its area on, which keeps it linear in the tile size, and in
-interactive play the base heights and routing are built on a background task so
-a starting tile never stalls a frame (prewarm and screenshot runs build them
-inline, keeping captures deterministic). A stream-power capacity proportional to √A·S then detaches bed where
+into it has passed its area on, which keeps it linear in the tile size. In
+interactive play the next tile's base heights and routing are built on one
+background thread while the current tile simulates, so a starting tile never
+stalls a frame and usually begins the frame the one before it finishes, rather
+than a preparation later; a tile whose rivers changed while it was prepared is
+built again. Prewarm and screenshot runs build them inline, keeping captures
+deterministic, and share the base heights' rows among every core: in a
+development build on four otherwise idle cores a tile's inputs take about
+55–80 ms there, where one core took 100–160 ms, and when other work shares the
+cores the time swings widely, past 300 ms. Every way gives the same bits,
+and the log reports each tile's time as `EROSION: tile (x, z) inputs in N ms`.
+A stream-power capacity proportional to √A·S then detaches bed where
 the routed sediment flux is below capacity and deposits where the flux exceeds
 it: steep, well-fed channels incise, slope breaks build fans, and valley floors
 and closed hollows fill with alluvium. Channels initiate above a few hundred
@@ -780,7 +843,23 @@ decide which slopes stand. Loose material sheds at its ~34-degree angle of
 repose; bare bedrock only fails above a much steeper, hardness-dependent limit
 (about 48 degrees in weak rock to 68 in the most resistant beds), and then
 slowly, as rockfall. The exchange is pairwise and antisymmetric, so it conserves
-material exactly without a scatter step. Together with incision this opens
+material exactly without a scatter step. **Weathering** adds the breakdown of
+rock below that limit: bare rock steeper than about 24 degrees turns into loose
+debris in place, weak beds and not the most resistant ones, and the cover
+already lying on it shields it, exponentially with its depth (0.30 metres on
+slopes below repose, where a regolith stays, and 0.05 metres on faces above it,
+where debris sheds as fast as it forms). Channels are left to the fluvial
+transport. At 0.015 metres per step a 50-degree face in weak rock retreats by
+about 0.3 metres over a tile's 140 steps, stays nearly bare, and builds a talus
+apron of about 2 metres at its foot, where without it the face stands
+unchanged between repose and its rockfall limit. It is off by default (rate 0,
+which leaves the simulation exactly as it was): on the mountain prewarm quartet
+0.015 lowers the share of bare bedrock from 27–48 to 20–34 percent and adds
+6–9 centimetres of mean cover, but it also smooths the measured fine detail by
+about a tenth, shifts where the largest catchments gather, and the material
+shader still paints its own rubble mantle on weak faces, so the two want tuning
+together, and a check that the GPU passes match the CPU reference kernel,
+before it is turned on. Together with incision this opens
 fresh cuts into V-shaped valleys, rounds weak crests, keeps resistant rock
 standing as cliffs and gathers talus aprons below steep faces. Substrate
 resistance comes from one shared, world-keyed geology
@@ -797,11 +876,23 @@ tent and stored as R32, so opposing pass weights form a smooth partition
 without 8-bit bands. The four fixed geometric weights are normalized together,
 while each pass fades in independently; a pass that is not ready contributes
 procedural base terrain rather than amplifying the others. The initial four-pass
-quartet is prewarmed at spawn. Beyond 1100 metres from the player, one shared C1
+quartet is prewarmed at spawn. Beyond 1100 metres from the fade's centre (the
+player, as below), one shared C1
 radial visibility field fades height and flow and material evidence back to the
 procedural base terrain, reaching zero by 1600 metres — safely before the
-nearest exact-four support edge of the 9×9 pass cache. CPU collision and both
-terrain shaders use the same lattice, weights, centre, and radii.
+nearest exact-four support edge of the 9×9 pass cache. The fade is centred on
+the player's position snapped to an eight-metre lattice, at most 5.7 metres
+from the player; that changes the faded erosion by at most 1.7% of its
+height change, 0.19 metres of the largest at 11 metres, and leaves everything
+within 1094 metres at full strength. Crossing a lattice line moves the centre
+eight metres at once, which steps the 1.1-1.6 km band by at most 2.4% of its
+change (0.26 metres of the largest), in height and in the material evidence
+the fade carries, in that one frame. CPU collision, the plant roots and both terrain
+shaders use the same lattice, weights, centre, and radii. Past the zero
+radius the fade is exactly zero, so no consumer samples a tile there at all:
+the clipmap, the lighting heightfield, the plants' roots, the material shader
+and the CPU skip the masks, lookups and atlas fetches that would only be
+multiplied by it, and the ground they find is the base terrain bit for bit.
 
 The retained RGBA flow atlas is available to the terrain shader and the
 diagnostics view with this per-texel contract:
@@ -814,7 +905,8 @@ diagnostics view with this per-texel contract:
 | A | Routed contributing area, in 4×4-metre cells |
 
 The RGBA surface atlas retains signed height displacement in R for the vertex
-shader and collision. G stores local concavity in metres; B stores the positive
+shader and collision. G stores local concavity in metres, which the snow pack
+also reads (the CPU keeps a copy for the footing on snow); B stores the positive
 log2 concentration of contributing area relative to a surrounding 12-metre
 ring, which finds each channel's thalweg; A stores the loose cover left above
 bedrock, in metres. These fields are derived at tile completion using the
@@ -831,8 +923,8 @@ inspect the erosion flow output on the terrain, or expand **Flow output** to
 inspect the cached target. Erosion
 parameters can be edited from the same panel and applied with **Regenerate
 erosion cache**; besides the runoff controls they include stream power,
-channel incision, alluvial deposition, maximum incision, talus slide and
-rockfall rates. The panel also reports maximum incision, deposited height,
+channel incision, alluvial deposition, maximum incision, talus slide,
+rockfall and weathering rates. The panel also reports maximum incision, deposited height,
 small-scale detail within actively eroded ground, flow-axis bias, the largest
 contributing area, the share of bare bedrock and the mean loose cover for the
 most recently completed tile.
@@ -1044,7 +1136,18 @@ extension is projected across a curved shore.
 Every choice is keyed by world position or by a river's head cell, so two
 regions that both see a whole catchment agree on it; when the player moves
 on, the next region is built on the async compute pool (about a second) and
-swapped in. The first region is built before anything streams.
+swapped in. The first region is built before anything streams. The build's
+maps and sets of grid cells hash with a fixed key (foldhash, where std's
+SipHash draws a new key in every process), so a region comes out the same to
+the bit in every run, down to the order of its lists. With that hashing, a
+bitmap for the cells of each basin and a lake-sheet lookup made once per
+ribbon vertex instead of three times, the build does over a third less work
+than it did (51 rather than 80 billion instructions for the spawn region in
+the dev profile). The `RIVERS:` lines, at startup and for every region
+streamed in, and `--river-map` say how long each stage of a build took: the
+corridors' ground, the courses (and within them the lakes and the wider
+corridors of rerouted rivers), the carve segments and their grid, the lake
+sheets and the water surface.
 
 `--river-map path.png` charts a region from above (shaded relief, channels
 and lakes) and prints its statistics, how well the channels fit the land (how
@@ -1495,8 +1598,11 @@ changing the visibility computed by the original terrain shadow march.
 The lighting heightfield, its maximum-height reduction, and the 512×512 shoreline
 heightfield are cached until their terrain inputs or world mappings change.
 Erosion tile uploads and reveals, lookup shifts, and river updates invalidate
-both maps. Moving the player also invalidates the lighting map because erosion
-fades with distance from the player. The shoreline map stays entirely inside
+both maps. Moving the player into the next cell of the erosion fade's
+eight-metre lattice also invalidates the lighting map, because the fade
+reaches across it: walking retakes the map about once every eight metres, 12
+times over a 100-metre walk instead of on every one of its 600 frames, and
+movement inside a cell retakes nothing. The shoreline map stays entirely inside
 the full-strength erosion radius, so it can be reused within its eight-metre
 mapping snap. Stationary frames after streaming settles reuse both captures and
 copy the cached maximum into the frame's lighting uniforms.

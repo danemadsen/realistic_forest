@@ -6,6 +6,8 @@
 // uWaterState:    water (depth, velocity x, velocity z, accumulated discharge)
 // uDrainage:      drainage (contributing area in cells, routed sediment flux,
 //                 bedrock resistance for the thermal pass, 0)
+// uRouting:       each cell's routing normaliser, from the water pass
+// uStatic:        the tile's world-keyed runoff path noise
 //
 // Two processes share the pass. The runoff solver below (the original
 // erosion_terrain.fs) carves the fine rills and gullies that the transient
@@ -124,12 +126,19 @@ struct StageUniforms {
 // uRouting: each cell's routing normaliser (R), written by this iteration's
 // water pass from the same beds this pass reads
 @group(1) @binding(3) var uRouting: texture_2d<f32>;
+// uStatic: the broad and fine runoff path noise (R, G), which this pass
+// would otherwise evaluate every iteration, stamped once per tile by the
+// init pass. The geology is still evaluated here: it depends on the evolving
+// bedrock, and a split of it around a stored value compiles to different
+// last bits, which the simulation's routing amplifies.
+@group(1) @binding(4) var uStatic: texture_2d<f32>;
 
 // Samplers sit at GL unit + 8 per the spec; this pass only texel-fetches.
 @group(1) @binding(8) var tex0_sampler: sampler;
 @group(1) @binding(9) var uWaterState_sampler: sampler;
 @group(1) @binding(10) var uDrainage_sampler: sampler;
 @group(1) @binding(11) var uRouting_sampler: sampler;
+@group(1) @binding(12) var uStatic_sampler: sampler;
 
 // ---------------------------------------------------------------------------
 // Fullscreen-triangle vertex shader (porting spec section 4)
@@ -163,86 +172,66 @@ fn gridSize() -> vec2<i32>
                max(vec2<i32>(stage.resolution + vec2<f32>(0.5)), vec2<i32>(1)));
 }
 
-fn clampCoord(coord: vec2<i32>) -> vec2<i32>
+// The grid size (`gridSize()`, read once per fragment) is passed to every
+// helper below rather than re-derived inside each texel load.
+fn clampCoord(coord: vec2<i32>, size: vec2<i32>) -> vec2<i32>
 {
-    return clamp(coord, vec2<i32>(0), gridSize() - vec2<i32>(1));
+    return clamp(coord, vec2<i32>(0), size - vec2<i32>(1));
 }
 
-fn fragmentCoord(position: vec4<f32>) -> vec2<i32>
+fn fragmentCoord(position: vec4<f32>, size: vec2<i32>) -> vec2<i32>
 {
-    let resolution = select(vec2<f32>(gridSize()), stage.resolution,
+    let resolution = select(vec2<f32>(size), stage.resolution,
         stage.resolution.x >= 1.0 && stage.resolution.y >= 1.0);
     let uv = position.xy / resolution;
-    return clampCoord(vec2<i32>(floor(uv * vec2<f32>(gridSize()))));
+    return clampCoord(vec2<i32>(floor(uv * vec2<f32>(size))), size);
 }
 
-fn fetchTerrain(coord: vec2<i32>) -> vec4<f32>
+fn fetchTerrain(coord: vec2<i32>, size: vec2<i32>) -> vec4<f32>
 {
-    return textureLoad(texture0, clampCoord(coord), 0);
+    return textureLoad(texture0, clampCoord(coord, size), 0);
 }
 
-fn fetchWater(coord: vec2<i32>) -> vec4<f32>
+fn fetchWater(coord: vec2<i32>, size: vec2<i32>) -> vec4<f32>
 {
-    return textureLoad(uWaterState, clampCoord(coord), 0);
+    return textureLoad(uWaterState, clampCoord(coord, size), 0);
 }
 
-fn fetchDrainage(coord: vec2<i32>) -> vec4<f32>
+fn fetchDrainage(coord: vec2<i32>, size: vec2<i32>) -> vec4<f32>
 {
-    return textureLoad(uDrainage, clampCoord(coord), 0);
+    return textureLoad(uDrainage, clampCoord(coord, size), 0);
 }
 
-fn sampleTerrainBilinear(texel_position: vec2<f32>) -> vec4<f32>
+fn sampleTerrainBilinear(texel_position: vec2<f32>, size: vec2<i32>) -> vec4<f32>
 {
-    let max_position = vec2<f32>(gridSize() - vec2<i32>(1));
+    let max_position = vec2<f32>(size - vec2<i32>(1));
     let position = clamp(texel_position, vec2<f32>(0.0), max_position);
     let lower = vec2<i32>(floor(position));
-    let upper = clampCoord(lower + vec2<i32>(1));
+    let upper = clampCoord(lower + vec2<i32>(1), size);
     let fraction = fract(position);
 
-    let sample00 = fetchTerrain(lower);
-    let sample10 = fetchTerrain(vec2<i32>(upper.x, lower.y));
-    let sample01 = fetchTerrain(vec2<i32>(lower.x, upper.y));
-    let sample11 = fetchTerrain(upper);
+    let sample00 = fetchTerrain(lower, size);
+    let sample10 = fetchTerrain(vec2<i32>(upper.x, lower.y), size);
+    let sample01 = fetchTerrain(vec2<i32>(lower.x, upper.y), size);
+    let sample11 = fetchTerrain(upper, size);
     return mix(mix(sample00, sample10, fraction.x),
                mix(sample01, sample11, fraction.x), fraction.y);
 }
 
-fn sampleWaterBilinear(texel_position: vec2<f32>) -> vec4<f32>
+fn sampleWaterBilinear(texel_position: vec2<f32>, size: vec2<i32>) -> vec4<f32>
 {
-    let max_position = vec2<f32>(gridSize() - vec2<i32>(1));
+    let max_position = vec2<f32>(size - vec2<i32>(1));
     let position = clamp(texel_position, vec2<f32>(0.0), max_position);
     let lower = vec2<i32>(floor(position));
-    let upper = clampCoord(lower + vec2<i32>(1));
+    let upper = clampCoord(lower + vec2<i32>(1), size);
     let fraction = fract(position);
 
-    let sample00 = fetchWater(lower);
-    let sample10 = fetchWater(vec2<i32>(upper.x, lower.y));
-    let sample01 = fetchWater(vec2<i32>(lower.x, upper.y));
-    let sample11 = fetchWater(upper);
+    let sample00 = fetchWater(lower, size);
+    let sample10 = fetchWater(vec2<i32>(upper.x, lower.y), size);
+    let sample01 = fetchWater(vec2<i32>(lower.x, upper.y), size);
+    let sample11 = fetchWater(upper, size);
     return mix(mix(sample00, sample10, fraction.x),
                mix(sample01, sample11, fraction.x), fraction.y);
-}
-
-// A small, smooth, world-space variation takes the place of the random initial
-// direction of Nerthus's droplets. It breaks up perfectly parallel Eulerian
-// flow without changing from iteration to iteration or at tile overlaps.
-fn hash12(position: vec2<f32>) -> f32
-{
-    var p = fract(vec3<f32>(position.xyx) * 0.1031);
-    p += dot(p, p.yzx + 33.33);
-    return fract((p.x + p.y) * p.z);
-}
-
-fn valueNoise(position: vec2<f32>) -> f32
-{
-    let cell = floor(position);
-    var fraction = fract(position);
-    fraction = fraction * fraction * (3.0 - 2.0 * fraction);
-    let n00 = hash12(cell);
-    let n10 = hash12(cell + vec2<f32>(1.0, 0.0));
-    let n01 = hash12(cell + vec2<f32>(0.0, 1.0));
-    let n11 = hash12(cell + vec2<f32>(1.0, 1.0));
-    return mix(mix(n00, n10, fraction.x), mix(n01, n11, fraction.x), fraction.y);
 }
 
 // BEGIN SHARED GEOLOGY
@@ -314,6 +303,41 @@ fn similarityWeight(neighbour_height: f32, center_height: f32,
     return spatial_weight / (1.0 + difference * difference);
 }
 
+// What the drainage gather has collected for a cell: the routed contributing
+// area and sediment flux its donors hand it, and the steepest bed descent and
+// lowest bed among its neighbours.
+struct DonorGather {
+    drainage_area: f32,
+    sediment_in: f32,
+    steepest_descent: f32,
+    lowest_neighbour: f32,
+};
+
+// One neighbour's part of the drainage gather. Its bed comes from the 3x3
+// the pass has already loaded; a neighbour standing above this cell passes
+// on the share of its area and sediment flux that its squared slope toward
+// this cell earns. Cells beyond the grid neither give nor receive flow. The
+// gather calls this for the eight neighbours in one fixed order, which its
+// float sums depend on.
+fn gatherDonor(gather: ptr<function, DonorGather>, donor_offset: vec2<i32>, donor_bed: f32,
+               coord: vec2<i32>, size: vec2<i32>, bed_height: f32, cell_size: f32)
+{
+    let donor_coord = coord + donor_offset;
+    if (any(donor_coord < vec2<i32>(0)) || any(donor_coord >= size)) { return; }
+    let donor_distance = cell_size
+        * select(1.0, 1.41421356, donor_offset.x != 0 && donor_offset.y != 0);
+    let fall = (bed_height - donor_bed) / donor_distance;
+    (*gather).steepest_descent = max((*gather).steepest_descent, fall);
+    (*gather).lowest_neighbour = min((*gather).lowest_neighbour, donor_bed);
+    // The same pair seen from the donor: its slope toward this cell.
+    let rise = -fall;
+    if (rise <= 0.0) { return; }
+    let share = rise * rise / max(textureLoad(uRouting, donor_coord, 0).r, 1.0e-12);
+    let donor_drainage = fetchDrainage(donor_coord, size);
+    (*gather).drainage_area += max(donor_drainage.r, 0.0) * share;
+    (*gather).sediment_in += max(donor_drainage.g, 0.0) * share;
+}
+
 // ---------------------------------------------------------------------------
 // Fragment stage
 // ---------------------------------------------------------------------------
@@ -326,13 +350,13 @@ struct FragmentOutput {
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
 {
-    let coord = fragmentCoord(position);
     let size = gridSize();
+    let coord = fragmentCoord(position, size);
 
     // Simulate the complete padded domain. The retained footprint is only
     // a readback crop, never a hydraulic or erosion boundary.
-    let terrain = fetchTerrain(coord);
-    let water = fetchWater(coord);
+    let terrain = fetchTerrain(coord, size);
+    let water = fetchWater(coord, size);
 
     var bed_height = terrain.r;
     let base_height = terrain.b;
@@ -348,7 +372,7 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
     // carries off whatever water and sediment reach it. Drainage A keeps the
     // mark for the next iteration and the thermal pass; B reads as hard rock
     // so the banks above it are not undercut by the talus pass.
-    if (fetchDrainage(coord).a > 0.5)
+    if (fetchDrainage(coord, size).a > 0.5)
     {
         return FragmentOutput(vec4<f32>(base_height, 0.0, base_height, loose),
                               vec4<f32>(0.0, 0.0, 1.0, 1.0));
@@ -365,6 +389,17 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
     let rock_erodibility = pow(max(1.0 - hardness, 0.0), 1.35);
     let loose_erodibility = 1.0 - 0.96 * erosionSpawnProtection(world_position);
 
+    // The 3x3 neighbourhood, loaded once: the drainage gather, the Sobel
+    // gradient and the detail-preserving footprint below all read it.
+    let terrain_left  = fetchTerrain(coord + vec2<i32>(-1, 0), size);
+    let terrain_right = fetchTerrain(coord + vec2<i32>( 1, 0), size);
+    let terrain_down  = fetchTerrain(coord + vec2<i32>( 0,-1), size);
+    let terrain_up    = fetchTerrain(coord + vec2<i32>( 0, 1), size);
+    let terrain_left_down  = fetchTerrain(coord + vec2<i32>(-1,-1), size);
+    let terrain_right_down = fetchTerrain(coord + vec2<i32>( 1,-1), size);
+    let terrain_left_up    = fetchTerrain(coord + vec2<i32>(-1, 1), size);
+    let terrain_right_up   = fetchTerrain(coord + vec2<i32>( 1, 1), size);
+
     // Drainage routing. Every bed cell passes its contributing area, and the
     // sediment flux it carries, to its lower neighbours in proportion to
     // their squared slope. The water pass just before this one left each
@@ -373,30 +408,20 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
     // heights route the flow (not the transient water surface), which keeps
     // the routing acyclic from one iteration to the next. Cells beyond the
     // grid neither give nor receive flow, keeping the simulation wall closed.
-    var drainage_area = 1.0;
-    var sediment_in = 0.0;
-    var steepest_descent = 0.0;
-    var lowest_neighbour = bed_height;
-    for (var donor = 0; donor < 9; donor++)
-    {
-        if (donor == 4) { continue; }
-        let donor_offset = vec2<i32>(donor % 3 - 1, donor / 3 - 1);
-        let donor_coord = coord + donor_offset;
-        if (any(donor_coord < vec2<i32>(0)) || any(donor_coord >= size)) { continue; }
-        let donor_bed = fetchTerrain(donor_coord).r;
-        let donor_distance = cell_size
-            * select(1.0, 1.41421356, donor_offset.x != 0 && donor_offset.y != 0);
-        let fall = (bed_height - donor_bed) / donor_distance;
-        steepest_descent = max(steepest_descent, fall);
-        lowest_neighbour = min(lowest_neighbour, donor_bed);
-        // The same pair seen from the donor: its slope toward this cell.
-        let rise = -fall;
-        if (rise <= 0.0) { continue; }
-        let share = rise * rise / max(textureLoad(uRouting, donor_coord, 0).r, 1.0e-12);
-        let donor_drainage = fetchDrainage(donor_coord);
-        drainage_area += max(donor_drainage.r, 0.0) * share;
-        sediment_in += max(donor_drainage.g, 0.0) * share;
-    }
+    // The donors are visited row by row from (-1, -1) to (1, 1).
+    var gather = DonorGather(1.0, 0.0, 0.0, bed_height);
+    gatherDonor(&gather, vec2<i32>(-1,-1), terrain_left_down.r, coord, size, bed_height, cell_size);
+    gatherDonor(&gather, vec2<i32>( 0,-1), terrain_down.r, coord, size, bed_height, cell_size);
+    gatherDonor(&gather, vec2<i32>( 1,-1), terrain_right_down.r, coord, size, bed_height, cell_size);
+    gatherDonor(&gather, vec2<i32>(-1, 0), terrain_left.r, coord, size, bed_height, cell_size);
+    gatherDonor(&gather, vec2<i32>( 1, 0), terrain_right.r, coord, size, bed_height, cell_size);
+    gatherDonor(&gather, vec2<i32>(-1, 1), terrain_left_up.r, coord, size, bed_height, cell_size);
+    gatherDonor(&gather, vec2<i32>( 0, 1), terrain_up.r, coord, size, bed_height, cell_size);
+    gatherDonor(&gather, vec2<i32>( 1, 1), terrain_right_up.r, coord, size, bed_height, cell_size);
+    let drainage_area = gather.drainage_area;
+    let sediment_in = gather.sediment_in;
+    let steepest_descent = gather.steepest_descent;
+    let lowest_neighbour = gather.lowest_neighbour;
 
     // Semi-Lagrangian backtracing asks which upstream cell supplied this cell.
     // Nerthus advances droplets by a bounded step. Applying the same bound here
@@ -409,29 +434,20 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
         backtrace = backtrace * (1.25 / backtrace_length);
     }
     let upstream_position = vec2<f32>(coord) - backtrace;
-    let upstream_sediment = max(sampleTerrainBilinear(upstream_position).g, 0.0);
+    let upstream_sediment = max(sampleTerrainBilinear(upstream_position, size).g, 0.0);
     let transport_blend = clamp(max(stage.transport_rate, 0.0) * dt, 0.0, 1.0);
     var sediment = mix(max(terrain.g, 0.0), upstream_sediment, transport_blend);
 
     // A Sobel gradient is less axis-biased than the old cardinal difference.
     // The same samples are reused by the detail-preserving footprint below.
-    let terrain_left  = fetchTerrain(coord + vec2<i32>(-1, 0));
-    let terrain_right = fetchTerrain(coord + vec2<i32>( 1, 0));
-    let terrain_down  = fetchTerrain(coord + vec2<i32>( 0,-1));
-    let terrain_up    = fetchTerrain(coord + vec2<i32>( 0, 1));
-    let terrain_left_down  = fetchTerrain(coord + vec2<i32>(-1,-1));
-    let terrain_right_down = fetchTerrain(coord + vec2<i32>( 1,-1));
-    let terrain_left_up    = fetchTerrain(coord + vec2<i32>(-1, 1));
-    let terrain_right_up   = fetchTerrain(coord + vec2<i32>( 1, 1));
-
-    let water_left  = fetchWater(coord + vec2<i32>(-1, 0));
-    let water_right = fetchWater(coord + vec2<i32>( 1, 0));
-    let water_down  = fetchWater(coord + vec2<i32>( 0,-1));
-    let water_up    = fetchWater(coord + vec2<i32>( 0, 1));
-    let water_left_down  = fetchWater(coord + vec2<i32>(-1,-1));
-    let water_right_down = fetchWater(coord + vec2<i32>( 1,-1));
-    let water_left_up    = fetchWater(coord + vec2<i32>(-1, 1));
-    let water_right_up   = fetchWater(coord + vec2<i32>( 1, 1));
+    let water_left  = fetchWater(coord + vec2<i32>(-1, 0), size);
+    let water_right = fetchWater(coord + vec2<i32>( 1, 0), size);
+    let water_down  = fetchWater(coord + vec2<i32>( 0,-1), size);
+    let water_up    = fetchWater(coord + vec2<i32>( 0, 1), size);
+    let water_left_down  = fetchWater(coord + vec2<i32>(-1,-1), size);
+    let water_right_down = fetchWater(coord + vec2<i32>( 1,-1), size);
+    let water_left_up    = fetchWater(coord + vec2<i32>(-1, 1), size);
+    let water_right_up   = fetchWater(coord + vec2<i32>( 1, 1), size);
 
     let left_height  = terrain_left.r  + max(water_left.r, 0.0);
     let right_height = terrain_right.r + max(water_right.r, 0.0);
@@ -451,15 +467,21 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
     let speed = length(velocity);
     let water_depth = max(water.r, 0.0);
 
+    // A small, smooth, world-space variation takes the place of the random
+    // initial direction of Nerthus's droplets. It breaks up perfectly parallel
+    // Eulerian flow without changing from iteration to iteration or at tile
+    // overlaps: broad and fine value noise over the world's cells, which the
+    // init pass evaluated into the static field.
     let world_cell = world_position / cell_size;
-    let broad_path_noise = valueNoise(world_cell * 0.16 + vec2<f32>(17.13, -9.71));
-    let fine_path_noise = valueNoise(world_cell * 0.43 + vec2<f32>(-31.7, 22.9));
+    let path_noises = textureLoad(uStatic, coord, 0);
+    let broad_path_noise = path_noises.r;
+    let fine_path_noise = path_noises.g;
     let path_noise = broad_path_noise * 0.45 + fine_path_noise * 0.55;
 
     // Nerthus gives a droplet a random direction on perfectly flat ground.
     // Use a deterministic world-cell angle here so an overlap evaluates the
     // same way in every tile and flat cells do not all inherit an eastward bias.
-    let flat_angle = hash12(floor(world_cell) + vec2<f32>(91.7, -54.3)) * 6.28318530718;
+    let flat_angle = geologyHash(floor(world_cell) + vec2<f32>(91.7, -54.3)) * 6.28318530718;
     let flat_direction = vec2<f32>(cos(flat_angle), sin(flat_angle));
 
     // Treat the water velocity as the droplet's inertial direction and bend it
@@ -490,8 +512,8 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
 
     let travel_texels = mix(0.65, 1.15, speed / (speed + 3.0));
     let forward_position = vec2<f32>(coord) + travel_direction * travel_texels;
-    let forward_terrain = sampleTerrainBilinear(forward_position);
-    let forward_water = sampleWaterBilinear(forward_position);
+    let forward_terrain = sampleTerrainBilinear(forward_position, size);
+    let forward_water = sampleWaterBilinear(forward_position, size);
     let center_surface = bed_height + water_depth;
     let forward_surface = forward_terrain.r + max(forward_water.r, 0.0);
     let height_change_along_path = forward_surface - center_surface;
@@ -721,11 +743,14 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> FragmentOutput
 //     offset 76  maximum_incision:  f32
 //     offset 80  drainage_saturation: f32
 //     offset 84  (struct rounds to 88 bytes)
-//   Texture bindings (RGBA32F float textures, texel loads only, no filtering):
+//   Texture bindings (float textures, texel loads only, no filtering; uRouting
+//   is R32Float, uStatic RG32Float, the rest RGBA32F):
 //     texture0    -> @group(1) @binding(0) texture_2d<f32>; sampler @binding(8) (unused)
 //     uWaterState -> @group(1) @binding(1) texture_2d<f32>; sampler @binding(9) (unused)
 //     uDrainage   -> @group(1) @binding(2) texture_2d<f32>; sampler @binding(10) (unused)
 //     uRouting    -> @group(1) @binding(3) texture_2d<f32>; sampler @binding(11) (unused)
+//     uStatic     -> @group(1) @binding(4) texture_2d<f32>; sampler @binding(12) (unused)
+//       (the static field the init pass's mode 3 stamps once per tile)
 //   Outputs: @location(0) = updated terrain
 //     (bed height, sediment, immutable base height, loose cover);
 //     @location(1) = drainage (contributing area, sediment flux out,

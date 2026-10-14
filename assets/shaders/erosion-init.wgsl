@@ -1,9 +1,11 @@
 // PORT NOTES (erosion_init.fs -> erosion-init.wgsl):
-// - Single RGBA32F output at @location(0), exactly as the GLSL wrote it
+// - Single vec4 output at @location(0), exactly as the GLSL wrote it
 //   (`finalColor`); every uMode branch writes that one output slot (mode 0
 //   stamps terrain state, mode 2 stamps the CPU-routed drainage area, any
-//   other mode clears to 0.0). Terrain A now carries the initial loose cover;
-//   hardness is evaluated from the shared world-keyed geology by each pass.
+//   other mode clears to 0.0), into an RGBA32F target, except mode 3, which
+//   writes the terrain pass's static world-keyed field into an RG32Float
+//   target that keeps only the first two lanes. Terrain A now carries the initial loose cover; hardness is
+//   evaluated from the shared world-keyed geology by each pass.
 // - No hoisted samples: the GLSL only texelFetches, and textureLoad carries no
 //   WGSL uniform-control-flow restriction. No dropped blit flips (the source
 //   has none). No `inverse_*` fields needed (the source inverts no matrices).
@@ -45,7 +47,8 @@ struct GlobalUniforms {
 
 struct StageUniforms {            // uMode, uWorldMin, uCellSize
     mode: i32,                    // uMode: 0 = stamp terrain state (initial loose cover),
-                                  // 2 = stamp drainage area, any other value = clear
+                                  // 2 = stamp drainage area, 3 = the static field,
+                                  // any other value = clear
     world_min: vec2<f32>,         // uWorldMin: world-space XZ corner of texel (0, 0)
     cell_size: f32,               // uCellSize: world units per erosion texel
 };
@@ -172,6 +175,19 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
         // and thermal passes hold them fixed and keep the mark.
         return vec4<f32>(max(base.g, 0.0), 0.0, 0.0, select(0.0, 1.0, base.b > 0.5));
     }
+    else if (stage.mode == 3)
+    {
+        // The runoff's broad and fine path noise, which the terrain pass
+        // reads every iteration, evaluated once per tile instead of 140
+        // times. The cell centre and cell coordinate are built exactly as
+        // that pass builds them, and the noise is stored as it would leave
+        // the function there, so the pass reads the bits it computed before.
+        let cell_size = max(stage.cell_size, 0.0001);
+        let world_position = stage.world_min + (vec2<f32>(coord) + vec2<f32>(0.5)) * cell_size;
+        let world_cell = world_position / cell_size;
+        return vec4<f32>(geologyNoise(world_cell * 0.16 + vec2<f32>(17.13, -9.71)),
+                         geologyNoise(world_cell * 0.43 + vec2<f32>(-31.7, 22.9)), 0.0, 0.0);
+    }
     else
     {
         return vec4<f32>(0.0);
@@ -180,7 +196,9 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
 
 // STAGE UNIFORMS:
 //   mode      : i32        — uMode: 0 = stamp terrain state (height, 0, height, loose cover),
-//                              2 = stamp drainage (area, 0, 0, 0) from texture0.g,
+//                              2 = stamp drainage (area, 0, 0, river mark) from texture0.g/b,
+//                              3 = stamp the static field (broad and fine path noise,
+//                                  into an RG32Float target) the terrain pass reads,
 //                              any other value clears the tile to vec4(0.0)
 //   world_min : vec2<f32>  — uWorldMin: world-space XZ corner of texel (0, 0) of the state texture
 //   cell_size : f32        — uCellSize: world units per erosion texel

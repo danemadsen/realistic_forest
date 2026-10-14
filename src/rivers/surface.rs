@@ -26,9 +26,9 @@
 //! The mesh is cut into 256 m chunks with their bounds, so the renderer only
 //! draws what the camera can see.
 
+use super::FastMap;
 use super::network::{FLOW_CELL, Lake, River, RiverEnd, RiverNode};
 use crate::constants::SEA_LEVEL;
-use std::collections::HashMap;
 
 /// One water-surface vertex: 68 bytes, mirrored by `vs_inland`'s inputs in
 /// water.wgsl.
@@ -298,29 +298,29 @@ fn under_sheet(depth: f32) -> f32 {
 /// height of the sheets' corners (sunk at their edges), the highest where
 /// two sheets meet.
 struct Sheets {
-    cells: HashMap<[i32; 2], f32>,
-    corners: HashMap<[i32; 2], f32>,
+    cells: FastMap<[i32; 2], f32>,
+    corners: FastMap<[i32; 2], f32>,
     /// The highest lake over each cell, and its level.
-    owner: HashMap<[i32; 2], (usize, f32)>,
+    owner: FastMap<[i32; 2], (usize, f32)>,
     /// Each lake's clarity at the corners of its sheet: its own water's
     /// (`lake_clarity`), and its inflows' where they run into it
     /// (`paint_plume`).
-    clarity: Vec<HashMap<[i32; 2], f32>>,
+    clarity: Vec<FastMap<[i32; 2], f32>>,
     /// Each lake's whitewater and foam at the corners of its sheet where an
     /// inflow runs into it (`paint_plume`); none elsewhere.
-    stir: Vec<HashMap<[i32; 2], [f32; 2]>>,
+    stir: Vec<FastMap<[i32; 2], [f32; 2]>>,
 }
 
 impl Sheets {
     fn new(lakes: &[Lake]) -> Self {
-        let mut cells: HashMap<[i32; 2], f32> = HashMap::new();
-        let mut corners: HashMap<[i32; 2], f32> = HashMap::new();
-        let mut owner: HashMap<[i32; 2], (usize, f32)> = HashMap::new();
+        let mut cells: FastMap<[i32; 2], f32> = FastMap::default();
+        let mut corners: FastMap<[i32; 2], f32> = FastMap::default();
+        let mut owner: FastMap<[i32; 2], (usize, f32)> = FastMap::default();
         let mut clarity = Vec::with_capacity(lakes.len());
         for (index, lake) in lakes.iter().enumerate() {
-            let sunk: HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
+            let sunk: FastMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
             let clear = lake_clarity(lake.level, lake.cells.len() as f32 * LAKE_CELL * LAKE_CELL);
-            let mut own = HashMap::new();
+            let mut own = FastMap::default();
             for &cell in lake.cells.iter().chain(&lake.shore) {
                 let entry = owner.entry(cell).or_insert((index, lake.level));
                 if lake.level > entry.1 {
@@ -337,7 +337,7 @@ impl Sheets {
             }
             clarity.push(own);
         }
-        let stir = vec![HashMap::new(); lakes.len()];
+        let stir = vec![FastMap::default(); lakes.len()];
         Sheets { cells, corners, owner, clarity, stir }
     }
 
@@ -573,13 +573,13 @@ const DRAWN_CELL: f32 = 8.0;
 struct Drawn<'a> {
     vertices: &'a [SurfaceVertex],
     triangles: Vec<[u32; 3]>,
-    cells: HashMap<[i32; 2], Vec<u32>>,
+    cells: FastMap<[i32; 2], Vec<u32>>,
 }
 
 impl<'a> Drawn<'a> {
     fn new(ribbon: &'a Ribbon) -> Self {
         let triangles: Vec<[u32; 3]> = ribbon.triangles().chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
-        let mut cells: HashMap<[i32; 2], Vec<u32>> = HashMap::new();
+        let mut cells: FastMap<[i32; 2], Vec<u32>> = FastMap::default();
         for (k, triangle) in triangles.iter().enumerate() {
             let mut low = [f32::INFINITY; 2];
             let mut high = [f32::NEG_INFINITY; 2];
@@ -771,7 +771,7 @@ pub fn build(rivers: &[River], lakes: &[Lake], dry_ground: &dyn Fn([f32; 2]) -> 
     // Every parent's ribbon is built before its tributaries', which run
     // into it as drawn.
     let ribbons: Vec<std::cell::OnceCell<Ribbon>> = rivers.iter().map(|_| Default::default()).collect();
-    let mut drawn: HashMap<usize, Drawn> = HashMap::new();
+    let mut drawn: FastMap<usize, Drawn> = FastMap::default();
     for index in parents_first(rivers) {
         let river = &rivers[index];
         let parent = match river.end {
@@ -909,13 +909,13 @@ fn resolve_clarity(rivers: &[River], lakes: &[Lake], sheets: &mut Sheets) -> Vec
         let breadth = (lakes[lake].cells.len() as f32).sqrt() * LAKE_CELL;
         // Foam drifts out on the sheet's current, as far as it carries it
         // in its lifetime, and no shorter than on slack water.
-        let current: HashMap<[i32; 2], [f32; 2]> = lakes[lake].current.iter().copied().collect();
+        let current: FastMap<[i32; 2], [f32; 2]> = lakes[lake].current.iter().copied().collect();
         let drift = |corner: [i32; 2]| FOAM_LIFETIME * current.get(&corner).map_or(0.0, |v| v[0].hypot(v[1])).max(0.3);
         // Each corner's share of inflowing water, and of its clarity over
         // the lake's own; and the whitewater and foam the inflows carry
         // out from the toes of their falls, the most any one brings.
-        let mut mixed: HashMap<[i32; 2], (f32, f32)> = HashMap::new();
-        let mut stir: HashMap<[i32; 2], [f32; 2]> = HashMap::new();
+        let mut mixed: FastMap<[i32; 2], (f32, f32)> = FastMap::default();
+        let mut stir: FastMap<[i32; 2], [f32; 2]> = FastMap::default();
         for &(index, origin, first, run_end) in &inlets[lake] {
             let nodes = &rivers[index].nodes;
             let inflow = river_clarity(&rivers[index], sheets)[origin.min(first - 1)];
@@ -966,7 +966,7 @@ fn paint_plume(
     origin: usize,
     run_end: usize,
     breadth: f32,
-    corners: &HashMap<[i32; 2], f32>,
+    corners: &FastMap<[i32; 2], f32>,
     drift: &dyn Fn([i32; 2]) -> f32,
     paint: &mut dyn FnMut([i32; 2], Plume),
 ) {
@@ -1333,6 +1333,9 @@ fn ribbon(
             if draft.past_coast {
                 vertex.position[1] = vertex.position[1].min(SEA_LEVEL - UNDER_SEA);
             }
+            // The sheet over the vertex, if any, and how far inside its edge:
+            // searched once, for each of the three tests below.
+            let under = sheets.under(p);
             // Under the sheet of a lake whose level it stands at (running
             // into it, out of it or through it), the ribbon runs on just
             // beneath the sheet as drawn, its edge sunk and all, and
@@ -1341,7 +1344,7 @@ fn ribbon(
             // is never in sight. Well inside, where the sheet hides it for
             // good, it stops.
             let water = draft.water;
-            if let Some((lake, depth)) = sheets.under(p)
+            if let Some((lake, depth)) = under
                 && water <= lake + LEVEL_TIE
                 && water >= lake - SHEET_BAND
             {
@@ -1354,7 +1357,7 @@ fn ribbon(
                 // down under it over `TOE_RUN` metres inside its edge, as
                 // its outer strips do onto the ground, wherever that edge
                 // crosses it.
-                if let Some((lake, depth)) = sheets.under(p)
+                if let Some((lake, depth)) = under
                     && water > lake + LEVEL_TIE
                     && draft.merge <= 0.0
                 {
@@ -1373,7 +1376,7 @@ fn ribbon(
                 && water > level + LEVEL_TIE
                 && draft.merge <= 0.0
             {
-                let sheet = match sheets.under(p) {
+                let sheet = match under {
                     Some((lake, _)) if (lake - level).abs() <= LEVEL_TIE => sheets.height(p).unwrap_or(level).min(level),
                     _ => level,
                 };
@@ -1567,12 +1570,12 @@ fn add_lake(
     vertices: &mut Vec<SurfaceVertex>,
     chunk_triangles: &mut std::collections::BTreeMap<(i32, i32), Vec<u32>>,
     lake: &Lake,
-    clarity: &HashMap<[i32; 2], f32>,
-    stir: &HashMap<[i32; 2], [f32; 2]>,
+    clarity: &FastMap<[i32; 2], f32>,
+    stir: &FastMap<[i32; 2], [f32; 2]>,
 ) {
-    let sunk: HashMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
-    let current: HashMap<[i32; 2], [f32; 2]> = lake.current.iter().copied().collect();
-    let mut corner_index = HashMap::new();
+    let sunk: FastMap<[i32; 2], f32> = lake.edge.iter().copied().collect();
+    let current: FastMap<[i32; 2], [f32; 2]> = lake.current.iter().copied().collect();
+    let mut corner_index = FastMap::default();
     let mut corner = |vertices: &mut Vec<SurfaceVertex>, x: i32, z: i32| -> u32 {
         let push_vertex = || {
             let height = sunk.get(&[x, z]).map_or(lake.level, |&h| h.min(lake.level));
@@ -2046,8 +2049,7 @@ mod tests {
     /// downstream.
     #[test]
     fn ribbons_carry_their_current_downstream() {
-        let noise = crate::noise::NoiseField::new();
-        let network = crate::rivers::network::generate(&noise, [0, 0]);
+        let (_, network) = crate::rivers::spawn_network();
         let mesh = &network.surface;
         let (mut total, mut reversed, mut askew) = (0.0f64, 0.0f64, 0.0f64);
         for triangle in mesh.indices.chunks_exact(3) {

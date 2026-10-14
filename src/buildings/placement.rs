@@ -819,10 +819,9 @@ mod tests {
     use crate::buildings::assets::tests::library;
 
     fn planner() -> (SettlementPlanner, Arc<RiverNetwork>, Arc<NoiseField>) {
-        let noise = Arc::new(NoiseField::new());
+        let (noise, network) = crate::rivers::spawn_network();
         let library = library();
         let planner = SettlementPlanner::new(noise.clone(), Footprint::from_library(&library));
-        let network = Arc::new(crate::rivers::network::generate(&noise, [0, 0]));
         (planner, network, noise)
     }
 
