@@ -302,15 +302,13 @@ mod tests {
     }
 
     fn catalog_of(species: Species) -> Catalog {
-        Catalog {
-            models: vec![scatter::CatalogModel {
-                species,
-                form: String::new(),
-                height: 10.0,
-                crown_radius: 2.0,
-                trunk_radius: 0.25,
-            }],
-        }
+        Catalog::new(vec![scatter::CatalogModel {
+            species,
+            form: String::new(),
+            height: 10.0,
+            crown_radius: 2.0,
+            trunk_radius: 0.25,
+        }])
     }
 
     fn plant(scale: f32) -> PlantInstance {

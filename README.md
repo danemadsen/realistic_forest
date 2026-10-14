@@ -494,7 +494,10 @@ player within a few seconds and is not regenerated when the player walks back
 and forth across a boundary.
 
 `--vegetation-map path.png` renders the scatter from above without opening a
-window and prints its statistics. `--map-centre x,z` and `--map-extent metres`
+window and prints its statistics, and how long the scatter took, with the
+CPU time its chunk levels spent in each phase: sampling the landform around
+each chunk, the distance to the rivers' banks, the habitat grid, and the
+candidates of every layer. `--map-centre x,z` and `--map-extent metres`
 (default `1024`) choose the area:
 
 ```sh

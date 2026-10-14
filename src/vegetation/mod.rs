@@ -444,9 +444,7 @@ pub(crate) mod tests {
             crown_radius: 2.0,
             trunk_radius,
         };
-        Catalog {
-            models: vec![model(Species::Oak, 0.4), model(Species::Bush, 0.1), model(Species::Lilac, 0.2)],
-        }
+        Catalog::new(vec![model(Species::Oak, 0.4), model(Species::Bush, 0.1), model(Species::Lilac, 0.2)])
     }
 
     pub(crate) fn plant(x: f32, z: f32, model: u32, layer: Layer) -> PlantInstance {
