@@ -226,6 +226,17 @@ its normal sampling interval, which prevents cracks and greatly reduces LOD
 shimmer. A 5800-metre far plane bounds the finite render horizon while
 generation itself remains unbounded.
 
+Both meshes store their triangles in 28×28-quad blocks, each walked in
+seven-quad stripes, so a 32-vertex post-transform cache shades each vertex
+1.17 times instead of the twice that whole 224-quad rows cost. Each frame the
+terrain pass skips every block whose box lies wholly outside the view. The box
+spans the terrain's whole height range, −400 to 600 metres against a landform
+that stays within −310 and 514, and reaches past the block as far as the
+geomorph can move a vertex, so only off-screen triangles are dropped and the
+image is unchanged. Over 500 seeded views 57% of the blocks are drawn, in 2.3
+draws per level on average. The grass habitat capture still draws its five
+levels whole.
+
 Terrain uses triplanar PBR textures with a muted, earthy palette, placed from
 the erosion simulation's own record of the ground. The simulation tracks the
 loose cover (soil, colluvium, talus and alluvium) left above bedrock, and the

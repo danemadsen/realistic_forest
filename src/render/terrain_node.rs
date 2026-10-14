@@ -418,11 +418,13 @@ impl StageUniform {
     }
 }
 
-/// An uploaded mesh: interleaved vertex data plus its u32 index buffer.
+/// An uploaded mesh: interleaved vertex data plus its u32 index buffer, whose
+/// triangles are grouped into the culling blocks `blocks` lists.
 struct GpuMesh {
     vertices: Buffer,
     indices: Buffer,
     index_count: u32,
+    blocks: Vec<ClipBlock>,
 }
 
 /// Everything [`prepare_terrain`] builds once the shared globals buffer and
@@ -520,8 +522,8 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
     // DrawClipmap: uErosionVisibilityCenter is the player's XZ and every
     // level shares it (SetTerrainSharedUniforms runs once per frame).
     let visibility_center = [view.player_position[0], view.player_position[2]];
-    for (level, stage) in resources.levels.iter().enumerate() {
-        let uniforms = TerrainStageUniforms::build(
+    let level_uniforms: [TerrainStageUniforms; CLIP_LEVELS] = std::array::from_fn(|level| {
+        TerrainStageUniforms::build(
             // The C++ hands MatrixIdentity() to DrawMesh for every level:
             // a level's world placement comes from uClipOrigin, not from
             // the model matrix.
@@ -530,8 +532,10 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
             view.player_position,
             view.lookup_minimum,
             visibility_center,
-        );
-        queue.write_buffer(&stage.buffer, 0, bytemuck::bytes_of(&uniforms));
+        )
+    });
+    for (stage, uniforms) in resources.levels.iter().zip(&level_uniforms) {
+        queue.write_buffer(&stage.buffer, 0, bytemuck::bytes_of(uniforms));
     }
 
     // Everything derived from the terrain (the two heightfields and the grass
@@ -749,6 +753,8 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
         // Five levels include the two new sub-metre grids and still cover
         // the complete 512 m capture. The habitat vertex entry reads the
         // underlying terrain so snow tracks do not invalidate the grass map.
+        // The capture draws every block of them: its window, not the view,
+        // is what it must cover.
         for (level, stage) in resources.levels.iter().take(5).enumerate() {
             let mesh = if level == 0 { &resources.center_mesh } else { &resources.ring_mesh };
             pass.set_bind_group(2, &stage.bind_group, &[]);
@@ -858,21 +864,31 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
     );
 
     // The C++ walks the levels in order and draws
-    // `level == 0 ? center : ring` for each of them.
+    // `level == 0 ? center : ring` for each of them. Only the blocks of a
+    // level that can reach the view are drawn: a block wholly outside it
+    // would cost its vertices' terrain evaluations for no pixel.
     if let Some(pipeline) = pipeline_cache.get_render_pipeline(resources.terrain_pipeline) {
         pass.set_render_pipeline(pipeline);
         pass.set_bind_group(0, &resources.globals, &[]);
         pass.set_bind_group(1, &resources.terrain_textures, &[]);
-        for (level, stage) in resources.levels.iter().enumerate() {
+        let planes = clip_volume_planes(&globals.globals.view, &globals.globals.projection);
+        let mut runs = Vec::new();
+        for (level, (stage, uniforms)) in resources.levels.iter().zip(&level_uniforms).enumerate() {
             let mesh = if level == 0 {
                 &resources.center_mesh
             } else {
                 &resources.ring_mesh
             };
+            visible_block_runs(&mesh.blocks, &planes, uniforms, &mut runs);
+            if runs.is_empty() {
+                continue;
+            }
             pass.set_bind_group(2, &stage.bind_group, &[]);
             pass.set_vertex_buffer(0, mesh.vertices.slice(..));
             pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..mesh.index_count, 0, 0..1);
+            for run in &runs {
+                pass.draw_indexed(run.clone(), 0, 0..1);
+            }
         }
     }
 
@@ -882,12 +898,14 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
 // Mesh construction (CreateClipGrid / GenMeshPlane)
 // ---------------------------------------------------------------------------
 
-/// Uploads one interleaved vertex buffer plus its u32 index buffer.
+/// Uploads one interleaved vertex buffer plus its u32 index buffer, whose
+/// triangles `blocks` groups.
 fn upload_mesh<V: bytemuck::Pod, I: bytemuck::Pod>(
     device: &RenderDevice,
     label: &str,
     vertices: &[V],
     indices: &[I],
+    blocks: Vec<ClipBlock>,
 ) -> GpuMesh {
     let index_count = indices.len() as u32;
     let vertex_buffer = device.create_buffer_with_data(&wgpu::util::BufferInitDescriptor {
@@ -904,6 +922,161 @@ fn upload_mesh<V: bytemuck::Pod, I: bytemuck::Pod>(
         vertices: vertex_buffer,
         indices: index_buffer,
         index_count,
+        blocks,
+    }
+}
+
+/// Quads per side of one culling block. 224 = 8 × 28, and the ring's
+/// 112-quad hole is exactly the middle 4 × 4 blocks, so the centre mesh holds
+/// 64 blocks and the ring 48.
+const CLIP_BLOCK: i32 = 28;
+/// Quads across one stripe of a block. A block is walked a stripe at a time,
+/// row by row up the stripe, so the 8 vertices a row shares with the next
+/// are among the last 16 the vertex stage shaded: any post-transform reuse
+/// window of 32 or more still holds them, and each vertex is shaded about
+/// once, where a walk along whole 224-quad rows shades each twice.
+const CLIP_STRIPE: i32 = 7;
+const _: () = assert!(
+    CLIP_CELLS as i32 % CLIP_BLOCK == 0
+        && (CLIP_CELLS / 4) as i32 % CLIP_BLOCK == 0
+        && CLIP_BLOCK % CLIP_STRIPE == 0,
+    "clip blocks must tile the mesh and the ring's hole, and stripes a block"
+);
+
+/// Everything the terrain vertex stage outputs lies within this height
+/// range, metres. The base landform lies within about [-310, 514]
+/// (`terrain_draw_bounds_contain_the_landform`); the streamed erosion moves
+/// it by about ten metres at most, the rivers' carves and levees and the
+/// building pads reshape it within the ground around them, and snow lifts it
+/// by a third of a metre, all far inside these margins.
+const TERRAIN_DRAW_FLOOR: f32 = -400.0;
+const TERRAIN_DRAW_CEILING: f32 = 600.0;
+
+/// One culling block of a clip mesh: the run of its triangles in the index
+/// buffer and the quads it covers, in the mesh's planar grid coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ClipBlock {
+    first_index: u32,
+    index_count: u32,
+    /// The block's lowest and highest grid lines in x and z.
+    quads_min: [i32; 2],
+    quads_max: [i32; 2],
+}
+
+/// The six indices of the grid quad whose lower-left corner is `(x, z)`.
+fn clip_quad_indices(x: i32, z: i32) -> [u32; 6] {
+    let half = (CLIP_CELLS / 2) as i32;
+    let vertices_per_side = CLIP_CELLS as i32 + 1;
+    let lower_left = ((z + half) * vertices_per_side + (x + half)) as u32;
+    let upper_left = lower_left + vertices_per_side as u32;
+    let lower_right = lower_left + 1;
+    let upper_right = upper_left + 1;
+    // Counter-clockwise seen from +Y, matching the
+    // glFrontFace(GL_CCW) state raylib initialises.
+    [lower_left, upper_left, upper_right, lower_left, upper_right, lower_right]
+}
+
+/// The index half of `CreateClipGrid`: the C++'s triangles with the C++'s
+/// winding, grouped into `CLIP_BLOCK`-quad blocks and walked in stripes
+/// within each block. The blocks go ring by ring out from the centre, and
+/// round each ring by angle, so the blocks a view keeps of one level are a
+/// few contiguous runs of the index buffer, drawn a run at a time.
+fn clip_mesh_indices(ring: bool) -> (Vec<u32>, Vec<ClipBlock>) {
+    let half = (CLIP_CELLS / 2) as i32;
+    let hole = (CLIP_CELLS / 4) as i32;
+    let mut order = Vec::new();
+    for z0 in (-half..half).step_by(CLIP_BLOCK as usize) {
+        for x0 in (-half..half).step_by(CLIP_BLOCK as usize) {
+            if ring && x0 >= -hole && x0 < hole && z0 >= -hole && z0 < hole {
+                continue;
+            }
+            let centre = [x0 + CLIP_BLOCK / 2, z0 + CLIP_BLOCK / 2];
+            let layer = centre[0].abs().max(centre[1].abs());
+            let angle = (centre[1] as f32).atan2(centre[0] as f32);
+            order.push((layer, angle, [x0, z0]));
+        }
+    }
+    order.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)));
+
+    let mut indices: Vec<u32> = Vec::with_capacity(CLIP_CELLS * CLIP_CELLS * 6);
+    let mut blocks = Vec::with_capacity(order.len());
+    for (_, _, [x0, z0]) in order {
+        let first_index = indices.len() as u32;
+        for stripe in (x0..x0 + CLIP_BLOCK).step_by(CLIP_STRIPE as usize) {
+            for z in z0..z0 + CLIP_BLOCK {
+                for x in stripe..stripe + CLIP_STRIPE {
+                    indices.extend_from_slice(&clip_quad_indices(x, z));
+                }
+            }
+        }
+        blocks.push(ClipBlock {
+            first_index,
+            index_count: indices.len() as u32 - first_index,
+            quads_min: [x0, z0],
+            quads_max: [x0 + CLIP_BLOCK, z0 + CLIP_BLOCK],
+        });
+    }
+    (indices, blocks)
+}
+
+/// The clip volume of `projection × view` as six world-space half-spaces,
+/// `plane · (x, y, z, 1) ≥ 0` (Gribb-Hartmann): x and y within ±w, and the
+/// reverse-Z depth between the far plane, at 0, and the near plane, at w.
+fn clip_volume_planes(view: &[f32; 16], projection: &[f32; 16]) -> [[f32; 4]; 6] {
+    let m = crate::matrices::mul_m4(projection, view);
+    let row = |r: usize| [m[r], m[4 + r], m[8 + r], m[12 + r]];
+    let (x, y, z, w) = (row(0), row(1), row(2), row(3));
+    [
+        std::array::from_fn(|i| w[i] + x[i]),
+        std::array::from_fn(|i| w[i] - x[i]),
+        std::array::from_fn(|i| w[i] + y[i]),
+        std::array::from_fn(|i| w[i] - y[i]),
+        z,
+        std::array::from_fn(|i| w[i] - z[i]),
+    ]
+}
+
+/// The index ranges of one level's blocks that can reach the view, with
+/// consecutive ranges merged into one draw. A block is left out only when
+/// its box lies wholly outside one clip plane, and the box holds everything
+/// the block draws: it spans the terrain's whole height range, and reaches
+/// past the block on every side as far as the vertex stage's geomorph can
+/// slide a vertex, half the coarser level's spacing (terrain-vs.wgsl
+/// `terrainVertex` rounds toward that lattice). The placement is `stage`'s,
+/// the uniforms the level is drawn with.
+fn visible_block_runs(
+    blocks: &[ClipBlock],
+    planes: &[[f32; 4]; 6],
+    stage: &TerrainStageUniforms,
+    runs: &mut Vec<std::ops::Range<u32>>,
+) {
+    runs.clear();
+    let [origin_x, origin_z] = stage.clip_origin;
+    let reach = stage.next_spacing * 0.5;
+    for block in blocks {
+        let low = [
+            origin_x + block.quads_min[0] as f32 * stage.spacing - reach,
+            TERRAIN_DRAW_FLOOR,
+            origin_z + block.quads_min[1] as f32 * stage.spacing - reach,
+        ];
+        let high = [
+            origin_x + block.quads_max[0] as f32 * stage.spacing + reach,
+            TERRAIN_DRAW_CEILING,
+            origin_z + block.quads_max[1] as f32 * stage.spacing + reach,
+        ];
+        let outside = planes.iter().any(|plane| {
+            // The box's corner furthest along the plane's inward normal.
+            let corner = |axis: usize| if plane[axis] >= 0.0 { high[axis] } else { low[axis] };
+            plane[0] * corner(0) + plane[1] * corner(1) + plane[2] * corner(2) + plane[3] < 0.0
+        });
+        if outside {
+            continue;
+        }
+        let range = block.first_index..block.first_index + block.index_count;
+        match runs.last_mut() {
+            Some(run) if run.end == range.start => run.end = range.end,
+            _ => runs.push(range),
+        }
     }
 }
 
@@ -920,7 +1093,6 @@ fn upload_mesh<V: bytemuck::Pod, I: bytemuck::Pod>(
 fn build_clip_mesh(device: &RenderDevice, ring: bool) -> GpuMesh {
     let vertices_per_side = CLIP_CELLS + 1;
     let half = (CLIP_CELLS / 2) as i32;
-    let hole = (CLIP_CELLS / 4) as i32;
 
     let mut vertices: Vec<f32> = Vec::with_capacity(vertices_per_side * vertices_per_side * 3);
     for z in -half..=half {
@@ -930,36 +1102,14 @@ fn build_clip_mesh(device: &RenderDevice, ring: bool) -> GpuMesh {
             vertices.push(z as f32);
         }
     }
-
-    let mut indices: Vec<u32> = Vec::with_capacity(CLIP_CELLS * CLIP_CELLS * 6);
-    for z in -half..half {
-        for x in -half..half {
-            if ring && x >= -hole && x < hole && z >= -hole && z < hole {
-                continue;
-            }
-            let lower_left = ((z + half) * vertices_per_side as i32 + (x + half)) as u32;
-            let upper_left = lower_left + vertices_per_side as u32;
-            let lower_right = lower_left + 1;
-            let upper_right = upper_left + 1;
-            // Counter-clockwise seen from +Y, matching the
-            // glFrontFace(GL_CCW) state raylib initialises.
-            indices.extend_from_slice(&[
-                lower_left,
-                upper_left,
-                upper_right,
-                lower_left,
-                upper_right,
-                lower_right,
-            ]);
-        }
-    }
+    let (indices, blocks) = clip_mesh_indices(ring);
 
     let label = if ring {
         "forest_clip_ring"
     } else {
         "forest_clip_center"
     };
-    upload_mesh(device, label, &vertices, &indices)
+    upload_mesh(device, label, &vertices, &indices, blocks)
 }
 
 // ---------------------------------------------------------------------------
@@ -2442,5 +2592,337 @@ mod heightfield_cache_tests {
             ]),
             "the heightfield capture reads a stage field HeightfieldKey does not know about"
         );
+    }
+}
+
+#[cfg(test)]
+mod clip_block_tests {
+    use super::*;
+    use crate::player::{Player, PlayerCamera};
+
+    const VERTICES_PER_SIDE: usize = CLIP_CELLS + 1;
+
+    /// The C++'s walk, which the blocks reorder: every quad of the grid, row
+    /// by row, less the ring's hole.
+    fn row_major_indices(ring: bool) -> Vec<u32> {
+        let vertices_per_side = VERTICES_PER_SIDE;
+        let half = (CLIP_CELLS / 2) as i32;
+        let hole = (CLIP_CELLS / 4) as i32;
+        let mut indices: Vec<u32> = Vec::with_capacity(CLIP_CELLS * CLIP_CELLS * 6);
+        for z in -half..half {
+            for x in -half..half {
+                if ring && x >= -hole && x < hole && z >= -hole && z < hole {
+                    continue;
+                }
+                let lower_left = ((z + half) * vertices_per_side as i32 + (x + half)) as u32;
+                let upper_left = lower_left + vertices_per_side as u32;
+                let lower_right = lower_left + 1;
+                let upper_right = upper_left + 1;
+                indices.extend_from_slice(&[
+                    lower_left,
+                    upper_left,
+                    upper_right,
+                    lower_left,
+                    upper_right,
+                    lower_right,
+                ]);
+            }
+        }
+        indices
+    }
+
+    fn triangles(indices: &[u32]) -> Vec<[u32; 3]> {
+        let mut triangles: Vec<[u32; 3]> =
+            indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+        triangles.sort_unstable();
+        triangles
+    }
+
+    #[test]
+    fn clip_blocks_hold_every_triangle_once() {
+        let half = (CLIP_CELLS / 2) as i32;
+        for (ring, block_count) in [(false, 64), (true, 48)] {
+            let (indices, blocks) = clip_mesh_indices(ring);
+            // The same triangles, each wound as before, none twice.
+            assert_eq!(triangles(&indices), triangles(&row_major_indices(ring)), "ring {ring}");
+            assert_eq!(blocks.len(), block_count);
+            // The blocks share the index buffer out between them in order...
+            let mut next = 0;
+            for block in &blocks {
+                assert_eq!(block.first_index, next);
+                assert_eq!(block.index_count, (CLIP_BLOCK * CLIP_BLOCK * 6) as u32);
+                next += block.index_count;
+                // ...and each draws only vertices on its own quads, so a
+                // block's box holds its triangles.
+                let range = block.first_index as usize..next as usize;
+                for &index in &indices[range] {
+                    let x = (index as usize % VERTICES_PER_SIDE) as i32 - half;
+                    let z = (index as usize / VERTICES_PER_SIDE) as i32 - half;
+                    assert!((block.quads_min[0]..=block.quads_max[0]).contains(&x), "{block:?}");
+                    assert!((block.quads_min[1]..=block.quads_max[1]).contains(&z), "{block:?}");
+                }
+            }
+            assert_eq!(next as usize, indices.len());
+        }
+    }
+
+    /// Vertex-stage invocations per vertex drawn, for a post-transform cache
+    /// that is a FIFO of `size` vertices.
+    fn fifo_invocations(indices: &[u32], size: usize) -> f64 {
+        let mut held = vec![false; VERTICES_PER_SIDE * VERTICES_PER_SIDE];
+        let mut drawn = held.clone();
+        let mut fifo = std::collections::VecDeque::with_capacity(size + 1);
+        let mut shaded = 0usize;
+        for &index in indices {
+            drawn[index as usize] = true;
+            if held[index as usize] {
+                continue;
+            }
+            shaded += 1;
+            held[index as usize] = true;
+            fifo.push_back(index);
+            if fifo.len() > size {
+                held[fifo.pop_front().unwrap() as usize] = false;
+            }
+        }
+        shaded as f64 / drawn.iter().filter(|&&drawn| drawn).count() as f64
+    }
+
+    /// The same for hardware that shades the vertices of a batch of
+    /// triangles together, `size` distinct vertices at most to a batch, and
+    /// reuses a vertex only inside its batch.
+    fn batch_invocations(indices: &[u32], size: usize) -> f64 {
+        let mut batch: Vec<u32> = Vec::with_capacity(size);
+        let mut drawn = vec![false; VERTICES_PER_SIDE * VERTICES_PER_SIDE];
+        let mut shaded = 0usize;
+        // Each grid triangle has three distinct vertices.
+        for triangle in indices.chunks_exact(3) {
+            let mut new: Vec<u32> = triangle.iter().copied().filter(|v| !batch.contains(v)).collect();
+            if batch.len() + new.len() > size {
+                shaded += batch.len();
+                batch.clear();
+                new = triangle.to_vec();
+            }
+            batch.extend(new);
+            for &index in triangle {
+                drawn[index as usize] = true;
+            }
+        }
+        (shaded + batch.len()) as f64 / drawn.iter().filter(|&&drawn| drawn).count() as f64
+    }
+
+    #[test]
+    fn clip_block_order_reuses_vertices() {
+        for ring in [false, true] {
+            let (blocks, _) = clip_mesh_indices(ring);
+            let rows = row_major_indices(ring);
+            let (fifo, batch) = (fifo_invocations(&blocks, 32), batch_invocations(&blocks, 64));
+            let (fifo_rows, batch_rows) = (fifo_invocations(&rows, 32), batch_invocations(&rows, 64));
+            println!(
+                "ring {ring}: FIFO-32 {fifo_rows:.2} -> {fifo:.2}, batch-64 {batch_rows:.2} -> {batch:.2} \
+                 invocations per vertex"
+            );
+            // A walk along whole rows shades every vertex about twice; the
+            // stripes shade it about once.
+            assert!(fifo_rows > 1.9 && batch_rows > 1.9);
+            assert!(fifo <= 1.20, "FIFO-32 {fifo}");
+            assert!(batch <= 1.35, "batch-64 {batch}");
+        }
+    }
+
+    /// One seeded camera pose: a player within half a clipmap cell of a
+    /// random point of its 64 m lattice, at a height, heading and pitch.
+    struct Pose {
+        player: Player,
+        aspect: f32,
+    }
+
+    fn poses(count: usize) -> Vec<Pose> {
+        // SplitMix64, so the poses are the same on every run.
+        let mut state = 0x5eed_c11b_b10c_u64;
+        let mut unit = move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32
+        };
+        (0..count)
+            .map(|_| {
+                let lattice = [
+                    ((unit() - 0.5) * 240.0).round() * CLIP_ANCHOR_SPACING,
+                    ((unit() - 0.5) * 240.0).round() * CLIP_ANCHOR_SPACING,
+                ];
+                let player = Player {
+                    position: Vec3::new(
+                        lattice[0] + (unit() - 0.5) * CLIP_ANCHOR_SPACING,
+                        2.0 + unit() * 498.0,
+                        lattice[1] + (unit() - 0.5) * CLIP_ANCHOR_SPACING,
+                    ),
+                    yaw: unit() * std::f32::consts::TAU,
+                    pitch: (-89.0 + unit() * 119.0f32).to_radians(),
+                    ..Player::default()
+                };
+                Pose { player, aspect: 1.0 + unit() * 1.4 }
+            })
+            .collect()
+    }
+
+    /// The view and projection `prepare_forest_globals` builds for a pose.
+    fn camera_matrices(pose: &Pose) -> ([f32; 16], [f32; 16]) {
+        let camera = PlayerCamera::from_player(&pose.player);
+        let view = crate::matrices::view_matrix(camera.position, camera.target, camera.up);
+        let projection = crate::matrices::perspective(68.0, pose.aspect, NEAR_PLANE, FAR_PLANE);
+        (view, projection)
+    }
+
+    fn level_stages(pose: &Pose) -> [TerrainStageUniforms; CLIP_LEVELS] {
+        let position = pose.player.position.to_array();
+        std::array::from_fn(|level| {
+            TerrainStageUniforms::build(
+                Mat4::IDENTITY.to_cols_array(),
+                level as u32,
+                position,
+                (0, 0),
+                [position[0], position[2]],
+            )
+        })
+    }
+
+    fn transform(m: &[f32; 16], p: [f32; 4]) -> [f32; 4] {
+        std::array::from_fn(|row| (0..4).map(|k| m[k * 4 + row] * p[k]).sum())
+    }
+
+    /// Where `terrainVertex` places the grid vertex `(x, z)` of a level, in
+    /// world XZ: the fine lattice, geomorphed toward the coarser one.
+    fn placed_vertex(stage: &TerrainStageUniforms, x: i32, z: i32) -> [f32; 2] {
+        let local = [x as f32 * stage.spacing, z as f32 * stage.spacing];
+        let fine = [stage.clip_origin[0] + local[0], stage.clip_origin[1] + local[1]];
+        let ring_distance = local[0].abs().max(local[1].abs());
+        let t = ((ring_distance - stage.morph_start) / (stage.morph_end - stage.morph_start).max(0.0001))
+            .clamp(0.0, 1.0);
+        let morph = t * t * (3.0 - 2.0 * t);
+        let next = stage.next_spacing.max(0.0001);
+        let coarse = fine.map(|v| (v / next + 0.5).floor() * next);
+        [
+            fine[0] * (1.0 - morph) + coarse[0] * morph,
+            fine[1] * (1.0 - morph) + coarse[1] * morph,
+        ]
+    }
+
+    #[test]
+    fn culled_blocks_hold_nothing_the_camera_sees() {
+        let meshes = [clip_mesh_indices(false).1, clip_mesh_indices(true).1];
+        let (mut kept, mut total) = (0usize, 0usize);
+        let mut runs = Vec::new();
+        for (number, pose) in poses(500).iter().enumerate() {
+            let (view, projection) = camera_matrices(pose);
+            let planes = clip_volume_planes(&view, &projection);
+            for (level, stage) in level_stages(pose).iter().enumerate() {
+                let blocks = &meshes[usize::from(level > 0)];
+                visible_block_runs(blocks, &planes, stage, &mut runs);
+                for block in blocks {
+                    total += 1;
+                    let start = block.first_index;
+                    if runs.iter().any(|run| run.contains(&start)) {
+                        kept += 1;
+                        continue;
+                    }
+                    // Every vertex of a culled block lies in the box of its
+                    // vertices as the vertex stage places them, between the
+                    // lowest and the highest the terrain reaches. Taken
+                    // through the camera as the GPU takes it, each corner of
+                    // that box lies outside one and the same clip plane;
+                    // the plane is flat in world space, so the whole box,
+                    // and every triangle the block draws, does too.
+                    let (mut low, mut high) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+                    for z in block.quads_min[1]..=block.quads_max[1] {
+                        for x in block.quads_min[0]..=block.quads_max[0] {
+                            let placed = placed_vertex(stage, x, z);
+                            for axis in 0..2 {
+                                low[axis] = low[axis].min(placed[axis]);
+                                high[axis] = high[axis].max(placed[axis]);
+                            }
+                        }
+                    }
+                    let mut outside = [true; 6];
+                    for corner in 0..8 {
+                        let world_x = if corner & 1 == 0 { low[0] } else { high[0] };
+                        let world_z = if corner & 2 == 0 { low[1] } else { high[1] };
+                        let height = if corner & 4 == 0 { TERRAIN_DRAW_FLOOR } else { TERRAIN_DRAW_CEILING };
+                        let eye = transform(&view, [world_x, height, world_z, 1.0]);
+                        let [cx, cy, cz, cw] = transform(&projection, eye);
+                        let inside = [cw + cx, cw - cx, cw + cy, cw - cy, cz, cw - cz];
+                        for (outside, inside) in outside.iter_mut().zip(inside) {
+                            *outside &= inside < 0.0;
+                        }
+                    }
+                    assert!(
+                        outside.contains(&true),
+                        "pose {number} level {level}: culled block {block:?} reaches the view"
+                    );
+                }
+            }
+        }
+        let share = kept as f64 / total as f64;
+        println!("{share:.3} of the blocks drawn over 500 poses");
+        // The culling does cull: well under all of the blocks are drawn.
+        assert!(share < 0.75, "{share}");
+    }
+
+    #[test]
+    fn views_draw_few_runs() {
+        let meshes = [clip_mesh_indices(false).1, clip_mesh_indices(true).1];
+        let (mut draws, mut levels, mut most) = (0usize, 0usize, 0usize);
+        let mut runs = Vec::new();
+        let level_gazes = poses(500).into_iter().filter(|pose| pose.player.pitch.abs() <= 45f32.to_radians());
+        for pose in level_gazes {
+            let (view, projection) = camera_matrices(&pose);
+            let planes = clip_volume_planes(&view, &projection);
+            for (level, stage) in level_stages(&pose).iter().enumerate() {
+                visible_block_runs(&meshes[usize::from(level > 0)], &planes, stage, &mut runs);
+                draws += runs.len();
+                levels += 1;
+                most = most.max(runs.len());
+            }
+        }
+        let mean = draws as f64 / levels as f64;
+        println!("{mean:.2} draws per level on average, {most} at most");
+        // A view keeps a sector of each ring of blocks, one run per ring
+        // (two where the sector crosses where the rings' order starts).
+        assert!(mean <= 3.0, "{mean}");
+        assert!(most <= 8, "{most}");
+    }
+
+    #[test]
+    fn terrain_draw_bounds_contain_the_landform() {
+        use crate::noise::{base_height, push_from_waterline, shape_elevation};
+        // The macro landform before its vertical scale spans -5 m less the
+        // continental (32 m) and plains (6 m) amplitudes, up to -5 m plus
+        // those and the tallest mountains (20 + 68 m); the fine octaves add
+        // or take at most 1.4 + 2.8 + 0.55 + 0.55 m (noise.rs base_height).
+        let macro_lowest = SEA_LEVEL - 5.0 - 32.0 - 6.0;
+        let macro_highest = SEA_LEVEL - 5.0 + 32.0 + 6.0 + 20.0 + 68.0;
+        let fine = (1.4 + 2.8 + 0.55 + 0.55) * LANDFORM_VERTICAL_SCALE;
+        let profile = |macro_height: f32| shape_elevation((macro_height - SEA_LEVEL) * LANDFORM_VERTICAL_SCALE);
+        let lowest = push_from_waterline(SEA_LEVEL + profile(macro_lowest) - fine);
+        let highest = push_from_waterline(SEA_LEVEL + profile(macro_highest) + fine);
+        println!("the landform lies within [{lowest:.1}, {highest:.1}] m");
+        // With fifty metres to spare for the erosion, the carves, the pads
+        // and the snow.
+        assert!(lowest >= TERRAIN_DRAW_FLOOR + 50.0, "{lowest}");
+        assert!(highest <= TERRAIN_DRAW_CEILING - 50.0, "{highest}");
+
+        let noise = crate::noise::NoiseField::new();
+        let (mut low, mut high) = (f32::INFINITY, f32::NEG_INFINITY);
+        for z in (-8192..=8192).step_by(64) {
+            for x in (-8192..=8192).step_by(64) {
+                let height = base_height(&noise, x as f32, z as f32);
+                low = low.min(height);
+                high = high.max(height);
+            }
+        }
+        println!("16 km at 64 m: [{low:.1}, {high:.1}] m");
+        assert!(low >= lowest && high <= highest, "[{low}, {high}]");
     }
 }
