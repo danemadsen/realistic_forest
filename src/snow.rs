@@ -524,49 +524,6 @@ mod tests {
         ));
     }
 
-    /// The terrain's snowbeds (terrain-fs.wgsl) are the pack NIVAL_REACH
-    /// metres further down the thaw: they hug the pack's margin, reach about
-    /// that far below it on level ground, and are nothing where no pack lay.
-    #[test]
-    fn snowbeds_follow_the_pack_and_never_reach_below_it() {
-        const NIVAL_REACH: f32 = 8.0;
-        let shader = include_str!("../assets/shaders/terrain-fs.wgsl");
-        assert!(shader.contains(&format!("const NIVAL_REACH: f32 = {NIVAL_REACH:?};")));
-        assert!(shader.contains("if (height - stage.sea_level + NIVAL_REACH >= snowFloor())"));
-        assert!(shader.contains(
-            "snowbed = smoothHermite(0.2, 0.7, snowCoverage(height + NIVAL_REACH, materialNormal,"
-        ));
-        let earlier = |height: f32, gradient: Vec2, concavity: f32| {
-            smooth_hermite(0.2, 0.7, snow_coverage(height + NIVAL_REACH, gradient, concavity))
-        };
-        for direction in azimuths(12) {
-            for steepness in [0.0, 0.3, 0.7, 1.2] {
-                for concavity in [-6.0, 0.0, 6.0] {
-                    let gradient = direction * steepness;
-                    // Below the guard there is no earlier pack at all.
-                    assert_eq!(earlier(SNOW_FLOOR - NIVAL_REACH - 0.01, gradient, concavity), 0.0);
-                    for height in [95.0, 105.0, 115.0, 125.0] {
-                        let now = smooth_hermite(0.2, 0.7, snow_coverage(height, gradient, concavity));
-                        assert!(earlier(height, gradient, concavity) >= now);
-                    }
-                }
-            }
-        }
-        // On level ground, the strip the earlier pack half covered and the
-        // pack now does not spans the reach in height.
-        let (mut first, mut last) = (f32::MAX, f32::MIN);
-        let mut height = 80.0;
-        while height < 140.0 {
-            let before = snow_coverage(height + NIVAL_REACH, Vec2::ZERO, 0.0);
-            if before >= 0.5 && snow_coverage(height, Vec2::ZERO, 0.0) < 0.5 {
-                first = first.min(height);
-                last = last.max(height);
-            }
-            height += 0.01;
-        }
-        assert!((last - first - NIVAL_REACH).abs() < 0.05, "{first}..{last}");
-    }
-
     /// The shader's snowCoverage, run on a GPU (or a software adapter), must
     /// give the player's footing the pack it draws.
     #[test]

@@ -236,10 +236,6 @@ fn snowCoverage(height: f32, normal: vec3<f32>, concavity: f32) -> f32
 }
 // END SHARED SNOW COVERAGE
 
-// Metres of snowline: how much lower the pack lay in the last weeks of the
-// thaw, which sets the reach of the snowbeds beside it (shadeTerrain).
-const NIVAL_REACH: f32 = 8.0;
-
 // Mirror-tile a coordinate pair so a non-periodic field can be re-tiled by
 // reflection: C0-continuous across every wrap (period 2 in p units), unlike a
 // plain fract() which steps at each tile border.
@@ -1840,27 +1836,9 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let channelSoil = channel * (1.0 - transport) * soilRetention;
     var disturbedSoil = 1.0 - (1.0 - scouredSoil) * (1.0 - freshFan) * (1.0 - channelSoil);
     disturbedSoil += (soilEdge - 0.5) * 0.6 * disturbedSoil * (1.0 - disturbedSoil);
-    // Snowbeds: the ground the pack left last. Gaea's snowfall stops while its
-    // thaw keeps melting (nerthus cs/engine.rs), so the pack a few weeks
-    // earlier is this one with NIVAL_REACH metres less melt. The ground it
-    // has since left was soaked by meltwater and thawed late, too late in the
-    // season for closed turf: it carries moss and patches of wet bare soil,
-    // most in hollows. It follows the pack's own margin, its hollow tongues
-    // and lee plasters included, and never touches the pack: fSnow, the lift
-    // and the footing are unchanged. Below the floor the earlier pack is
-    // exactly zero whatever the slope, aspect or relief.
-    var snowbed = 0.0;
-    if (height - stage.sea_level + NIVAL_REACH >= snowFloor())
-    {
-        snowbed = smoothHermite(0.2, 0.7, snowCoverage(height + NIVAL_REACH, materialNormal,
-                                                       input.frag_concavity.x))
-                * mix(0.65, 1.0, hollow);
-    }
-    let snowbedSoil = snowbed * smoothHermite(0.35, 0.65, soilSmall * 0.6 + soilEdge * 0.4);
     let grassSoilBlend = clamp(1.0 - (1.0 - backgroundSoil) * (1.0 - disturbedSoil)
                                    * (1.0 - thinSoil * 0.55) * (1.0 - alpine * 0.30)
-                                   * (1.0 - rockFringe * 0.90)
-                                   * (1.0 - snowbedSoil * 0.55), 0.0, 1.0);
+                                   * (1.0 - rockFringe * 0.90), 0.0, 1.0);
     // Coverage follows the same climate, slope, wind and relief field as the
     // raised snow geometry, over the same interpolated relief, so the white
     // lies exactly on the lifted pack. The relief only deepens or thins the
@@ -1992,13 +1970,10 @@ fn shadeTerrain(input: FsInput, habitat: bool,
                          + fringeApproach * 0.28
                          // The turf just beyond a river's or lake's bare
                          // margin grows lush and dark green on the moist soil.
-                         - shoreZone * (1.0 - shoreBare) * 0.40
-                         // A snowbed stays wet all summer.
-                         - snowbed * 0.30,
+                         - shoreZone * (1.0 - shoreBare) * 0.40,
                          0.0, 1.0);
-    // Moss carpets in a snowbed are darker than the turf around them.
     let grassTint = mix(vec3<f32>(0.31, 0.39, 0.27), vec3<f32>(0.48, 0.40, 0.28), grassDryness)
-                  * mix(0.94, 1.06, groundGrowth) * mix(1.0, 0.86, snowbed);
+                  * mix(0.94, 1.06, groundGrowth);
     // Neutralise the powder scan's blue cast while leaving headroom for its
     // grain and wind relief in sunlight. Shadow colour comes from sky lighting.
     let snowTint = vec3<f32>(1.03, 1.02, 1.00);
@@ -2934,11 +2909,9 @@ fn shadeTerrain(input: FsInput, habitat: bool,
         // Saturated coastal sediment has the same finish on both sides of a
         // mouth. Otherwise the river lookup alone darkens an offshore strip.
         let marine_saturation = under_sea*(gSand + gGravel + gRock)*0.72;
-        // Meltwater keeps a snowbed's soil and stone wet below the pack.
-        let meltWet = snowbed * 0.40 * (1.0 - 0.6 * gGrass);
         let moisture = clamp(max(waterAmount * 0.52 + channel * 0.25 + shoreWet * 0.65
                                  + lapped * 0.72 + dampShore * 0.32
-                                 + pointBar * 0.5 + stoneBank * 0.5 + meltWet, marine_saturation), 0.0, 0.72)
+                                 + pointBar * 0.5 + stoneBank * 0.5, marine_saturation), 0.0, 0.72)
                      * (1.0 - gSnow);
         let damp = albedo * vec3<f32>(0.55, 0.57, 0.56);
         albedo = mix(albedo, damp, moisture);
