@@ -233,9 +233,9 @@ terrain pass skips every block whose box lies wholly outside the view. The box
 spans the terrain's whole height range, −400 to 600 metres against a landform
 that stays within −310 and 514, and reaches past the block as far as the
 geomorph can move a vertex, so only off-screen triangles are dropped and the
-image is unchanged. Over 500 seeded views 57% of the blocks are drawn, in 2.3
-draws per level on average. The grass habitat capture still draws its five
-levels whole.
+image is unchanged. Over 500 seeded views 57% of the blocks are drawn, and a
+view pitched no more than 45 degrees takes 2.3 draws per level on average and
+5 at most. The grass habitat capture still draws its five levels whole.
 
 Terrain uses triplanar PBR textures with a muted, earthy palette, placed from
 the erosion simulation's own record of the ground. The simulation tracks the
@@ -834,14 +834,18 @@ tent and stored as R32, so opposing pass weights form a smooth partition
 without 8-bit bands. The four fixed geometric weights are normalized together,
 while each pass fades in independently; a pass that is not ready contributes
 procedural base terrain rather than amplifying the others. The initial four-pass
-quartet is prewarmed at spawn. Beyond 1100 metres from the player, one shared C1
+quartet is prewarmed at spawn. Beyond 1100 metres from the fade's centre (the
+player, as below), one shared C1
 radial visibility field fades height and flow and material evidence back to the
 procedural base terrain, reaching zero by 1600 metres — safely before the
 nearest exact-four support edge of the 9×9 pass cache. The fade is centred on
 the player's position snapped to an eight-metre lattice, at most 5.7 metres
 from the player; that changes the faded erosion by at most 1.7% of its
 height change, 0.19 metres of the largest at 11 metres, and leaves everything
-within 1094 metres at full strength. CPU collision, the plant roots and both terrain
+within 1094 metres at full strength. Crossing a lattice line moves the centre
+eight metres at once, which steps the 1.1-1.6 km band by at most 2.4% of its
+change (0.26 metres of the largest), in height and in the material evidence
+the fade carries, in that one frame. CPU collision, the plant roots and both terrain
 shaders use the same lattice, weights, centre, and radii. Past the zero
 radius the fade is exactly zero, so no consumer samples a tile there at all:
 the clipmap, the lighting heightfield, the plants' roots, the material shader

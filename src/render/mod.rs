@@ -899,6 +899,30 @@ mod tests {
         }
     }
 
+    /// Every draw that fades the erosion centres the fade on the player's
+    /// eight-metre lattice point, as the CPU's footing does: a stage built
+    /// round the raw player position would shift the 1.1-1.6 km band against
+    /// the collision and make the lighting map's key stale.
+    #[test]
+    fn every_terrain_stage_fades_round_the_anchor() {
+        for (name, source) in [
+            ("terrain_node.rs", include_str!("terrain_node.rs")),
+            ("vegetation_node.rs", include_str!("vegetation_node.rs")),
+        ] {
+            let code = source.split("#[cfg(test)]").next().unwrap();
+            let mut calls = 0;
+            for (at, _) in code.match_indices("TerrainStageUniforms::build(") {
+                calls += 1;
+                let window = &code[at.saturating_sub(600)..(at + 600).min(code.len())];
+                assert!(
+                    window.contains("erosion_fade_anchor("),
+                    "{name}: a terrain stage near byte {at} is built without the fade anchor"
+                );
+            }
+            assert!(calls > 0, "{name} builds no terrain stage any more; update this test");
+        }
+    }
+
     #[test]
     fn erosion_and_materials_share_one_geology() {
         let common = include_str!("../../assets/shaders/geology-functions.wgslinc").trim();
