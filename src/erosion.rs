@@ -1768,6 +1768,244 @@ mod tests {
         assert!(river_cells > 0, "the tiles cross the rivers, so the carving is compared too");
     }
 
+    /// One cell of the thermal pass's input: bed height (terrain R), loose
+    /// cover (terrain A), and the contributing area and bedrock resistance
+    /// the terrain pass left in drainage R and B.
+    #[derive(Clone, Copy)]
+    struct ThermalCell {
+        bed: f32,
+        loose: f32,
+        area: f32,
+        resistance: f32,
+    }
+
+    /// `weathering` in erosion-thermal.wgsl, line by line.
+    fn weathering_reference(loose: f32, resistance: f32, area: f32, steepest_rock: f32, rate: f32) -> f32 {
+        let weatherability = 1.0 - smoothstep(0.25, 0.75, resistance);
+        let shedding = smoothstep(EROSION_LOOSE_REPOSE - 0.05, EROSION_LOOSE_REPOSE + 0.20, steepest_rock);
+        let cover_scale = lerp(EROSION_WEATHERING_COVER, EROSION_WEATHERING_COVER_STEEP, shedding);
+        let shielding = (-loose / cover_scale.max(0.001)).exp();
+        let exposed = smoothstep(EROSION_WEATHERING_SLOPE, EROSION_LOOSE_REPOSE, steepest_rock);
+        let hillslope = 1.0 - smoothstep(12.0, 60.0, area);
+        rate.max(0.0) * weatherability * shielding * exposed * hillslope
+    }
+
+    /// One step of erosion-thermal.wgsl's `fs_main` over a `width` x `depth`
+    /// grid of land, line by line: the pairwise talus and rockfall exchange,
+    /// then weathering at `rate`, every cell reading only the step's input.
+    /// `wrap_z` joins the grid's z edges, so a strip stands for an endless
+    /// escarpment; the shader's edges are closed walls.
+    fn thermal_reference_step(cells: &[ThermalCell], width: usize, depth: usize,
+                              wrap_z: bool, rate: f32) -> Vec<ThermalCell> {
+        let settings = ErosionSettings::default();
+        let loose_rate = settings.talus_rate.clamp(0.0, 0.0625);
+        let rock_rate = settings.rockfall_rate.clamp(0.0, 0.0625);
+        let rock_limit = |resistance: f32| {
+            lerp(EROSION_SOFT_ROCK_SLOPE, EROSION_HARD_ROCK_SLOPE, resistance.clamp(0.0, 1.0))
+        };
+        let mut next = cells.to_vec();
+        for z in 0..depth {
+            for x in 0..width {
+                let center = cells[z * width + x];
+                let center_loose = center.loose.max(0.0);
+                let center_rock_limit = rock_limit(center.resistance);
+                let center_rock = center.bed - center_loose;
+                let mut height_change = 0.0f32;
+                let mut loose_change = 0.0f32;
+                let mut steepest_rock = 0.0f32;
+                for (dx, dz) in NEIGHBOURS {
+                    let nx = x as i64 + dx;
+                    let mut nz = z as i64 + dz;
+                    if wrap_z {
+                        nz = nz.rem_euclid(depth as i64);
+                    }
+                    if nx < 0 || nz < 0 || nx >= width as i64 || nz >= depth as i64 {
+                        continue;
+                    }
+                    let neighbour = cells[nz as usize * width + nx as usize];
+                    // SQRT_2 is the very f32 the shader's 1.41421356 rounds to.
+                    let diagonal = dx != 0 && dz != 0;
+                    let distance = EROSION_CELL_SIZE * if diagonal { std::f32::consts::SQRT_2 } else { 1.0 };
+                    steepest_rock = steepest_rock
+                        .max((center_rock - (neighbour.bed - neighbour.loose.max(0.0))) / distance);
+                    let drop = center.bed - neighbour.bed;
+                    let fall = drop.abs();
+                    if fall <= EROSION_LOOSE_REPOSE * distance {
+                        continue;
+                    }
+                    let center_is_source = drop > 0.0;
+                    let source_loose = if center_is_source { center_loose } else { neighbour.loose.max(0.0) };
+                    let source_rock_limit =
+                        if center_is_source { center_rock_limit } else { rock_limit(neighbour.resistance) };
+                    let loose_moved = (loose_rate * (fall - EROSION_LOOSE_REPOSE * distance))
+                        .min(source_loose * 0.125);
+                    let rock_moved = rock_rate * (fall - source_rock_limit * distance).max(0.0);
+                    let moved = loose_moved.max(rock_moved);
+                    if center_is_source {
+                        height_change -= moved;
+                        loose_change -= loose_moved;
+                    } else {
+                        height_change += moved;
+                        loose_change += moved;
+                    }
+                }
+                let produced = weathering_reference(center_loose, center.resistance.clamp(0.0, 1.0),
+                                                    center.area, steepest_rock, rate);
+                next[z * width + x] = ThermalCell {
+                    bed: center.bed + height_change,
+                    loose: (center_loose + loose_change).max(0.0) + produced,
+                    ..center
+                };
+            }
+        }
+        next
+    }
+
+    /// The shared geology's resistance with both rock bodies at their mean
+    /// (0.5), so only the bedding varies: resistant beds every 19 m of
+    /// bedrock elevation, dipping along x as the shared block dips them.
+    fn bedding_resistance(bedrock: f32, x: f32) -> f32 {
+        let bed_coordinate = (bedrock + x * 0.017) / 19.0;
+        let bedding = smoothstep(0.35, 0.85, 0.5 + 0.5 * (bed_coordinate * std::f32::consts::TAU).sin());
+        smoothstep(0.25, 0.82, 0.5 * 0.62 + 0.5 * 0.24 + bedding * 0.14)
+    }
+
+    /// Weathering only turns bedrock into cover where it stands, after the
+    /// exchange, so the thermal pass still moves bed material without
+    /// creating or losing any: the summed bed is unchanged while the cover
+    /// grows by what weathering produced.
+    #[test]
+    fn thermal_reference_conserves_bed_material_with_weathering() {
+        let (width, depth) = (48, 40);
+        let ground = rough_ground(width.max(depth));
+        let mut cells: Vec<ThermalCell> = (0..width * depth)
+            .map(|cell| {
+                let (x, z) = (cell % width, cell / width);
+                // Steep, rough relief: 3x the rough ground's relief, cells 4 m
+                // apart, standing well above zero so the bed's sum is too.
+                let bed = 200.0 + ground[z * width.max(depth) + x] * 3.0;
+                ThermalCell {
+                    bed,
+                    loose: ((x * 7 + z * 3) % 5) as f32 * 0.08,
+                    area: ((x * 13 + z * 5) % 90) as f32,
+                    resistance: ((x * 11 + z * 17) % 10) as f32 * 0.1,
+                }
+            })
+            .collect();
+        let bed_total = |cells: &[ThermalCell]| cells.iter().map(|cell| cell.bed as f64).sum::<f64>();
+        let loose_total = |cells: &[ThermalCell]| cells.iter().map(|cell| cell.loose as f64).sum::<f64>();
+        let (bed_before, loose_before) = (bed_total(&cells), loose_total(&cells));
+        let mut moved = 0.0f64;
+        for _ in 0..60 {
+            let next = thermal_reference_step(&cells, width, depth, false, 0.015);
+            moved += cells.iter().zip(&next).map(|(a, b)| (a.bed - b.bed).abs() as f64).sum::<f64>();
+            cells = next;
+        }
+        let drift = (bed_total(&cells) - bed_before).abs() / bed_before;
+        assert!(drift <= 1e-6, "the bed drifted by {drift:e} of its total");
+        assert!(moved > 10.0, "the relief sheds material ({moved} m moved)");
+        assert!(loose_total(&cells) > loose_before, "weathering adds cover");
+    }
+
+    /// Weathering stops under a thick enough cover, and never acts in
+    /// channels (from 60 cells of catchment), on the most resistant rock, or
+    /// on slopes gentler than the weathering slope; at rate 0 it is nothing.
+    #[test]
+    fn weathering_is_shielded_by_cover_and_absent_in_channels_and_hard_rock() {
+        let rate = 0.015;
+        for slope in [0.5, 0.67, 0.9, 1.2, 1.8] {
+            let mut previous = f32::INFINITY;
+            for step in 0..=40 {
+                let produced = weathering_reference(step as f32 * 0.025, 0.2, 1.0, slope, rate);
+                assert!(produced <= previous, "more cover weathers faster at slope {slope}");
+                previous = produced;
+            }
+            assert!(previous < rate * 0.04, "a metre of cover shields slope {slope}: {previous}");
+            assert!(weathering_reference(0.0, 0.2, 1.0, slope, rate) > 0.0, "bare weak rock at {slope}");
+            assert_eq!(weathering_reference(0.0, 0.75, 1.0, slope, rate), 0.0, "resistant rock");
+            assert_eq!(weathering_reference(0.0, 0.2, 60.0, slope, rate), 0.0, "a channel");
+            assert_eq!(weathering_reference(0.0, 0.2, 1.0, slope, 0.0), 0.0, "rate 0");
+        }
+        for slope in [0.0, 0.2, EROSION_WEATHERING_SLOPE] {
+            assert_eq!(weathering_reference(0.0, 0.0, 1.0, slope, rate), 0.0, "gentle slope {slope}");
+        }
+        // Steep faces shed their debris, so a thinner skin shields them.
+        let gentle = weathering_reference(0.1, 0.2, 1.0, 0.6, rate) / weathering_reference(0.0, 0.2, 1.0, 0.6, rate);
+        let steep = weathering_reference(0.1, 0.2, 1.0, 1.2, rate) / weathering_reference(0.0, 0.2, 1.0, 1.2, rate);
+        assert!(steep < gentle * 0.5, "10 cm shields a face more than a slope: {steep} vs {gentle}");
+    }
+
+    /// An escarpment 60 m high at tan 1.2 (50 degrees) in weak rock, between a
+    /// gentle footslope and a plateau, never reaches its rockfall limit, so
+    /// without weathering it barely changes in 140 steps. Weathering lowers
+    /// its bedrock by decimetres, keeps the face nearly bare while the debris
+    /// sheds, and builds a talus apron of metres at its foot.
+    #[test]
+    fn weathered_escarpments_retreat_and_build_aprons() {
+        let (width, depth) = (120, 8);
+        let face_tan = 1.2f32;
+        let height_at = |x: f32| {
+            if x < 120.0 {
+                0.1 * x
+            } else if x <= 120.0 + 60.0 / face_tan {
+                12.0 + face_tan * (x - 120.0)
+            } else {
+                72.0 + 0.05 * (x - 120.0 - 60.0 / face_tan)
+            }
+        };
+        let centre = |x: usize| (x as f32 + 0.5) * EROSION_CELL_SIZE;
+        let run = |rate: f32| {
+            // The initial cover as erosion-init stamps it, at the mean soil patch.
+            let heights: Vec<f32> = (0..width).map(|x| height_at(centre(x))).collect();
+            let row: Vec<ThermalCell> = (0..width)
+                .map(|x| {
+                    let (left, right) = (x.saturating_sub(1), (x + 1).min(width - 1));
+                    let steepness = (heights[right] - heights[left]).abs()
+                        / ((right - left) as f32 * EROSION_CELL_SIZE);
+                    let resistance = bedding_resistance(heights[x], centre(x));
+                    ThermalCell {
+                        bed: heights[x],
+                        loose: 1.35 * (1.0 - smoothstep(0.42, 0.78, steepness)) * lerp(1.0, 0.45, resistance),
+                        area: 1.0,
+                        resistance,
+                    }
+                })
+                .collect();
+            let start: Vec<ThermalCell> = (0..depth).flat_map(|_| row.iter().copied()).collect();
+            let mut cells = start.clone();
+            for _ in 0..ErosionSettings::default().iterations {
+                // The terrain pass leaves the resistance of the bedrock it exposes.
+                for (cell, state) in cells.iter_mut().enumerate() {
+                    state.resistance = bedding_resistance(state.bed - state.loose, centre(cell % width));
+                }
+                cells = thermal_reference_step(&cells, width, depth, true, rate);
+            }
+            let middle = depth / 2 * width;
+            let face: Vec<usize> = (0..width)
+                .filter(|x| centre(*x) > 125.0 && centre(*x) < 120.0 + 60.0 / face_tan - 5.0)
+                .collect();
+            let lowering = face.iter().map(|x| {
+                let (before, after) = (start[middle + x], cells[middle + x]);
+                (before.bed - before.loose) - (after.bed - after.loose)
+            }).sum::<f32>() / face.len() as f32;
+            let cover = face.iter().map(|x| cells[middle + x].loose).sum::<f32>() / face.len() as f32;
+            let apron = (0..width)
+                .filter(|x| centre(*x) > 90.0 && centre(*x) <= 125.0)
+                .map(|x| cells[middle + x].bed - start[middle + x].bed)
+                .fold(f32::NEG_INFINITY, f32::max);
+            (lowering, cover, apron)
+        };
+        let (still_lowering, _, still_apron) = run(0.0);
+        let (lowering, cover, apron) = run(0.015);
+        eprintln!("the face retreats {lowering:.3} m under {cover:.3} m of cover above a \
+                   {apron:.2} m apron; without weathering {still_lowering:.3} m and {still_apron:.2} m");
+        assert!(still_lowering.abs() < 0.05 && still_apron < 0.6,
+                "without weathering the face stands: {still_lowering} m lower, {still_apron} m apron");
+        assert!((0.15..=0.45).contains(&lowering), "the face retreats {lowering} m");
+        assert!(cover <= 0.2, "the face stays nearly bare, {cover} m of cover");
+        assert!(apron >= 1.5, "an apron of {apron} m builds at its foot");
+    }
+
     /// Waits for the tile preparation's work in flight, if any, to finish.
     fn wait_for_preparation(preparation: &TilePreparation) {
         let started = std::time::Instant::now();

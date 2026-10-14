@@ -12,7 +12,10 @@
 // Everything that moves arrives as loose cover. Repeated with the hydraulic
 // passes this widens fresh incisions into V-shaped valleys, rounds weak
 // crests, keeps resistant rock standing as cliffs and accumulates scree
-// aprons at the foot of steep faces.
+// aprons at the foot of steep faces. With a weathering rate, bare rock
+// steeper than the weathering slope also breaks down into cover in place,
+// so faces between repose and the rockfall limit retreat instead of standing
+// frozen.
 //
 // The exchange is pairwise and antisymmetric: both cells of a pair evaluate
 // the same transfer from the same data (the higher cell is the source), so
@@ -55,7 +58,10 @@ struct StageUniforms {
     loose_repose: f32,          // tan of the loose cover's angle of repose
     soft_rock_slope: f32,       // tan of the steepest stable face in weak bedrock
     hard_rock_slope: f32,       // tan of the steepest stable face in resistant bedrock
-    _pad: f32,
+    weathering_rate: f32,       // metres of bare weak bedrock broken into cover per step
+    weathering_cover: f32,      // cover depth (m) that shields bedrock e-fold below repose
+    weathering_cover_steep: f32, // the same on faces above repose, where debris sheds
+    weathering_slope: f32,      // tan of the bedrock slope where weathering begins
 };
 @group(2) @binding(0) var<uniform> stage: StageUniforms;
 
@@ -107,6 +113,28 @@ fn rockSlopeLimit(resistance: f32) -> f32
     return mix(stage.soft_rock_slope, stage.hard_rock_slope, clamp(resistance, 0.0, 1.0));
 }
 
+// Bedrock under thin cover breaks down into loose debris in place: frost,
+// roots and wetting crack exposed rock, and the mantle that builds up
+// shields what lies beneath, so production falls off exponentially with the
+// cover above it (Heimsath et al. 1997). Weak beds weather; the most
+// resistant stand. Below repose the debris stays as a thin regolith; on
+// faces above it only a skin of cover shields the rock, because debris sheds
+// as fast as it forms, so the faces retreat and stay bare while the pass's
+// own pair exchange carries the rubble down to the aprons at their feet.
+// Channels are left to the fluvial pass. `steepest_rock` is the steepest
+// descent of the bedrock to a neighbour's bedrock.
+fn weathering(loose: f32, resistance: f32, area: f32, steepest_rock: f32) -> f32
+{
+    let weatherability = 1.0 - smoothstep(0.25, 0.75, resistance);
+    let shedding = smoothstep(stage.loose_repose - 0.05, stage.loose_repose + 0.20, steepest_rock);
+    let cover_scale = mix(stage.weathering_cover, stage.weathering_cover_steep, shedding);
+    let shielding = exp(-loose / max(cover_scale, 0.001));
+    let exposed = smoothstep(stage.weathering_slope, stage.loose_repose, steepest_rock);
+    // The terrain pass's own channel onset, 12 to 60 cells of catchment.
+    let hillslope = 1.0 - smoothstep(12.0, 60.0, area);
+    return max(stage.weathering_rate, 0.0) * weatherability * shielding * exposed * hillslope;
+}
+
 @fragment
 fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
 {
@@ -126,9 +154,11 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
     let center_rock_limit = rockSlopeLimit(center_drainage.b);
     let loose_rate = clamp(stage.loose_rate, 0.0, 0.0625);
     let rock_rate = clamp(stage.rock_rate, 0.0, 0.0625);
+    let center_rock = center.r - center_loose;
 
     var height_change = 0.0;
     var loose_change = 0.0;
+    var steepest_rock = 0.0;
     for (var index = 0; index < 9; index++)
     {
         if (index == 4) { continue; }
@@ -143,6 +173,10 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
 
         let diagonal = offset.x != 0 && offset.y != 0;
         let distance = cell_size * select(1.0, 1.41421356, diagonal);
+        // How steeply this cell's bedrock stands over the land around it,
+        // under both cells' cover: weathering's exposure below.
+        steepest_rock = max(steepest_rock,
+            (center_rock - (neighbour.r - max(neighbour.a, 0.0))) / distance);
         let drop = center.r - neighbour.r;
         let fall = abs(drop);
         if (fall <= stage.loose_repose * distance) { continue; }
@@ -171,16 +205,22 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32>
         }
     }
 
+    // Weathering turns bedrock into cover where it stands: the bed height,
+    // and so the exchange's conservation, is untouched, and every cell reads
+    // only the pass's input state, as the exchange does.
+    let produced = weathering(center_loose, clamp(center_drainage.b, 0.0, 1.0),
+                              center_drainage.r, steepest_rock);
     return vec4<f32>(center.r + height_change, center.g, center.b,
-                     max(center_loose + loose_change, 0.0));
+                     max(center_loose + loose_change, 0.0) + produced);
 }
 
-// STAGE UNIFORMS (group 2, binding 0), 48 bytes:
+// STAGE UNIFORMS (group 2, binding 0), 60 bytes, rounding to 64:
 //   offset  0 resolution: vec2<f32>  offset  8 cell_size        offset 12 sea_level
 //   offset 16 world_min: vec2<f32> (unused here; kept for the shared fill)
 //   offset 24 loose_rate             offset 28 rock_rate
 //   offset 32 loose_repose           offset 36 soft_rock_slope  offset 40 hard_rock_slope
-//   offset 44 pad
+//   offset 44 weathering_rate        offset 48 weathering_cover
+//   offset 52 weathering_cover_steep offset 56 weathering_slope
 // Textures (group 1): binding 0 = terrain state RGBA32F, binding 1 = drainage
 // state RGBA32F (texel loads only; non-filtering samplers at 8 and 9 for
 // layout parity).

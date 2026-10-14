@@ -416,9 +416,13 @@ pub struct ErosionThermalStageUniforms {
     pub loose_repose: f32,      // 32
     pub soft_rock_slope: f32,   // 36
     pub hard_rock_slope: f32,   // 40
-    _end_pad: f32,              // 44
+    pub weathering_rate: f32,   // 44
+    pub weathering_cover: f32,  // 48
+    pub weathering_cover_steep: f32, // 52
+    pub weathering_slope: f32,  // 56
+    _end_pad: f32,              // 60 (uniform size rounds to 64)
 }
-const _: () = assert!(std::mem::size_of::<ErosionThermalStageUniforms>() == 48);
+const _: () = assert!(std::mem::size_of::<ErosionThermalStageUniforms>() == 64);
 
 /// The group(0) bind group layout every pass shares: one uniform buffer.
 ///
@@ -1026,6 +1030,11 @@ mod tests {
                 ("loose_repose", offset_of!(ErosionThermalStageUniforms, loose_repose)),
                 ("soft_rock_slope", offset_of!(ErosionThermalStageUniforms, soft_rock_slope)),
                 ("hard_rock_slope", offset_of!(ErosionThermalStageUniforms, hard_rock_slope)),
+                ("weathering_rate", offset_of!(ErosionThermalStageUniforms, weathering_rate)),
+                ("weathering_cover", offset_of!(ErosionThermalStageUniforms, weathering_cover)),
+                ("weathering_cover_steep",
+                 offset_of!(ErosionThermalStageUniforms, weathering_cover_steep)),
+                ("weathering_slope", offset_of!(ErosionThermalStageUniforms, weathering_slope)),
             ]),
         ];
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/shaders");

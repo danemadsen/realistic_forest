@@ -830,6 +830,10 @@ impl WorkerErosionSim {
         thermal.loose_repose = EROSION_LOOSE_REPOSE;
         thermal.soft_rock_slope = EROSION_SOFT_ROCK_SLOPE;
         thermal.hard_rock_slope = EROSION_HARD_ROCK_SLOPE;
+        thermal.weathering_rate = self.settings.weathering_rate;
+        thermal.weathering_cover = EROSION_WEATHERING_COVER;
+        thermal.weathering_cover_steep = EROSION_WEATHERING_COVER_STEEP;
+        thermal.weathering_slope = EROSION_WEATHERING_SLOPE;
         self.queue
             .write_buffer(&self.thermal_stage_buffer, 0, bytemuck::bytes_of(&thermal));
     }

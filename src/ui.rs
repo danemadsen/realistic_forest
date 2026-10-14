@@ -956,6 +956,7 @@ fn draw_advanced_controls(
     ui.add(max_incision_slider);
     ui.add(egui::Slider::new(&mut erosion_settings.talus_rate, 0.0..=0.0625).text("Talus slide"));
     ui.add(egui::Slider::new(&mut erosion_settings.rockfall_rate, 0.0..=0.0625).text("Rockfall"));
+    ui.add(egui::Slider::new(&mut erosion_settings.weathering_rate, 0.0..=0.05).text("Weathering"));
     ui.horizontal(|ui| {
         if ui.button("Regenerate erosion cache").clicked() {
             rerun.0 = true;

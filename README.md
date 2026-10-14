@@ -839,7 +839,21 @@ decide which slopes stand. Loose material sheds at its ~34-degree angle of
 repose; bare bedrock only fails above a much steeper, hardness-dependent limit
 (about 48 degrees in weak rock to 68 in the most resistant beds), and then
 slowly, as rockfall. The exchange is pairwise and antisymmetric, so it conserves
-material exactly without a scatter step. Together with incision this opens
+material exactly without a scatter step. **Weathering** adds the breakdown of
+rock below that limit: bare rock steeper than about 24 degrees turns into loose
+debris in place, weak beds and not the most resistant ones, and the cover
+already lying on it shields it, exponentially with its depth (0.30 metres on
+slopes below repose, where a regolith stays, and 0.05 metres on faces above it,
+where debris sheds as fast as it forms). Channels are left to the fluvial
+transport. At 0.015 metres per step a 50-degree face in weak rock retreats by
+about 0.3 metres over a tile's 140 steps, stays nearly bare, and builds a talus
+apron of about 2 metres at its foot, where without it the face stands
+unchanged between repose and its rockfall limit. It is off by default (rate 0,
+which leaves the simulation exactly as it was): on the mountain prewarm quartet
+0.015 lowers the share of bare bedrock from 27–48 to 20–34 percent and adds
+6–9 centimetres of mean cover, but it also smooths the measured fine detail by
+about a tenth, and the material shader still paints its own rubble mantle on
+weak faces, so the two want tuning together first. Together with incision this opens
 fresh cuts into V-shaped valleys, rounds weak crests, keeps resistant rock
 standing as cliffs and gathers talus aprons below steep faces. Substrate
 resistance comes from one shared, world-keyed geology
@@ -903,8 +917,8 @@ inspect the erosion flow output on the terrain, or expand **Flow output** to
 inspect the cached target. Erosion
 parameters can be edited from the same panel and applied with **Regenerate
 erosion cache**; besides the runoff controls they include stream power,
-channel incision, alluvial deposition, maximum incision, talus slide and
-rockfall rates. The panel also reports maximum incision, deposited height,
+channel incision, alluvial deposition, maximum incision, talus slide,
+rockfall and weathering rates. The panel also reports maximum incision, deposited height,
 small-scale detail within actively eroded ground, flow-axis bias, the largest
 contributing area, the share of bare bedrock and the mean loose cover for the
 most recently completed tile.
