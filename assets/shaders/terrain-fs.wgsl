@@ -1652,9 +1652,15 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     let deposition = 1.0 - exp(-max(surface.r - 0.004, 0.0) * 12.0);
     // Ring concavity re-anchored to the field's real scales: the 12 m-ring
     // relief of a common swale is 0.1-0.5 m, so (0.05, 1.2) puts a 0.3 m swale
-    // at ~0.12 and saturates at 1.2 m bowls.
-    let hollow = smoothHermite(0.05, 1.2, surface.g);
-    let ridge = smoothHermite(0.05, 1.2, -surface.g);
+    // at ~0.12 and saturates at 1.2 m bowls. The simulation records it near
+    // the player (atlas G); where the simulation is faded out or not yet
+    // revealed, the same measure taken over the material ring stands in
+    // (Gaea's Soil, at the scale the distance resolves), so hollows keep
+    // their soil and noses their stone at any distance instead of switching
+    // off at the erosion radius.
+    let reliefConcavity = surface.g + (1.0 - flowDomain)*input.frag_concavity.y;
+    let hollow = smoothHermite(0.05, 1.2, reliefConcavity);
+    let ridge = smoothHermite(0.05, 1.2, -reliefConcavity);
 
     // Low-frequency drift lets the grass boundary with the beach breathe a
     // few metres instead of tracing one deterministic contour. Frequency
@@ -1763,7 +1769,8 @@ fn shadeTerrain(input: FsInput, habitat: bool,
     // the rock's own exposure field just short of bare rock, so it widens
     // where a face wanes gradually into its base; thick footslope deposits
     // (not channel fill) extend it as colluvial aprons. Beyond the simulated
-    // radius, where neither side is known, only the faint rim remains.
+    // radius no deposits are known, but the far relief still tells the
+    // concave footslope from the convex crest, so the band follows it there.
     // The band's outer edge is ragged at two scales, so grass islands
     // survive in the debris and dirt bays reach into the turf over a few
     // metres instead of meeting along one line.

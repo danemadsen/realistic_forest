@@ -252,7 +252,12 @@ dirt bays reach into the turf, the turf thins and dries to olive before it
 gives way, and where turf and soil meet they mix in proportion, as tufts
 growing through soil do, instead of switching at a contact edge. Beyond the erosion radius
 the shader estimates the cover the simulation starts from, so material
-boundaries stay put with distance.
+boundaries stay put with distance. The relief the simulation measures goes on
+past that radius too, taken over the material interval below as Gaea's Soil
+mask takes concavity at several scales: hollows keep their soil and noses
+their stone, and footslopes their fringe, at any distance, thinning only as
+relief finer than a vertex is filtered away, instead of the far ranges
+reading as slope and noise alone.
 
 Grass004 covers ground with a few decimetres of soil. Ground103 soil, with
 subtle Ground106 variation, shows through thin, stony cover, in cut banks and
