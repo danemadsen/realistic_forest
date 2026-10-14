@@ -1,9 +1,10 @@
 // PORT NOTES (erosion_init.fs -> erosion-init.wgsl):
-// - Single RGBA32F output at @location(0), exactly as the GLSL wrote it
+// - Single vec4 output at @location(0), exactly as the GLSL wrote it
 //   (`finalColor`); every uMode branch writes that one output slot (mode 0
-//   stamps terrain state, mode 2 stamps the CPU-routed drainage area, mode 3
-//   the terrain pass's static world-keyed field, any other mode clears to
-//   0.0). Terrain A now carries the initial loose cover; hardness is
+//   stamps terrain state, mode 2 stamps the CPU-routed drainage area, any
+//   other mode clears to 0.0), into an RGBA32F target, except mode 3, which
+//   writes the terrain pass's static world-keyed field into an RG32Float
+//   target that keeps only the first two lanes. Terrain A now carries the initial loose cover; hardness is
 //   evaluated from the shared world-keyed geology by each pass.
 // - No hoisted samples: the GLSL only texelFetches, and textureLoad carries no
 //   WGSL uniform-control-flow restriction. No dropped blit flips (the source

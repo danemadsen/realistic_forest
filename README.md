@@ -787,14 +787,17 @@ Each pass loads its 3×3 neighbourhood once, and the runoff's path noise, which
 depends on world position alone, is evaluated once per tile by the
 initialisation into a static field that the terrain pass reads on each of its
 140 iterations. The routing normaliser is a single-channel target. With the
-same arithmetic in the same order, the simulation is unchanged to the last bit,
-and on llvmpipe a tile takes about a quarter less GPU time (4.4 s against
-5.9 s). The geology is still evaluated in the terrain pass: it depends on the
+same arithmetic in the same order, the simulation is unchanged to the last bit
+on llvmpipe (another driver may compile the reordered loads to different last
+bits, and match only statistically), and there a tile's simulation takes about
+a quarter less wall time from submission to completion (4.4 s against 5.9 s).
+The geology is still evaluated in the terrain pass: it depends on the
 evolving bedrock, and splitting it around a stored value compiles to different
 last bits on llvmpipe, which the routing amplifies until a tile's largest
 catchment moves by tens of percent, for only 5 percent more speed. A prewarmed
-tile's ready line in the log reports the GPU time its initialisation and
-iterations took (`simulated in N ms`).
+tile's ready line in the log reports the wall time its initialisation and
+iterations took, from submission to the queue's completion (`simulated in N
+ms`).
 
 The runoff solver adapts the useful physics from the hydraulic erosion shader
 in `~/nerthus` without depending on its WebGPU compute atomics. Runoff retains
@@ -819,9 +822,10 @@ background thread while the current tile simulates, so a starting tile never
 stalls a frame and usually begins the frame the one before it finishes, rather
 than a preparation later; a tile whose rivers changed while it was prepared is
 built again. Prewarm and screenshot runs build them inline, keeping captures
-deterministic, and share the base heights' rows among every core: a tile's
-inputs take about 65–95 ms there instead of 100–160 ms on one core (a
-development build on a busy four-core machine). Every way gives the same bits,
+deterministic, and share the base heights' rows among every core: in a
+development build on four otherwise idle cores a tile's inputs take about
+55–80 ms there, where one core took 100–160 ms, and when other work shares the
+cores the time swings widely, past 300 ms. Every way gives the same bits,
 and the log reports each tile's time as `EROSION: tile (x, z) inputs in N ms`.
 A stream-power capacity proportional to √A·S then detaches bed where
 the routed sediment flux is below capacity and deposits where the flux exceeds
@@ -852,8 +856,10 @@ unchanged between repose and its rockfall limit. It is off by default (rate 0,
 which leaves the simulation exactly as it was): on the mountain prewarm quartet
 0.015 lowers the share of bare bedrock from 27–48 to 20–34 percent and adds
 6–9 centimetres of mean cover, but it also smooths the measured fine detail by
-about a tenth, and the material shader still paints its own rubble mantle on
-weak faces, so the two want tuning together first. Together with incision this opens
+about a tenth, shifts where the largest catchments gather, and the material
+shader still paints its own rubble mantle on weak faces, so the two want tuning
+together, and a check that the GPU passes match the CPU reference kernel,
+before it is turned on. Together with incision this opens
 fresh cuts into V-shaped valleys, rounds weak crests, keeps resistant rock
 standing as cliffs and gathers talus aprons below steep faces. Substrate
 resistance comes from one shared, world-keyed geology

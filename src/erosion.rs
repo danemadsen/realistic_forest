@@ -13,7 +13,7 @@ use bevy::ecs::prelude::Resource;
 use bevy::tasks::{block_on, poll_once, AsyncComputeTaskPool, Task};
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct TileKey {
@@ -976,15 +976,24 @@ fn inline_preparation_workers() -> usize {
 }
 
 /// Inputs being built on the task pool, with the river network they carve:
-/// `Arc::as_ptr` of the network in force when the task began, or 0 for none.
+/// the network in force when the task began, or `None` for none. Held weakly,
+/// which keeps a replaced network's allocation, so a later network can never
+/// take its address and pass for it.
 struct PendingTile {
     key: TileKey,
-    rivers: usize,
+    rivers: Option<Weak<crate::rivers::network::RiverNetwork>>,
     task: Task<PreparedTile>,
 }
 
-fn rivers_tag(rivers: &Option<Arc<crate::rivers::network::RiverNetwork>>) -> usize {
-    rivers.as_ref().map_or(0, |network| Arc::as_ptr(network) as usize)
+impl PendingTile {
+    /// Whether these inputs carve `rivers`, the network now in force.
+    fn carves(&self, rivers: &Option<Arc<crate::rivers::network::RiverNetwork>>) -> bool {
+        match (&self.rivers, rivers) {
+            (None, None) => true,
+            (Some(built), Some(current)) => std::ptr::eq(built.as_ptr(), Arc::as_ptr(current)),
+            _ => false,
+        }
+    }
 }
 
 /// Builds the next tile's inputs on the async compute pool. Base heights and
@@ -1018,40 +1027,43 @@ impl TilePreparation {
                 .get(key)
                 .is_some_and(|tile| tile.state == ErosionTileState::Queued)
         };
-        let stale = |pending: &PendingTile| {
-            !still_queued(&pending.key) || pending.rivers != rivers_tag(&cache.rivers)
-        };
+        let stale =
+            |pending: &PendingTile| !still_queued(&pending.key) || !pending.carves(&cache.rivers);
         if self.pending.as_ref().is_some_and(stale) {
             self.pending = None;
         }
     }
 
-    /// Starts building `key`'s inputs unless current work is in flight.
+    /// Starts building `key`'s inputs unless they are already in flight or
+    /// built. Work for another tile is dropped: the player has moved and the
+    /// queue's best tile with them, and the tile it was for, still queued, is
+    /// prepared again when its turn comes. The best tile changes only when
+    /// the player crosses a lattice line, so little is thrown away.
     fn start(&mut self, cache: &ErosionCache, key: TileKey) {
         self.discard_stale(cache);
-        if self.pending.is_some() {
+        if self.pending.as_ref().is_some_and(|pending| pending.key == key) {
             return;
         }
         let noise = self.noise.clone();
         let rivers = cache.rivers.clone();
-        let tag = rivers_tag(&rivers);
+        let built_for = rivers.as_ref().map(Arc::downgrade);
         let task = AsyncComputeTaskPool::get()
             .spawn(async move { prepare_tile(&noise, rivers.as_deref(), key, 1) });
         self.pending = Some(PendingTile {
             key,
-            rivers: tag,
+            rivers: built_for,
             task,
         });
     }
 
-    /// The prepared inputs of a tile still queued in `cache`, once they are
-    /// ready. Starts preparing `next` when nothing is in flight; work for a
-    /// tile that has meanwhile left the queue, or that carves rivers no
-    /// longer in force, is dropped. Work for a tile other than `next` that is
-    /// still queued is kept and begun.
+    /// `next`'s prepared inputs, once they are ready. Starts preparing it
+    /// when they are not in flight; work for any other tile is dropped, so
+    /// the tile begun is always the queue's best, never one chosen before the
+    /// player moved. Work that carves rivers no longer in force is dropped
+    /// too.
     fn poll(&mut self, cache: &ErosionCache, next: TileKey) -> Option<PreparedTile> {
         self.discard_stale(cache);
-        let Some(mut pending) = self.pending.take() else {
+        let Some(mut pending) = self.pending.take_if(|pending| pending.key == next) else {
             self.start(cache, next);
             return None;
         };
@@ -2073,17 +2085,54 @@ mod tests {
         preparation.start(&cache, next);
         wait_for_preparation(&preparation);
         let pending = preparation.pending.as_mut().expect("the prefetch");
-        assert_eq!(pending.rivers, 0, "built without rivers");
+        assert!(pending.rivers.is_none() && pending.carves(&None), "built without rivers");
 
-        // Stand in for a network since replaced: the finished work no longer
-        // carves the rivers in force.
-        pending.rivers = 0x5eed;
+        // Stand in for a network since replaced and dropped: the finished
+        // work no longer carves the rivers in force.
+        pending.rivers = Some(Weak::new());
+        assert!(!pending.carves(&cache.rivers));
         assert!(preparation.poll(&cache, next).is_none(), "stale inputs are never handed out");
         let pending = preparation.pending.as_ref().expect("the inputs are built again");
-        assert_eq!(pending.rivers, rivers_tag(&cache.rivers));
+        assert!(pending.carves(&cache.rivers));
         wait_for_preparation(&preparation);
         let prepared = preparation.poll(&cache, next).expect("the rebuilt inputs");
         assert_eq!(prepared.key, next);
+    }
+
+    /// The prefetch follows the queue's best tile: when the player moves and
+    /// another tile becomes best, the work for the old one is dropped rather
+    /// than begun ahead of it, and work for the best tile is never restarted.
+    #[test]
+    fn a_prefetch_follows_the_best_tile() {
+        AsyncComputeTaskPool::get_or_init(bevy::tasks::TaskPool::new);
+        let noise = Arc::new(NoiseField::new());
+        let mut preparation = TilePreparation::new(noise);
+        let mut cache = ErosionCache::default();
+        ensure_erosion_cache(&mut cache, tile(0, 0));
+        let (chosen, best) = (tile(1, 0), tile(0, 1));
+        assert_eq!(cache.tiles[&chosen].state, ErosionTileState::Queued);
+        assert_eq!(cache.tiles[&best].state, ErosionTileState::Queued);
+
+        // Built for the tile that was best when the active one began.
+        preparation.start(&cache, chosen);
+        wait_for_preparation(&preparation);
+        preparation.start(&cache, chosen);
+        let held = preparation.poll(&cache, chosen).expect("finished work is kept, not restarted");
+        assert_eq!(held.key, chosen);
+
+        // The player moves on while it waits: the next frame's best tile
+        // replaces it, whether the work is in flight or already built.
+        preparation.start(&cache, chosen);
+        preparation.start(&cache, best);
+        assert_eq!(preparation.pending.as_ref().expect("the prefetch").key, best);
+        preparation.start(&cache, chosen);
+        wait_for_preparation(&preparation);
+        assert!(preparation.poll(&cache, best).is_none(), "the old best tile is never begun");
+        assert_eq!(preparation.pending.as_ref().expect("the best tile's inputs").key, best);
+        wait_for_preparation(&preparation);
+        let prepared = preparation.poll(&cache, best).expect("the best tile's inputs");
+        assert_eq!(prepared.key, best);
+        assert_eq!(cache.tiles[&chosen].state, ErosionTileState::Queued, "still queued for later");
     }
 
     /// The ordinary path: a frame that is consumed leaves nothing behind.
