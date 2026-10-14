@@ -307,6 +307,10 @@ white plaster up to about 58 degrees while windward faces shed theirs from
 about 33. No noise moves the pack: every input is the terrain itself, near the
 player the eroded bed's own 12 m relief and far away the same measure taken
 over the material interval, so a margin stays put as the camera approaches.
+The ground the pack left last is a snowbed: where the pack lay eight metres
+further down the thaw, meltwater kept the soil soaked and the season was too
+short for closed turf, so a band of dark, mossy turf with patches of wet bare
+soil follows the margin, strongest in hollows, without ever touching the pack.
 Scan contrast and wind relief are restrained, while fine grain, roughness and
 glints still respond to the light; only the thinning fringe keeps a faint
 sediment stain.
