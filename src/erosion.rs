@@ -1754,8 +1754,7 @@ mod tests {
     /// thread as from four, over the spawn region's rivers.
     #[test]
     fn prepared_tiles_are_bit_identical_across_worker_counts() {
-        let noise = NoiseField::new();
-        let network = crate::rivers::network::generate(&noise, [0, 0]);
+        let (noise, network) = crate::rivers::spawn_network();
         let mut river_cells = 0;
         for key in [tile(0, 0), tile(-1, 2), tile(3, -5)] {
             let serial = prepare_tile(&noise, Some(&network), key, 1);
