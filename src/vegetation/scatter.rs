@@ -240,6 +240,7 @@ fn lerp_habitat(a: &Habitat, b: &Habitat, t: f32) -> Habitat {
             turf: l(a.site.turf, b.site.turf),
             shore: l(a.site.shore, b.site.shore),
             river: l(a.site.river, b.site.river),
+            snow: l(a.site.snow, b.site.snow),
         },
         forest: l(a.forest, b.forest),
         edge: l(a.edge, b.edge),
