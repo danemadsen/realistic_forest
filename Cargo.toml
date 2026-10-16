@@ -10,7 +10,7 @@ edition = "2024"
 # already in the lock via bevy_egui, so no versions move.
 bevy = { version = "0.19.1", features = ["system_clipboard"] }
 bevy_egui = "0.42.0"
-quick-noise = "0.2.0"
+quick-noise = "0.3.0"
 bytemuck = { version = "1", features = ["derive"] }
 gltf = { version = "1.4", default-features = false, features = ["utils", "names"] }
 
