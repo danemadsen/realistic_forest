@@ -4958,11 +4958,10 @@ checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quick-noise"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15a5a40b16225b4b752d0f4b79f067f62dee85a808bc243bf003d71011996950"
+checksum = "b4abc949dda92b7a41fef7195fea7c292d6d6c6816cae7234f2ac869894e0202"
 dependencies = [
- "itertools 0.14.0",
  "simply-simd",
 ]
 
@@ -5506,9 +5505,9 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "simply-simd"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07d3fc54ec27d047cce486d86839abf6ccbede36f6c6bcfb0f697b0729c69887"
+checksum = "b71cbdd555e42332c1ce7891819c9081a95f3a6ead77f741f14e1670c437e94b"
 dependencies = [
  "itertools 0.14.0",
  "num-traits",
