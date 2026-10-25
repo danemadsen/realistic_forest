@@ -42,6 +42,8 @@ pub const DRAW_DISTANCE: f32 = 1800.0;
 const INTERIOR_DISTANCE: f32 = 140.0;
 /// Doors cast shadows only into the cascades this near.
 const DOOR_SHADOW_CASCADES: usize = 2;
+/// Nearby rooms and stairs cast shadows into the detailed cascades.
+const INTERIOR_SHADOW_CASCADES: usize = 2;
 /// Roofs within this of the camera keep the rain off what is under them.
 const SHELTER_REACH: f32 = 70.0;
 /// Roof boxes the rain is given at most.
@@ -464,8 +466,8 @@ fn build_gpu(
 struct InstanceGroups {
     /// (model or door mesh, interior?) -> instances, for the G-buffer.
     gbuffer: HashMap<(Mesh, bool), Vec<BuildingInstance>>,
-    /// The same per cascade, exteriors and doors only.
-    shadows: [HashMap<Mesh, Vec<BuildingInstance>>; SHADOW_CASCADES],
+    /// The same per cascade, with nearby interiors in the detailed maps.
+    shadows: [HashMap<(Mesh, bool), Vec<BuildingInstance>>; SHADOW_CASCADES],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -549,7 +551,7 @@ pub(super) fn prepare_buildings(
     let Some(gpu) = state.gpu.as_mut() else {
         return;
     };
-    let (instances, mut frame_draws) = lay_out_draws(library, &groups, &gpu.materials);
+    let (instances, mut frame_draws) = lay_out_draws(library, &groups);
     upload_instances(&device, &queue, gpu, &instances);
     if let Some(shadow) = &shadow {
         upload_cascades(&queue, gpu, shadow);
@@ -583,6 +585,7 @@ fn gather_instances(
         let centre = Vec3::new(placement.pad.centre.x, placement.origin.y + height * 0.5, placement.pad.centre.y);
         let radius = Vec2::new(model.radius(), height * 0.5).length();
         let distance = Vec2::new(centre.x - sight.camera.x, centre.z - sight.camera.z).length();
+        let nearby_interior = distance < INTERIOR_DISTANCE + radius;
         let drawn = distance < DRAW_DISTANCE + radius && in_frustum(&sight.planes, centre, radius);
         let shadow_cascades = if sight.shadows {
             SHADOW_SPLITS[1..].iter().filter(|&&split| distance < split + radius + 30.0).count()
@@ -601,7 +604,7 @@ fn gather_instances(
         let doors: Vec<(u32, BuildingInstance)> = model.doors.iter().enumerate().map(door_instance).collect();
         if drawn {
             groups.gbuffer.entry((Mesh::Building(placement.model), false)).or_default().push(building);
-            if distance < INTERIOR_DISTANCE + radius {
+            if nearby_interior {
                 groups.gbuffer.entry((Mesh::Building(placement.model), true)).or_default().push(building);
             }
             for (mesh, instance) in &doors {
@@ -612,10 +615,15 @@ fn gather_instances(
         // in reach of every coarser one.
         let first_cascade = SHADOW_CASCADES - shadow_cascades;
         for cascade in first_cascade..SHADOW_CASCADES {
-            groups.shadows[cascade].entry(Mesh::Building(placement.model)).or_default().push(building);
+            groups.shadows[cascade].entry((Mesh::Building(placement.model), false)).or_default().push(building);
+            // Interior floors and partitions must block the sun as well as
+            // the shell, including when the camera cannot see their faces.
+            if nearby_interior && cascade < INTERIOR_SHADOW_CASCADES {
+                groups.shadows[cascade].entry((Mesh::Building(placement.model), true)).or_default().push(building);
+            }
             if cascade < DOOR_SHADOW_CASCADES {
                 for (mesh, instance) in &doors {
-                    groups.shadows[cascade].entry(Mesh::Door(*mesh)).or_default().push(*instance);
+                    groups.shadows[cascade].entry((Mesh::Door(*mesh), false)).or_default().push(*instance);
                 }
             }
         }
@@ -647,7 +655,6 @@ fn gather_instances(
 fn lay_out_draws(
     library: &BuildingLibrary,
     groups: &InstanceGroups,
-    materials: &[Option<BindGroup>],
 ) -> (Vec<BuildingInstance>, BuildingFrameDraws) {
     let mut instances: Vec<BuildingInstance> = Vec::new();
     let mut frame_draws = BuildingFrameDraws::default();
@@ -674,7 +681,7 @@ fn lay_out_draws(
                 instance_offset: offset,
                 instance_count: run.len() as u32,
             };
-            let is_glass = materials[primitive.material].is_none();
+            let is_glass = library.materials[primitive.material].glass;
             if !is_glass {
                 draws.push(draw);
             } else if let Some(glass) = glass.as_deref_mut() {
@@ -690,11 +697,12 @@ fn lay_out_draws(
         push_draws(&mut instances, &mut frame_draws.gbuffer, Some(&mut frame_draws.glass), primitives, run);
     }
     for cascade in 0..SHADOW_CASCADES {
-        let mut keys: Vec<Mesh> = groups.shadows[cascade].keys().copied().collect();
+        let mut keys: Vec<(Mesh, bool)> = groups.shadows[cascade].keys().copied().collect();
         keys.sort();
         for key in keys {
             let run = &groups.shadows[cascade][&key];
-            push_draws(&mut instances, &mut frame_draws.shadows[cascade], None, primitives_of(key, false), run);
+            let primitives = primitives_of(key.0, key.1);
+            push_draws(&mut instances, &mut frame_draws.shadows[cascade], None, primitives, run);
         }
     }
     (instances, frame_draws)
@@ -1051,5 +1059,87 @@ mod tests {
             -reach.x * instance.turn[1] + reach.y * instance.turn[0],
         );
         assert!(shader_turn.distance(turn_by(reach, yaw)) < 1e-6);
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn nearbyInteriorMeshesCastShadowsWithoutWindowGlass() {
+        use crate::buildings::pads::{Pad, PadKind};
+        use crate::buildings::placement::Placement;
+
+        let library = crate::buildings::assets::tests::library();
+        let open_doors = HashMap::new();
+        let origin = Vec3::new(709.25, 10.0, 565.38);
+        let mut glass_primitives = 0;
+
+        for (model_index, model) in library.models.iter().enumerate() {
+            for primitive in model.exterior.iter().chain(&model.interior) {
+                if library.materials[primitive.material].glass {
+                    glass_primitives += 1;
+                }
+            }
+            let centre = Vec2::new(origin.x, origin.z) + model.footprint_centre();
+            let pad = Pad {
+                centre,
+                axis: Vec2::X,
+                half: model.footprint_half(),
+                height: origin.y,
+                skirt: 2.0,
+                inset: 0.0,
+                kind: PadKind::Building,
+            };
+            let placement = Placement {
+                id: model_index as u64,
+                model: model_index as u32,
+                origin,
+                yaw: 0.0,
+                pad,
+                town: None,
+            };
+            let snapshot = BuildingSnapshot {
+                generation: 1,
+                placements: vec![placement],
+            };
+            // Keep the model out of the view: its floors must still stop
+            // light reaching another surface inside the building.
+            let sight = Sight {
+                camera: Vec3::new(centre.x, origin.y + 5.62, centre.y),
+                planes: [[0.0, 0.0, 0.0, -10000.0]; 4],
+                shadows: true,
+            };
+            let mut shelters = Vec::new();
+            let groups = gather_instances(&library, &snapshot, &sight, &open_doors, &mut shelters);
+            let (_, frame_draws) = lay_out_draws(&library, &groups);
+            assert!(frame_draws.gbuffer.is_empty());
+
+            for (cascade, draws) in frame_draws.shadows.iter().enumerate() {
+                assert!(!draws.is_empty(), "{} cascade {cascade}", model.name);
+                for primitive in &model.interior {
+                    if library.materials[primitive.material].glass {
+                        continue;
+                    }
+                    let drawn = draws.iter().any(|draw| {
+                        draw.primitive.first_index == primitive.first_index
+                            && draw.primitive.base_vertex == primitive.base_vertex
+                    });
+                    assert_eq!(drawn, cascade < INTERIOR_SHADOW_CASCADES, "{} cascade {cascade}", model.name);
+                }
+                assert!(draws.iter().all(|draw| !library.materials[draw.primitive.material].glass));
+            }
+
+            // Interior detail is unnecessary once the building is beyond
+            // the distance where rooms could be seen through an opening.
+            let radius = Vec2::new(model.radius(), model.maximum.y * 0.5).length();
+            let distant_sight = Sight {
+                camera: sight.camera + Vec3::X * (INTERIOR_DISTANCE + radius + 1.0),
+                ..sight
+            };
+            let distant_groups = gather_instances(&library, &snapshot, &distant_sight, &open_doors, &mut shelters);
+            for cascade in &distant_groups.shadows {
+                assert!(cascade.keys().all(|(_, interior)| !interior), "{}", model.name);
+            }
+        }
+
+        assert!(glass_primitives > 0, "the regression must exercise window glass");
     }
 }

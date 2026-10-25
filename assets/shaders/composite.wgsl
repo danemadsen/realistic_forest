@@ -758,7 +758,12 @@ fn terrainMapWeight(world_xz: vec2<f32>) -> f32 {
     let edge = min(min(uv.x, uv.y), min(1.0 - uv.x, 1.0 - uv.y));
     return smoothstep(0.0, 0.06, edge);
 }
-fn vegetationShadowPcf(map: texture_depth_2d, uv: vec2<f32>, depth: f32) -> f32 {
+fn vegetationShadowPcf(map: texture_depth_2d, uv: vec2<f32>, depth: f32, shelter_weight: f32) -> f32 {
+    // Architectural joins need a tight footprint: the canopy's broad tent
+    // would sample sunlight on the far side of a wall or an upper floor.
+    if (shelter_weight >= 1.0) {
+        return textureSampleCompareLevel(map, vegetation_shadow_sampler, uv, depth);
+    }
     // A 4x4 grid of bilinear comparisons a texel apart: a smooth tent five
     // texels wide, about the penumbra the sun's disc gives a branch ten
     // metres up in the nearest cascade. Sparser taps would stamp every small
@@ -772,34 +777,42 @@ fn vegetationShadowPcf(map: texture_depth_2d, uv: vec2<f32>, depth: f32) -> f32 
                                              uv + offset, depth);
         }
     }
-    return lit/16.0;
+    let broad_shadow = lit/16.0;
+    if (shelter_weight > 0.0) {
+        let tight_shadow = textureSampleCompareLevel(map, vegetation_shadow_sampler, uv, depth);
+        return mix(broad_shadow, tight_shadow, shelter_weight);
+    }
+    return broad_shadow;
 }
 
-// Light reaching a point through the plants, in one cascade. The lookup is
-// pushed off the surface, along its normal and toward the light, by a
-// little more than a texel, so a lit trunk or crown does not shadow itself
-// through the depth map's own quantisation.
-fn vegetationShadowCascade(world_position: vec3<f32>, normal_world: vec3<f32>, cascade: u32) -> f32 {
+// Light reaching a point through plants and buildings, in one cascade.
+// Exposed surfaces use texel-scale offsets to avoid self-shadowing; sheltered
+// building surfaces keep the lookup close to the receiver so joins stay sealed.
+fn vegetationShadowCascade(world_position: vec3<f32>, normal_world: vec3<f32>, cascade: u32, shelter_weight: f32) -> f32 {
     let texel = vegetation_shadows.texel[cascade];
     let to_light = -vegetation_shadows.light.xyz;
     let grazing = 1.0 - abs(dot(normal_world, to_light));
-    let lookup = world_position + normal_world*texel*(1.0 + 1.5*grazing) + to_light*texel*1.5;
+    // The foliage bias can move a room's lookup through its thin wall skins.
+    // Sheltered surfaces need only a small offset to cover depth quantisation.
+    let normal_bias = mix(texel*(1.0 + 1.5*grazing), min(texel*0.15, 0.01), shelter_weight);
+    let light_bias = mix(texel*1.5, min(texel*0.05, 0.003), shelter_weight);
+    let lookup = world_position + normal_world*normal_bias + to_light*light_bias;
     let clip = vegetation_shadows.view_projection[cascade]*vec4<f32>(lookup, 1.0);
     let uv = vec2<f32>(0.5 + 0.5*clip.x, 0.5 - 0.5*clip.y);
     if (any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || clip.z > 1.0) {
         return 1.0;
     }
     switch cascade {
-        case 0u: { return vegetationShadowPcf(vegetation_shadow_map_0, uv, clip.z); }
-        case 1u: { return vegetationShadowPcf(vegetation_shadow_map_1, uv, clip.z); }
-        default: { return vegetationShadowPcf(vegetation_shadow_map_2, uv, clip.z); }
+        case 0u: { return vegetationShadowPcf(vegetation_shadow_map_0, uv, clip.z, shelter_weight); }
+        case 1u: { return vegetationShadowPcf(vegetation_shadow_map_1, uv, clip.z, shelter_weight); }
+        default: { return vegetationShadowPcf(vegetation_shadow_map_2, uv, clip.z, shelter_weight); }
     }
 }
 
 // Light reaching a point through the plants: the cascade covering its horizontal
 // distance from the camera, blended into the next over the last stretch of each,
 // and fading out past the last. Camera height does not lower shadow quality.
-fn vegetationShadow(world_position: vec3<f32>, normal_world: vec3<f32>) -> f32 {
+fn vegetationShadow(world_position: vec3<f32>, normal_world: vec3<f32>, shelter_weight: f32) -> f32 {
     let horizontal_distance = length(world_position.xz - globals.camera_position.xz);
     if (vegetation_shadows.light.w < 0.5 || horizontal_distance >= vegetation_shadows.splits.w) {
         return 1.0;
@@ -811,7 +824,7 @@ fn vegetationShadow(world_position: vec3<f32>, normal_world: vec3<f32>) -> f32 {
             break;
         }
     }
-    var lit = vegetationShadowCascade(world_position, normal_world, cascade);
+    var lit = vegetationShadowCascade(world_position, normal_world, cascade, shelter_weight);
     let start = select(0.0, vegetation_shadows.splits[max(cascade, 1u) - 1u], cascade > 0u);
     let end = vegetation_shadows.splits[cascade];
     // The distant fade has its own width, independent of cascade transitions.
@@ -821,7 +834,7 @@ fn vegetationShadow(world_position: vec3<f32>, normal_world: vec3<f32>) -> f32 {
     if (blend > 0.0) {
         var next = 1.0;
         if (cascade < 2u) {
-            next = vegetationShadowCascade(world_position, normal_world, cascade + 1u);
+            next = vegetationShadowCascade(world_position, normal_world, cascade + 1u, shelter_weight);
         }
         lit = mix(lit, next, blend);
     }
@@ -1235,8 +1248,11 @@ fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let n_dot_h = max(dot(normal_view, half_vector), 0.0);
     let n_dot_v = max(dot(normal_view, to_camera), 0.0);
     let v_dot_h = max(dot(to_camera, half_vector), 0.0);
-    // Plants shade whichever light their cascades were drawn from.
-    let plant_shadow = vegetationShadow(world_position, normal_world);
+    // Plants and buildings shade whichever light their cascades were drawn from.
+    // Keep indoor joins sealed without reducing the bias exposed roofs need.
+    // The baked sky share changes smoothly around windows and porch edges.
+    let shadow_shelter = select(0.0, 1.0 - smoothstep(0.15, 0.45, shelter.x), building);
+    let plant_shadow = vegetationShadow(world_position, normal_world, shadow_shelter);
     let plant_light = vegetation_shadows.light.w;
     var sun_visibility = 1.0;
     if (globals.settings_a.x > 0.01) {

@@ -684,6 +684,9 @@ has it, dimmer under a porch roof and barely there from inside the room. The
 buildings are drawn depth-only into
 the plants' sun and moon shadow cascades after the plants, so roofs shade the
 rooms under them and houses shade the ground, the plants and each other.
+Nearby interior walls, upper floors and stairs also cast into the two detailed
+cascades, even outside the view. Sheltered building surfaces use a tight shadow
+filter and small receiver offsets to keep light from bleeding through mesh joins.
 
 The G-buffer position's alpha marks a building's pixels and carries the sky and
 rain shares baked into its vertices. The composite lights a surface from the
