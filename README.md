@@ -30,6 +30,29 @@ cargo run --release --bin realistic_forest
 A debug build also works and is much faster to compile; the shaders are compiled
 by naga at runtime either way.
 
+Shader sources are embedded in the executable at compile time. Development runs
+can read the loose meshes and textures in `assets/models` and `assets/textures`.
+To package those assets for distribution:
+
+```sh
+cargo build --release --locked --bin realistic_forest --bin pack-assets
+cargo run --release --locked --bin pack-assets -- assets target/release/assets
+cargo run --release --locked --bin pack-assets -- --verify assets target/release/assets
+```
+
+Distribute the executable alongside `assets/models.pak` and
+`assets/textures.pak`. Keep both pak files together in that adjacent `assets`
+directory; the program finds them when launched from another working directory.
+Each pak is a ZIP container with independently Zstandard-compressed files, read
+directly without extracting. The verifier checks every file against the source
+assets, including archive checksums and completeness. Generated packs use stable
+file ordering and metadata for reproducible output. Rebuild them after changing
+meshes or textures; rebuilding the executable updates embedded shaders.
+
+Release archives also carry `GRASS-ATTRIBUTION.md` and `WATER-ATTRIBUTION.md`.
+Keep those notices with redistributed builds. Asset metadata and attribution
+files under `models` and `textures` remain inside their respective pak files.
+
 ## Controls
 
 | Input | Action |

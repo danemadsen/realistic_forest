@@ -364,8 +364,8 @@ pub struct PendingAtlasPatch {
     pub age: u32,
 }
 
-/// The five erosion WGSL sources, published once by the main world (which
-/// owns the asset server) and taken once by the worker thread, which compiles
+/// The five embedded erosion WGSL sources, published once by the main world
+/// and taken once by the worker thread, which compiles
 /// them into shader modules on its own device.
 ///
 /// As bytes because that is what crosses threads and what

@@ -54,9 +54,9 @@ jobs:
 
       # The GPU-dependent tests are #[ignore]d, so this runs on a headless
       # runner. Run them by hand on a real adapter with `-- --ignored`.
-      - name: Unit tests
+      - name: Unit tests, including asset pak round trips
         if: ${{ !cancelled() }}
-        run: cargo test --locked
+        run: cargo test --locked --all-targets
 
       # Parses every assets/shaders/*.wgsl with naga and checks entry points.
       # Shaders are compiled at runtime, so this is the only CI signal for them.

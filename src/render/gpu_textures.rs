@@ -19,11 +19,12 @@ fn asset_path(relative: &str) -> PathBuf {
     PathBuf::from(crate::resolve_asset_root()).join(relative)
 }
 
-fn load_image_rgba(path: &PathBuf) -> Option<(Vec<u8>, usize)> {
-    let reader = image::ImageReader::open(path).ok()?;
-    let decoded = reader.decode().ok()?;
+fn load_image_rgba(path: &PathBuf) -> Result<(Vec<u8>, usize), String> {
+    let texture_bytes = crate::asset_io::read(path)?;
+    let decoded = image::load_from_memory(&texture_bytes)
+        .map_err(|error| format!("loading terrain texture {}: {error}", path.display()))?;
     let size = decoded.width() as usize;
-    Some((decoded.to_rgba8().into_raw(), size))
+    Ok((decoded.to_rgba8().into_raw(), size))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -293,25 +294,31 @@ fn build_terrain_layers(
     let mut layers: Vec<Option<MipChain8>> = (0..TERRAIN_ATLAS_SLOTS).map(|_| None).collect();
     for (index, folder) in TERRAIN_MATERIALS.iter().enumerate() {
         let map_path = asset_path(&format!("textures/{folder}/{folder}{map_suffix}"));
-        let Some((map_rgba, map_size)) = load_image_rgba(&map_path) else {
-            log::warn!("Terrain texture missing: {}", map_path.display());
-            continue;
+        let (map_rgba, map_size) = match load_image_rgba(&map_path) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                log::warn!("Terrain texture unavailable: {error}");
+                continue;
+            }
         };
         let mut tile_bytes =
             downscale_tile_wrapping(&map_rgba, map_size, TERRAIN_TILE_SIZE, encoding);
 
         if let Some(mask_suffix) = mask_suffix {
             let mask_path = asset_path(&format!("textures/{folder}/{folder}{mask_suffix}"));
-            if let Some((mask_rgba, mask_size)) = load_image_rgba(&mask_path) {
-                let mask_bytes = downscale_tile_wrapping(
-                    &mask_rgba,
-                    mask_size,
-                    TERRAIN_TILE_SIZE,
-                    TextureEncoding::Linear,
-                );
-                for pixel in 0..tile_area {
-                    tile_bytes[pixel * 4 + 3] = mask_bytes[pixel * 4];
+            match load_image_rgba(&mask_path) {
+                Ok((mask_rgba, mask_size)) => {
+                    let mask_bytes = downscale_tile_wrapping(
+                        &mask_rgba,
+                        mask_size,
+                        TERRAIN_TILE_SIZE,
+                        TextureEncoding::Linear,
+                    );
+                    for pixel in 0..tile_area {
+                        tile_bytes[pixel * 4 + 3] = mask_bytes[pixel * 4];
+                    }
                 }
+                Err(error) => log::warn!("Terrain texture mask unavailable: {error}"),
             }
         }
 

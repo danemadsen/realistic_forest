@@ -501,29 +501,88 @@ impl Plugin for ForestRenderPlugin {
         // Shared cross-world state: the erosion bridge carries one frame of
         // simulation commands at a time from the main world.
         let bridge = app.world().resource::<ErosionBridge>().clone();
-        // Shader assets live in the main world's Assets<Shader>; handles work
-        // in the render app because PipelineCache watches shader assets.
+        // Embed the self-contained WGSL sources in the executable. Shader
+        // assets still live in the main world, where PipelineCache watches
+        // them, and their handles remain valid in the render app.
         let handles = {
-            let asset_server = app.world().resource::<AssetServer>();
+            let mut shader_assets = app.world_mut().resource_mut::<Assets<Shader>>();
+            let mut add_shader = |source: &'static str, path: &'static str| {
+                let shader = Shader::from_wgsl(source, path);
+                shader_assets.add(shader)
+            };
             ForestShaderHandles {
-                terrain_vs: asset_server.load::<Shader>("shaders/terrain-vs.wgsl"),
-                terrain_fs: asset_server.load::<Shader>("shaders/terrain-fs.wgsl"),
-                grass: asset_server.load::<Shader>("shaders/grass.wgsl"),
-                grass_cull: asset_server.load::<Shader>("shaders/grass-cull.wgsl"),
-                grass_ground_average: asset_server.load::<Shader>("shaders/grass-ground-average.wgsl"),
-                vegetation: asset_server.load::<Shader>("shaders/vegetation.wgsl"),
-                vegetation_cull: asset_server.load::<Shader>("shaders/vegetation-cull.wgsl"),
-                building: asset_server.load::<Shader>("shaders/building.wgsl"),
-                ssao: asset_server.load::<Shader>("shaders/ssao.wgsl"),
-                ssao_blur: asset_server.load::<Shader>("shaders/ssao-blur.wgsl"),
-                composite: asset_server.load::<Shader>("shaders/composite.wgsl"),
-                fxaa: asset_server.load::<Shader>("shaders/fxaa.wgsl"),
-                water: asset_server.load::<Shader>("shaders/water.wgsl"),
-                precipitation: asset_server.load::<Shader>("shaders/precipitation.wgsl"),
-                lightning: asset_server.load::<Shader>("shaders/lightning.wgsl"),
-                cloud_probe: asset_server.load::<Shader>("shaders/cloud-probe.wgsl"),
-                cloud_shadow_map: asset_server.load::<Shader>("shaders/cloud-shadow-map.wgsl"),
-                heightfield_max: asset_server.load::<Shader>("shaders/heightfield-max.wgsl"),
+                terrain_vs: add_shader(
+                    include_str!("../../assets/shaders/terrain-vs.wgsl"),
+                    "shaders/terrain-vs.wgsl",
+                ),
+                terrain_fs: add_shader(
+                    include_str!("../../assets/shaders/terrain-fs.wgsl"),
+                    "shaders/terrain-fs.wgsl",
+                ),
+                grass: add_shader(
+                    include_str!("../../assets/shaders/grass.wgsl"),
+                    "shaders/grass.wgsl",
+                ),
+                grass_cull: add_shader(
+                    include_str!("../../assets/shaders/grass-cull.wgsl"),
+                    "shaders/grass-cull.wgsl",
+                ),
+                grass_ground_average: add_shader(
+                    include_str!("../../assets/shaders/grass-ground-average.wgsl"),
+                    "shaders/grass-ground-average.wgsl",
+                ),
+                vegetation: add_shader(
+                    include_str!("../../assets/shaders/vegetation.wgsl"),
+                    "shaders/vegetation.wgsl",
+                ),
+                vegetation_cull: add_shader(
+                    include_str!("../../assets/shaders/vegetation-cull.wgsl"),
+                    "shaders/vegetation-cull.wgsl",
+                ),
+                building: add_shader(
+                    include_str!("../../assets/shaders/building.wgsl"),
+                    "shaders/building.wgsl",
+                ),
+                ssao: add_shader(
+                    include_str!("../../assets/shaders/ssao.wgsl"),
+                    "shaders/ssao.wgsl",
+                ),
+                ssao_blur: add_shader(
+                    include_str!("../../assets/shaders/ssao-blur.wgsl"),
+                    "shaders/ssao-blur.wgsl",
+                ),
+                composite: add_shader(
+                    include_str!("../../assets/shaders/composite.wgsl"),
+                    "shaders/composite.wgsl",
+                ),
+                fxaa: add_shader(
+                    include_str!("../../assets/shaders/fxaa.wgsl"),
+                    "shaders/fxaa.wgsl",
+                ),
+                water: add_shader(
+                    include_str!("../../assets/shaders/water.wgsl"),
+                    "shaders/water.wgsl",
+                ),
+                precipitation: add_shader(
+                    include_str!("../../assets/shaders/precipitation.wgsl"),
+                    "shaders/precipitation.wgsl",
+                ),
+                lightning: add_shader(
+                    include_str!("../../assets/shaders/lightning.wgsl"),
+                    "shaders/lightning.wgsl",
+                ),
+                cloud_probe: add_shader(
+                    include_str!("../../assets/shaders/cloud-probe.wgsl"),
+                    "shaders/cloud-probe.wgsl",
+                ),
+                cloud_shadow_map: add_shader(
+                    include_str!("../../assets/shaders/cloud-shadow-map.wgsl"),
+                    "shaders/cloud-shadow-map.wgsl",
+                ),
+                heightfield_max: add_shader(
+                    include_str!("../../assets/shaders/heightfield-max.wgsl"),
+                    "shaders/heightfield-max.wgsl",
+                ),
             }
         };
         // The main world's terrain layer images (and the erosion blend mask)

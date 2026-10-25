@@ -63,12 +63,12 @@ jobs:
           shared-key: build-${{ matrix.platform }}
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
-      # Only the game: the other bins in src/bin are developer tools.
+      # Build the game and the release asset packer together.
       - name: Build
-        run: cargo build --release --locked --bin realistic_forest
+        run: cargo build --release --locked --bin realistic_forest --bin pack-assets
 
-      # The binary finds its shaders and textures in an `assets` folder next to
-      # it (or in the working directory), so a runnable archive carries both.
+      # Shaders are embedded. Meshes and textures load directly from the two
+      # compressed pak files in the executable's adjacent assets directory.
       - name: Package
         id: package
         shell: bash
@@ -83,7 +83,10 @@ jobs:
           mkdir -p "dist/${name}"
           cp "target/release/realistic_forest${EXE_SUFFIX}" "dist/${name}/"
           cp README.md "dist/${name}/"
-          cp -R assets "dist/${name}/assets"
+          cp assets/models/GRASS-ATTRIBUTION.md "dist/${name}/"
+          cp src/water/ATTRIBUTION.md "dist/${name}/WATER-ATTRIBUTION.md"
+          "target/release/pack-assets${EXE_SUFFIX}" assets "dist/${name}/assets"
+          "target/release/pack-assets${EXE_SUFFIX}" --verify assets "dist/${name}/assets"
 
           cd dist
           if [ "${ARCHIVE_EXT}" = "zip" ]; then

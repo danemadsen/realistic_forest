@@ -13,7 +13,7 @@
 //! Life cycle, in order:
 //!
 //! 1. the main world publishes the five WGSL sources through
-//!    [`ErosionBridge::publish_shader_sources`] (it owns the asset server);
+//!    [`ErosionBridge::publish_shader_sources`] from the embedded bytes;
 //! 2. the render world's slim erosion node asks [`spawn_erosion_worker`] once
 //!    it has the shared `RenderAdapter`; the worker thread opens its own
 //!    `wgpu` device, mirrors the render device's requested features and

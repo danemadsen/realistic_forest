@@ -1,3 +1,5 @@
 /target
 /tmp
+/dist
+/assets/*.pak
 .DS_Store

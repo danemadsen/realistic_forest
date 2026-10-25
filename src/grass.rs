@@ -160,12 +160,8 @@ impl GrassAssets {
     /// rocks and other models that share the directory.
     pub fn load(models_directory: impl AsRef<Path>) -> Result<Self, String> {
         let directory = models_directory.as_ref();
-        let entries = std::fs::read_dir(directory)
+        let mut paths = crate::asset_io::readDirectory(directory)
             .map_err(|e| format!("Reading grass directory {}: {e}", directory.display()))?;
-        let mut paths = entries
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("Reading grass directory entry: {e}"))?;
         paths.retain(|path| {
             path.extension().is_some_and(|extension| extension == "glb")
                 && path
@@ -199,7 +195,8 @@ impl GrassAssets {
         path: &Path,
         materials_by_key: &mut HashMap<String, usize>,
     ) -> Result<(), String> {
-        let gltf = gltf::Gltf::open(path).map_err(|e| e.to_string())?;
+        let model_bytes = crate::asset_io::read(path)?;
+        let gltf = gltf::Gltf::from_slice(&model_bytes).map_err(|e| e.to_string())?;
         let blob = gltf.blob.as_deref().ok_or("Expected a GLB binary buffer")?;
         let primitives: Vec<_> = gltf.meshes().flat_map(|mesh| mesh.primitives()).collect();
         if primitives.len() != 1 || primitives[0].mode() != gltf::mesh::Mode::Triangles {
@@ -364,7 +361,9 @@ fn load_texture(
     let image = match image.source() {
         gltf::image::Source::Uri { uri, .. } => {
             let path: PathBuf = model.parent().unwrap_or(Path::new(".")).join(uri);
-            image::open(&path).map_err(|e| format!("Loading texture {}: {e}", path.display()))?
+            let texture_bytes = crate::asset_io::read(&path)?;
+            image::load_from_memory(&texture_bytes)
+                .map_err(|e| format!("Loading texture {}: {e}", path.display()))?
         }
         gltf::image::Source::View { view, .. } => {
             let bytes = blob

@@ -373,7 +373,8 @@ impl Loader {
 
     /// Read one GLB's primitives, registering its materials and textures.
     fn read_glb(&mut self, path: &Path, lod: Option<u32>) -> Result<Vec<RawPrimitive>, String> {
-        let gltf = gltf::Gltf::open(path).map_err(|e| e.to_string())?;
+        let model_bytes = crate::asset_io::read(path)?;
+        let gltf = gltf::Gltf::from_slice(&model_bytes).map_err(|e| e.to_string())?;
         let blob = gltf.blob.as_deref().ok_or("expected a GLB binary chunk")?;
         let directory = path.parent().unwrap_or(Path::new("."));
         let mut primitives = Vec::new();
@@ -475,7 +476,7 @@ impl Loader {
                 return None;
             }
             match texture.source().source() {
-                gltf::image::Source::Uri { uri, .. } => Some(normalize_path(&directory.join(uri))),
+                gltf::image::Source::Uri { uri, .. } => Some(directory.join(uri)),
                 gltf::image::Source::View { .. } => None,
             }
         };
@@ -484,15 +485,28 @@ impl Loader {
             .base_color_texture()
             .and_then(|info| uri_of(info.texture(), info.tex_coord()))
             .ok_or("plant materials need an external base colour texture")?;
+        let base = crate::asset_io::canonicalize(&base)?;
         let normal = material
             .normal_texture()
             .and_then(|info| uri_of(info.texture(), info.tex_coord()));
+        let normal = normal
+            .as_deref()
+            .map(crate::asset_io::canonicalize)
+            .transpose()?;
         let roughness = pbr
             .metallic_roughness_texture()
             .and_then(|info| uri_of(info.texture(), info.tex_coord()));
+        let roughness = roughness
+            .as_deref()
+            .map(crate::asset_io::canonicalize)
+            .transpose()?;
         let occlusion = material
             .occlusion_texture()
             .and_then(|info| uri_of(info.texture(), info.tex_coord()));
+        let occlusion = occlusion
+            .as_deref()
+            .map(crate::asset_io::canonicalize)
+            .transpose()?;
         let blended = material.alpha_mode() != gltf::material::AlphaMode::Opaque;
         let surface = if !blended {
             Surface::Bark
@@ -540,24 +554,6 @@ impl Loader {
     }
 }
 
-/// Collapse `a/b/../c` so the same texture reached from different model
-/// directories dedupes to one key.
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
-                }
-            }
-            std::path::Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
-}
-
 impl VegetationAssets {
     /// Load every plant model in `models_directory`. Rocks and grass are
     /// skipped. Fails if no plant model is found or any file is malformed.
@@ -572,10 +568,10 @@ impl VegetationAssets {
     }
 
     fn load_inner(directory: &Path, with_textures: bool) -> Result<Self, String> {
-        let dir_entries = std::fs::read_dir(directory)
+        let dir_entries = crate::asset_io::readDirectory(directory)
             .map_err(|e| format!("reading {}: {e}", directory.display()))?;
         let glb_paths = dir_entries
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .into_iter()
             .filter(|path| path.extension().is_some_and(|extension| extension == "glb"));
         let parse_glb_entry = |path: PathBuf| -> Option<(ModelName, PathBuf)> {
             let stem = path.file_stem()?.to_str()?.to_string();
@@ -753,7 +749,8 @@ pub(crate) struct Image {
 }
 
 pub(crate) fn decode(path: &Path) -> Result<Image, String> {
-    let image = image::open(path)
+    let texture_bytes = crate::asset_io::read(path)?;
+    let image = image::load_from_memory(&texture_bytes)
         .map_err(|e| format!("loading texture {}: {e}", path.display()))?
         .into_rgba8();
     Ok(Image {

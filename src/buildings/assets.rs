@@ -286,7 +286,8 @@ impl Loader {
             let Some(path) = path else {
                 return Ok(None);
             };
-            let resolved = std::fs::canonicalize(&path).map_err(|e| format!("texture {}: {e}", path.display()))?;
+            let resolved = crate::asset_io::canonicalize(&path)
+                .map_err(|e| format!("texture {}: {e}", path.display()))?;
             Ok(Some(resolved))
         };
         let pbr = material.pbr_metallic_roughness();
@@ -430,7 +431,8 @@ impl Loader {
     }
 
     fn read_building(&mut self, path: &Path, name: &str) -> Result<BuildingModel, String> {
-        let gltf = gltf::Gltf::open(path).map_err(|e| e.to_string())?;
+        let model_bytes = crate::asset_io::read(path)?;
+        let gltf = gltf::Gltf::from_slice(&model_bytes).map_err(|e| e.to_string())?;
         let blob = gltf.blob.as_deref().ok_or("expected a GLB binary chunk")?;
         let directory = path.parent().unwrap_or(Path::new("."));
         let scene = gltf.default_scene().or_else(|| gltf.scenes().next()).ok_or("no scene")?;
@@ -713,9 +715,10 @@ impl BuildingLibrary {
     /// textures are listed in `texture_keys` for [`prepare_textures`].
     pub fn load(directory: impl AsRef<Path>) -> Result<Self, String> {
         let directory = directory.as_ref();
-        let entries = std::fs::read_dir(directory).map_err(|e| format!("reading {}: {e}", directory.display()))?;
+        let entries = crate::asset_io::readDirectory(directory)
+            .map_err(|e| format!("reading {}: {e}", directory.display()))?;
         let mut paths: Vec<PathBuf> = entries
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .into_iter()
             .filter(|path| path.extension().is_some_and(|extension| extension == "glb"))
             .collect();
         paths.sort();

@@ -28,6 +28,8 @@ mod water;
 mod weather;
 mod snow;
 
+use realistic_forest::asset_io;
+
 use crate::automation::AutomationSettings;
 use crate::constants::*;
 use crate::erosion::{
@@ -198,6 +200,10 @@ fn main() {
         let extent = if automation.map_extent_set { automation.map_extent } else { 8192.0 };
         rivers::map::run_map(&noise_field, path, automation.map_centre, extent);
         return;
+    }
+    if let Err(error) = asset_io::initialize() {
+        eprintln!("ASSETS: {error}");
+        std::process::exit(1);
     }
     // --building-map charts the settlements and exits with no window.
     if let Some(path) = &automation.building_map {
@@ -484,30 +490,10 @@ fn main() {
     app.run();
 }
 
-/// The asset root the C++ used: `AssetPath` resolved `assets/` against the
-/// working directory. Bevy instead uses `CARGO_MANIFEST_DIR` (under
-/// `cargo run`) or the executable's directory (an installed binary), so accept
-/// whichever candidate actually holds the shaders and fall back to bevy's
-/// default. This keeps `./target/release/realistic_forest` working from the
-/// project root the way `./build/forest` does, and a packaged build working
-/// from any directory. Every runtime file read under `assets/` goes through
-/// here; a bare `"assets/..."` path only works from the project root.
+/// Meshes and textures come from executable-adjacent paks in packaged builds,
+/// or loose source directories during development. Shaders are embedded.
 fn resolve_asset_root() -> String {
-    let candidates = [
-        std::env::current_dir().ok().map(|dir| dir.join("assets")),
-        std::env::var("CARGO_MANIFEST_DIR")
-            .ok()
-            .map(|dir| std::path::PathBuf::from(dir).join("assets")),
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|dir| dir.join("assets"))),
-    ];
-    for candidate in candidates.into_iter().flatten() {
-        if candidate.join("shaders").join("terrain-vs.wgsl").is_file() {
-            return candidate.to_string_lossy().into_owned();
-        }
-    }
-    "assets".to_string()
+    asset_io::rootPath().to_string_lossy().into_owned()
 }
 
 /// The camera and the player. This is the only camera entity in the app, so
@@ -857,62 +843,53 @@ fn erosion_stream_system(
     }
 }
 
-/// One-shot WGSL publisher for the erosion worker, in `Local` state: loads
-/// the five sim shaders' handles on the first run, then publishes the
-/// sources once `Assets<Shader>` has all of them (the files may take a
-/// frame or two to load).
-#[derive(Default)]
-struct ErosionShaderPublication {
-    handles: Option<[Handle<Shader>; 5]>,
-    published: bool,
-}
-
-/// The main world owns the asset server, so it reads the five sim WGSLs
-/// through bevy's asset root resolution and publishes their bytes; the
-/// worker thread compiles them verbatim on its own device.
-///
-/// The sim shaders are self-contained (no `#import`s, asserted by
-/// `erosion_worker`'s tests), so the asset source's text is what the shaders
-/// need — raw `wgpu::ShaderSource::Wgsl` compilation has no naga_oil
-/// preprocessing step to run them through.
+/// Publish the embedded sim shaders once. They are self-contained (no
+/// `#import`s, asserted by `erosion_worker`'s tests), so the worker compiles
+/// their original bytes directly on its own device.
 fn publish_erosion_shader_sources(
-    mut publication: Local<ErosionShaderPublication>,
-    asset_server: Res<AssetServer>,
-    shaders: Res<Assets<Shader>>,
+    mut published: Local<bool>,
     bridge: Res<ErosionBridge>,
 ) {
-    if publication.published {
+    if *published {
         return;
     }
-    let handles = publication.handles.get_or_insert_with(|| {
-        ["init", "flux", "water", "terrain", "thermal"].map(|name| {
-            asset_server.load::<Shader>(&format!("shaders/erosion-{name}.wgsl"))
-        })
-    });
-    let Some(sources) = (|| {
-        Some(ErosionShaderSources {
-            init: shader_source_bytes(shaders.get(&handles[0])?)?,
-            flux: shader_source_bytes(shaders.get(&handles[1])?)?,
-            water: shader_source_bytes(shaders.get(&handles[2])?)?,
-            terrain: shader_source_bytes(shaders.get(&handles[3])?)?,
-            thermal: shader_source_bytes(shaders.get(&handles[4])?)?,
-        })
-    })() else {
-        // Still loading; nothing has spawned the worker yet anyway.
-        return;
+    let sources = ErosionShaderSources {
+        init: include_bytes!("../assets/shaders/erosion-init.wgsl").to_vec(),
+        flux: include_bytes!("../assets/shaders/erosion-flux.wgsl").to_vec(),
+        water: include_bytes!("../assets/shaders/erosion-water.wgsl").to_vec(),
+        terrain: include_bytes!("../assets/shaders/erosion-terrain.wgsl").to_vec(),
+        thermal: include_bytes!("../assets/shaders/erosion-thermal.wgsl").to_vec(),
     };
     bridge.publish_shader_sources(sources);
-    publication.published = true;
+    *published = true;
 }
 
-/// The WGSL text of a bevy `Shader` asset as bytes.
-fn shader_source_bytes(shader: &Shader) -> Option<Vec<u8>> {
-    Some(match &shader.source {
-        bevy::shader::Source::Wgsl(text) | bevy::shader::Source::Wesl(text) => {
-            text.to_string().into_bytes()
-        }
-        _ => return None,
-    })
+#[cfg(test)]
+mod embedded_shader_tests {
+    use super::*;
+
+    #[test]
+    fn erosion_shaders_publish_once_without_asset_plugins() {
+        let mut app = App::new();
+        app.init_resource::<ErosionBridge>();
+        app.add_systems(Update, publish_erosion_shader_sources);
+
+        app.update();
+        let bridge = app.world().resource::<ErosionBridge>();
+        let sources = bridge.take_shader_sources().expect("embedded shaders are ready");
+        let shader_sources = [
+            sources.init,
+            sources.flux,
+            sources.water,
+            sources.terrain,
+            sources.thermal,
+        ];
+        assert!(shader_sources.iter().all(|source| !source.is_empty()));
+
+        app.update();
+        let bridge = app.world().resource::<ErosionBridge>();
+        assert!(!bridge.shader_sources_ready());
+    }
 }
 
 /// `--measure-overlap` replaces the normal stream/measure pair, exactly as the

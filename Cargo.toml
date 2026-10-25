@@ -20,6 +20,10 @@ naga = { version = "29.0.3", features = ["wgsl-in"] }
 log = "0.4"
 image = "0.25"
 chrono = "0.4"
+# Asset paks use the standard ZIP index/checksums with per-file Zstandard frames.
+# Disable unrelated codecs and encryption to keep the dependency surface small.
+zip = { version = "9.1.1", default-features = false, features = ["zstd"] }
+tempfile = "3"
 
 # macOS only, and only for `clamp_to_primary_work_area`: raylib clamps
 # `InitWindow`'s screen size to the primary monitor's work area before creating
