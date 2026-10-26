@@ -429,6 +429,36 @@ fn ground_bolts_restrike_down_the_main_channel_only() {
 }
 
 #[test]
+fn thunder_strokes_follow_visible_flashes_without_continuing_current() {
+    assert_eq!(LightningEvent::default().thunder_strokes().count(), 0);
+
+    let settings = AppSettings::default();
+    let mut storm = WeatherState::from_preset(WeatherPreset::Thunderstorm, false);
+    for kind in [BoltKind::Ground, BoltKind::Crawler, BoltKind::Hidden] {
+        storm.force_strike([900.0, 0.0], kind, 0.0, [0.0; 2], &settings);
+        let event = storm.lightning;
+        let acoustic_strokes: Vec<_> = event.thunder_strokes().collect();
+        assert_eq!(acoustic_strokes[0], (0.0, 1.0), "{kind:?}");
+        let ordered_delays = acoustic_strokes
+            .windows(2)
+            .all(|pair| pair[1].0 > pair[0].0);
+        assert!(ordered_delays, "{kind:?}: stroke delays must increase");
+
+        for ((delay, energy), stroke) in acoustic_strokes.iter().zip(&event.strokes) {
+            let time = event.first_stroke_seconds() + delay;
+            let before = event.pulse(time - 0.00001).flash;
+            let at_stroke = event.pulse(time + 0.00001).flash;
+            let pulse_jump = at_stroke - before;
+            let expected_jump = energy.sqrt() + stroke.continuing;
+            assert!(
+                (pulse_jump - expected_jump).abs() < 0.005,
+                "{kind:?}: acoustic stroke at {delay}s must follow flash; {pulse_jump} vs {expected_jump}"
+            );
+        }
+    }
+}
+
+#[test]
 fn storms_discharge_every_few_seconds_with_occasional_bursts() {
     let settings = AppSettings::default();
     let mut storm = WeatherState::from_preset(WeatherPreset::Thunderstorm, false);

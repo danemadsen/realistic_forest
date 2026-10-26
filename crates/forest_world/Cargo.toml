@@ -11,6 +11,8 @@ forest_erosion = { path = "../forest_erosion" }
 forest_vegetation = { path = "../forest_vegetation" }
 forest_buildings = { path = "../forest_buildings" }
 bevy.workspace = true
+# Preserve the reference project's tuned procedural clap and roll synthesis.
+thunder-synth = { git = "https://github.com/Thoralf-M/thunder-synth", rev = "55f605981cdc27d81b5740acc9ada133715eaab5" }
 
 [dev-dependencies]
 forest_vegetation = { path = "../forest_vegetation", features = ["test_support"] }

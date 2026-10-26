@@ -1,10 +1,8 @@
-//! Thunder built from the lightning channel itself. Sound from each piece of
-//! the channel reaches the listener after its own travel time at the speed
-//! of sound, so a near strike opens with a ripping crack and rolls on as the
-//! distant upper channel arrives, while a far one is a low grumble whose high
-//! frequencies the air has absorbed. Echoes off the ground and the cloud deck
-//! stretch the tail. The samples are synthesised off the main thread when a
-//! discharge begins and played once its first sound reaches the listener.
+//! Procedural thunder using thunder-synth's statistically shaped claps and rolls.
+//! Channel distance controls sound propagation and the balance of close cracks
+//! and distant rolls; its range spread controls the rolling duration. Rendering
+//! runs off the main thread. Every discharge is generated from fresh noise,
+//! without recorded audio, and retains the reference synthesizer's dynamics.
 
 use crate::automation::AutomationSettings;
 use crate::lightning::{ActiveBolt, BoltKind, BoltSegment};
@@ -21,14 +19,22 @@ use std::num::NonZero;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub const THUNDER_SAMPLE_RATE: u32 = 44_100;
+/// The reference generator's native rate; the audio backend resamples for playback.
+pub const THUNDER_SAMPLE_RATE: u32 = thunder_synth::SAMPLE_RATE;
+/// Approximate sound speed in metres per second in mild outdoor air.
 pub const SPEED_OF_SOUND: f32 = 343.0;
-/// Even a channel spanning kilometres of range stops rolling within this.
-const MAX_THUNDER_SECONDS: f32 = 14.0;
-/// Echoes keep a strike rumbling this long after its last direct sound.
-const TAIL_SECONDS: f32 = 4.0;
-/// Energy arrivals are gathered per millisecond.
-const SAMPLES_PER_BIN: usize = 44;
+/// Bound rendering work even for channels with an unusually large range spread.
+const MAX_THUNDER_SECONDS: f32 = 18.0;
+/// Leave the reference clap's complete three-second decay after the last arrival.
+const TAIL_SECONDS: f32 = thunder_synth::CLAP_SECS;
+/// Upstream claps have 50 ms of silence before their audible attack.
+const CLAP_PREROLL_SECONDS: f32 = 0.05;
+/// Later return strokes add a short crack, keeping the first clap's full tail.
+const RESTRIKE_SECONDS: f32 = 0.18;
+/// Restrikes stay beneath the main clap and taper further with each stroke.
+const RESTRIKE_GAIN: f32 = 0.22;
+/// Match the reference roll's fade when the final roll ends between clip boundaries.
+const ROLL_FADE_SECONDS: f32 = 0.8;
 
 /// A piece of the channel as the listener hears it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -122,30 +128,137 @@ impl ThunderRandom {
     }
 }
 
-/// One-pole smoothing with time constant `seconds`, run over per-millisecond bins.
-fn smooth_bins(bins: &mut [f32], seconds: f32) {
-    let keep = (-0.001 / seconds).exp();
-    let mut state = 0.0;
-    for bin in bins.iter_mut() {
-        state = state * keep + *bin * (1.0 - keep);
-        *bin = state;
+/// Render fresh noise through the unchanged upstream synthesizer. Its public API
+/// guarantees a 44-byte header followed by mono, little-endian 16-bit PCM.
+fn render_reference(kind: thunder_synth::Thunder, seed: u64) -> Vec<f32> {
+    let generated_wav = thunder_synth::wav(kind, seed);
+    let (frames, _) = generated_wav[44..].as_chunks::<2>();
+    frames
+        .iter()
+        .map(|bytes| {
+            let encoded = i16::from_le_bytes([bytes[0], bytes[1]]);
+            f32::from(encoded) / 32768.0
+        })
+        .collect()
+}
+
+fn lowpass(samples: &mut [f32], cutoff: f32) {
+    let keep = (-std::f32::consts::TAU * cutoff / THUNDER_SAMPLE_RATE as f32).exp();
+    let (mut first, mut second) = (0.0, 0.0);
+    for sample in samples {
+        first = first * keep + *sample * (1.0 - keep);
+        second = second * keep + first * (1.0 - keep);
+        *sample = second;
     }
 }
 
-fn root_mean_square(samples: &[f32]) -> f32 {
-    (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len().max(1) as f32)
-        .sqrt()
-        .max(1e-9)
+fn add_rolls(samples: &mut [f32], seed: u64, proximity: f32, muffled: bool) {
+    let rate = THUNDER_SAMPLE_RATE as f32;
+    let overlap = (thunder_synth::ROLL_OVERLAP * rate) as usize;
+    let fade = ROLL_FADE_SECONDS * rate;
+    let roll_gain = 0.15 + 0.85 * (1.0 - proximity);
+    let length = samples.len();
+    let (mut start, mut index) = (0, 0_u64);
+    while start < length {
+        let roll_seed = seed.wrapping_add(index.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let mut roll = render_reference(thunder_synth::Thunder::Roll, roll_seed);
+        if muffled {
+            lowpass(&mut roll, 900.0);
+        }
+        for (offset, value) in roll.iter().take(length - start).enumerate() {
+            let position = start + offset;
+            let seconds = position as f32 / rate;
+            // Give the initial clap room, as in the reference's clap-over-roll mix.
+            let duck = 1.0 - 0.6 * proximity * (-seconds / 0.6).exp();
+            let ending = ((length - 1 - position) as f32 / fade).min(1.0);
+            samples[position] += value * roll_gain * duck * ending;
+        }
+        start += roll.len() - overlap;
+        index += 1;
+    }
 }
 
-/// The thunder of `sources` as mono samples at [`THUNDER_SAMPLE_RATE`],
-/// starting when the nearest source is heard. `muffled` thunder comes from
-/// inside the cloud and has lost its crack. Peaks are normalised to 0.9.
-pub fn synthesize_thunder(sources: &[ThunderSource], seed: u64, muffled: bool) -> Vec<f32> {
-    if sources.is_empty() {
-        return Vec::new();
+fn add_claps(
+    samples: &mut [f32],
+    strokes: &[(f32, f32)],
+    seed: u64,
+    distance: f32,
+    proximity: f32,
+) {
+    if proximity < 0.001 {
+        return;
     }
     let rate = THUNDER_SAMPLE_RATE as f32;
+    let preroll = (CLAP_PREROLL_SECONDS * rate) as usize;
+    for (index, &(seconds, energy)) in strokes.iter().enumerate() {
+        let clap_seed = seed.wrapping_add((index as u64).wrapping_mul(0xD1B5_4A32_D192_ED03));
+        let mut clap = render_reference(thunder_synth::Thunder::Clap, clap_seed);
+        if distance > 500.0 {
+            let range = (distance - 500.0) / 1500.0;
+            let cutoff = 12_000.0 / (1.0 + range * range);
+            lowpass(&mut clap, cutoff);
+        }
+        let start = (seconds * rate) as usize;
+        let available = samples.len().saturating_sub(start);
+        let (duration, gain) = if index == 0 {
+            (clap.len() - preroll, proximity * energy.sqrt())
+        } else {
+            let duration = (RESTRIKE_SECONDS * rate) as usize;
+            let gain = proximity * energy.sqrt() * RESTRIKE_GAIN / (index as f32).sqrt();
+            (duration, gain)
+        };
+        let count = duration.min(available);
+        let attack = 0.001 * rate;
+        let release = 0.05 * rate;
+        for offset in 0..count {
+            let onset = (offset as f32 / attack).min(1.0);
+            let ending = if index == 0 {
+                1.0
+            } else {
+                ((duration - 1 - offset) as f32 / release).min(1.0)
+            };
+            samples[start + offset] += clap[preroll + offset] * gain * onset * ending;
+        }
+    }
+}
+
+/// The thunder of one return stroke as mono samples at [`THUNDER_SAMPLE_RATE`].
+/// Empty or inactive sources are silent. Near claps and far rolls retain the
+/// reference generator's relative levels, with a soft limiter for overlapping peals.
+pub fn synthesize_thunder(sources: &[ThunderSource], seed: u64, muffled: bool) -> Vec<f32> {
+    synthesize_discharge(sources, &[(0.0, 1.0)], seed, muffled)
+}
+
+fn synthesize_discharge(
+    sources: &[ThunderSource],
+    strokes: &[(f32, f32)],
+    seed: u64,
+    muffled: bool,
+) -> Vec<f32> {
+    let sources: Vec<_> = sources
+        .iter()
+        .copied()
+        .filter(|source| {
+            source.distance.is_finite()
+                && source.distance > 0.0
+                && source.energy.is_finite()
+                && source.energy > 0.0
+        })
+        .collect();
+    let strokes: Vec<_> = strokes
+        .iter()
+        .copied()
+        .filter(|(time, energy)| {
+            time.is_finite()
+                && *time >= 0.0
+                && *time <= MAX_THUNDER_SECONDS - TAIL_SECONDS
+                && energy.is_finite()
+                && *energy > 0.0
+        })
+        .collect();
+    if sources.is_empty() || strokes.is_empty() {
+        return Vec::new();
+    }
     let nearest = sources
         .iter()
         .map(|source| source.distance)
@@ -154,102 +267,30 @@ pub fn synthesize_thunder(sources: &[ThunderSource], seed: u64, muffled: bool) -
         .iter()
         .map(|source| source.distance)
         .fold(0.0, f32::max);
-    let spread = ((farthest - nearest) / SPEED_OF_SOUND).min(MAX_THUNDER_SECONDS - TAIL_SECONDS);
+    let last_stroke = strokes.iter().map(|(time, _)| *time).fold(0.0, f32::max);
+    let spread = ((farthest - nearest) / SPEED_OF_SOUND + last_stroke)
+        .min(MAX_THUNDER_SECONDS - TAIL_SECONDS);
+    let rate = THUNDER_SAMPLE_RATE as f32;
     let length = ((spread + TAIL_SECONDS) * rate) as usize;
-    let bins = length / SAMPLES_PER_BIN + 1;
+    let range = (nearest - 250.0).max(0.0) / 1800.0;
+    let proximity = if muffled { 0.0 } else { (-range * range).exp() };
+    let mut samples = vec![0.0; length];
+    add_rolls(&mut samples, seed, proximity, muffled);
+    add_claps(&mut samples, &strokes, seed, nearest, proximity);
 
-    // Energy arriving each millisecond: the low rumble, and the high
-    // frequencies only the nearer parts of the channel still carry, since
-    // air absorbs several decibels of them per kilometre.
-    let mut low = vec![0.0f32; bins];
-    let mut high = vec![0.0f32; bins];
-    for source in sources {
-        let bin = ((source.distance - nearest) / SPEED_OF_SOUND * 1000.0) as usize;
-        if bin >= bins {
-            continue;
+    // Preserve the reference's dynamic range: normalising every roll to a
+    // clap's peak would turn quiet distant thunder into an equally loud roar.
+    for sample in &mut samples {
+        let magnitude = sample.abs();
+        if magnitude > 0.9 {
+            let compressed = 0.9 + 0.099 * ((magnitude - 0.9) / 0.099).tanh();
+            *sample = sample.signum() * compressed;
         }
-        let arriving = source.energy / (source.distance * source.distance);
-        low[bin] += arriving;
-        high[bin] += arriving * (-source.distance / 400.0).exp() * if muffled { 0.05 } else { 1.0 };
-    }
-    // The rumble from each piece rings for tens of milliseconds; the crack
-    // is sharp. Echoes off the ground and the cloud deck add a rolling tail.
-    smooth_bins(&mut low, 0.045);
-    smooth_bins(&mut high, 0.012);
-    let mut echo = low.clone();
-    smooth_bins(&mut echo, 1.6);
-    for (bin, echoed) in low.iter_mut().zip(echo) {
-        *bin += echoed * 6.0;
-    }
-
-    // Shape white noise into the two bands, then normalise each band so the
-    // envelopes alone decide their balance.
-    let mut random = ThunderRandom::new(seed);
-    let low_cutoff: f32 = if muffled { 70.0 } else { 110.0 };
-    let low_keep = (-std::f32::consts::TAU * low_cutoff / rate).exp();
-    let crack_keep = (-std::f32::consts::TAU * 1500.0 / rate).exp();
-    let mut rumble = Vec::with_capacity(length);
-    let mut crack = Vec::with_capacity(length);
-    let (mut first, mut second, mut smooth) = (0.0f32, 0.0f32, 0.0f32);
-    for _ in 0..length {
-        let noise = random.range(-1.0, 1.0);
-        first = first * low_keep + noise * (1.0 - low_keep);
-        second = second * low_keep + first * (1.0 - low_keep);
-        smooth = smooth * crack_keep + noise * (1.0 - crack_keep);
-        rumble.push(second);
-        crack.push(noise - smooth);
-    }
-    let rumble_gain = 1.0 / root_mean_square(&rumble);
-    let crack_gain = 1.0 / root_mean_square(&crack);
-
-    // The rumble rolls: its loudness wanders a few times a second as
-    // different stretches of the channel arrive in and out of step.
-    let mut roll_phase = random.range(0.0, std::f32::consts::TAU);
-    let mut roll_rate = random.range(3.0, 8.0);
-    let mut samples = Vec::with_capacity(length);
-    for index in 0..length {
-        let position = index as f32 / SAMPLES_PER_BIN as f32;
-        let bin = (position as usize).min(bins - 1);
-        let next = (bin + 1).min(bins - 1);
-        let fraction = position - bin as f32;
-        let low_level = (low[bin] + (low[next] - low[bin]) * fraction)
-            .max(0.0)
-            .sqrt();
-        let high_level = (high[bin] + (high[next] - high[bin]) * fraction)
-            .max(0.0)
-            .sqrt();
-        if index % 4410 == 0 {
-            roll_rate = (roll_rate + random.range(-1.5, 1.5)).clamp(2.5, 9.0);
-        }
-        roll_phase += std::f32::consts::TAU * roll_rate / rate;
-        let roll = 0.7 + 0.3 * roll_phase.sin();
-        samples.push(
-            rumble[index] * rumble_gain * low_level * roll
-                + crack[index] * crack_gain * high_level * 0.6,
-        );
-    }
-
-    // A few milliseconds of fade-in avoid a click; the end fades to silence.
-    let fade_in = (0.003 * rate) as usize;
-    let fade_out = ((0.4 * rate) as usize).min(length);
-    for (index, sample) in samples.iter_mut().take(fade_in).enumerate() {
-        *sample *= index as f32 / fade_in as f32;
-    }
-    for index in 0..fade_out {
-        samples[length - 1 - index] *= index as f32 / fade_out as f32;
-    }
-    let peak = samples
-        .iter()
-        .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
-    if peak > 0.0 {
-        let gain = 0.9 / peak;
-        samples.iter_mut().for_each(|sample| *sample *= gain);
     }
     samples
 }
 
-/// Synthesised thunder, played through bevy_audio as a custom source so no
-/// audio file format is needed.
+/// Procedural PCM played through Bevy's custom audio source.
 #[derive(Asset, TypePath, Clone)]
 pub struct ThunderSound {
     samples: Arc<[f32]>,
@@ -358,14 +399,16 @@ pub fn queue_thunder(
     if sources.is_empty() {
         return;
     }
-    // The flash came this long ago; sound left the channel at the same time.
-    let since_flash = (lightning.age_seconds - lightning.first_stroke_seconds()).max(0.0);
+    // Keep the remaining leader time when the first return stroke has not
+    // fired yet: sound leaves the channel with the stroke, not the leader.
+    let since_flash = lightning.age_seconds - lightning.first_stroke_seconds();
     let start_at =
         time.elapsed_secs_f64() + (arrival_seconds(&sources) - since_flash).max(0.0) as f64;
     let loudness = loudness(&sources);
     let seed = bolt.generation ^ (lightning.seed.to_bits() as u64) << 20;
+    let strokes: Vec<_> = lightning.thunder_strokes().collect();
     let task = AsyncComputeTaskPool::get()
-        .spawn(async move { synthesize_thunder(&sources, seed, muffled) });
+        .spawn(async move { synthesize_discharge(&sources, &strokes, seed, muffled) });
     queue.pending.push(PendingThunder {
         task,
         samples: None,

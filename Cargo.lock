@@ -3037,6 +3037,7 @@ dependencies = [
  "forest_erosion",
  "forest_vegetation",
  "forest_water",
+ "thunder-synth",
  "wgpu",
 ]
 
@@ -5954,6 +5955,11 @@ checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
 ]
+
+[[package]]
+name = "thunder-synth"
+version = "0.1.0"
+source = "git+https://github.com/Thoralf-M/thunder-synth?rev=55f605981cdc27d81b5740acc9ada133715eaab5#55f605981cdc27d81b5740acc9ada133715eaab5"
 
 [[package]]
 name = "tiff"

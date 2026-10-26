@@ -188,10 +188,23 @@ only light the deck, or crawl visibly along its base as branching spider
 lightning. The channel is drawn with a white core and a blue-violet glow that
 heavy rain softens and widens, and cloud hides any part above the base. Each
 flash lights nearby ground, clouds, fog, rain, and water, and the water mirrors
-the bolt. Thunder is synthesised from the bolt itself: each part of the channel
-is heard after its own travel time at the speed of sound, so a close strike
-cracks and then rolls, a distant one only rumbles, and a flash inside the cloud
-is muffled.
+the bolt. Thunder uses [Thoralf-M/thunder-synth](https://github.com/Thoralf-M/thunder-synth),
+pinned to revision `55f605981cdc27d81b5740acc9ada133715eaab5` (Apache-2.0).
+Its 32-band claps and 28-band rolls generate fresh noise with statistical decay
+and texture profiles; no recorded audio plays. The channel's nearest distance
+sets the travel delay and the balance of sharp claps and distant rolls, while
+its range spread sets the rolling duration. Hidden cloud flashes are muffled.
+Later visible return strokes add quieter, short cracks beneath the main clap.
+The reference's relative levels are preserved, and overlapping peals pass through
+a soft limiter. Rendering runs off the main thread at the generator's native
+22,050 Hz; the audio backend resamples for playback.
+
+To render nearby, medium, distant, and cloud thunder for listening without opening
+the app, run `cargo run -p forest_world --example thunder-preview -- tmp/thunder-preview`.
+These WAV previews include unchanged reference claps and rolls alongside the
+integrated nearby, medium, distant, and cloud sounds, with alternate nearby seeds.
+Integrated previews start at the first sound arrival and preserve the generator's
+levels; the app also applies travel delay and distance attenuation.
 
 **Volumetric clouds** controls cloud coverage, density, base altitude, layer
 thickness, wind speed and direction, and shadow strength. **Cloud shape** expands

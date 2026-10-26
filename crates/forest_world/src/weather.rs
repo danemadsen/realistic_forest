@@ -453,6 +453,14 @@ impl LightningEvent {
         }
     }
 
+    /// Acoustic stroke delays and relative energies, measured from the first return stroke.
+    pub(crate) fn thunder_strokes(&self) -> impl Iterator<Item = (f32, f32)> + '_ {
+        let first = self.first_stroke_seconds();
+        self.strokes[..self.stroke_count]
+            .iter()
+            .map(move |stroke| (stroke.time - first, stroke.peak.powi(2)))
+    }
+
     /// When nothing of the discharge remains visible.
     #[cfg(test)]
     pub fn duration_seconds(&self) -> f32 {

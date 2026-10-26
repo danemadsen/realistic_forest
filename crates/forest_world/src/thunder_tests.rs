@@ -23,6 +23,37 @@ fn brightness(samples: &[f32]) -> f32 {
     changes / total.max(1e-9)
 }
 
+fn energy(samples: &[f32]) -> f64 {
+    samples
+        .iter()
+        .map(|sample| f64::from(*sample).powi(2))
+        .sum()
+}
+
+/// Two-pole low- and high-pass filters measure the body between bass and hiss.
+fn middle_band_energy(samples: &[f32]) -> f64 {
+    let rate = THUNDER_SAMPLE_RATE as f32;
+    let low_keep = (-std::f32::consts::TAU * 1200.0 / rate).exp();
+    let high_keep = (-std::f32::consts::TAU * 100.0 / rate).exp();
+    let mut low_first = 0.0;
+    let mut low_second = 0.0;
+    let mut high_first = 0.0;
+    let mut high_second = 0.0;
+    let mut total = 0.0;
+
+    for sample in samples {
+        low_first = low_first * low_keep + sample * (1.0 - low_keep);
+        low_second = low_second * low_keep + low_first * (1.0 - low_keep);
+        high_first = high_first * high_keep + low_second * (1.0 - high_keep);
+        let high_passed = low_second - high_first;
+        high_second = high_second * high_keep + high_passed * (1.0 - high_keep);
+        let middle = high_passed - high_second;
+        total += f64::from(middle).powi(2);
+    }
+
+    total
+}
+
 #[test]
 fn sound_arrives_after_its_travel_time() {
     let sources = column(1715.0, 1200.0, 40);
@@ -66,7 +97,7 @@ fn a_longer_channel_rolls_for_longer() {
 }
 
 #[test]
-fn thunder_is_finite_and_normalised() {
+fn thunder_is_finite_bounded_and_click_free() {
     for muffled in [false, true] {
         let samples = synthesize_thunder(&column(800.0, 1200.0, 80), 11, muffled);
         assert!(!samples.is_empty());
@@ -74,10 +105,206 @@ fn thunder_is_finite_and_normalised() {
         let peak = samples
             .iter()
             .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
-        assert!((peak - 0.9).abs() < 1e-3);
+        assert!(
+            peak > 0.0 && peak < 1.0,
+            "the original dynamics must remain audible without clipping: peak {peak}"
+        );
+        assert_eq!(samples[0], 0.0, "the onset starts without a click");
         assert_eq!(*samples.last().unwrap(), 0.0, "the tail fades to silence");
+
+        let mean =
+            samples.iter().map(|sample| f64::from(*sample)).sum::<f64>() / samples.len() as f64;
+        let rms = (energy(&samples) / samples.len() as f64).sqrt();
+        assert!(
+            mean.abs() < rms * 0.01,
+            "the waveform must not carry a DC offset: mean {mean}, rms {rms}"
+        );
     }
     assert!(synthesize_thunder(&[], 1, false).is_empty());
+}
+
+#[test]
+fn nearby_thunder_preserves_the_reference_clap() {
+    let sources = [ThunderSource {
+        distance: 250.0,
+        energy: 12.0,
+    }];
+    let rendered = synthesize_thunder(&sources, 7, false);
+    let reference_wav = thunder_synth::wav(thunder_synth::Thunder::Clap, 7);
+    let (frames, _) = reference_wav[44..].as_chunks::<2>();
+    let reference_samples: Vec<_> = frames
+        .iter()
+        .map(|bytes| f32::from(i16::from_le_bytes([bytes[0], bytes[1]])) / 32768.0)
+        .collect();
+    let preroll = (0.05 * THUNDER_SAMPLE_RATE as f32) as usize;
+    let opening = (0.6 * THUNDER_SAMPLE_RATE as f32) as usize;
+    let reference_opening = &reference_samples[preroll..preroll + opening];
+    let rendered_opening = &rendered[..opening];
+    let product: f64 = rendered_opening
+        .iter()
+        .zip(reference_opening)
+        .map(|(actual, reference)| f64::from(*actual) * f64::from(*reference))
+        .sum();
+    let reference_energy = energy(reference_opening);
+    let rendered_energy = energy(rendered_opening);
+    let correlation = product / (reference_energy * rendered_energy).sqrt();
+
+    assert!(
+        correlation > 0.95,
+        "the close crack must retain the reference's actual texture and decay: correlation {correlation}"
+    );
+    assert_eq!(
+        THUNDER_SAMPLE_RATE,
+        thunder_synth::SAMPLE_RATE,
+        "play generated samples at the reference's native rate"
+    );
+}
+
+#[test]
+fn distant_rolls_keep_their_lower_peaks() {
+    for seed in [11, 23, 37] {
+        let near = synthesize_thunder(&column(250.0, 100.0, 12), seed, false);
+        let far = synthesize_thunder(&column(4500.0, 100.0, 12), seed, false);
+        let near_peak = near
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+        let far_peak = far
+            .iter()
+            .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
+
+        assert!(
+            near_peak > far_peak * 1.25,
+            "seed {seed}: do not normalize a distant roll to a close clap's peak: near {near_peak}, far {far_peak}"
+        );
+    }
+}
+
+#[test]
+fn thunder_is_repeatable_without_reusing_the_same_sound() {
+    let sources = column(900.0, 400.0, 24);
+    let first = synthesize_thunder(&sources, 17, false);
+    let repeated = synthesize_thunder(&sources, 17, false);
+    let different = synthesize_thunder(&sources, 18, false);
+
+    assert_eq!(
+        first, repeated,
+        "one seed must reproduce the same discharge"
+    );
+    assert_ne!(
+        first, different,
+        "another seed must create a fresh waveform"
+    );
+}
+
+#[test]
+fn silent_or_invalid_sources_do_not_create_a_normalised_noise_burst() {
+    let invalid_sources = [
+        ThunderSource {
+            distance: 500.0,
+            energy: 0.0,
+        },
+        ThunderSource {
+            distance: f32::NAN,
+            energy: 12.0,
+        },
+        ThunderSource {
+            distance: f32::INFINITY,
+            energy: 12.0,
+        },
+        ThunderSource {
+            distance: 0.0,
+            energy: 12.0,
+        },
+        ThunderSource {
+            distance: -500.0,
+            energy: 12.0,
+        },
+        ThunderSource {
+            distance: 500.0,
+            energy: f32::NAN,
+        },
+        ThunderSource {
+            distance: 500.0,
+            energy: f32::INFINITY,
+        },
+        ThunderSource {
+            distance: 500.0,
+            energy: -12.0,
+        },
+    ];
+
+    for source in invalid_sources {
+        let samples = synthesize_thunder(&[source], 5, false);
+        assert!(
+            samples.iter().all(|sample| *sample == 0.0),
+            "an inactive source must stay silent: {source:?}"
+        );
+    }
+
+    let mut mixed_sources = invalid_sources.to_vec();
+    mixed_sources.push(ThunderSource {
+        distance: 500.0,
+        energy: 12.0,
+    });
+    let samples = synthesize_thunder(&mixed_sources, 5, false);
+    assert!(
+        samples.iter().all(|sample| sample.is_finite()),
+        "invalid sources must not poison an otherwise audible discharge"
+    );
+    assert!(
+        energy(&samples) > 0.0,
+        "the valid source must remain audible"
+    );
+}
+
+#[test]
+fn nearby_thunder_has_audible_body_between_bass_and_crack() {
+    let sources = column(450.0, 900.0, 60);
+    let samples = synthesize_thunder(&sources, 23, false);
+    let opening_length = THUNDER_SAMPLE_RATE as usize;
+    let opening = &samples[..opening_length];
+    let body_share = middle_band_energy(opening) / energy(opening);
+
+    assert!(
+        body_share > 0.08,
+        "thunder needs midrange body as well as deep bass and high hiss: share {body_share}"
+    );
+}
+
+#[test]
+fn restrikes_extend_the_roll_and_add_a_subordinate_crack() {
+    let sources = column(900.0, 100.0, 12);
+    let single_stroke = [(0.0, 1.0)];
+    let repeated_strokes = [(0.0, 1.0), (1.5, 0.8)];
+    let single = synthesize_discharge(&sources, &single_stroke, 31, false);
+    let repeated = synthesize_discharge(&sources, &repeated_strokes, 31, false);
+    let extra_seconds = (repeated.len() - single.len()) as f32 / THUNDER_SAMPLE_RATE as f32;
+
+    assert!(
+        (extra_seconds - 1.5).abs() < 0.05,
+        "the final stroke's travel time must extend the sound: {extra_seconds} seconds"
+    );
+
+    let window_start = (1.5 * THUNDER_SAMPLE_RATE as f32) as usize;
+    let window_end = (2.2 * THUNDER_SAMPLE_RATE as f32) as usize;
+    let single_window = &single[window_start..window_end];
+    let repeated_window = &repeated[window_start..window_end];
+    let difference: Vec<_> = repeated_window
+        .iter()
+        .zip(single_window)
+        .map(|(repeated, single)| repeated - single)
+        .collect();
+    let added_energy = energy(&difference);
+    let initial_end = (0.7 * THUNDER_SAMPLE_RATE as f32) as usize;
+    let first_clap_energy = energy(&single[..initial_end]);
+    assert!(
+        added_energy > first_clap_energy * 0.001 && added_energy < first_clap_energy * 0.25,
+        "a later stroke must add an audible crack while preserving the dominant first clap: added {added_energy}, first {first_clap_energy}"
+    );
+    assert!(
+        synthesize_discharge(&sources, &[], 31, false).is_empty(),
+        "a discharge without return strokes must be silent"
+    );
 }
 
 #[test]
