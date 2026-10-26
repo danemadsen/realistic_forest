@@ -1,0 +1,17 @@
+[package]
+name = "forest_world"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+forest_core = { path = "../forest_core" }
+forest_water = { path = "../forest_water" }
+forest_erosion = { path = "../forest_erosion" }
+forest_vegetation = { path = "../forest_vegetation" }
+forest_buildings = { path = "../forest_buildings" }
+bevy.workspace = true
+
+[dev-dependencies]
+forest_vegetation = { path = "../forest_vegetation", features = ["test_support"] }
+bytemuck.workspace = true
+wgpu.workspace = true

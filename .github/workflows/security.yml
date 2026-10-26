@@ -3,9 +3,9 @@ name: security
 on:
   push:
     branches: [master]
-    paths: [Cargo.toml, Cargo.lock, .github/workflows/security.yml]
+    paths: [Cargo.toml, "crates/**/Cargo.toml", Cargo.lock, .github/workflows/security.yml]
   pull_request:
-    paths: [Cargo.toml, Cargo.lock, .github/workflows/security.yml]
+    paths: [Cargo.toml, "crates/**/Cargo.toml", Cargo.lock, .github/workflows/security.yml]
   # Advisories land independently of commits, so re-check on a schedule.
   schedule:
     - cron: "23 5 * * 1"

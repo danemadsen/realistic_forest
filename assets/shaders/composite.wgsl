@@ -46,7 +46,7 @@ struct StageUniforms {
 @group(1) @binding(5) var atmosphere_texture: texture_2d<f32>;
 @group(1) @binding(13) var atmosphere_sampler: sampler;
 
-// The plants' shadow cascades (src/render/vegetation_shadows.rs): depth from
+// The plants' shadow cascades (crates/forest_render/src/vegetation_shadows.rs): depth from
 // the sun, or from the moon at night, with nested coverage around the camera's
 // ground position so altitude and viewing direction do not change quality.
 struct VegetationShadows {
@@ -415,7 +415,7 @@ fn cloudShadow(world_position: vec3<f32>, to_light: vec3<f32>) -> f32 {
                                 cloudShadowDepth(world_position, to_light, interval));
 }
 
-// The cloud shadow map (src/render/cloud_node.rs) is rebuilt every frame.
+// The cloud shadow map (crates/forest_render/src/cloud_node.rs) is rebuilt every frame.
 // Below the layer, every point on one sun ray has the same interval through
 // it, sampled at the same world positions, so cloudShadowDepth depends only on
 // where that ray enters the layer's lower bound. The map stores that depth per

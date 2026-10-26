@@ -1,5 +1,5 @@
 // Instanced plants in the terrain G-buffer: bark, foliage cards and LOD-3
-// billboards through one pipeline, fed by vegetation-cull.wgsl's compacted
+// billboards through one pipeline, fed by vegetation_cull.wgsl's compacted
 // per-model, per-LOD lists. From the composite on, a plant is lit, shadowed
 // by the terrain and cloud marches, fogged and reflected exactly as the
 // ground is; foliage carries a translucency mask in the position alpha that
@@ -36,14 +36,14 @@ struct GlobalUniforms {
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
 // One shadow cascade being drawn; the shadow pipeline binds it in place of
-// the globals. Mirrors `CascadeUniform` in src/render/vegetation_node.rs.
+// the globals. Mirrors `CascadeUniform` in crates/forest_render/src/vegetation_node.rs.
 struct ShadowCascade {
     view_projection: mat4x4<f32>, // world -> cascade clip, depth 0 nearest the light
     light: vec4<f32>,             // direction the light travels, metres per texel
 };
 @group(0) @binding(1) var<uniform> cascade: ShadowCascade;
 
-// Mirrors `ModelParams` in src/render/vegetation_node.rs (112 bytes).
+// Mirrors `ModelParams` in crates/forest_render/src/vegetation_node.rs (112 bytes).
 struct ModelParams {
     height: f32,
     crown_radius: f32,
@@ -68,7 +68,7 @@ struct VegetationFrame {
 @group(1) @binding(1) var<storage, read> models: array<ModelParams>;
 
 // One streamed plant, as the scatter wrote it. Mirrors `PlantInstance` in
-// src/vegetation/scatter.rs (32 bytes).
+// crates/forest_vegetation/src/scatter.rs (32 bytes).
 struct PlantInstance {
     position: vec3<f32>,
     scale: f32,

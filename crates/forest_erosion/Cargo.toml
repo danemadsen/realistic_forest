@@ -1,0 +1,16 @@
+[package]
+name = "forest_erosion"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bevy.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+wgpu.workspace = true
+forest_core = { path = "../forest_core" }
+forest_water = { path = "../forest_water" }
+
+[dev-dependencies]
+naga.workspace = true
+forest_water = { path = "../forest_water", features = ["test_support"] }

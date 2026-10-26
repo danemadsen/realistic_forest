@@ -1,0 +1,23 @@
+[package]
+name = "forest_render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+forest_assets = { path = "../forest_assets" }
+forest_core = { path = "../forest_core" }
+forest_water = { path = "../forest_water" }
+forest_erosion = { path = "../forest_erosion" }
+forest_vegetation = { path = "../forest_vegetation" }
+forest_buildings = { path = "../forest_buildings" }
+forest_world = { path = "../forest_world" }
+bevy.workspace = true
+bevy_egui.workspace = true
+bytemuck.workspace = true
+wgpu.workspace = true
+log.workspace = true
+image.workspace = true
+
+[dev-dependencies]
+forest_buildings = { path = "../forest_buildings", features = ["test_support"] }
+naga.workspace = true

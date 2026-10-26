@@ -6,7 +6,7 @@
 // colour, and a detail map packing the normal's XY, roughness and ambient
 // occlusion), and every vertex carries the share of the sky it sees past the
 // building and the share of the rain that reaches it, baked when the kit was
-// exported (scripts/export-buildings.py).
+// exported (scripts/export_buildings.py).
 //
 // The G-buffer position's alpha tells the composite what a surface is: under
 // 0.5 the sky, 1.0 and up the ground and plants (snow in the hundredths, grass
@@ -46,14 +46,14 @@ struct GlobalUniforms {
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 
 // One shadow cascade being drawn; the shadow pipeline binds it in place of
-// the globals. Mirrors `CascadeUniform` in src/render/building_node.rs.
+// the globals. Mirrors `CascadeUniform` in crates/forest_render/src/building_node.rs.
 struct ShadowCascade {
     view_projection: mat4x4<f32>, // world -> cascade clip, depth 0 nearest the light
     light: vec4<f32>,             // direction the light travels, metres per texel
 };
 @group(0) @binding(1) var<uniform> cascade: ShadowCascade;
 
-// Mirrors `MaterialUniform` in src/render/building_node.rs.
+// Mirrors `MaterialUniform` in crates/forest_render/src/building_node.rs.
 struct BuildingMaterial {
     base_color_factor: vec4<f32>,
     params: vec4<f32>,   // roughness factor, normal scale, unused, unused
@@ -73,7 +73,7 @@ struct VsOut {
 };
 
 // A building-space direction turned about +Y by the instance's cosine and
-// sine (src/buildings/collision.rs, BuildingFrame::turn).
+// sine (crates/forest_buildings/src/collision.rs, BuildingFrame::turn).
 fn turnAboutY(v: vec3<f32>, turn: vec2<f32>) -> vec3<f32> {
     return vec3<f32>(v.x*turn.x + v.z*turn.y, v.y, -v.x*turn.y + v.z*turn.x);
 }

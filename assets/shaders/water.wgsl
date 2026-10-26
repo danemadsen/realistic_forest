@@ -5,7 +5,7 @@
 // bevy-aqua-optics/src/optics.wgsl (godot_fresnel), the body radiance is
 // bevy-aqua-medium/src/medium.wgsl, the foam/SSS/composition is
 // bevy-aqua-core/src/cascade/material.wgsl, and the submerged medium is
-// bevy-aqua-volume/src/volume.wgsl. See src/water/ATTRIBUTION.md.
+// bevy-aqua-volume/src/volume.wgsl. See crates/forest_water/src/ATTRIBUTION.md.
 //
 // ONE WATER. Every surface is shaded by `fs_water`, whichever mesh it comes
 // from: the sea's camera-centred Crest tiles (`vs_sea`) or the rivers'
@@ -41,7 +41,7 @@
 //   project's own deferred G-buffer instead of a depth prepass.
 // - Aqua bakes the spectrum into a five-layer cascade texture array and
 //   samples it, giving each cascade LOD only the wavelength band it newly
-//   resolves (see `ranges` in src/water/waves.rs). Here the 40-component sum
+//   resolves (see `ranges` in crates/forest_water/src/waves.rs). Here the 40-component sum
 //   displaces vertices with a continuous mesh limit, while fragments evaluate
 //   normals and compression using the projected footprint of each wave.
 //   Lighting therefore retains waves beyond the geometry's 744 m fade, even
@@ -161,7 +161,7 @@ struct WaterStageUniforms
 // crosses into the next 8 m window would shift every crown by 8 m.
 @group(1) @binding(7) var<uniform> canopy_window: vec4<f32>;
 // The sky probe is raymarched with a short reuse window (see
-// PROBE_INTEGRATION_PERIOD in src/render/cloud_node.rs). Waves sample it in
+// PROBE_INTEGRATION_PERIOD in crates/forest_render/src/cloud_node.rs). Waves sample it in
 // their reflected direction, so the complete cloud sky remains visible
 // offscreen.
 @group(3) @binding(2) var cloud_sky_probe: texture_2d<f32>;
@@ -986,7 +986,7 @@ fn cloudShadow(world_position: vec3<f32>, to_light: vec3<f32>) -> f32 {
                                 cloudShadowDepth(world_position, to_light, interval));
 }
 
-// The cloud shadow map (src/render/cloud_node.rs) is rebuilt every frame.
+// The cloud shadow map (crates/forest_render/src/cloud_node.rs) is rebuilt every frame.
 // Below the layer, every point on one sun ray has the same interval through
 // it, sampled at the same world positions, so cloudShadowDepth depends only on
 // where that ray enters the layer's lower bound. The map stores that depth per
@@ -1626,7 +1626,7 @@ fn waterImpacts(world_xz: vec2<f32>, time: f32, footprint: f32,
 // The water body: what it is, and so what colour it is
 // ---------------------------------------------------------------------------
 //
-// The sea's colour is its optics preset (src/water/optics.rs, uploaded as
+// The sea's colour is its optics preset (crates/forest_water/src/optics.rs, uploaded as
 // `stage.extinction` and `stage.scatter`). Inland water takes one of three
 // natural colours, blended by what the water is and where it lies:
 //
@@ -1753,7 +1753,7 @@ fn waterMedium(body: WaterBody) -> WaterMedium
 // whose slope runs 1.65 times as steep up the wind as across it. Where each
 // component heads, its wavelength and its phase are fixed for the wind's
 // heading (`stage.wind_waves`, drawn on the CPU from that broadest spread by
-// `wind_sea_components` in src/water/waves.rs); the local wind and fetch only
+// `wind_sea_components` in crates/forest_water/src/waves.rs); the local wind and fetch only
 // weight them, so where the spread is narrower the waves across the wind
 // carry less. A gust or a nearer shore then changes how high the ripples run,
 // never where their crests lie, and nothing re-phases them from one frame to
@@ -1778,7 +1778,7 @@ const RUNG_LOG_SPAN: f32 = 0.34657359;
 // long to see repeat.
 const WIND_PERIOD: f32 = 512.0;
 // The broadest the wind sea is spread, the spread its components are drawn
-// from (`SPREAD_FLOOR` in src/water/waves.rs).
+// from (`SPREAD_FLOOR` in crates/forest_water/src/waves.rs).
 const SPREAD_FLOOR: f32 = 0.955;
 // A component's wavelength lies within a quarter octave of its rung's.
 const WIND_RUNG_STRETCH: f32 = 1.1892071;
@@ -1818,7 +1818,7 @@ fn windPeakWavenumber(wind: f32, fetch: f32) -> f32
 // How narrowly the waves at `frequency_ratio` times the peak's angular
 // frequency are spread about the wind, as the `beta` of a sech^2(beta*theta)
 // spread: Donelan, Hamilton and Hui's fit eased into Banner's, floored at
-// SPREAD_FLOOR. Mirrors `spreading_beta` in src/water/waves.rs, which
+// SPREAD_FLOOR. Mirrors `spreading_beta` in crates/forest_water/src/waves.rs, which
 // carries the measurements.
 fn spreadingBeta(frequency_ratio: f32) -> f32
 {

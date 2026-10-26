@@ -35,9 +35,9 @@ can read the loose meshes and textures in `assets/models` and `assets/textures`.
 To package those assets for distribution:
 
 ```sh
-cargo build --release --locked --bin realistic_forest --bin pack-assets
-cargo run --release --locked --bin pack-assets -- assets target/release/assets
-cargo run --release --locked --bin pack-assets -- --verify assets target/release/assets
+cargo build --release --locked --bin realistic_forest --bin pack_assets
+cargo run --release --locked --bin pack_assets -- assets target/release/assets
+cargo run --release --locked --bin pack_assets -- --verify assets target/release/assets
 ```
 
 Distribute the executable alongside `assets/models.pak` and
@@ -52,6 +52,44 @@ meshes or textures; rebuilding the executable updates embedded shaders.
 Release archives also carry `GRASS-ATTRIBUTION.md` and `WATER-ATTRIBUTION.md`.
 Keep those notices with redistributed builds. Asset metadata and attribution
 files under `models` and `textures` remain inside their respective pak files.
+
+## Workspace structure
+
+The `realistic_forest` application crate lives in `crates/forest_app` and owns the
+executable, command-line tools, assembly, and developer UI. The repository root is
+a virtual Cargo workspace with no `src` directory. Eight domain crates provide
+the shared foundations:
+
+| Crate | Responsibility |
+| --- | --- |
+| `realistic_forest` (`forest_app`) | Application assembly, input, captures, developer UI, and command-line tools |
+| `forest_assets` | Loose assets, pak archives, and asset-root discovery |
+| `forest_core` | Settings, terrain noise, matrices, deterministic fields, shared player state, snow coverage, and building pads |
+| `forest_water` | Ocean optics and waves, river networks, carving, surfaces, and maps |
+| `forest_erosion` | Erosion cache, height-map preparation, worker simulation, finalization, and GPU data layouts |
+| `forest_vegetation` | Plant assets, ecology, scatter, collision, grass, and streaming |
+| `forest_buildings` | Building assets, settlement placement, doors, collision, and streaming |
+| `forest_world` | Player movement, day/night, weather, lightning, thunder, snow trails, and automation settings |
+| `forest_render` | Render schedules, GPU resources, render extraction, and drawing passes |
+
+The vegetation stream receives a settlement-clearing supplier from the application,
+so vegetation and buildings do not depend on each other. The erosion worker owns
+its GPU layouts and can compile without the renderer.
+
+Source, shader, and script filenames use snake_case. Authored model and texture
+names retain their existing identities and references.
+
+Check all crates and their test targets from the repository root:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --locked --all-targets
+cargo test --workspace --locked --all-targets
+cargo run --locked --bin wgsl_check
+```
+
+GPU tests remain explicitly ignored by the normal test run; run them on a capable
+adapter with `cargo test --workspace --locked --all-targets -- --ignored`.
 
 ## Controls
 
@@ -315,7 +353,7 @@ instead of aliasing into rows of triangles along snow and rock margins.
 
 Snow006 forms a continuous white pack above the climate snowline
 (`SNOWLINE_ALTITUDE`, 112 metres), settled the way Gaea's snowfall settles it,
-in closed form (`snow-functions.wgslinc`). A broad altitude transition and
+in closed form (`snow_functions.wgslinc`). A broad altitude transition and
 modest spring-sun aspect shift keep the edge smooth. The terrain shapes the
 pack in proportion to its depth, as Gaea restores fine relief under a coarse
 pack: hollows and gullies hold it a few metres lower and noses and crests lose
@@ -543,7 +581,7 @@ cargo run --release --bin realistic_forest -- --vegetation-map forest.png --map-
 ### Drawing them
 
 The scatter knows only the base landform. Every frame, a compute pass on the
-GPU (`vegetation-cull.wgsl`) handles every streamed plant. It seats each root
+GPU (`vegetation_cull.wgsl`) handles every streamed plant. It seats each root
 on the eroded terrain, using the same height function as the clipmap, and
 sinks trunks a little into slopes. It drops plants that land on steep faces,
 in incised channels or at the waterline, and grows small plants only where the
@@ -614,7 +652,7 @@ Collision reads the same streamed chunks the renderer draws from, so it holds
 exactly the trees you see, and no more: it applies the cull pass's rooting
 rules on the CPU, with the same eroded terrain height the player walks on
 (`vegetation/collision.rs`; a test keeps its literals matching
-`vegetation-cull.wgsl`), and a tree the cull refuses on a steep face, in an
+`vegetation_cull.wgsl`), and a tree the cull refuses on a steep face, in an
 incised channel or at the waterline is not there to walk into.
 
 The diagnostics panel's **Vegetation** section turns the plants and their
@@ -628,7 +666,7 @@ The world is settled, sparsely, with the wild-west kit in `~/buildings`: seven
 houses (`house-a` to `house-g`, one and two storeys, porches, verandas,
 balconies, outside stairs, granny flats across breezeways and patios) and a
 sheriff's office with its jail. Each lives in `assets/models/buildings` as a
-GLB exported from its `.blend` by `scripts/export-buildings.sh`; all of them
+GLB exported from its `.blend` by `scripts/export_buildings.sh`; all of them
 share one set of textures in `assets/textures/buildings`, referenced by
 relative URI rather than packed into every file. A GLB holds the building's
 parts (`part.*`), its doors (`door.*`, each with its node origin on its hinge)
@@ -641,7 +679,7 @@ when it is exported.
 ### Where they stand
 
 Placement is a pure function of world position, read from the same uneroded,
-river-carved ground the erosion starts from (`src/buildings/placement.rs`), so
+river-carved ground the erosion starts from (`crates/forest_buildings/src/placement.rs`), so
 a building stands where it stands however the world streams in, and the plant
 scatter, the terrain and the collision all agree on it.
 
@@ -670,8 +708,8 @@ find the nearest one.
 
 ### The ground under them
 
-Each building stands on a pad (`src/buildings/pads.rs`, and its pasted shader
-copy `assets/shaders/building-pads.wgslinc`): the building's footprint and a
+Each building stands on a pad (`crates/forest_core/src/building_pads.rs`, and its pasted shader
+copy `assets/shaders/building_pads.wgslinc`): the building's footprint and a
 2 m yard, levelled at the mean height of the ground under it, its foundation
 sunk a few centimetres. Around the pad the ground eases back into the land over
 a skirt, the pad's weight falling as a smootherstep of the distance from the
@@ -696,7 +734,7 @@ street.
 ### Drawing them
 
 The buildings join the G-buffer between the terrain and the plants
-(`src/render/building_node.rs`, `assets/shaders/building.wgsl`), instanced per
+(`crates/forest_render/src/building_node.rs`, `assets/shaders/building.wgsl`), instanced per
 model, with their doors drawn at their current swing. Rooms, stairs and ceiling
 joists are drawn only within 140 m, where they can be seen through a window or
 a door; the shells to 1800 m. Window glass stays out of the G-buffer, so a
@@ -725,7 +763,7 @@ porch, and back down outside.
 ### Walking through them
 
 Walls, windows, railings, posts and stair stringers are solid to a walker
-(`src/buildings/collision.rs`): each convex piece's cross-section between a
+(`crates/forest_buildings/src/collision.rs`): each convex piece's cross-section between a
 step over the feet and the top of the head is pushed out of, in stretches of
 10 cm, so a walk into a wall slides along it. Floors, decks, steps and stair
 treads are stood on: the highest top under the body, read at its centre and
@@ -744,8 +782,8 @@ door from its yard and up house-c's stairs, inside and out.
 
 ### Re-exporting the kit
 
-`scripts/export-buildings.sh [kit directory] [blender binary]` runs
-`scripts/export-buildings.py` in headless Blender over each building; the
+`scripts/export_buildings.sh [kit directory] [blender binary]` runs
+`scripts/export_buildings.py` in headless Blender over each building; the
 `.blend` files are only read. Each material's Mapping node (its UV scale and
 turn) is baked into the exported UVs, faces longer than 1.25 m are cut so the
 baked sky has corners to vary over, and the packed images are written out once,
@@ -779,7 +817,7 @@ disagrees with itself this much from one seed to the next — across 40
 FastNoiseLite seeds at identical parameters the height field's sd spans
 39–88 metres and its cross-seed correlation spans -0.37 to +1.0, a range that
 contains the port's terrain (sd 45 metres, the 15th percentile). Run
-`cargo run --bin noise-compare` to dump the field for such a comparison.
+`cargo run --bin noise_compare` to dump the field for such a comparison.
 
 ## Erosion and flow output
 
@@ -889,7 +927,7 @@ before it is turned on. Together with incision this opens
 fresh cuts into V-shaped valleys, rounds weak crests, keeps resistant rock
 standing as cliffs and gathers talus aprons below steep faces. Substrate
 resistance comes from one shared, world-keyed geology
-(`assets/shaders/geology-functions.wgslinc`): broad and fine rock bodies plus
+(`assets/shaders/geology_functions.wgslinc`): broad and fine rock bodies plus
 gently dipping, warped resistant beds every ~19 metres of elevation, evaluated
 at the bedrock surface a cut actually exposes, so incision slows on a resistant
 bed and leaves a bench. The terrain material shader reads the same geology.
@@ -958,7 +996,7 @@ most recently completed tile.
 ## Rivers and creeks
 
 Rivers and creeks run from the mountains to the sea, through lakes where
-their water fills a basin. They are generated in `src/rivers` for a 16 km
+their water fills a basin. They are generated in `crates/forest_water/src/rivers` for a 16 km
 region around the player, follow the land the way its water would, are cut
 into the terrain, lined with bank plants, and drawn with their
 own flowing-water shader; their current pushes the player about.
@@ -1252,8 +1290,8 @@ bed over 0.75 m; straight reaches and deeper beds keep their profiles, and
 extra centreline segments cannot deepen the junction. The water ribbons
 cover the rounded shelf and return to their ordinary width away from it.
 
-The same arithmetic runs on the CPU (`src/rivers/carve.rs`) and in the shared
-`assets/shaders/river-functions.wgslinc`, over the same uploaded segments and
+The same arithmetic runs on the CPU (`crates/forest_water/src/rivers/carve.rs`) and in the shared
+`assets/shaders/river_functions.wgslinc`, over the same uploaded segments and
 a 32 m lookup grid, so the drawn ground, the player's footing, the seated
 plants, the lighting heightfield and the erosion all see one
 channel; tests hold the shader copies identical and the GPU result to the
@@ -1300,7 +1338,7 @@ river mouth and the surrounding seabed, and sand, soil and turf retain their
 proportional mixture through the shore.
 
 Out of the water every river and lake is edged with bare earth, as the sea is
-with its beach. The band is measured up the shore (`river-shore.wgslinc`,
+with its beach. The band is measured up the shore (`river_shore.wgslinc`,
 shared by both terrain stages): horizontally on a gentle shore and six metres
 per metre of rise on a steep one, in the water's own size, so it spreads over
 a floodplain or a flat pond margin, narrows to a strip on a cut bank, and is

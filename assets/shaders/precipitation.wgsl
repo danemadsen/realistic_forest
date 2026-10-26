@@ -44,7 +44,7 @@ struct PrecipitationFrame {
     shelter: vec4<f32>,
     // The roofs near the camera, two vec4 each: centre XZ and the turn's
     // cosine and sine, then half extents, the ground under the box and the
-    // top of its roof (src/render/building_node.rs).
+    // top of its roof (crates/forest_render/src/building_node.rs).
     shelters: array<vec4<f32>, 64>,
 };
 @group(2) @binding(0) var<uniform> frame: PrecipitationFrame;

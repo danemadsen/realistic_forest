@@ -1,0 +1,17 @@
+[package]
+name = "forest_water"
+version.workspace = true
+edition.workspace = true
+
+[features]
+test_support = []
+
+[dependencies]
+forest_core = { path = "../forest_core" }
+bevy.workspace = true
+bytemuck.workspace = true
+image.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+wgpu.workspace = true

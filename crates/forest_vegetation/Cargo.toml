@@ -1,0 +1,21 @@
+[package]
+name = "forest_vegetation"
+version.workspace = true
+edition.workspace = true
+
+[features]
+test_support = []
+
+[dependencies]
+bevy.workspace = true
+bytemuck.workspace = true
+gltf.workspace = true
+image.workspace = true
+log.workspace = true
+forest_assets = { path = "../forest_assets" }
+forest_core = { path = "../forest_core" }
+forest_erosion = { path = "../forest_erosion" }
+forest_water = { path = "../forest_water" }
+
+[dev-dependencies]
+forest_water = { path = "../forest_water", features = ["test_support"] }

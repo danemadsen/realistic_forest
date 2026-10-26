@@ -38,7 +38,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev libx11-dev
 
-      # Clippy, the tests and wgsl-check all use the dev profile, so one job
+      # Clippy, the tests and wgsl_check all use the dev profile, so one job
       # compiles Bevy once and the three steps share it. Only master saves the
       # cache: a Bevy target directory is several GB and PR branches would
       # otherwise push it out of the 10 GB repository quota.
@@ -50,16 +50,16 @@ jobs:
       # Fails on compile errors and deny-by-default lints only. The tree has
       # existing clippy warnings, so `-D warnings` is off until they are cleared.
       - name: Clippy
-        run: cargo clippy --locked --all-targets
+        run: cargo clippy --workspace --locked --all-targets
 
       # The GPU-dependent tests are #[ignore]d, so this runs on a headless
       # runner. Run them by hand on a real adapter with `-- --ignored`.
       - name: Unit tests, including asset pak round trips
         if: ${{ !cancelled() }}
-        run: cargo test --locked --all-targets
+        run: cargo test --workspace --locked --all-targets
 
       # Parses every assets/shaders/*.wgsl with naga and checks entry points.
       # Shaders are compiled at runtime, so this is the only CI signal for them.
       - name: Validate shaders
         if: ${{ !cancelled() }}
-        run: cargo run --locked --bin wgsl-check
+        run: cargo run --locked --bin wgsl_check
