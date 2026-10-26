@@ -26,6 +26,7 @@ default-members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.98.1"
 
 [workspace.dependencies]
 # The clipboard backend is needed for the application's pose-copy command.
@@ -42,6 +43,14 @@ chrono = "0.4"
 # Paks retain ZIP checksums and independently Zstandard-compressed files.
 zip = { version = "9.1.1", default-features = false, features = ["zstd"] }
 tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+allow_attributes_without_reason = "warn"
 
 [profile.dev]
 opt-level = 1

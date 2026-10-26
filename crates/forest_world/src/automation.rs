@@ -200,18 +200,43 @@ impl Default for AutomationSettings {
 pub const DEFAULT_EROSION_PREWARM: u32 = 4;
 
 const DEG_TO_RAD: f32 = std::f32::consts::PI / 180.0;
+// Grass streaming uses this same coordinate range; larger automated poses
+// cannot become ready and can overflow the surrounding spatial grids.
+const MAX_AUTOMATION_COORDINATE: f32 = 1_000_000_000.0;
+// Snow trails rasterize a capsule's bounding box at 0.125 m resolution.
+// Limit a capture's seed segment so malformed input cannot stall startup.
+const MAX_AUTOMATION_SNOW_TRAIL_LENGTH: f32 = 128.0;
+// Match the standard wgpu texture dimension limit before Bevy allocates a
+// CPU-backed offscreen image or a platform creates a window.
+const MAX_AUTOMATION_IMAGE_DIMENSION: i32 = 8192;
 
 fn parse_floats(argument: &str, expected: usize) -> Option<Vec<f32>> {
     let values: Option<Vec<f32>> = argument
         .split(',')
-        .map(|part| part.trim().parse::<f32>().ok())
+        .map(|part| {
+            part.trim()
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())
+        })
         .collect();
     values.filter(|values| values.len() == expected)
 }
 
 fn parse_ints(argument: &str, expected: usize) -> Option<Vec<i64>> {
-    parse_floats(argument, expected)
-        .map(|values| values.into_iter().map(|value| value as i64).collect())
+    let values: Option<Vec<i64>> = argument
+        .split(',')
+        .map(|part| part.trim().parse::<i64>().ok())
+        .collect();
+    values.filter(|values| values.len() == expected)
+}
+
+fn parse_coordinates(argument: &str, expected: usize) -> Option<Vec<f32>> {
+    parse_floats(argument, expected).filter(|values| {
+        values
+            .iter()
+            .all(|value| value.abs() <= MAX_AUTOMATION_COORDINATE)
+    })
 }
 
 fn parse_lightning(argument: &str) -> Option<ForcedLightning> {
@@ -249,12 +274,19 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
     let mut index = 0;
     while index < arguments.len() {
         let flag = arguments[index].as_str();
-        let next = arguments.get(index + 1);
+        let next = arguments
+            .get(index + 1)
+            .filter(|value| !value.starts_with("--"));
         match flag {
             "--camera" => {
                 if let Some(next) = next {
                     index += 1;
-                    match parse_floats(next, 5) {
+                    let pose = parse_floats(next, 5).filter(|values| {
+                        values[..3]
+                            .iter()
+                            .all(|value| value.abs() <= MAX_AUTOMATION_COORDINATE)
+                    });
+                    match pose {
                         Some(v) => {
                             automation.has_camera = true;
                             automation.position = [v[0], v[1], v[2]];
@@ -305,7 +337,7 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--river-probe" => {
                 if let Some(next) = next {
                     index += 1;
-                    match parse_floats(next, 2) {
+                    match parse_coordinates(next, 2) {
                         Some(v) => automation.river_probe = Some([v[0] as f64, v[1] as f64]),
                         None => println!("WARNING: --river-probe expects x,z"),
                     }
@@ -332,7 +364,7 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--map-centre" | "--map-center" => {
                 if let Some(next) = next {
                     index += 1;
-                    match parse_floats(next, 2) {
+                    match parse_coordinates(next, 2) {
                         Some(v) => automation.map_centre = [v[0] as f64, v[1] as f64],
                         None => println!("WARNING: {flag} expects x,z"),
                     }
@@ -341,7 +373,9 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--map-extent" => {
                 if let Some(next) = next {
                     index += 1;
-                    if let Ok(value) = next.parse::<f64>() {
+                    if let Ok(value) = next.parse::<f64>()
+                        && value.is_finite()
+                    {
                         automation.map_extent = value.clamp(16.0, 16384.0);
                         automation.map_extent_set = true;
                     }
@@ -351,7 +385,17 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--overlap-tile" => {
                 if let Some(next) = next {
                     index += 1;
-                    match parse_ints(next, 2) {
+                    let tile_coordinates = parse_ints(next, 2).filter(|values| {
+                        values.iter().all(|value| {
+                            value
+                                .checked_sub(forest_core::constants::EROSION_LOOKUP_RADIUS)
+                                .is_some()
+                                && value
+                                    .checked_add(forest_core::constants::EROSION_LOOKUP_RADIUS + 1)
+                                    .is_some()
+                        })
+                    });
+                    match tile_coordinates {
                         Some(v) => automation.overlap_tile = TileKey { x: v[0], z: v[1] },
                         None => println!("WARNING: --overlap-tile expects x,z tile keys"),
                     }
@@ -380,11 +424,20 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
                 }
             }
             "--snow-trail" => {
-                if let Some(values) = next.and_then(|value| parse_floats(value, 4)) {
+                let trail = next
+                    .and_then(|value| parse_coordinates(value, 4))
+                    .filter(|values| {
+                        let delta_x = values[2] - values[0];
+                        let delta_z = values[3] - values[1];
+                        delta_x.hypot(delta_z) <= MAX_AUTOMATION_SNOW_TRAIL_LENGTH
+                    });
+                if let Some(values) = trail {
                     automation.snow_trail = Some([values[0], values[1], values[2], values[3]]);
                     index += 1;
                 } else {
-                    eprintln!("WARNING: --snow-trail expects startX,startZ,endX,endZ");
+                    eprintln!(
+                        "WARNING: --snow-trail expects finite startX,startZ,endX,endZ within {MAX_AUTOMATION_SNOW_TRAIL_LENGTH} metres of each other"
+                    );
                     if next.is_some_and(|value| !value.starts_with("--")) {
                         index += 1;
                     }
@@ -505,7 +558,10 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--probe-extent" => {
                 if let Some(next) = next {
                     index += 1;
-                    if let Ok(value) = next.parse::<f32>() {
+                    if let Ok(value) = next.parse::<f32>()
+                        && value.is_finite()
+                        && value.abs() <= MAX_AUTOMATION_COORDINATE
+                    {
                         automation.probe_extent = value.max(1.0);
                     }
                 }
@@ -513,7 +569,9 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--probe-step" => {
                 if let Some(next) = next {
                     index += 1;
-                    if let Ok(value) = next.parse::<f32>() {
+                    if let Ok(value) = next.parse::<f32>()
+                        && value.is_finite()
+                    {
                         automation.probe_step = value.max(0.01);
                     }
                 }
@@ -521,27 +579,27 @@ pub fn parse_automation(arguments: impl Iterator<Item = String>) -> AutomationSe
             "--size" => {
                 if let Some(next) = next {
                     index += 1;
-                    // The C++ reads this with sscanf("%d,%d") (main.cpp:386),
-                    // so only the comma form parses: `--size 1200x700` fails
-                    // the scanf and falls back to 1600x900 with the warning
-                    // below (whose text says "WxH" regardless). Accepting x/X
-                    // here as well made one argument select a different window
-                    // in each binary, so the two captures were not comparable.
-                    let width_height = next
+                    // Retain the legacy tool's comma-only syntax so both
+                    // capture paths interpret window sizes consistently.
+                    let width_height: Option<Vec<i32>> = next
                         .split(',')
-                        .filter_map(|part| part.trim().parse::<i32>().ok())
-                        .collect::<Vec<_>>();
-                    if width_height.len() == 2 && width_height[0] > 0 && width_height[1] > 0 {
+                        .map(|part| part.trim().parse::<i32>().ok())
+                        .collect();
+                    if let Some(width_height) = width_height
+                        && width_height.len() == 2
+                        && width_height[0] > 0
+                        && width_height[1] > 0
+                        && width_height[0] <= MAX_AUTOMATION_IMAGE_DIMENSION
+                        && width_height[1] <= MAX_AUTOMATION_IMAGE_DIMENSION
+                    {
                         automation.width = width_height[0];
                         automation.height = width_height[1];
                     } else {
                         automation.width = 1600;
                         automation.height = 900;
-                        // The C++ prints this verbatim (main.cpp's sscanf on
-                        // "%d,%d" falls through to the same default) and it
-                        // is the reader's only clue that a malformed --size
-                        // was ignored, so it must reach the terminal.
-                        println!("WARNING: --size expects WxH, keeping 1600x900");
+                        println!(
+                            "WARNING: --size expects W,H with each dimension in 1..={MAX_AUTOMATION_IMAGE_DIMENSION}, keeping 1600x900"
+                        );
                     }
                 }
             }

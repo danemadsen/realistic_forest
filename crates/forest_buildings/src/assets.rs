@@ -436,12 +436,12 @@ impl Loader {
             &primitive.indices,
         );
         let first = self.vertices.len() as u32;
-        for index in 0..primitive.positions.len() {
+        for (index, &tangent) in tangents.iter().enumerate() {
             let vertex = BuildingVertex {
                 position: primitive.positions[index],
                 normal: primitive.normals[index],
                 uv: primitive.uvs[index],
-                tangent: tangents[index],
+                tangent,
                 sky: primitive.sky[index],
             };
             self.vertices.push(vertex);
@@ -730,7 +730,7 @@ fn convex_pieces(
         ids.push(id);
     }
     let mut groups: HashMap<u32, Vec<[u32; 3]>> = HashMap::new();
-    for triangle in indices.chunks_exact(3) {
+    for triangle in indices.as_chunks::<3>().0 {
         let part = parts[triangle[0] as usize];
         let corners = [
             ids[triangle[0] as usize],
@@ -926,7 +926,9 @@ pub fn prepare_textures(keys: &[TextureKey]) -> Result<Vec<PreparedTexture>, Str
                 break;
             }
             let prepared = prepare_texture(&keys[index]);
-            results.lock().unwrap_or_else(|e| e.into_inner())[index] = Some(prepared);
+            results
+                .lock()
+                .expect("building texture results lock poisoned")[index] = Some(prepared);
         }
     };
     std::thread::scope(|scope| {
@@ -934,7 +936,9 @@ pub fn prepare_textures(keys: &[TextureKey]) -> Result<Vec<PreparedTexture>, Str
             scope.spawn(worker);
         }
     });
-    let prepared = results.into_inner().unwrap_or_else(|e| e.into_inner());
+    let prepared = results
+        .into_inner()
+        .expect("building texture results lock poisoned");
     prepared
         .into_iter()
         .map(|result| result.expect("every texture prepared"))

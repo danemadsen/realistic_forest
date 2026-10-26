@@ -2,6 +2,7 @@
 name = "forest_water"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [features]
 test_support = []
@@ -15,3 +16,6 @@ log.workspace = true
 
 [dev-dependencies]
 wgpu.workspace = true
+
+[lints]
+workspace = true

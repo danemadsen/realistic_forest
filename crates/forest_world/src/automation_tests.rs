@@ -190,3 +190,108 @@ fn invalid_cloud_values_preserve_previous_value_and_following_flags() {
     assert_eq!(parse(&["--cloud-base", "99"]).cloud_base_height, 1300.0);
     assert_eq!(parse(&["--cloud-thickness", "99"]).cloud_thickness, 1200.0);
 }
+
+#[test]
+fn spatial_arguments_reject_nonfinite_and_unsupported_coordinates() {
+    for invalid in ["NaN", "inf", "-inf", "1e38"] {
+        let camera = format!("{invalid},0,0,0,0");
+        let settings = parse(&["--camera", &camera, "--pause-time"]);
+        assert!(!settings.has_camera, "camera {invalid}");
+        assert!(settings.pause_time);
+
+        let point = format!("{invalid},0");
+        let settings = parse(&["--river-probe", &point, "--map-centre", &point]);
+        assert!(settings.river_probe.is_none(), "river probe {invalid}");
+        assert_eq!(settings.map_centre, [0.0, 0.0], "map centre {invalid}");
+
+        let trail = format!("0,0,{invalid},0");
+        let settings = parse(&["--snow-trail", &trail]);
+        assert!(settings.snow_trail.is_none(), "snow trail {invalid}");
+    }
+    let settings = parse(&["--camera", "1,2,3,NaN,0"]);
+    assert!(!settings.has_camera);
+}
+
+#[test]
+fn overlap_tiles_parse_integers_without_float_rounding() {
+    let settings = parse(&["--overlap-tile", "16777217,-16777217"]);
+    assert_eq!(
+        settings.overlap_tile,
+        TileKey {
+            x: 16_777_217,
+            z: -16_777_217
+        }
+    );
+
+    for invalid in [
+        "1.5,0",
+        "NaN,0",
+        "9223372036854775807,0",
+        "0,-9223372036854775808",
+        "9223372036854775808,0",
+    ] {
+        let settings = parse(&["--overlap-tile", invalid, "--pause-time"]);
+        assert_eq!(settings.overlap_tile, TileKey { x: 0, z: 0 }, "{invalid}");
+        assert!(settings.pause_time);
+    }
+}
+
+#[test]
+fn numeric_arguments_keep_following_flags_and_reject_nonfinite_extents() {
+    for flag in [
+        "--camera",
+        "--shot",
+        "--wait",
+        "--erosion-prewarm",
+        "--river-probe",
+        "--map-centre",
+        "--map-extent",
+        "--overlap-tile",
+        "--probe-extent",
+        "--probe-step",
+        "--size",
+    ] {
+        assert!(parse(&[flag, "--pause-time"]).pause_time, "{flag}");
+    }
+
+    let defaults = AutomationSettings::default();
+    for invalid in ["NaN", "inf", "-inf"] {
+        let settings = parse(&[
+            "--probe-extent",
+            invalid,
+            "--probe-step",
+            invalid,
+            "--map-extent",
+            invalid,
+        ]);
+        assert_eq!(settings.probe_extent, defaults.probe_extent);
+        assert_eq!(settings.probe_step, defaults.probe_step);
+        assert_eq!(settings.map_extent, defaults.map_extent);
+        assert!(!settings.map_extent_set);
+    }
+}
+
+#[test]
+fn window_size_rejects_invalid_components_instead_of_skipping_them() {
+    let defaults = AutomationSettings::default();
+    for invalid in ["640,bad,480", "2147483647,2147483647", "8193,480", "640,0"] {
+        let settings = parse(&["--size", invalid]);
+        assert_eq!(
+            (settings.width, settings.height),
+            (defaults.width, defaults.height),
+            "{invalid}"
+        );
+    }
+    let settings = parse(&["--size", "640,480"]);
+    assert_eq!((settings.width, settings.height), (640, 480));
+}
+
+#[test]
+fn snow_trail_seeds_cannot_stall_startup_with_unbounded_rasterization() {
+    let settings = parse(&["--snow-trail", "0,0,10000,10000", "--pause-time"]);
+    assert!(settings.snow_trail.is_none());
+    assert!(settings.pause_time);
+
+    let settings = parse(&["--snow-trail", "100,200,102,204"]);
+    assert_eq!(settings.snow_trail, Some([100.0, 200.0, 102.0, 204.0]));
+}

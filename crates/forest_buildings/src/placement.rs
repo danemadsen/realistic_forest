@@ -31,7 +31,7 @@ use forest_core::constants::SEA_LEVEL;
 use forest_core::noise::{NoiseField, base_height};
 use forest_water::rivers::network::RiverNetwork;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 /// Side of a homestead cell, metres: at most one house in each.
 pub const HOMESTEAD_CELL: f32 = 480.0;
@@ -814,10 +814,16 @@ fn plan_homestead(
 pub struct SettlementPlanner {
     noise: Arc<NoiseField>,
     footprints: Vec<Footprint>,
+    snapshots: Mutex<HashMap<Option<usize>, Arc<SettlementCache>>>,
+}
+
+/// Every cached decision shares one immutable river snapshot. A weak reference
+/// keeps its address unique without retaining an obsolete river network.
+struct SettlementCache {
+    network: Option<Weak<RiverNetwork>>,
+    water: Option<WaterIndex>,
     towns: Mutex<HashMap<[i64; 2], Arc<Option<Town>>>>,
     homesteads: Mutex<HashMap<[i64; 2], Arc<Option<Placement>>>>,
-    /// The water index of the network it last saw, by the network's address.
-    water: Mutex<Option<(usize, Arc<WaterIndex>)>>,
 }
 
 fn cell_range(minimum: Vec2, maximum: Vec2, size: f32) -> ([i64; 2], [i64; 2]) {
@@ -837,9 +843,7 @@ impl SettlementPlanner {
         Self {
             noise,
             footprints,
-            towns: Mutex::new(HashMap::new()),
-            homesteads: Mutex::new(HashMap::new()),
-            water: Mutex::new(None),
+            snapshots: Mutex::new(HashMap::new()),
         }
     }
 
@@ -847,43 +851,72 @@ impl SettlementPlanner {
         &self.footprints
     }
 
-    fn water_index(&self, rivers: Option<&Arc<RiverNetwork>>) -> Option<Arc<WaterIndex>> {
-        let network = rivers?;
-        let address = Arc::as_ptr(network) as usize;
-        let mut cached = self.water.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((known, index)) = cached.as_ref()
-            && *known == address
+    fn cache_for(&self, rivers: Option<&Arc<RiverNetwork>>) -> Arc<SettlementCache> {
+        let identity = rivers.map(|network| Arc::as_ptr(network) as usize);
         {
-            return Some(index.clone());
+            let mut snapshots = self
+                .snapshots
+                .lock()
+                .expect("settlement snapshots lock poisoned");
+            snapshots.retain(|_, cache| {
+                cache
+                    .network
+                    .as_ref()
+                    .is_none_or(|network| network.strong_count() > 0)
+            });
+            if let Some(cache) = snapshots.get(&identity) {
+                return Arc::clone(cache);
+            }
         }
-        let index = Arc::new(WaterIndex::build(network));
-        *cached = Some((address, index.clone()));
-        Some(index)
+        // Build the index outside the registry lock; other snapshot queries
+        // may still be planning towns or clearings concurrently.
+        let cache = Arc::new(SettlementCache {
+            network: rivers.map(Arc::downgrade),
+            water: rivers.map(|network| WaterIndex::build(network)),
+            towns: Mutex::new(HashMap::new()),
+            homesteads: Mutex::new(HashMap::new()),
+        });
+        let mut snapshots = self
+            .snapshots
+            .lock()
+            .expect("settlement snapshots lock poisoned");
+        Arc::clone(snapshots.entry(identity).or_insert(cache))
     }
 
-    fn town(&self, ground: &Ground<'_>, cell: [i64; 2]) -> Arc<Option<Town>> {
-        if let Some(town) = self
+    fn town(
+        &self,
+        cache: &SettlementCache,
+        ground: &Ground<'_>,
+        cell: [i64; 2],
+    ) -> Arc<Option<Town>> {
+        if let Some(town) = cache
             .towns
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("settlement cache lock poisoned")
             .get(&cell)
         {
             return town.clone();
         }
         let town = Arc::new(plan_town(ground, &self.footprints, cell));
-        self.towns
+        cache
+            .towns
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("settlement cache lock poisoned")
             .entry(cell)
             .or_insert(town)
             .clone()
     }
 
-    fn homestead(&self, ground: &Ground<'_>, cell: [i64; 2]) -> Arc<Option<Placement>> {
-        if let Some(homestead) = self
+    fn homestead(
+        &self,
+        cache: &SettlementCache,
+        ground: &Ground<'_>,
+        cell: [i64; 2],
+    ) -> Arc<Option<Placement>> {
+        if let Some(homestead) = cache
             .homesteads
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("settlement cache lock poisoned")
             .get(&cell)
         {
             return homestead.clone();
@@ -896,13 +929,14 @@ impl SettlementPlanner {
         let mut towns = Vec::new();
         for cz in first[1]..=last[1] {
             for cx in first[0]..=last[0] {
-                towns.push(self.town(ground, [cx, cz]));
+                towns.push(self.town(cache, ground, [cx, cz]));
             }
         }
         let homestead = Arc::new(plan_homestead(ground, &self.footprints, cell, &towns));
-        self.homesteads
+        cache
+            .homesteads
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
+            .expect("settlement cache lock poisoned")
             .entry(cell)
             .or_insert(homestead)
             .clone()
@@ -916,11 +950,11 @@ impl SettlementPlanner {
         minimum: Vec2,
         maximum: Vec2,
     ) -> Vec<Placement> {
-        let water = self.water_index(rivers);
+        let cache = self.cache_for(rivers);
         let ground = Ground {
             noise: &self.noise,
             rivers: rivers.map(|network| network.as_ref()),
-            water: water.as_deref(),
+            water: cache.water.as_ref(),
         };
         let inside = |placement: &Placement| {
             let centre = placement.pad.centre;
@@ -937,7 +971,7 @@ impl SettlementPlanner {
         );
         for cz in first[1]..=last[1] {
             for cx in first[0]..=last[0] {
-                if let Some(town) = self.town(&ground, [cx, cz]).as_ref() {
+                if let Some(town) = self.town(&cache, &ground, [cx, cz]).as_ref() {
                     found.extend(
                         town.placements
                             .iter()
@@ -950,7 +984,7 @@ impl SettlementPlanner {
         let (first, last) = cell_range(minimum, maximum, HOMESTEAD_CELL);
         for cz in first[1]..=last[1] {
             for cx in first[0]..=last[0] {
-                let homestead = self.homestead(&ground, [cx, cz]);
+                let homestead = self.homestead(&cache, &ground, [cx, cz]);
                 if let Some(placement) = homestead.as_ref()
                     && inside(placement)
                 {
@@ -991,17 +1025,17 @@ impl SettlementPlanner {
         minimum: Vec2,
         maximum: Vec2,
     ) -> Vec<Town> {
-        let water = self.water_index(rivers);
+        let cache = self.cache_for(rivers);
         let ground = Ground {
             noise: &self.noise,
             rivers: rivers.map(|network| network.as_ref()),
-            water: water.as_deref(),
+            water: cache.water.as_ref(),
         };
         let (first, last) = cell_range(minimum, maximum, TOWN_CELL);
         let mut towns = Vec::new();
         for cz in first[1]..=last[1] {
             for cx in first[0]..=last[0] {
-                if let Some(town) = self.town(&ground, [cx, cz]).as_ref() {
+                if let Some(town) = self.town(&cache, &ground, [cx, cz]).as_ref() {
                     towns.push(town.clone());
                 }
             }
@@ -1020,6 +1054,31 @@ mod tests {
         let library = library();
         let planner = SettlementPlanner::new(noise.clone(), Footprint::from_library(&library));
         (planner, network, noise)
+    }
+
+    #[test]
+    fn settlement_queries_keep_each_river_snapshot_independent() {
+        let (planner, network, noise) = planner();
+        let minimum = Vec2::splat(-5000.0);
+        let maximum = Vec2::splat(5000.0);
+        let dry = planner.placements_in(None, minimum, maximum);
+        let expected_planner = SettlementPlanner::new(noise, planner.footprints().to_vec());
+        let expected = expected_planner.placements_in(Some(&network), minimum, maximum);
+        assert_ne!(
+            dry, expected,
+            "the river constraints must affect the fixture"
+        );
+
+        std::thread::scope(|scope| {
+            let wet_query = scope.spawn(|| planner.placements_in(Some(&network), minimum, maximum));
+            let dry_again = planner.placements_in(None, minimum, maximum);
+            let wet = wet_query.join().expect("settlement query worker panicked");
+            assert_eq!(wet, expected, "dry cached cells must not hide the rivers");
+            assert_eq!(
+                dry_again, dry,
+                "an old snapshot must retain its own decisions"
+            );
+        });
     }
 
     #[test]

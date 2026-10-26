@@ -342,12 +342,12 @@ impl GrassStream {
         let mut index = 0;
         while index < self.pending.len() {
             let pending = &mut self.pending[index];
-            if pending.completed.is_none() {
-                if let Some(task) = &mut pending.task {
-                    pending.completed = block_on(poll_once(task));
-                    if pending.completed.is_some() {
-                        pending.task = None;
-                    }
+            if pending.completed.is_none()
+                && let Some(task) = &mut pending.task
+            {
+                pending.completed = block_on(poll_once(task));
+                if pending.completed.is_some() {
+                    pending.task = None;
                 }
             }
             let Some(data) = &pending.completed else {
@@ -635,10 +635,10 @@ mod tests {
                 counts[key.layer] += 1;
                 assert!(used[key.layer].insert(resident.ticket.slot));
             }
-            for layer in 0..LAYER_COUNT {
-                assert!(counts[layer] <= residency.capacities[layer]);
+            for (layer, &count) in counts.iter().enumerate() {
+                assert!(count <= residency.capacities[layer]);
                 assert_eq!(
-                    counts[layer] + residency.free[layer].len(),
+                    count + residency.free[layer].len(),
                     residency.capacities[layer]
                 );
             }

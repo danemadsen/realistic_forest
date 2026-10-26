@@ -477,7 +477,7 @@ impl SurfaceMesh {
         for chunk in self.chunks.iter().filter(holds) {
             let first = chunk.first_index as usize;
             let triangles = &self.indices[first..first + chunk.index_count as usize];
-            for triangle in triangles.chunks_exact(3) {
+            for triangle in triangles.as_chunks::<3>().0 {
                 let [a, b, c] = [0, 1, 2].map(|k| self.vertices[triangle[k] as usize]);
                 let flat = |v: &SurfaceVertex| [v.position[0] - p[0], v.position[2] - p[1]];
                 let (pa, pb, pc) = (flat(&a), flat(&b), flat(&c));
@@ -617,11 +617,7 @@ struct Drawn<'a> {
 
 impl<'a> Drawn<'a> {
     fn new(ribbon: &'a Ribbon) -> Self {
-        let triangles: Vec<[u32; 3]> = ribbon
-            .triangles()
-            .chunks_exact(3)
-            .map(|t| [t[0], t[1], t[2]])
-            .collect();
+        let triangles = ribbon.triangles().as_chunks::<3>().0.to_vec();
         let mut cells: FastMap<[i32; 2], Vec<u32>> = FastMap::default();
         for (k, triangle) in triangles.iter().enumerate() {
             let mut low = [f32::INFINITY; 2];
@@ -1975,7 +1971,13 @@ mod tests {
                 sides.iter().all(|&side| side >= 0.0) || sides.iter().all(|&side| side <= 0.0);
             same_sign && [a, b, c].iter().all(|vertex| vertex[1] >= 5.0 - 1e-5)
         };
-        assert!(mesh.indices.chunks_exact(3).any(contains_point));
+        assert!(
+            mesh.indices
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .any(|triangle| contains_point(triangle))
+        );
     }
 
     /// The surface drawn on top over `p`, the highest there, its attributes
@@ -2171,7 +2173,7 @@ mod tests {
                 Some(d) => {
                     let under = level - v.position[1];
                     assert!(
-                        under >= UNDER_SHEET - 1e-4 && under <= UNDER_SHEET_DEEP + 1e-4,
+                        (UNDER_SHEET - 1e-4..=UNDER_SHEET_DEEP + 1e-4).contains(&under),
                         "{v:?}"
                     );
                     if d < SINK_START {
@@ -2508,7 +2510,7 @@ mod tests {
         let (_, network) = crate::rivers::spawn_network();
         let mesh = &network.surface;
         let (mut total, mut reversed, mut askew) = (0.0f64, 0.0f64, 0.0f64);
-        for triangle in mesh.indices.chunks_exact(3) {
+        for triangle in mesh.indices.as_chunks::<3>().0 {
             let [a, b, c] = [0, 1, 2].map(|k| mesh.vertices[triangle[k] as usize]);
             let ribbon = [a, b, c]
                 .iter()

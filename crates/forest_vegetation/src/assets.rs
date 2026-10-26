@@ -310,7 +310,7 @@ fn has_paired_billboard_cards(vertices: &[PlantVertex], indices: &[u32]) -> bool
     // The paired views are occasionally offset slightly during authoring.
     let tolerance = ((max_y - min_y) * 0.03).max(1e-4);
     let mut cards: Vec<Card> = Vec::new();
-    for triangle in indices.chunks_exact(3) {
+    for triangle in indices.as_chunks::<3>().0 {
         let a = Vec3::from_array(vertices[triangle[0] as usize].position);
         let b = Vec3::from_array(vertices[triangle[1] as usize].position);
         let c = Vec3::from_array(vertices[triangle[2] as usize].position);
@@ -815,7 +815,7 @@ fn prepare_textures(keys: &[TextureKey]) -> Result<Vec<PreparedTexture>, String>
                 break;
             }
             let prepared = prepare_texture(&keys[index]);
-            results.lock().unwrap_or_else(|e| e.into_inner())[index] = Some(prepared);
+            results.lock().expect("plant texture results lock poisoned")[index] = Some(prepared);
         }
     };
     std::thread::scope(|scope| {
@@ -823,12 +823,13 @@ fn prepare_textures(keys: &[TextureKey]) -> Result<Vec<PreparedTexture>, String>
             scope.spawn(worker);
         }
     });
-    let texture_results = results.into_inner().unwrap_or_else(|e| e.into_inner());
-    let textures = texture_results
+    let texture_results = results
+        .into_inner()
+        .expect("plant texture results lock poisoned");
+    texture_results
         .into_iter()
         .map(|result| result.expect("every texture prepared"))
-        .collect();
-    textures
+        .collect()
 }
 
 fn prepare_texture(key: &TextureKey) -> Result<PreparedTexture, String> {
@@ -1055,7 +1056,7 @@ fn downsample_linear(level: &Level) -> Level {
 
 fn alpha_histogram(rgba: &[u8]) -> [u32; 256] {
     let mut histogram = [0u32; 256];
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0.iter() {
         histogram[pixel[3] as usize] += 1;
     }
     histogram
@@ -1093,7 +1094,7 @@ fn preserve_coverage(level: &mut Level, cutoff: f32, target: f32) {
         }
     }
     if (best.0 - 1.0).abs() > 1e-4 {
-        for pixel in level.rgba.chunks_exact_mut(4) {
+        for pixel in level.rgba.as_chunks_mut::<4>().0.iter_mut() {
             pixel[3] = (pixel[3] as f32 * best.0).round().clamp(0.0, 255.0) as u8;
         }
     }
@@ -1135,8 +1136,10 @@ fn fill_transparent(level: &mut Level) {
     let filled = pyramid.swap_remove(0);
     for (pixel, source) in level
         .rgba
-        .chunks_exact_mut(4)
-        .zip(filled.rgba.chunks_exact(4))
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(filled.rgba.as_chunks::<4>().0.iter())
     {
         if pixel[3] == 0 {
             pixel[..3].copy_from_slice(&source[..3]);
@@ -1239,7 +1242,7 @@ mod tests {
         // whole card would vanish from the first mips on.
         let width = 32u32;
         let mut rgba = vec![0u8; (width * width * 4) as usize];
-        for (index, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+        for (index, pixel) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let opaque = crate::ecology::random(index as u64, 7) < 0.3;
             pixel.copy_from_slice(&[30, 160, 40, if opaque { 255 } else { 0 }]);
         }
@@ -1261,7 +1264,13 @@ mod tests {
             );
         }
         // Transparent texels inherit the card's colour, not black.
-        let transparent = levels[0].rgba.chunks_exact(4).find(|p| p[3] == 0).unwrap();
+        let transparent = levels[0]
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .find(|p| p[3] == 0)
+            .unwrap();
         assert!(transparent[1] > 100, "{transparent:?}");
     }
 

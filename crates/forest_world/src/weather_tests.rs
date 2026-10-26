@@ -65,8 +65,10 @@ fn weather_blends_continuously_and_cli_overrides_remain_exact() {
     // The shader resolves cloud values from these bits (bit 0 coverage,
     // 1 density, 2 base, 3 thickness); they must map exactly.
     assert_eq!(weather.override_bits(), 0b1111);
-    let mut settings = AppSettings::default();
-    settings.fog_density = 0.0;
+    let settings = AppSettings {
+        fog_density: 0.0,
+        ..AppSettings::default()
+    };
     // --no-fog stays fog-free whatever the weather profile is.
     let resolved = weather.conditions(&settings);
     assert_eq!(resolved.fog_density, 0.0);
@@ -439,10 +441,10 @@ fn storms_discharge_every_few_seconds_with_occasional_bursts() {
         seconds += 0.05;
         if storm.new_strike {
             strikes += 1;
-            if let Some(previous) = previous {
-                if seconds - previous < 2.1 {
-                    quick += 1;
-                }
+            if let Some(previous) = previous
+                && seconds - previous < 2.1
+            {
+                quick += 1;
             }
             previous = Some(seconds);
         }

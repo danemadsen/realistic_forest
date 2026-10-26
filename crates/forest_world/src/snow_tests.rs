@@ -385,8 +385,10 @@ fn the_shader_draws_the_pack_the_player_stands_on() {
         .expect("map readback");
     let bytes = readback.get_mapped_range(..).to_vec();
     let drawn: Vec<[f32; 4]> = bytes
-        .chunks_exact(16)
-        .map(bytemuck::pod_read_unaligned)
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|chunk| bytemuck::pod_read_unaligned(chunk))
         .collect();
     for (input, drawn) in inputs.iter().zip(drawn) {
         let footing = snow_coverage(input[0], Vec2::new(input[1], input[2]), input[3]);

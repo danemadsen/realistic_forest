@@ -132,6 +132,10 @@ pub struct PrecipitationNodeState {
     inner: Mutex<PrecipitationInner>,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bevy injects the resources used to prepare precipitation"
+)]
 fn prepare_precipitation(
     state: Res<PrecipitationNodeState>,
     globals: Res<ForestGlobals>,
@@ -145,9 +149,10 @@ fn prepare_precipitation(
     let Some(globals_buffer) = globals.buffer.as_ref() else {
         return;
     };
-    let Ok(mut inner) = state.inner.lock() else {
-        return;
-    };
+    let mut inner = state
+        .inner
+        .lock()
+        .expect("precipitation render state lock poisoned");
     if inner.globals_layout.is_none() {
         let layout = globals_layout();
         let group = super::bind_group(
@@ -295,9 +300,10 @@ pub fn forest_precipitation_pass(
     if !nearby_precipitation {
         return;
     }
-    let Ok(mut inner) = state.inner.lock() else {
-        return;
-    };
+    let mut inner = state
+        .inner
+        .lock()
+        .expect("precipitation render state lock poisoned");
     let format = view.main_texture_format();
     let (blit_id, particle_id) = if let Some(ids) = inner.pipelines.get(&format).copied() {
         ids
@@ -343,9 +349,10 @@ pub fn forest_precipitation_pass(
         return;
     };
 
-    let Ok(gbuffer_guard) = terrain.gbuffer.lock() else {
-        return;
-    };
+    let gbuffer_guard = terrain
+        .gbuffer
+        .lock()
+        .expect("terrain G-buffer lock poisoned");
     let Some(gbuffer) = gbuffer_guard.as_ref() else {
         return;
     };
@@ -405,6 +412,10 @@ pub fn forest_precipitation_pass(
     pass.draw(0..4, 0..PARTICLE_INSTANCES);
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument configures an independent render pipeline stage or target"
+)]
 pub(super) fn pipeline_descriptor(
     label: &'static str,
     shader: &Handle<Shader>,
@@ -468,6 +479,6 @@ mod tests {
             std::mem::size_of::<super::PrecipitationFrameGpu>()
         );
         // Instance indices travel through the uniform as floats.
-        assert!(super::PARTICLE_INSTANCES < 1 << 24);
+        const { assert!(super::PARTICLE_INSTANCES < 1 << 24) };
     }
 }

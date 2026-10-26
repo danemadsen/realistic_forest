@@ -4,6 +4,7 @@ use super::*;
 /// frame that calls `BeginErosionTile` carries one).
 fn frame_for(sim_min: [f32; 2], iterate: usize, finalize: bool) -> ErosionFrameCommands {
     ErosionFrameCommands {
+        simulation_id: SimulationId::default(),
         sim_min,
         init: None,
         iterate: (iterate > 0).then(|| IterateCommand {
@@ -22,6 +23,7 @@ fn frame_for(sim_min: [f32; 2], iterate: usize, finalize: bool) -> ErosionFrameC
 fn set_frame_carries_a_pending_init_to_the_next_frame() {
     let bridge = ErosionBridge::default();
     let with_pending_init = ErosionFrameCommands {
+        simulation_id: SimulationId::default(),
         sim_min: [0.0, 0.0],
         init: Some(InitTileCommand {
             key: tile(0, 0),
@@ -936,7 +938,12 @@ fn pending_patches_are_capped() {
     let bridge = ErosionBridge::default();
     let cap = forest_core::constants::EROSION_PENDING_PATCH_CAP;
     for index in 0..(cap as i64 + 8) {
-        bridge.push_patches(tile(index, 0), vec![index as f32], vec![index as f32]);
+        bridge.push_patches(
+            tile(index, 0),
+            SimulationId::default(),
+            vec![index as f32],
+            vec![index as f32],
+        );
     }
     let drained = bridge.drain_patches();
     assert_eq!(drained.len(), cap, "the cap truncates the deque");
@@ -976,6 +983,7 @@ fn watchdog_requeues_an_undelivered_tile_and_the_third_strike_fails_it() {
 
     let begin = |cache: &mut ErosionCache| {
         let mut commands = ErosionFrameCommands {
+            simulation_id: SimulationId::default(),
             sim_min: [0.0, 0.0],
             init: None,
             iterate: None,
@@ -1033,6 +1041,7 @@ fn a_failed_strike_clears_force_reveal() {
     let key = tile(1, 2);
     ensure_erosion_cache(&mut cache, key);
     let mut commands = ErosionFrameCommands {
+        simulation_id: SimulationId::default(),
         sim_min: [0.0, 0.0],
         init: None,
         iterate: None,
@@ -1051,7 +1060,10 @@ fn a_failed_strike_clears_force_reveal() {
     cache.force_reveal = Some(key);
 
     let bridge = ErosionBridge::default();
-    bridge.push_event(ErosionEvent::ReadbackFailed(key));
+    bridge.push_event(ErosionEvent::ReadbackFailed {
+        key,
+        simulation_id: cache.tiles[&key].simulation_id,
+    });
     apply_erosion_events(&mut cache, &bridge);
 
     assert_eq!(
@@ -1068,6 +1080,7 @@ fn map_failure_requeues_then_fails_a_tile() {
     let key = tile(1, 2);
     ensure_erosion_cache(&mut cache, key);
     let mut commands = ErosionFrameCommands {
+        simulation_id: SimulationId::default(),
         sim_min: [0.0, 0.0],
         init: None,
         iterate: None,
@@ -1087,6 +1100,7 @@ fn map_failure_requeues_then_fails_a_tile() {
         // active tile.
         if attempt > 1 {
             let mut commands = ErosionFrameCommands {
+                simulation_id: SimulationId::default(),
                 sim_min: [0.0, 0.0],
                 init: None,
                 iterate: None,
@@ -1100,7 +1114,10 @@ fn map_failure_requeues_then_fails_a_tile() {
             };
             begin_prepared_tile(&mut cache, &mut commands, prepared_tile);
         }
-        bridge.push_event(ErosionEvent::ReadbackFailed(key));
+        bridge.push_event(ErosionEvent::ReadbackFailed {
+            key,
+            simulation_id: cache.tiles[&key].simulation_id,
+        });
         apply_erosion_events(&mut cache, &bridge);
         let entry = cache.tiles.get(&key).expect("tile entry");
         assert_eq!(entry.failed_readbacks, attempt);
@@ -1147,7 +1164,8 @@ fn shader_sources_publish_once_and_cross_clone() {
         thermal: b"fn thermal() {}".to_vec(),
     };
     let published = sources.clone();
-    bridge.publish_shader_sources(published);
+    // SAFETY: these test shaders perform no memory accesses.
+    unsafe { bridge.publish_shader_sources(published) };
     assert!(
         bridge.shader_sources_ready(),
         "the render node's clone gate"
@@ -1168,4 +1186,147 @@ fn shader_sources_publish_once_and_cross_clone() {
     }
     assert!(!bridge.shader_sources_ready(), "consumed once");
     assert!(bridge.take_shader_sources().is_none(), "take-once");
+}
+
+fn begin_test_tile(cache: &mut ErosionCache, key: TileKey) -> ErosionFrameCommands {
+    let mut commands = frame_for(tile_simulation_minimum(key), 0, false);
+    let prepared = PreparedTile {
+        key,
+        base_height: Vec::new(),
+        drainage_area: Vec::new(),
+        river: Vec::new(),
+    };
+    begin_prepared_tile(cache, &mut commands, prepared);
+    commands
+}
+
+fn finalized_test_event(key: TileKey, simulation_id: SimulationId, delta: f32) -> ErosionEvent {
+    let tile = FinalizedTile {
+        key,
+        cpu_delta: vec![delta; EROSION_OUTPUT_RESOLUTION.pow(2)],
+        cpu_concavity: vec![0.0; EROSION_OUTPUT_RESOLUTION.pow(2)],
+        stats: TileDiagnostics::default(),
+    };
+    ErosionEvent::TileFinalized {
+        simulation_id,
+        tile,
+    }
+}
+
+#[test]
+fn pending_commands_do_not_merge_across_attempts_of_the_same_tile() {
+    let bridge = ErosionBridge::default();
+    let mut earlier = frame_for([0.0, 0.0], 12, true);
+    earlier.simulation_id = SimulationId::next();
+    let mut replacement = frame_for([0.0, 0.0], 6, false);
+    replacement.simulation_id = SimulationId::next();
+    bridge.set_frame(earlier, None);
+    bridge.set_frame(replacement, None);
+
+    let taken = bridge.take_commands().expect("the replacement is pending");
+    assert!(!taken.finalize, "the earlier finalize must not carry over");
+    assert_eq!(taken.iterate.expect("replacement iterations").count, 6);
+}
+
+#[test]
+fn reset_rejects_results_from_an_earlier_attempt_of_the_same_tile() {
+    let key = tile(0, 0);
+    let mut cache = ErosionCache::default();
+    let bridge = ErosionBridge::default();
+    ensure_erosion_cache(&mut cache, key);
+    let earlier = begin_test_tile(&mut cache, key).simulation_id;
+    reset_erosion_cache(&mut cache);
+    ensure_erosion_cache(&mut cache, key);
+    let replacement = begin_test_tile(&mut cache, key).simulation_id;
+    assert_ne!(earlier, replacement);
+
+    bridge.push_event(finalized_test_event(key, earlier, 99.0));
+    apply_erosion_events(&mut cache, &bridge);
+    assert!(cache.has_active_tile, "the replacement must keep running");
+    assert_eq!(cache.tiles[&key].state, ErosionTileState::Simulating);
+    assert!(cache.tiles[&key].cpu_delta.is_empty());
+
+    bridge.push_event(finalized_test_event(key, replacement, 2.0));
+    apply_erosion_events(&mut cache, &bridge);
+    assert!(!cache.has_active_tile);
+    assert_eq!(cache.tiles[&key].state, ErosionTileState::Ready);
+    assert!(
+        cache.tiles[&key]
+            .cpu_delta
+            .iter()
+            .all(|delta| *delta == 2.0)
+    );
+}
+
+#[test]
+fn stale_events_do_not_release_a_different_active_tile() {
+    let earlier_key = tile(0, 0);
+    let active_key = tile(1, 0);
+    let mut cache = ErosionCache::default();
+    let bridge = ErosionBridge::default();
+    ensure_erosion_cache(&mut cache, earlier_key);
+    let earlier_id = begin_test_tile(&mut cache, earlier_key).simulation_id;
+    reset_erosion_cache(&mut cache);
+    ensure_erosion_cache(&mut cache, active_key);
+    begin_test_tile(&mut cache, active_key);
+
+    bridge.push_event(finalized_test_event(earlier_key, earlier_id, 99.0));
+    bridge.push_event(ErosionEvent::ReadbackFailed {
+        key: earlier_key,
+        simulation_id: earlier_id,
+    });
+    apply_erosion_events(&mut cache, &bridge);
+
+    assert!(cache.has_active_tile);
+    assert_eq!(cache.active_tile, active_key);
+    assert_eq!(cache.tiles[&active_key].state, ErosionTileState::Simulating);
+    assert_eq!(cache.tiles[&earlier_key].state, ErosionTileState::Queued);
+    assert_eq!(cache.tiles[&earlier_key].failed_readbacks, 0);
+}
+
+#[test]
+fn retry_rejects_late_completions_and_failures_from_its_previous_attempt() {
+    let key = tile(0, 0);
+    let mut cache = ErosionCache::default();
+    let bridge = ErosionBridge::default();
+    ensure_erosion_cache(&mut cache, key);
+    let earlier_id = begin_test_tile(&mut cache, key).simulation_id;
+    bridge.push_event(ErosionEvent::ReadbackFailed {
+        key,
+        simulation_id: earlier_id,
+    });
+    apply_erosion_events(&mut cache, &bridge);
+    let retry_id = begin_test_tile(&mut cache, key).simulation_id;
+    assert_ne!(earlier_id, retry_id);
+
+    bridge.push_event(finalized_test_event(key, earlier_id, 99.0));
+    bridge.push_event(ErosionEvent::ReadbackFailed {
+        key,
+        simulation_id: earlier_id,
+    });
+    apply_erosion_events(&mut cache, &bridge);
+    assert!(cache.has_active_tile);
+    assert_eq!(cache.tiles[&key].failed_readbacks, 1);
+    assert_eq!(cache.tiles[&key].state, ErosionTileState::Simulating);
+
+    bridge.push_event(finalized_test_event(key, retry_id, 3.0));
+    apply_erosion_events(&mut cache, &bridge);
+    assert_eq!(cache.tiles[&key].state, ErosionTileState::Ready);
+}
+
+#[test]
+fn lookup_snapshot_keeps_attempts_with_their_allocations_and_origin() {
+    let key = tile(4, -3);
+    let mut cache = ErosionCache::default();
+    ensure_erosion_cache(&mut cache, key);
+    let commands = begin_test_tile(&mut cache, key);
+    cache.tiles.get_mut(&key).expect("registered tile").state = ErosionTileState::Ready;
+
+    let snapshot = erosion_lookup_snapshot(&cache);
+    let relative_x = (key.x - snapshot.minimum.x) as usize;
+    let relative_z = (key.z - snapshot.minimum.z) as usize;
+    let cell = relative_z * EROSION_LOOKUP_DIAMETER + relative_x;
+    assert_eq!(snapshot.minimum, cache.lookup_minimum);
+    assert_eq!(snapshot.records[cell * 4 + 3], 1.0);
+    assert_eq!(snapshot.simulation_ids[cell], commands.simulation_id);
 }

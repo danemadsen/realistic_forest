@@ -2,9 +2,11 @@ use super::*;
 
 #[test]
 fn view_vector_is_unit_length_and_matches_camera_target() {
-    let mut player = Player::default();
-    player.yaw = std::f32::consts::FRAC_PI_2;
-    player.pitch = 0.4;
+    let player = Player {
+        yaw: std::f32::consts::FRAC_PI_2,
+        pitch: 0.4,
+        ..default()
+    };
     let forward = player.forward();
     assert!((forward.length() - 1.0).abs() < 0.000001);
     assert!((forward.x - player.pitch.cos()).abs() < 0.000001);
@@ -20,9 +22,11 @@ fn view_vector_is_unit_length_and_matches_camera_target() {
 
 #[test]
 fn teleport_resets_momentum_and_rejects_invalid_coordinates() {
-    let mut player = Player::default();
-    player.vertical_velocity = -12.0;
-    player.water = WaterHere::sea(-5.0);
+    let mut player = Player {
+        vertical_velocity: -12.0,
+        water: WaterHere::sea(-5.0),
+        ..default()
+    };
     let destination = Vec3::new(120.0, 450.0, -870.0);
     assert!(player.teleport(destination));
     assert_eq!(player.position, destination);
@@ -60,12 +64,15 @@ fn snowy_world() -> (NoiseField, ErosionCache, SnowState, Player) {
     snow.recenter(position);
     let surface = snow::sample_surface(&erosion, &noise, position, position.to_array());
     assert_eq!(surface.coverage, 1.0);
-    let mut player = Player::default();
-    player.position = Vec3::new(
+    let player_position = Vec3::new(
         position.x,
         surface.height(&snow, position) + EYE_HEIGHT,
         position.y,
     );
+    let player = Player {
+        position: player_position,
+        ..default()
+    };
     (noise, erosion, snow, player)
 }
 

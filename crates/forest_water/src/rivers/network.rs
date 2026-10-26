@@ -1903,9 +1903,9 @@ fn fit_falling(raw: &[f32], ground: &[f32], s: &[f64]) -> Vec<f32> {
     };
     // Blocks of pooled points: (weighted sum, weight, count).
     let mut blocks: Vec<(f64, f64, usize)> = Vec::with_capacity(n);
-    for i in 0..n {
+    for (i, &height) in raw.iter().enumerate() {
         let w = weight(i);
-        blocks.push(((raw[i] + tilt(i)) as f64 * w, w, 1));
+        blocks.push(((height + tilt(i)) as f64 * w, w, 1));
         while blocks.len() > 1 {
             let last = blocks[blocks.len() - 1];
             let previous = blocks[blocks.len() - 2];

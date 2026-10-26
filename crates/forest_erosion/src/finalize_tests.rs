@@ -4,9 +4,26 @@ use super::*;
 /// versions are pinned to them byte-for-byte.
 fn bytes_to_f32_per_float(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
+}
+
+#[test]
+fn byte_conversion_accepts_unaligned_slices() {
+    let storage = [0x0000_0080u32, 0x0000_003fu32, 0x0000_0080u32];
+    let bytes = bytemuck::cast_slice::<u32, u8>(&storage);
+    for offset in 1..4 {
+        let slice = &bytes[offset..offset + 8];
+        let expected = bytes_to_f32_per_float(slice);
+        let actual = bytes_to_f32(slice);
+        let expected_bits: Vec<u32> = expected.iter().map(|value| value.to_bits()).collect();
+        let actual_bits: Vec<u32> = actual.iter().map(|value| value.to_bits()).collect();
+        assert_eq!(actual_bits, expected_bits, "byte offset {offset}");
+        assert!(bytes_to_f32(&slice[..3]).is_empty());
+    }
 }
 
 #[test]

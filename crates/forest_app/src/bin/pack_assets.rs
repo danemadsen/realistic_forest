@@ -1,6 +1,9 @@
 //! Build or verify the compressed model and texture archives distributed with Forest.
 
-#![allow(non_snake_case)]
+#![allow(
+    non_snake_case,
+    reason = "retains the existing asset tooling API names"
+)]
 
 use asset_pak::{PACK_GROUPS, PackStats};
 use realistic_forest::asset_pak;

@@ -48,8 +48,8 @@ pub struct CloudGpuResources {
 /// slides the sampling across cloud features the way a short walk does — the
 /// default flight speed (38 m/s, [`forest_world::player`]) covers ~7 m per
 /// two-frame window, under a quarter of one probe texel's 32-m arc at the
-/// 1300 m default base. See [`ProbeSkyState`] for why the stepwise inputs
-/// are latched separately and [`cloud_probe_pass`] for the reuse itself.
+/// 1300 m default base. Stepwise inputs are latched separately;
+/// [`cloud_probe_pass`] reuses the previous integration between updates.
 pub const PROBE_INTEGRATION_PERIOD: u32 = 2;
 
 /// Per-frame decision to re-integrate the sky probe, shared between the
@@ -196,7 +196,7 @@ fn update_cloud_probe_schedule(
     // than any cadence window; keep the probe at full rate until it clears.
     let changed = schedule
         .last_sky_state
-        .map_or(true, |previous| previous.changed_beyond(&state));
+        .is_none_or(|previous| previous.changed_beyond(&state));
     let integrate = globals.globals.lightning[3] > 0.001
         || changed
         || schedule.frames_since_probe >= PROBE_INTEGRATION_PERIOD;

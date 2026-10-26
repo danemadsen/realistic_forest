@@ -239,6 +239,17 @@ pub fn grass_line_height(noise: &NoiseField, x: f32, z: f32, height: f32) -> f32
 /// Print the un-eroded landform over a world grid as CSV so camera locations
 /// (snowy peaks, grass plains) can be found from the shell. Mirrors `RunProbe`.
 pub fn run_probe(probe_extent: f32, probe_step: f32) {
+    let probe_extent = f64::from(probe_extent);
+    let probe_step = f64::from(probe_step);
+    if !probe_extent.is_finite()
+        || !probe_step.is_finite()
+        || probe_extent <= 0.0
+        || probe_step <= 0.0
+        || -probe_extent + probe_step <= -probe_extent
+    {
+        eprintln!("PROBE: extent and step must be finite, positive, and advance the sampling grid");
+        return;
+    }
     let noise = NoiseField {
         samples: generate_noise_samples(),
     };
@@ -246,7 +257,8 @@ pub fn run_probe(probe_extent: f32, probe_step: f32) {
     while z <= probe_extent {
         let mut x = -probe_extent;
         while x <= probe_extent {
-            println!("{:.1},{:.1},{:.2}", x, z, base_height(&noise, x, z));
+            let height = base_height(&noise, x as f32, z as f32);
+            println!("{x:.1},{z:.1},{height:.2}");
             x += probe_step;
         }
         z += probe_step;

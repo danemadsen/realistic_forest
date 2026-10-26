@@ -232,8 +232,8 @@ pub fn synthesize_thunder(sources: &[ThunderSource], seed: u64, muffled: bool) -
     // A few milliseconds of fade-in avoid a click; the end fades to silence.
     let fade_in = (0.003 * rate) as usize;
     let fade_out = ((0.4 * rate) as usize).min(length);
-    for index in 0..fade_in.min(length) {
-        samples[index] *= index as f32 / fade_in as f32;
+    for (index, sample) in samples.iter_mut().take(fade_in).enumerate() {
+        *sample *= index as f32 / fade_in as f32;
     }
     for index in 0..fade_out {
         samples[length - 1 - index] *= index as f32 / fade_out as f32;

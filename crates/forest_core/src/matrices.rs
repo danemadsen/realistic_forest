@@ -46,7 +46,7 @@ pub fn view_matrix(eye: Vec3, target: Vec3, up: Vec3) -> [f32; 16] {
 /// resolution of about 1e-7 of the view distance — sub-millimetre at 2 km.
 ///
 /// Column-major, eye looks down -Z. The -1 that turns w_clip into -z sits in
-/// column 2 (index 11 = M[3][2]); M[3][3] stays 0. Putting -1 at index 15
+/// column 2 (index 11 = `M[3][2]`); `M[3][3]` stays 0. Putting -1 at index 15
 /// makes w_clip a constant -1, which drives every vertex outside the clip
 /// volume.
 pub fn perspective(fov_y_degrees: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {

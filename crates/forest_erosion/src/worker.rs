@@ -57,7 +57,7 @@ use crate::gpu_types::{
 };
 use crate::{
     ErosionBridge, ErosionEvent, ErosionFrameCommands, ErosionPhaseCosts, ErosionShaderSources,
-    FinalizedTile, TileKey,
+    FinalizedTile, SimulationId, TileKey,
 };
 use bevy::tasks::block_on;
 use bytemuck::Zeroable;
@@ -126,6 +126,7 @@ enum HalfResult {
 #[derive(Default)]
 struct ReadbackSlots {
     key: Option<TileKey>,
+    simulation_id: SimulationId,
     terrain: Option<HalfResult>,
     water: Option<HalfResult>,
     drainage: Option<HalfResult>,
@@ -149,9 +150,9 @@ enum ReadbackOutcome {
     /// Nothing landed yet (a plane is still in flight).
     Idle,
     /// The tile finalized, with its two 260x260 atlas patches.
-    Finalized(FinalizedTile, Vec<f32>, Vec<f32>),
+    Finalized(SimulationId, FinalizedTile, Vec<f32>, Vec<f32>),
     /// The readback failed; the main world requeues the tile.
-    Failed(TileKey),
+    Failed(TileKey, SimulationId),
 }
 
 // ---------------------------------------------------------------------------
@@ -214,18 +215,15 @@ struct WorkerErosionSim {
     water_targets: [wgpu::Texture; 2],
     // No readback plane samples flux or routing; the textures are kept only so
     // the views (which pass validation) keep their GPU objects alive.
-    #[allow(dead_code)]
-    flux_targets: [wgpu::Texture; 2],
+    _flux_targets: [wgpu::Texture; 2],
     drainage_targets: [wgpu::Texture; 2],
     /// Written by every water pass and read by the terrain pass right after,
     /// so it needs no ping-pong partner. One channel (R32Float): the routing
     /// normaliser is a single sum.
-    #[allow(dead_code)]
-    routing_target: wgpu::Texture,
+    _routing_target: wgpu::Texture,
     /// The runoff path noise the terrain pass reads, stamped once per tile
     /// by the init pass's `uMode` 3 and only read after that.
-    #[allow(dead_code)]
-    static_target: wgpu::Texture,
+    _static_target: wgpu::Texture,
     terrain_views: [wgpu::TextureView; 2],
     water_views: [wgpu::TextureView; 2],
     flux_views: [wgpu::TextureView; 2],
@@ -242,6 +240,9 @@ struct WorkerErosionSim {
 
     /// `activeTile` and how many of `settings.iterations` it has run.
     active_tile: Option<TileKey>,
+
+    /// The attempt currently stored in the simulation textures.
+    active_simulation_id: SimulationId,
 
     active_iterations: usize,
 
@@ -637,10 +638,10 @@ impl WorkerErosionSim {
             base_texture,
             terrain_targets,
             water_targets,
-            flux_targets,
+            _flux_targets: flux_targets,
             drainage_targets,
-            routing_target,
-            static_target,
+            _routing_target: routing_target,
+            _static_target: static_target,
             terrain_views,
             water_views,
             flux_views,
@@ -652,6 +653,7 @@ impl WorkerErosionSim {
             flux_index: 0,
             drainage_index: 0,
             active_tile: None,
+            active_simulation_id: SimulationId::default(),
             active_iterations: 0,
             last_finalize_us: 0,
             timing: None,
@@ -928,24 +930,24 @@ impl WorkerErosionSim {
     fn iteration_count(&self, commands: &ErosionFrameCommands) -> usize {
         let total = self.settings.iterations;
         let remaining = total.saturating_sub(self.active_iterations);
-        if let Some(iterate) = &commands.iterate {
-            if iterate.count > 0 {
-                // Deliberately NOT clamped to `remaining`. An explicit command
-                // is only ever filled in by the --measure-overlap driver, which
-                // mirrors `RunOverlapMeasurement`'s inner loop: the C++
-                // (main.cpp:1606-1614) calls `RunErosionIterations(6)` every
-                // pass and only compares `completedIterations` afterwards, so
-                // the last batch overshoots and 140 iterations at six per frame
-                // end on 144. The `.min(remaining)` this used to apply ran the
-                // last batch as two steps instead of six, so the tile was
-                // simulated 140 times while its recorded
-                // `completed_iterations` said 144 - the diagnostic measured a
-                // differently-converged simulation than the one it reported.
-                // The streaming path leaves `iterate` as None and keeps the
-                // clamp below, which is `UpdateErosionCache`'s
-                // `min(iterationBudget, remaining)` (main.cpp:1556-1559).
-                return iterate.count;
-            }
+        if let Some(iterate) = &commands.iterate
+            && iterate.count > 0
+        {
+            // Deliberately NOT clamped to `remaining`. An explicit command
+            // is only ever filled in by the --measure-overlap driver, which
+            // mirrors `RunOverlapMeasurement`'s inner loop: the C++
+            // (main.cpp:1606-1614) calls `RunErosionIterations(6)` every
+            // pass and only compares `completedIterations` afterwards, so
+            // the last batch overshoots and 140 iterations at six per frame
+            // end on 144. The `.min(remaining)` this used to apply ran the
+            // last batch as two steps instead of six, so the tile was
+            // simulated 140 times while its recorded
+            // `completed_iterations` said 144 - the diagnostic measured a
+            // differently-converged simulation than the one it reported.
+            // The streaming path leaves `iterate` as None and keeps the
+            // clamp below, which is `UpdateErosionCache`'s
+            // `min(iterationBudget, remaining)` (main.cpp:1556-1559).
+            return iterate.count;
         }
         let budget = if commands.init.is_some() && commands.finalize {
             total
@@ -963,6 +965,11 @@ impl WorkerErosionSim {
     /// outstanding, so each `queue.submit` lands strictly after the previous
     /// one's — the chunks execute exactly as one long command buffer would.
     fn process_commands(&mut self, commands: &ErosionFrameCommands) {
+        if commands.init.is_some() {
+            self.active_simulation_id = commands.simulation_id;
+        } else if commands.simulation_id != self.active_simulation_id {
+            return;
+        }
         if let Some(iterate) = &commands.iterate {
             self.settings = iterate.settings;
         }
@@ -1084,6 +1091,7 @@ impl WorkerErosionSim {
                 return false;
             }
             slots.key = Some(key);
+            slots.simulation_id = self.active_simulation_id;
         }
 
         let terrain_buffer = take_staging_buffer(&self.device, &self.pool);
@@ -1171,6 +1179,7 @@ impl WorkerErosionSim {
         let Some(key) = slots.key else {
             return ReadbackOutcome::Idle;
         };
+        let simulation_id = slots.simulation_id;
         let outcome = match (
             slots.terrain.take(),
             slots.water.take(),
@@ -1207,14 +1216,14 @@ impl WorkerErosionSim {
                 self.last_finalize_us = started_at.elapsed().as_micros() as u64;
                 tile.stats.simulation_ms = self.take_simulation_ms(key);
                 self.delivered = Some(key);
-                ReadbackOutcome::Finalized(tile, atlas_height, atlas_flow)
+                ReadbackOutcome::Finalized(simulation_id, tile, atlas_height, atlas_flow)
             }
             _ => {
                 // A failed or short readback: the C++ counts it and requeues
                 // the tile, which the main world does from the event.
                 self.timing = None;
                 self.delivered = Some(key);
-                ReadbackOutcome::Failed(key)
+                ReadbackOutcome::Failed(key, simulation_id)
             }
         }
     }
@@ -1306,6 +1315,8 @@ fn worker_thread_body(
         label: Some("erosion_worker"),
         required_features: features,
         required_limits: limits,
+        // SAFETY: the worker accepts wgpu's experimental-feature contract
+        // to mirror the renderer; these pipelines use standard operations.
         experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
         memory_hints: Default::default(),
         trace: Default::default(),
@@ -1371,7 +1382,10 @@ fn worker_thread_body(
         //    recorded on a device that just failed.
         if let Some(why) = error_slot.lock().ok().and_then(|mut slot| slot.take()) {
             if let Some(key) = sim.active_tile {
-                bridge.push_event(ErosionEvent::ReadbackFailed(key));
+                bridge.push_event(ErosionEvent::ReadbackFailed {
+                    key,
+                    simulation_id: sim.active_simulation_id,
+                });
             }
             log::error!("EROSION: worker device error: {why}");
             bridge.set_worker_dead(why);
@@ -1389,12 +1403,15 @@ fn worker_thread_body(
                     // again shortly rather than spin.
                     std::thread::sleep(Duration::from_millis(1));
                 }
-                ReadbackOutcome::Finalized(tile, atlas_height, atlas_flow) => {
-                    bridge.push_patches(tile.key, atlas_height, atlas_flow);
-                    bridge.push_event(ErosionEvent::TileFinalized(tile));
+                ReadbackOutcome::Finalized(simulation_id, tile, atlas_height, atlas_flow) => {
+                    bridge.push_patches(tile.key, simulation_id, atlas_height, atlas_flow);
+                    bridge.push_event(ErosionEvent::TileFinalized {
+                        simulation_id,
+                        tile,
+                    });
                 }
-                ReadbackOutcome::Failed(key) => {
-                    bridge.push_event(ErosionEvent::ReadbackFailed(key));
+                ReadbackOutcome::Failed(key, simulation_id) => {
+                    bridge.push_event(ErosionEvent::ReadbackFailed { key, simulation_id });
                 }
             }
             costs.consume_us += tick.elapsed().as_micros() as u64 - sim.last_finalize_us;
@@ -1754,10 +1771,10 @@ fn record_erosion_pass_targets(
 // ---------------------------------------------------------------------------
 
 fn take_staging_buffer(device: &wgpu::Device, pool: &Mutex<Vec<wgpu::Buffer>>) -> wgpu::Buffer {
-    if let Ok(mut pooled) = pool.lock() {
-        if let Some(buffer) = pooled.pop() {
-            return buffer;
-        }
+    if let Ok(mut pooled) = pool.lock()
+        && let Some(buffer) = pooled.pop()
+    {
+        return buffer;
     }
     let buffer_descriptor = wgpu::BufferDescriptor {
         label: Some("erosion_readback_staging"),

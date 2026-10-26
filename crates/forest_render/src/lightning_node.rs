@@ -96,9 +96,10 @@ fn prepare_lightning(
     let Some(globals_buffer) = globals.buffer.as_ref() else {
         return;
     };
-    let Ok(mut inner) = state.inner.lock() else {
-        return;
-    };
+    let mut inner = state
+        .inner
+        .lock()
+        .expect("lightning render state lock poisoned");
     if inner.globals_layout.is_none() {
         let layout = globals_layout();
         let group = super::bind_group(
@@ -163,11 +164,11 @@ fn prepare_lightning(
         inner.bolt_buffer = Some(buffer);
         inner.bolt_group = Some(group);
     }
-    if bolt_visible(&view) {
-        if let Some(buffer) = inner.bolt_buffer.as_ref() {
-            let uniforms = bolt_uniforms(&view);
-            queue.write_buffer(buffer, 0, bytemuck::cast_slice(&uniforms));
-        }
+    if bolt_visible(&view)
+        && let Some(buffer) = inner.bolt_buffer.as_ref()
+    {
+        let uniforms = bolt_uniforms(&view);
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(&uniforms));
     }
 }
 
@@ -193,9 +194,10 @@ pub fn forest_lightning_pass(view: ViewQuery<&ViewTarget>, world: &World, mut ct
     ) else {
         return;
     };
-    let Ok(mut inner) = state.inner.lock() else {
-        return;
-    };
+    let mut inner = state
+        .inner
+        .lock()
+        .expect("lightning render state lock poisoned");
     // Queue the pipelines before the first strike, so its opening frames
     // are not lost to shader compilation.
     let format = view.main_texture_format();
@@ -253,9 +255,10 @@ pub fn forest_lightning_pass(view: ViewQuery<&ViewTarget>, world: &World, mut ct
     ) else {
         return;
     };
-    let Ok(gbuffer_guard) = terrain.gbuffer.lock() else {
-        return;
-    };
+    let gbuffer_guard = terrain
+        .gbuffer
+        .lock()
+        .expect("terrain G-buffer lock poisoned");
     let Some(gbuffer) = gbuffer_guard.as_ref() else {
         return;
     };

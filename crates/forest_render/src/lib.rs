@@ -33,7 +33,7 @@ use bevy::shader::Shader;
 use bevy::window::PrimaryWindow;
 use forest_core::constants::*;
 use forest_core::noise::NoiseField;
-use forest_erosion::{ErosionBridge, ErosionCache};
+use forest_erosion::{ErosionBridge, ErosionCache, ErosionLookup};
 use forest_world::WorldOptions;
 use forest_world::day_night::DayNightCycle;
 use forest_world::player::{Player, PlayerCamera};
@@ -128,6 +128,9 @@ pub struct ExtractedForestView {
 
     pub draw_ocean: bool,
     pub lookup_minimum: (i64, i64),
+    /// Lookup records and attempt identities captured with this frame's origin.
+    pub erosion_lookup: ErosionLookup,
+
     pub snow_mapping: [f32; 4],
     pub snow_pixels: std::sync::Arc<[u8]>,
     pub snow_revision: u64,
@@ -664,7 +667,8 @@ fn extract_forest_view(mut main_world: ResMut<MainWorld>, mut view: ResMut<Extra
     }
     view.draw_ocean = world.resource::<WorldOptions>().draw_ocean;
     let cache = world.resource::<ErosionCache>();
-    view.lookup_minimum = (cache.lookup_minimum.x, cache.lookup_minimum.z);
+    view.erosion_lookup = forest_erosion::erosion_lookup_snapshot(cache);
+    view.lookup_minimum = (view.erosion_lookup.minimum.x, view.erosion_lookup.minimum.z);
     if view.settings.vegetation_shadows {
         let noise = world.resource::<NoiseField>();
         let eye = view.player_position;
@@ -684,19 +688,10 @@ fn extract_forest_view(mut main_world: ResMut<MainWorld>, mut view: ResMut<Extra
 }
 
 /// The globals uniform buffer shared at group(0) binding(0) by every pass.
-#[derive(Resource)]
+#[derive(Resource, Default)]
 pub struct ForestGlobals {
     pub globals: GlobalUniformsGpu,
     pub buffer: Option<wgpu::Buffer>,
-}
-
-impl Default for ForestGlobals {
-    fn default() -> Self {
-        Self {
-            globals: GlobalUniformsGpu::default(),
-            buffer: None,
-        }
-    }
 }
 
 pub fn prepare_forest_globals(

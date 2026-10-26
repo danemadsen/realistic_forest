@@ -53,6 +53,10 @@ pub(super) fn setup_blend_mask(mut cache: ResMut<ErosionCache>) {
 /// Applies the automation startup bits the C++ main does before the loop:
 /// the ground-level spawn height, the pinned pose for `--camera`, and the
 /// cursor state for unattended runs (DisableCursor in the normal case).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bevy injects each startup dependency separately"
+)]
 pub(super) fn setup_cursor_and_player(
     automation: Res<AutomationSettings>,
     mut local: Local<bool>,
@@ -78,6 +82,11 @@ pub(super) fn setup_cursor_and_player(
             [0.0, 0.0, 0.0]
         };
         snow.recenter(bevy::math::Vec2::new(spawn[0], spawn[2]));
+        if let Some([x0, z0, x1, z1]) = automation.snow_trail {
+            let start = bevy::math::Vec2::new(x0, z0);
+            let end = bevy::math::Vec2::new(x1, z1);
+            snow.stamp_segment(start, end);
+        }
         if automation.has_camera {
             player.position = bevy::math::Vec3::from(automation.position);
             player.yaw = automation.yaw;
@@ -121,7 +130,9 @@ pub(super) fn setup_cursor_and_player(
     };
     snow.recenter(snow_center);
     if let Some([x0, z0, x1, z1]) = automation.snow_trail {
-        snow.stamp_segment(bevy::math::Vec2::new(x0, z0), bevy::math::Vec2::new(x1, z1));
+        let start = bevy::math::Vec2::new(x0, z0);
+        let end = bevy::math::Vec2::new(x1, z1);
+        snow.stamp_segment(start, end);
     }
     // Ground-level spawn, matching the C++ pre-loop player placement.
     if !automation.has_camera {
@@ -162,4 +173,46 @@ pub(super) fn setup_cursor_and_player(
         player.yaw.to_degrees(),
         player.pitch.to_degrees(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offscreen_startup_applies_seeded_snow_trails_once() {
+        let mut app = App::new();
+        let automation = AutomationSettings {
+            has_camera: true,
+            position: [100.0, 20.0, 100.0],
+            snow_trail: Some([100.0, 100.0, 101.0, 100.0]),
+            ..default()
+        };
+        let offscreen = OffscreenCapture {
+            image: None,
+            size: [64, 64],
+        };
+        let noise = NoiseField {
+            samples: Vec::new(),
+        };
+        app.insert_resource(automation);
+        app.insert_resource(offscreen);
+        app.insert_resource(noise);
+        app.init_resource::<ErosionCache>();
+        app.init_resource::<snow::SnowState>();
+        app.world_mut().spawn(Player::default());
+        app.add_systems(Update, setup_cursor_and_player);
+
+        app.update();
+        let snow = app.world().resource::<snow::SnowState>();
+        let point = bevy::math::Vec2::new(100.5, 100.0);
+        assert!(snow.compression(point) > 0.9);
+        let revision = snow.revision();
+
+        app.update();
+        assert_eq!(
+            app.world().resource::<snow::SnowState>().revision(),
+            revision
+        );
+    }
 }

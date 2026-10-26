@@ -2,6 +2,7 @@
 name = "forest_erosion"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 bevy.workspace = true
@@ -14,3 +15,6 @@ forest_water = { path = "../forest_water" }
 [dev-dependencies]
 naga.workspace = true
 forest_water = { path = "../forest_water", features = ["test_support"] }
+
+[lints]
+workspace = true

@@ -189,20 +189,34 @@ pub fn finalize_erosion_tile(
     (tile, atlas_height, atlas_flow)
 }
 
-/// wgpu maps staging buffers as little-endian bytes and the host is LE too,
-/// so a `cast_slice` round-trips floats bit-exactly without per-float work.
-/// Truncates a trailing partial chunk exactly as a per-float
-/// `chunks_exact(4)` walk did, instead of panicking on a misaligned map
-/// range.
+/// Decodes little-endian floats, ignoring a trailing partial float.
+/// Aligned inputs on little-endian hosts use a bulk copy; other slices
+/// are decoded without requiring pointer alignment.
 pub fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    let aligned = bytes.len() - bytes.len() % 4;
-    bytemuck::cast_slice::<u8, f32>(&bytes[..aligned]).to_vec()
+    let complete_length = bytes.len() - bytes.len() % 4;
+    let complete_bytes = &bytes[..complete_length];
+    if cfg!(target_endian = "little")
+        && let Ok(values) = bytemuck::try_cast_slice::<u8, f32>(complete_bytes)
+    {
+        return values.to_vec();
+    }
+    let (chunks, _) = complete_bytes.as_chunks::<4>();
+    chunks
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect()
 }
 
 /// The inverse of [`bytes_to_f32`], for the lookup records and atlas patches
 /// the render world uploads through `write_padded_at`.
 pub fn f32_to_bytes(values: &[f32]) -> Vec<u8> {
-    bytemuck::cast_slice::<f32, u8>(values).to_vec()
+    if cfg!(target_endian = "little") {
+        return bytemuck::cast_slice::<f32, u8>(values).to_vec();
+    }
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
 }
 
 #[cfg(test)]

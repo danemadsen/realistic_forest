@@ -2,6 +2,7 @@
 name = "realistic_forest"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 forest_assets = { path = "../forest_assets" }
@@ -39,3 +40,5 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSScreen",
 ] }
 
+[lints]
+workspace = true

@@ -294,7 +294,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::needless_range_loop)]
     fn runs_cover_exactly_the_visible_chunks_in_reach() {
         let grid = ChunkGrid {
             min: [-240.0, -240.0],
@@ -308,18 +307,18 @@ mod tests {
             blade_extent: 1.0,
         };
         let runs = visible_runs(&grid, &footprint, &reach);
-        for layer in 0..LAYER_COUNT {
+        for (layer, layer_runs) in runs.iter().enumerate() {
             let mut covered = vec![false; grid.count()];
-            for run in &runs[layer] {
+            for run in layer_runs {
                 assert!(run.start < run.end);
                 for chunk in run.clone() {
                     covered[chunk as usize] = true;
                 }
             }
-            for chunk in 0..grid.count() {
+            for (chunk, &is_covered) in covered.iter().enumerate() {
                 let centre = grid.centre(chunk);
                 assert_eq!(
-                    covered[chunk],
+                    is_covered,
                     footprint.may_draw(
                         centre,
                         grid.radius(),

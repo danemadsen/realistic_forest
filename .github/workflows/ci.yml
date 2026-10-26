@@ -29,7 +29,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       # Keep in sync with the same step in build.yml.
       - name: Install system libraries
@@ -47,16 +47,23 @@ jobs:
           shared-key: ci-linux
           save-if: ${{ github.ref == 'refs/heads/master' }}
 
-      # Fails on compile errors and deny-by-default lints only. The tree has
-      # existing clippy warnings, so `-D warnings` is off until they are cleared.
+      - name: Formatting
+        run: cargo fmt --all --check
+
       - name: Clippy
-        run: cargo clippy --workspace --locked --all-targets
+        run: cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
 
       # The GPU-dependent tests are #[ignore]d, so this runs on a headless
       # runner. Run them by hand on a real adapter with `-- --ignored`.
       - name: Unit tests, including asset pak round trips
         if: ${{ !cancelled() }}
-        run: cargo test --workspace --locked --all-targets
+        run: cargo test --workspace --locked --all-targets --all-features
+
+      - name: Documentation
+        if: ${{ !cancelled() }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --locked --no-deps --all-features
 
       # Parses every assets/shaders/*.wgsl with naga and checks entry points.
       # Shaders are compiled at runtime, so this is the only CI signal for them.

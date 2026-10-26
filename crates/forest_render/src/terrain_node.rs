@@ -388,7 +388,7 @@ pub struct GbufferTargets {
     /// `grass_habitat.mapping` as a 16-byte uniform, for the GPU passes that
     /// sample the capture after the frame's capture lands: the water, which
     /// reads the canopy over the ground average. Written by the capture's own
-    /// pass ([`HabitatCapture::complete`]) and nowhere else; zero, no
+    /// pass and nowhere else; zero, no
     /// capture, until the first.
     pub grass_habitat_mapping_buffer: Buffer,
 
@@ -517,11 +517,11 @@ pub fn forest_terrain_pass(world: &World, mut ctx: RenderContext) {
     let mut gbuffer_guard = state
         .gbuffer
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .expect("terrain render state lock poisoned");
     let resources_guard = state
         .resources
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .expect("terrain render state lock poisoned");
     let (Some(gbuffer), Some(resources)) = (gbuffer_guard.as_mut(), resources_guard.as_ref())
     else {
         return;
@@ -1717,7 +1717,7 @@ fn prepare_terrain(
     let mut resources = state
         .resources
         .lock()
-        .unwrap_or_else(|error| error.into_inner());
+        .expect("terrain render state lock poisoned");
     if resources.is_some() {
         return;
     }
@@ -2041,11 +2041,12 @@ pub(crate) fn resize_gbuffer(
         let mut gbuffer = state
             .gbuffer
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(existing) = gbuffer.as_ref() {
-            if existing.width == width && existing.height == height {
-                return;
-            }
+            .expect("terrain render state lock poisoned");
+        if let Some(existing) = gbuffer.as_ref()
+            && existing.width == width
+            && existing.height == height
+        {
+            return;
         }
 
         let size = wgpu::Extent3d {
@@ -2271,7 +2272,7 @@ pub(crate) fn resize_gbuffer(
 /// Render-app registration for the terrain pass: the resize check first, then
 /// the one-time resource build, both in the `Render` schedule's `Prepare` set
 /// and after the shared globals buffer exists. The world-texture dependency is
-/// covered by the guard inside [`prepare_terrain`].
+/// covered by the guard inside the terrain preparation system.
 pub fn register_terrain_systems(render_app: &mut bevy::app::SubApp) {
     let mut config = (resize_gbuffer, prepare_terrain).chain();
     config = config.in_set(bevy::render::RenderSystems::Prepare);
@@ -2892,10 +2893,7 @@ mod clip_block_tests {
     }
 
     fn triangles(indices: &[u32]) -> Vec<[u32; 3]> {
-        let mut triangles: Vec<[u32; 3]> = indices
-            .chunks_exact(3)
-            .map(|t| [t[0], t[1], t[2]])
-            .collect();
+        let mut triangles = indices.as_chunks::<3>().0.to_vec();
         triangles.sort_unstable();
         triangles
     }
@@ -2968,7 +2966,7 @@ mod clip_block_tests {
         let mut drawn = vec![false; VERTICES_PER_SIDE * VERTICES_PER_SIDE];
         let mut shaded = 0usize;
         // Each grid triangle has three distinct vertices.
-        for triangle in indices.chunks_exact(3) {
+        for triangle in indices.as_chunks::<3>().0 {
             let mut new: Vec<u32> = triangle
                 .iter()
                 .copied()

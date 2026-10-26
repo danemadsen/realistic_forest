@@ -527,7 +527,10 @@ fn in_frustum(planes: &[[f32; 4]; 4], centre: Vec3, radius: f32) -> bool {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bevy injects the resources used to prepare buildings"
+)]
 pub(super) fn prepare_buildings(
     device: Res<RenderDevice>,
     queue: Res<RenderQueue>,
@@ -541,7 +544,7 @@ pub(super) fn prepare_buildings(
     mut shelters: ResMut<BuildingShelters>,
 ) {
     shelters.boxes.clear();
-    let mut state = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = state.0.lock().expect("building render state lock poisoned");
     state.frame = BuildingFrameDraws::default();
     let (Some(library), Some(snapshot)) = (extracted.library.as_ref(), extracted.snapshot.as_ref())
     else {
@@ -898,7 +901,7 @@ pub fn forest_building_pass(world: &World, mut ctx: RenderContext) {
     ) else {
         return;
     };
-    let state = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let state = state.0.lock().expect("building render state lock poisoned");
     let Some(gpu) = state.gpu.as_ref() else {
         return;
     };
@@ -908,7 +911,10 @@ pub fn forest_building_pass(world: &World, mut ctx: RenderContext) {
     let Some(pipeline) = cache.get_render_pipeline(gpu.draw_pipeline) else {
         return;
     };
-    let gbuffer = terrain.gbuffer.lock().unwrap_or_else(|e| e.into_inner());
+    let gbuffer = terrain
+        .gbuffer
+        .lock()
+        .expect("building render state lock poisoned");
     let Some(gbuffer) = gbuffer.as_ref() else {
         return;
     };
@@ -962,7 +968,7 @@ pub fn forest_building_shadow_pass(world: &World, mut ctx: RenderContext) {
     ) else {
         return;
     };
-    let state = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let state = state.0.lock().expect("building render state lock poisoned");
     let (Some(gpu), Some(shadow), Some(targets)) = (
         state.gpu.as_ref(),
         state.frame.shadow.as_ref(),
@@ -1076,7 +1082,7 @@ pub fn forest_building_glass_pass(
     ) else {
         return;
     };
-    let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = state.0.lock().expect("building render state lock poisoned");
     // Through a plain reference, so the GPU state (whose pipeline list may
     // grow) and the frame's draws borrow apart.
     let state = &mut *guard;
@@ -1091,7 +1097,10 @@ pub fn forest_building_glass_pass(
     let Some(pipeline) = cache.get_render_pipeline(pipeline_id) else {
         return;
     };
-    let gbuffer = terrain.gbuffer.lock().unwrap_or_else(|e| e.into_inner());
+    let gbuffer = terrain
+        .gbuffer
+        .lock()
+        .expect("building render state lock poisoned");
     let Some(gbuffer) = gbuffer.as_ref() else {
         return;
     };
@@ -1222,8 +1231,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(non_snake_case)]
-    fn nearbyInteriorMeshesCastShadowsWithoutWindowGlass() {
+    fn nearby_interior_meshes_cast_shadows_without_window_glass() {
         use forest_buildings::pads::{Pad, PadKind};
         use forest_buildings::placement::Placement;
 

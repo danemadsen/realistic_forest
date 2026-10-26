@@ -250,7 +250,10 @@ fn draw_instance_attributes() -> [wgpu::VertexAttribute; 7] {
     wgpu::vertex_attr_array![4 => Float32x2, 5 => Float32, 6 => Float32, 7 => Float32, 8 => Float32, 9 => Float32x2, 10 => Float32x4]
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bevy injects the resources used to prepare grass"
+)]
 fn prepare_grass(
     device: Res<RenderDevice>,
     adapter: Res<RenderAdapter>,
@@ -262,7 +265,7 @@ fn prepare_grass(
     state: Res<GrassNodeState>,
     readiness: Res<GrassReadiness>,
 ) {
-    let mut state = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = state.0.lock().expect("grass render state lock poisoned");
     if state.is_some() {
         return;
     }
@@ -622,7 +625,7 @@ fn prepare_grass_instances(
     state: Res<GrassNodeState>,
     readiness: Res<GrassReadiness>,
 ) {
-    let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = state.0.lock().expect("grass render state lock poisoned");
     let Some(resources) = guard.as_mut() else {
         return;
     };
@@ -664,11 +667,14 @@ pub fn forest_grass_pass(world: &World, mut ctx: RenderContext) {
     let Some(cache) = world.get_resource::<PipelineCache>() else {
         return;
     };
-    let gbuffer = terrain.gbuffer.lock().unwrap_or_else(|e| e.into_inner());
+    let gbuffer = terrain
+        .gbuffer
+        .lock()
+        .expect("grass render state lock poisoned");
     let Some(gbuffer) = gbuffer.as_ref().filter(|g| g.grass_habitat.ready) else {
         return;
     };
-    let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = state.0.lock().expect("grass render state lock poisoned");
     let Some(resources) = guard.as_mut() else {
         return;
     };

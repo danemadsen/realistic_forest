@@ -17,8 +17,7 @@ recording deliberate deviations; the atmospheric rendering extends that base.
 
 Requirements:
 
-- A recent stable Rust toolchain (developed against 1.98.1; the crate uses the
-  2024 edition)
+- Rust 1.98.1 or newer; the workspace uses the 2024 edition
 - A Vulkan, Metal or D3D12 capable GPU
 
 From a fresh checkout:
@@ -83,13 +82,14 @@ Check all crates and their test targets from the repository root:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --locked --all-targets
-cargo test --workspace --locked --all-targets
+cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
+cargo test --workspace --locked --all-targets --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps --all-features
 cargo run --locked --bin wgsl_check
 ```
 
 GPU tests remain explicitly ignored by the normal test run; run them on a capable
-adapter with `cargo test --workspace --locked --all-targets -- --ignored`.
+adapter with `cargo test --workspace --locked --all-targets --all-features -- --ignored`.
 
 ## Controls
 
@@ -208,10 +208,10 @@ cloud formations continuous. Set wind speed to zero to hold them in place.
 | --- | --- |
 | `--camera x,y,z,yawDeg,pitchDeg` | Pin the camera pose and fly, for reproducible shots; with `--shot`, mouse and keyboard input cannot move it |
 | `--shot path.png` | Render, save a screenshot, then exit; the log reports average, p95 and maximum frame time over the `--wait` window, split into frames while erosion tiles stream and settled frames. The water is drawn as a still of the game at 60 fps however long the frames take |
-| `--snow-trail x,z,x,z` | Seed one compressed snow segment between the two world XZ positions for reproducible screenshots |
+| `--snow-trail x,z,x,z` | Seed one compressed snow segment up to 128 m long between the two world XZ positions for reproducible screenshots |
 | `--wait n` | Frames to render before the screenshot, counted once the prewarmed erosion tiles, plants and grass are ready |
 | `--erosion-prewarm N` | Simulate the `N` nearest erosion tiles at full budget before streaming (default `4`, the quartet around the player); raise it so a capture shows erosion beyond the player's own lattice cell |
-| `--size W,H` | Window size in points (comma-separated, as the C++'s `sscanf`) |
+| `--size W,H` | Window size in points, with each dimension from 1 to 8192 (comma-separated, as the C++'s `sscanf`) |
 | `--probe` | Print terrain and erosion statistics, then exit |
 | `--probe-extent`, `--probe-step` | Probe sampling window |
 | `--measure-overlap` | Compare erosion tiles across a shared lattice edge |

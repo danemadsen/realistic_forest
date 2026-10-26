@@ -1,6 +1,6 @@
 //! Shared virtual asset paths for loose development files and release paks.
 
-#![allow(non_snake_case)]
+#![expect(non_snake_case, reason = "Preserve the existing camelCase asset API")]
 
 use crate::asset_pak::{MAX_ASSET_BYTES, PACK_GROUPS, PakArchive};
 use std::collections::HashMap;
@@ -20,6 +20,10 @@ pub struct AssetStore {
 }
 
 impl AssetStore {
+    /// Open a loose asset directory or its complete pair of pak archives.
+    ///
+    /// # Errors
+    /// Returns an error if the asset layout is incomplete or either pak is invalid.
     pub fn open(root: &Path) -> Result<Self, String> {
         let root = absolutePath(root)?;
         let storage = if hasPaks(&root) {
@@ -84,6 +88,11 @@ impl AssetStore {
         Ok(resolved)
     }
 
+    /// Read one asset without allowing paths or symlinks outside the store.
+    ///
+    /// # Errors
+    /// Returns an error for invalid paths, missing files, oversized assets,
+    /// failed I/O, or corrupt archive data.
     pub fn read(&self, path: &Path) -> Result<Vec<u8>, String> {
         let (absolute, name, group_index) = self.assetPath(path)?;
         match &self.storage {
@@ -106,6 +115,10 @@ impl AssetStore {
         }
     }
 
+    /// Validate an asset path and return its absolute logical name.
+    ///
+    /// # Errors
+    /// Returns an error if the asset is missing or its path escapes the store.
     pub fn canonicalize(&self, path: &Path) -> Result<PathBuf, String> {
         let (absolute, name, group_index) = self.assetPath(path)?;
         match &self.storage {
@@ -122,6 +135,9 @@ impl AssetStore {
     }
 
     /// Return files immediately inside a logical directory in stable order.
+    ///
+    /// # Errors
+    /// Returns an error for invalid or missing directories and failed I/O.
     pub fn readDirectory(&self, directory: &Path) -> Result<Vec<PathBuf>, String> {
         let (absolute, name, group_index) = self.assetPath(directory)?;
         let mut paths = Vec::new();
@@ -263,19 +279,34 @@ fn storeFor(path: &Path) -> Result<Arc<AssetStore>, String> {
     Ok(store)
 }
 
+/// Read an asset from the store containing its logical path.
+///
+/// # Errors
+/// Returns an error if no valid store is found or [`AssetStore::read`] fails.
 pub fn read(path: &Path) -> Result<Vec<u8>, String> {
     storeFor(path)?.read(path)
 }
 
+/// List the files immediately inside a directory in its containing store.
+///
+/// # Errors
+/// Returns an error if no valid store is found or [`AssetStore::readDirectory`] fails.
 pub fn readDirectory(directory: &Path) -> Result<Vec<PathBuf>, String> {
     storeFor(directory)?.readDirectory(directory)
 }
 
+/// Validate an asset path within its containing store.
+///
+/// # Errors
+/// Returns an error if no valid store is found or [`AssetStore::canonicalize`] fails.
 pub fn canonicalize(path: &Path) -> Result<PathBuf, String> {
     storeFor(path)?.canonicalize(path)
 }
 
 /// Validate the selected asset layout before the application starts loading it.
+///
+/// # Errors
+/// Returns an error if the selected root does not contain a complete valid store.
 pub fn initialize() -> Result<(), String> {
     storeFor(&rootPath().join("models"))?;
     Ok(())

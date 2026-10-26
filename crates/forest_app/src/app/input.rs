@@ -9,7 +9,10 @@ pub(super) struct CopyPose(String);
 
 /// 2 toggles the trainer and pointer capture; 3 toggles passive debug text.
 /// F12 saves a timestamped screenshot.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the domain inputs explicit at this call boundary"
+)]
 pub(super) fn handle_global_keys(
     mut settings: ResMut<AppSettings>,
     mut player: Query<&mut Player>,
@@ -55,20 +58,21 @@ pub(super) fn handle_global_keys(
         }
     }
     // P copies the current pose to the clipboard for debugging.
-    if !editing_menu && keyboard.just_pressed(KeyCode::KeyP) {
-        if let Ok(player) = player.single() {
-            let forward = player.forward();
-            let pose = format!(
-                "Position: {:.2}, {:.2}, {:.2}\nView: {:.3}, {:.3}, {:.3}",
-                player.position.x,
-                player.position.y,
-                player.position.z,
-                forward.x,
-                forward.y,
-                forward.z,
-            );
-            pose_copies.write(CopyPose(pose));
-        }
+    if !editing_menu
+        && keyboard.just_pressed(KeyCode::KeyP)
+        && let Ok(player) = player.single()
+    {
+        let forward = player.forward();
+        let pose = format!(
+            "Position: {:.2}, {:.2}, {:.2}\nView: {:.3}, {:.3}, {:.3}",
+            player.position.x,
+            player.position.y,
+            player.position.z,
+            forward.x,
+            forward.y,
+            forward.z,
+        );
+        pose_copies.write(CopyPose(pose));
     }
     if keyboard.just_pressed(KeyCode::F12) {
         commands
@@ -117,10 +121,11 @@ mod global_key_tests {
     }
 
     fn press(app: &mut App, key: KeyCode) {
-        let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
-        keys.reset_all();
-        keys.press(key);
-        drop(keys);
+        {
+            let mut keys = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+            keys.reset_all();
+            keys.press(key);
+        }
         app.update();
     }
 

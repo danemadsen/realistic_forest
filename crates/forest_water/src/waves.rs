@@ -14,9 +14,9 @@
 //! to specular roughness. The band partition is retained for the GPU contract.
 //!
 //! DIVERGENCE: two constants tune the sea this port draws without touching
-//! the ported table. [`RIPPLE_GAIN`] and [`SWELL_GAIN`] scale the uploaded
-//! amplitude of everything shorter than [`RIPPLE_BAND_METRES`] and of
-//! everything at or above [`SWELL_BAND_METRES`]. Aqua carries no equivalent of
+//! the ported table. `RIPPLE_GAIN` and `SWELL_GAIN` scale the uploaded
+//! amplitude of everything shorter than `RIPPLE_BAND_METRES` and of
+//! everything at or above `SWELL_BAND_METRES`. Aqua carries no equivalent of
 //! either. They are this port's look tuning, layered on top of the verbatim
 //! Crest power table rather than written into it, and each doc comment carries
 //! its own calibration.
@@ -132,7 +132,7 @@ const ANALYTIC_CHOP: f32 = 1.6;
 /// below pins that.
 ///
 /// The two octaves under it are where the surface's slope lives. At
-/// `sea_state_amplitude` 0.28 with [`SWELL_GAIN`] at 0.20 the 40 uploaded
+/// `sea_state_amplitude` 0.28 with `SWELL_GAIN` at 0.20 the 40 uploaded
 /// components give an RMS surface tilt of 2.037 degrees; the 2-8 m octaves
 /// carry 56.1% of that slope variance on 17.6% of the wave height, and the
 /// 16-64 m octaves only 6.2% of the slope on 51.6% of the height. The 2-8 m
@@ -140,7 +140,7 @@ const ANALYTIC_CHOP: f32 = 1.6;
 /// moves.
 const RIPPLE_BAND_METRES: f32 = 8.0;
 
-/// Amplitude gain for everything shorter than [`RIPPLE_BAND_METRES`].
+/// Amplitude gain for everything shorter than `RIPPLE_BAND_METRES`.
 ///
 /// This is layered on top of `POWER_LOG10`, not written into it. That table is
 /// Crest's `OceanWaveSpectrum.cs` defaults ported verbatim, and it also could
@@ -149,7 +149,7 @@ const RIPPLE_BAND_METRES: f32 = 8.0;
 /// octave instead of scaling a band.
 ///
 /// Calibration, measured against the exact float32 generator at
-/// `sea_state_amplitude` 0.28 with [`SWELL_GAIN`] at 0.20 (baseline, gain 1.0:
+/// `sea_state_amplitude` 0.28 with `SWELL_GAIN` at 0.20 (baseline, gain 1.0:
 /// RMS tilt 3.335 degrees, H_s 0.3090 m, sum|a| 0.5835 m, far-field GGX alpha
 /// 0.06667, fold 0.6240, breaking area 14.31% with the directions drawn by
 /// [`spreading_beta`]; 14.27% with Crest's concentrated fan):
@@ -164,15 +164,15 @@ const RIPPLE_BAND_METRES: f32 = 8.0;
 const RIPPLE_GAIN: f32 = 0.5;
 
 /// Lower wavelength of the swell band, in metres. `lod_max_wavelength(2)`, an
-/// octave boundary for the same reason [`RIPPLE_BAND_METRES`] is one: the gain
+/// octave boundary for the same reason `RIPPLE_BAND_METRES` is one: the gain
 /// must not half-scale an LOD band. It is the boundary between octave 7
 /// (`[8, 16)`) and octave 8, so the tapered set is whole octaves 8 and 9 — the
 /// two longest uploaded bands, `[16, 64)`, sixteen components.
 const SWELL_BAND_METRES: f32 = 16.0;
 
-/// Amplitude gain for everything at or above [`SWELL_BAND_METRES`].
+/// Amplitude gain for everything at or above `SWELL_BAND_METRES`.
 ///
-/// Built exactly like [`RIPPLE_GAIN`]: this port's look tuning, layered on top
+/// Built exactly like `RIPPLE_GAIN`: this port's look tuning, layered on top
 /// of Crest's power table rather than written into it, applied after the
 /// `MIN_AMPLITUDE` gate so the live component set, the `WAVE_SLOTS` assert and
 /// the LOD partition are untouched.
@@ -199,7 +199,7 @@ const SWELL_BAND_METRES: f32 = 16.0;
 /// reads as an ocean with the amplitude turned down, H_s 0.41 m under the
 /// default breeze, rougher than any lake and calm enough for a shoreline.
 ///
-/// Calibration at `sea_state_amplitude` 0.28 with [`RIPPLE_GAIN`] at its
+/// Calibration at `sea_state_amplitude` 0.28 with `RIPPLE_GAIN` at its
 /// shipped 0.5, columns sum|a| m / H_s m / RMS tilt deg / 2-8 m tilt deg /
 /// 16-64 m tilt deg / far-field alpha / fold (`ANALYTIC_CHOP * sum(ak)`) /
 /// breaking area (Jacobian < 0.90, over 2 km square) / slope up:across the
@@ -223,7 +223,7 @@ const SWELL_BAND_METRES: f32 = 16.0;
 /// the 13 m wave is the largest the 2-8 m waves lie nearer the peak and run
 /// closer to the wind.
 /// The 2-8 m tilt is 1.526 deg at every rung: the band edge is above it, so
-/// this lever and [`RIPPLE_GAIN`] are orthogonal by construction. The taper
+/// this lever and `RIPPLE_GAIN` are orthogonal by construction. The taper
 /// also *raises* the folding margin, from 1/sum(ak) 2.297 at 1.00 to 3.912 at
 /// 0.20, rather than spending it; 0.35 still keeps it above 2. The far-field
 /// alpha column is the swell's alone: the wind sea under 2 m adds its own
@@ -401,8 +401,8 @@ fn generate_components(
     })
 }
 
-/// The two tapers, [`RIPPLE_GAIN`] under [`RIPPLE_BAND_METRES`] and
-/// [`SWELL_GAIN`] from [`SWELL_BAND_METRES`] up. They are applied after the
+/// The two tapers, `RIPPLE_GAIN` under `RIPPLE_BAND_METRES` and
+/// `SWELL_GAIN` from `SWELL_BAND_METRES` up. They are applied after the
 /// multiplier and after the `MIN_AMPLITUDE` gate: they scale how much amplitude
 /// the sea carries, never which components exist. The live set is therefore
 /// identical to upstream's — a nonzero amplitude times 0.5 is still nonzero —
@@ -481,7 +481,7 @@ pub fn spread_angle(u: f32, beta: f32) -> f32 {
 /// Every rung takes [`WIND_PER_RUNG`] headings, one from each equal share of
 /// the broadest spread ([`SPREAD_FLOOR`]), each wandering a little within its
 /// share so no rung pairs its waves mirrored about the wind to cross in a
-/// lattice. The shares turn on by [`WIND_STRATUM_TURN`] from rung to rung, so
+/// lattice. The shares turn on by `WIND_STRATUM_TURN` from rung to rung, so
 /// the few rungs a pixel resolves together fill the spread evenly between
 /// them. The wavelengths are spread across the rung's half octave and the
 /// phases are random, so the rungs do not lock to each other either. A wave
@@ -670,7 +670,7 @@ mod tests {
 
     /// The directions and phases are drawn from their own streams, so the
     /// wavelengths and amplitudes must still be Crest's draw exactly: the
-    /// wave heights and the largest wave documented on [`SWELL_GAIN`].
+    /// wave heights and the largest wave documented on `SWELL_GAIN`.
     #[test]
     fn the_wavelengths_and_amplitudes_are_crests_draw() {
         let spectrum = build(0.28, 0.7);

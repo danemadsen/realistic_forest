@@ -1698,7 +1698,7 @@ mod gpu_tests {
         let results: &[[f32; 4]] = bytemuck::cast_slice(&mapped);
         let mut inside = 0;
         let mut lakes = 0;
-        for (p, pair) in points.iter().zip(results.chunks_exact(2)) {
+        for (p, pair) in points.iter().zip(results.as_chunks::<2>().0.iter()) {
             let (gpu, shade) = (pair[0], pair[1]);
             let cpu = network.envelope(p[0], p[1]);
             let close = |a: f32, b: f32| {

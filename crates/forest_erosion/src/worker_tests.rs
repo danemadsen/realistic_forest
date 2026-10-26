@@ -209,7 +209,8 @@ fn worker_delivers_a_tile_end_to_end() {
     }))
     .expect("no GPU adapter for the erosion worker test");
     let bridge = ErosionBridge::default();
-    bridge.publish_shader_sources(sources);
+    // SAFETY: these project shaders bound texture and array accesses for worker draws.
+    unsafe { bridge.publish_shader_sources(sources) };
     assert!(spawn_erosion_worker(
         &bridge,
         &adapter,
@@ -228,6 +229,7 @@ fn worker_delivers_a_tile_end_to_end() {
     let drainage_area =
         crate::route_base_drainage(&base_height, EROSION_RESOLUTION, EROSION_CELL_SIZE);
     let frame_commands = ErosionFrameCommands {
+        simulation_id: SimulationId::default(),
         sim_min: tile_simulation_minimum(key),
         init: Some(InitTileCommand {
             key,
@@ -245,12 +247,15 @@ fn worker_delivers_a_tile_end_to_end() {
             panic!("worker died before finalizing: {why}");
         }
         let events = bridge.drain_events();
-        let finalized = events.iter().find_map(|event| match event {
-            ErosionEvent::TileFinalized(tile) => Some(tile),
-            ErosionEvent::ReadbackFailed(key) => {
-                panic!("the test tile's readback failed: ({}, {})", key.x, key.z)
-            }
-        });
+        let finalized = events
+            .iter()
+            .map(|event| match event {
+                ErosionEvent::TileFinalized { tile, .. } => tile,
+                ErosionEvent::ReadbackFailed { key, .. } => {
+                    panic!("the test tile's readback failed: ({}, {})", key.x, key.z)
+                }
+            })
+            .next();
         if let Some(tile) = finalized {
             assert_eq!(tile.key, key);
             assert_eq!(

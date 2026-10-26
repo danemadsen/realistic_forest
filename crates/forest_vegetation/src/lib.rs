@@ -23,7 +23,7 @@ use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 use forest_core::noise::NoiseField;
 use forest_core::player::Player;
 use scatter::{Catalog, LEVEL_GROUND, LEVEL_SHRUBS, LEVEL_TREES, PlantInstance};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -160,6 +160,8 @@ pub struct VegetationField {
     catalog: Option<Arc<Catalog>>,
     chunks: HashMap<[i64; 2], ChunkLevels>,
     tasks: HashMap<([i64; 2], u8), Task<Vec<PlantInstance>>>,
+    stale: HashSet<([i64; 2], u8)>,
+    river_generation: Option<u64>,
     snapshot: Arc<VegetationSnapshot>,
     dirty: bool,
     since_publish: f32,
@@ -197,6 +199,8 @@ impl VegetationField {
             catalog: None,
             chunks: HashMap::new(),
             tasks: HashMap::new(),
+            stale: HashSet::new(),
+            river_generation: None,
             snapshot: Arc::new(VegetationSnapshot {
                 generation: 0,
                 plants: Vec::new(),
@@ -241,7 +245,9 @@ impl VegetationField {
         let Some(catalog) = self.catalog.as_deref() else {
             return;
         };
-        let (low, high) = (centre - Vec2::splat(reach), centre + Vec2::splat(reach));
+        let search_radius = reach + collision::MAX_TRUNK_RADIUS;
+        let low = centre - Vec2::splat(search_radius);
+        let high = centre + Vec2::splat(search_radius);
         let first = scatter::chunk_of(low.x as f64, low.y as f64);
         let last = scatter::chunk_of(high.x as f64, high.y as f64);
         for cz in first[1]..=last[1] {
@@ -326,6 +332,23 @@ impl VegetationField {
         self.dirty = false;
         self.since_publish = 0.0;
     }
+
+    fn refresh_rivers(&mut self, generation: u64) {
+        if self.river_generation == Some(generation) {
+            return;
+        }
+        self.river_generation = Some(generation);
+        self.tasks.clear();
+        self.stale.clear();
+        for (&chunk, levels) in &self.chunks {
+            for (level, plants) in levels.iter().enumerate() {
+                if plants.is_some() {
+                    self.stale.insert((chunk, level as u8));
+                }
+            }
+        }
+        self.settled = false;
+    }
 }
 
 /// Distance from a point to the nearest point of a chunk.
@@ -337,7 +360,10 @@ fn chunk_distance(chunk: [i64; 2], x: f64, z: f64) -> f64 {
 }
 
 /// Stream chunk levels around the player and publish snapshots.
-#[allow(non_snake_case)]
+#[expect(
+    non_snake_case,
+    reason = "Preserve the existing vegetation streaming API"
+)]
 pub fn streamVegetation<C>(
     field: &mut VegetationField,
     rivers: &forest_water::rivers::RiverField,
@@ -380,12 +406,14 @@ pub fn streamVegetation<C>(
     let Some(player) = player else {
         return;
     };
+    field.refresh_rivers(rivers.generation());
     let (px, pz) = (player.position.x as f64, player.position.z as f64);
     field.since_publish += delta_seconds;
 
     // Collect finished levels.
     let store_level = |(key, plants): (([i64; 2], u8), Vec<PlantInstance>)| {
         field.chunks.entry(key.0).or_default()[key.1 as usize] = Some(Arc::new(plants));
+        field.stale.remove(&key);
         key
     };
     let finished: Vec<([i64; 2], u8)> = field
@@ -412,6 +440,12 @@ pub fn streamVegetation<C>(
         levels.iter().any(Option::is_some)
     });
     field.dirty |= dropped;
+    field.stale.retain(|&(chunk, level)| {
+        field
+            .chunks
+            .get(&chunk)
+            .is_some_and(|levels| levels[level as usize].is_some())
+    });
     field.tasks.retain(|&(chunk, level), _| {
         chunk_distance(chunk, px, pz) <= LEVEL_RADIUS[level as usize] + LEVEL_HYSTERESIS
     });
@@ -431,7 +465,8 @@ pub fn streamVegetation<C>(
                 let present = field
                     .chunks
                     .get(&chunk)
-                    .is_some_and(|levels| levels[level as usize].is_some());
+                    .is_some_and(|levels| levels[level as usize].is_some())
+                    && !field.stale.contains(&(chunk, level));
                 if !present && !field.tasks.contains_key(&(chunk, level)) {
                     // Nearer detail first; trees before the ground layers.
                     wanted.push((distance + level as f64 * 40.0, chunk, level));
@@ -508,6 +543,48 @@ pub(crate) mod tests {
         found.clear();
         field.solids_near(Vec2::new(10.0, 3.5), 3.0, &mut found);
         assert!(found.is_empty());
+    }
+
+    #[test]
+    fn solids_near_includes_bark_reaching_across_a_chunk_boundary() {
+        for (root, centre) in [
+            (Vec2::new(0.05, 10.0), Vec2::new(-0.5, 10.0)),
+            (Vec2::new(-0.05, 10.0), Vec2::new(0.5, 10.0)),
+            (Vec2::new(10.0, 0.05), Vec2::new(10.0, -0.5)),
+            (Vec2::new(10.0, -0.05), Vec2::new(10.0, 0.5)),
+        ] {
+            let tree = plant(root.x, root.y, 0, Layer::Canopy);
+            let field = VegetationField::with_plants(catalog(), vec![tree]);
+            let mut found = Vec::new();
+            field.solids_near(centre, 0.3, &mut found);
+            assert_eq!(found.len(), 1, "root {root}, query {centre}");
+            assert_eq!(found[0].position, root);
+        }
+    }
+
+    #[test]
+    fn river_replacements_refresh_chunk_clearings_without_removing_visible_plants() {
+        let tree = plant(10.0, 10.0, 0, Layer::Canopy);
+        let mut field = VegetationField::with_plants(catalog(), vec![tree]);
+        field.river_generation = Some(1);
+        field.settled = true;
+        field.refresh_rivers(1);
+        assert!(
+            field.stale.is_empty(),
+            "an unchanged river snapshot is reusable"
+        );
+
+        field.refresh_rivers(2);
+        assert!(field.stale.contains(&([0, 0], LEVEL_TREES)));
+        assert!(!field.settled, "capture must await updated clearings");
+        let kept = field.chunks[&[0, 0]][LEVEL_TREES as usize]
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            kept.as_slice(),
+            &[tree],
+            "retain plants until replacements arrive"
+        );
     }
 
     /// The real library and scatter: every tree and lilac stands as a stem

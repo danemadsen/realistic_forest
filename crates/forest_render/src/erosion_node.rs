@@ -26,7 +26,9 @@ use bevy::render::renderer::{RenderAdapter, RenderContext, RenderDevice, RenderQ
 use forest_core::constants::*;
 use forest_erosion::finalize::f32_to_bytes;
 use forest_erosion::worker::spawn_erosion_worker;
-use forest_erosion::{ErosionBridge, ErosionPhaseCosts, PendingAtlasPatch, TileKey};
+use forest_erosion::{
+    ErosionBridge, ErosionLookup, ErosionPhaseCosts, PendingAtlasPatch, SimulationId, TileKey,
+};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -93,6 +95,9 @@ pub fn forest_erosion_pass(world: &World, _ctx: RenderContext) {
     let Some(bridge) = world.get_resource::<ErosionBridge>() else {
         return;
     };
+    let Some(view) = world.get_resource::<ExtractedForestView>() else {
+        return;
+    };
 
     // Phase attribution for --shot captures: every early return below simply
     // skips phases, so their costs stay out of the totals.
@@ -105,48 +110,46 @@ pub fn forest_erosion_pass(world: &World, _ctx: RenderContext) {
     // sources exist would kill the worker for what is only asset loading
     // latency. A failed spawn has already reported through the bridge (the
     // main world panics on reading it), so there is nothing left to retry.
-    if !state.spawned.load(Ordering::SeqCst) && bridge.shader_sources_ready() {
-        if !state.spawned.swap(true, Ordering::SeqCst) {
-            spawn_worker(world, bridge);
-            costs.lookup_atlas_us += tick.elapsed().as_micros() as u64;
-            tick = std::time::Instant::now();
-        }
+    if !state.spawned.load(Ordering::SeqCst)
+        && bridge.shader_sources_ready()
+        && !state.spawned.swap(true, Ordering::SeqCst)
+    {
+        spawn_worker(world, bridge);
+        costs.lookup_atlas_us += tick.elapsed().as_micros() as u64;
+        tick = std::time::Instant::now();
     }
 
-    // The C++ refreshes the 11x11 lookup from `UpdateErosionLookup` at the
-    // end of every cache update; the bridge carries those records across,
-    // and they also carry the atlas slots the pending patches wait for.
-    let records = bridge.take_lookup();
-    if let Some(records) = records.as_deref() {
-        if records.len() == EROSION_LOOKUP_DIAMETER * EROSION_LOOKUP_DIAMETER * 4 {
-            textures.revision.note_lookup(records);
-            write_padded_at(
-                queue,
-                &textures.lookup_texture,
-                &f32_to_bytes(records),
-                LOOKUP_TEXTURE_SIZE,
-                LOOKUP_TEXTURE_SIZE,
-                SIM_TEXEL_BYTES,
-                [0, 0],
-                0,
-            );
-        }
+    // Pipelined rendering overlaps the next main-world update. Records and
+    // allocation identities must come from the same extraction as the origin
+    // in this frame's globals, rather than the bridge's newer live state.
+    let lookup = &view.erosion_lookup;
+    let records = &lookup.records;
+    if records.len() == EROSION_LOOKUP_DIAMETER * EROSION_LOOKUP_DIAMETER * 4 {
+        textures.revision.note_lookup(records);
+        write_padded_at(
+            queue,
+            &textures.lookup_texture,
+            &f32_to_bytes(records),
+            LOOKUP_TEXTURE_SIZE,
+            LOOKUP_TEXTURE_SIZE,
+            SIM_TEXEL_BYTES,
+            [0, 0],
+            0,
+        );
     }
 
     // Atlas patches the worker finished. They join the pending list first, so
     // a patch whose slot publishes on a later frame survives; only uploads,
     // age accounting and eviction happen here.
     let patches = bridge.drain_patches();
-    if let Ok(mut pending) = state.pending_patches.lock() {
-        pending.extend(patches);
-        if let (Some(records), Some(view)) = (
-            records.as_deref(),
-            world.get_resource::<ExtractedForestView>(),
-        ) {
-            flush_pending_atlas(queue, textures, view.lookup_minimum, records, &mut pending);
-            pending.retain(|patch| patch.age <= MAX_PENDING_ATLAS_AGE);
-        }
-    }
+    let mut pending = state
+        .pending_patches
+        .lock()
+        .expect("erosion pending atlas lock poisoned");
+    pending.extend(patches);
+    flush_pending_atlas(queue, textures, lookup, &mut pending);
+    pending.retain(|patch| patch.age <= MAX_PENDING_ATLAS_AGE);
+    drop(pending);
     costs.lookup_atlas_us += tick.elapsed().as_micros() as u64;
 
     bridge.record_phase_costs(costs);
@@ -165,7 +168,7 @@ fn spawn_worker(world: &World, bridge: &ErosionBridge) {
     // mirroring the render device's requested features and limits.
     spawn_erosion_worker(
         bridge,
-        &**render_adapter.0,
+        &render_adapter.0,
         render_device.features(),
         render_device.limits(),
     );
@@ -174,15 +177,27 @@ fn spawn_worker(world: &World, bridge: &ErosionBridge) {
 /// Decides whether the lookup records contain an allocated atlas slot for
 /// `key`. `UpdateErosionLookup` writes the same numbers in the same 11x11
 /// record layout the lookup texture carries: the slot in (x, z) at offsets
-/// 0 and 1, the allocation state at offset 3.
-fn published_slot(key: TileKey, lookup_minimum: (i64, i64), records: &[f32]) -> Option<(f32, f32)> {
+/// 0 and 1, the allocation state at offset 3. The attempt identity must also
+/// match, so a reset or retry cannot upload an older simulation's patch.
+fn published_slot(
+    key: TileKey,
+    simulation_id: SimulationId,
+    lookup: &ErosionLookup,
+) -> Option<(f32, f32)> {
     let diameter = EROSION_LOOKUP_DIAMETER as i64;
-    let relative_x = key.x - lookup_minimum.0;
-    let relative_z = key.z - lookup_minimum.1;
+    let relative_x = key.x.checked_sub(lookup.minimum.x)?;
+    let relative_z = key.z.checked_sub(lookup.minimum.z)?;
     if relative_x < 0 || relative_z < 0 || relative_x >= diameter || relative_z >= diameter {
         return None;
     }
-    let record = ((relative_z * diameter + relative_x) * 4) as usize;
+    let cell = (relative_z * diameter + relative_x) as usize;
+    if simulation_id == SimulationId::default()
+        || lookup.simulation_ids.get(cell) != Some(&simulation_id)
+    {
+        return None;
+    }
+    let records = &lookup.records;
+    let record = cell * 4;
     if records.get(record + 3).copied().unwrap_or(0.0) > 0.0 {
         Some((records[record], records[record + 1]))
     } else {
@@ -196,14 +211,14 @@ fn published_slot(key: TileKey, lookup_minimum: (i64, i64), records: &[f32]) -> 
 pub fn flush_pending_atlas(
     queue: &RenderQueue,
     textures: &GpuWorldTextures,
-    lookup_minimum: (i64, i64),
-    records: &[f32],
+    lookup: &ErosionLookup,
     patches: &mut Vec<PendingAtlasPatch>,
 ) -> usize {
     let mut uploaded = 0;
     let mut index = 0;
     while index < patches.len() {
-        let slot = published_slot(patches[index].key, lookup_minimum, records);
+        let patch = &patches[index];
+        let slot = published_slot(patch.key, patch.simulation_id, lookup);
         let Some((slot_x, slot_z)) = slot else {
             patches[index].age += 1;
             index += 1;
@@ -256,28 +271,91 @@ pub fn flush_pending_atlas(
 #[cfg(test)]
 mod node_tests {
     use super::*;
-    use forest_erosion::tile;
+    use forest_erosion::{
+        ErosionCache, ErosionFrameCommands, ErosionTileState, PreparedTile, begin_prepared_tile,
+        ensure_erosion_cache, erosion_lookup_snapshot, tile,
+    };
+
+    fn begin_attempt(cache: &mut ErosionCache, key: TileKey) -> SimulationId {
+        let mut commands = ErosionFrameCommands {
+            simulation_id: SimulationId::default(),
+            sim_min: [0.0; 2],
+            init: None,
+            iterate: None,
+            finalize: false,
+        };
+        let prepared = PreparedTile {
+            key,
+            base_height: Vec::new(),
+            drainage_area: Vec::new(),
+            river: Vec::new(),
+        };
+        begin_prepared_tile(cache, &mut commands, prepared);
+        commands.simulation_id
+    }
 
     /// The record layout `published_slot` reads: slot in (x, z) at offsets
     /// 0 and 1, the allocation state at offset 3 — what `erosion_lookup_records`
     /// writes and what `flush_pending_atlas` gates on.
     #[test]
     fn published_slot_reads_the_record_layout() {
-        let mut records = vec![0.0; EROSION_LOOKUP_DIAMETER * EROSION_LOOKUP_DIAMETER * 4];
+        let key = tile(2, 1);
+        let mut cache = ErosionCache::default();
+        ensure_erosion_cache(&mut cache, key);
+        cache.lookup_minimum = tile(0, 0);
+        let simulation_id = begin_attempt(&mut cache, key);
         // Inside the window but not yet published: wait.
-        assert_eq!(published_slot(tile(0, 0), (0, 0), &records), None);
+        let unpublished = erosion_lookup_snapshot(&cache);
+        assert_eq!(published_slot(key, simulation_id, &unpublished), None);
         // Published: the slot the record carries.
-        let diameter = EROSION_LOOKUP_DIAMETER as i64;
-        let record = ((1 * diameter + 2) * 4) as usize;
-        records[record] = 5.0;
-        records[record + 1] = 6.0;
-        records[record + 3] = 1.0;
+        let allocated = cache.tiles.get_mut(&key).expect("test tile is allocated");
+        allocated.atlas_slot = 6 * EROSION_ATLAS_COLUMNS + 5;
+        allocated.state = ErosionTileState::Ready;
+        let lookup = erosion_lookup_snapshot(&cache);
         assert_eq!(
-            published_slot(tile(2, 1), (0, 0), &records),
+            published_slot(key, simulation_id, &lookup),
             Some((5.0, 6.0))
         );
         // Outside the 11x11 window: no slot at all.
-        assert_eq!(published_slot(tile(100, 0), (0, 0), &records), None);
-        assert_eq!(published_slot(tile(0, -100), (0, 0), &records), None);
+        for outside in [tile(100, 0), tile(0, -100), tile(i64::MIN, i64::MAX)] {
+            assert_eq!(published_slot(outside, simulation_id, &lookup), None);
+        }
+    }
+
+    #[test]
+    fn atlas_slots_follow_the_extracted_origin_and_simulation_attempt() {
+        let key = tile(2, 1);
+        let mut cache = ErosionCache::default();
+        ensure_erosion_cache(&mut cache, key);
+        cache.lookup_minimum = tile(0, 0);
+        let earlier_id = begin_attempt(&mut cache, key);
+        let earlier = cache.tiles.get_mut(&key).expect("test tile is allocated");
+        earlier.atlas_slot = 6 * EROSION_ATLAS_COLUMNS + 5;
+        earlier.state = ErosionTileState::Ready;
+        let extracted = erosion_lookup_snapshot(&cache);
+
+        // The next main-world update can restart the same tile and move its
+        // lookup window while the renderer still holds the earlier snapshot.
+        let newer_id = begin_attempt(&mut cache, key);
+        cache.lookup_minimum = tile(1, 0);
+        let newer = cache
+            .tiles
+            .get_mut(&key)
+            .expect("test tile remains allocated");
+        newer.atlas_slot = 3;
+        newer.state = ErosionTileState::Ready;
+        let next_snapshot = erosion_lookup_snapshot(&cache);
+
+        assert_ne!(earlier_id, newer_id);
+        assert_eq!(
+            published_slot(key, earlier_id, &extracted),
+            Some((5.0, 6.0))
+        );
+        assert_eq!(published_slot(key, newer_id, &extracted), None);
+        assert_eq!(published_slot(key, earlier_id, &next_snapshot), None);
+        assert_eq!(
+            published_slot(key, newer_id, &next_snapshot),
+            Some((3.0, 0.0))
+        );
     }
 }

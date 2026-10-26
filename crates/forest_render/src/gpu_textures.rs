@@ -8,7 +8,7 @@ use bevy::render::{ExtractSchedule, MainWorld};
 use forest_core::constants::*;
 use forest_core::noise::NoiseField;
 use forest_erosion::ErosionCache;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
@@ -19,11 +19,22 @@ fn asset_path(relative: &str) -> PathBuf {
     PathBuf::from(forest_assets::resolveAssetRoot()).join(relative)
 }
 
-fn load_image_rgba(path: &PathBuf) -> Result<(Vec<u8>, usize), String> {
+fn load_image_rgba(path: &Path) -> Result<(Vec<u8>, usize), String> {
     let texture_bytes = forest_assets::asset_io::read(path)?;
-    let decoded = image::load_from_memory(&texture_bytes)
+    decode_terrain_image(&texture_bytes, path)
+}
+
+fn decode_terrain_image(texture_bytes: &[u8], path: &Path) -> Result<(Vec<u8>, usize), String> {
+    let decoded = image::load_from_memory(texture_bytes)
         .map_err(|error| format!("loading terrain texture {}: {error}", path.display()))?;
     let size = decoded.width() as usize;
+    let height = decoded.height() as usize;
+    if size == 0 || size != height || !size.is_multiple_of(TERRAIN_TILE_SIZE) {
+        return Err(format!(
+            "terrain texture {} has incompatible dimensions {size}x{height}; expected a square with sides divisible by {TERRAIN_TILE_SIZE}",
+            path.display()
+        ));
+    }
     Ok((decoded.to_rgba8().into_raw(), size))
 }
 
@@ -115,6 +126,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn terrain_image_dimensions_are_validated_before_resampling() {
+        let tile_size = TERRAIN_TILE_SIZE as u32;
+        let dimensions = [
+            (tile_size, tile_size, true),
+            (tile_size, tile_size / 2, false),
+            (tile_size / 2, tile_size / 2, false),
+            (tile_size + 1, tile_size + 1, false),
+        ];
+        let path = Path::new("textures/test-terrain.png");
+        for (width, height, valid) in dimensions {
+            let image = image::RgbaImage::new(width, height);
+            let mut encoded = std::io::Cursor::new(Vec::new());
+            image
+                .write_to(&mut encoded, image::ImageFormat::Png)
+                .expect("encode terrain dimension fixture");
+            let result = decode_terrain_image(encoded.get_ref(), path);
+            if valid {
+                let (pixels, size) = result.expect("square terrain fixture is accepted");
+                assert_eq!(size, TERRAIN_TILE_SIZE);
+                assert_eq!(pixels.len(), TERRAIN_TILE_SIZE * TERRAIN_TILE_SIZE * 4);
+            } else {
+                let error = result.expect_err("incompatible terrain dimensions are rejected");
+                assert!(error.contains("textures/test-terrain.png"), "{error}");
+                assert!(error.contains(&format!("{width}x{height}")), "{error}");
+            }
+        }
+    }
+
+    #[test]
     fn terrain_revision_moves_only_when_the_data_does() {
         let revision = TerrainRevision::default();
         let records = vec![0.0f32; 484];
@@ -171,12 +211,12 @@ mod tests {
     fn linear_mips_round_without_a_dark_bias() {
         let blocks: [[u8; 4]; 4] = [[1, 1, 1, 2], [1, 1, 1, 3], [1, 1, 1, 4], [1, 1, 2, 6]];
         let mut src = vec![0u8; 4 * 4 * 4];
-        for block in 0..4 {
+        for (block, values) in blocks.iter().enumerate() {
             let (bx, by) = (block % 2, block / 2);
             for dy in 0..2 {
                 for dx in 0..2 {
                     let index = ((by * 2 + dy) * 4 + bx * 2 + dx) * 4;
-                    src[index] = blocks[block][dy * 2 + dx];
+                    src[index] = values[dy * 2 + dx];
                     src[index + 3] = 255;
                 }
             }
@@ -435,7 +475,6 @@ pub struct GpuWorldTextures {
 
     /// R32 1024², 11 mips, trilinear + repeat (base noise). Held so the
     /// texture outlives the view the samplers bind.
-    #[allow(dead_code)]
     pub noise_texture: wgpu::Texture,
 
     pub noise_view: wgpu::TextureView,
@@ -502,8 +541,8 @@ fn float_texture(
 pub fn ssao_noise_pixels() -> Vec<u8> {
     let count = SSAO_NOISE_WIDTH as usize * SSAO_NOISE_WIDTH as usize;
     let mut pixels = vec![0u8; count * 4];
-    for (index, pixel) in pixels.chunks_exact_mut(4).enumerate() {
-        let angle = index as f32 * 2.39996323;
+    for (index, pixel) in pixels.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let angle = index as f32 * 2.399_963_1;
         pixel[0] = ((angle.cos() * 0.5 + 0.5) * 255.0) as u8;
         pixel[1] = ((angle.sin() * 0.5 + 0.5) * 255.0) as u8;
         pixel[2] = 128;
@@ -571,6 +610,10 @@ fn write_padded(
 /// level by level (the base noise) must land in their own levels, and a
 /// hardcoded 0 silently stacks them all into the base level — leaving the base
 /// level holding only the final 1x1 mip and every real mip zero-filled.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "texture uploads specify layout, destination and mip level independently"
+)]
 pub fn write_padded_at(
     queue: &RenderQueue,
     texture: &wgpu::Texture,
@@ -761,70 +804,69 @@ pub fn prepare_gpu_textures(
 
     // PBR texture arrays with CPU-built mip chains (wgpu cannot generate
     // array mips on the GPU), trilinear + repeat + max anisotropy.
-    let make_array = |label: &str,
-                      layers: &Box<[MipChain8; TERRAIN_ATLAS_SLOTS]>,
-                      format: wgpu::TextureFormat| {
-        let level_counts = layers.iter().map(|layer| layer.levels.len());
-        let max_levels = level_counts.max().unwrap_or(1) as u32;
-        let array_descriptor = wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d {
-                width: TERRAIN_TILE_SIZE as u32,
-                height: TERRAIN_TILE_SIZE as u32,
-                depth_or_array_layers: TERRAIN_ATLAS_SLOTS as u32,
-            },
-            mip_level_count: max_levels,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        };
-        let texture = device.wgpu_device().create_texture(&array_descriptor);
-        for level in 0..max_levels as usize {
-            let size = (TERRAIN_TILE_SIZE >> level).max(1) as u32;
-            // Layers contiguous, each row padded to 256.
-            let raw_row = size as usize * 4;
-            let row = raw_row.next_multiple_of(256);
-            let mut level_bytes = vec![0u8; row * size as usize * TERRAIN_ATLAS_SLOTS];
-            for (slot, layer) in layers.iter().enumerate() {
-                let Some(data) = layer.levels.get(level) else {
-                    continue; // shorter chains leave zero-filled tail levels
-                };
-                let layer_offset = slot * row * size as usize;
-                for y in 0..size as usize {
-                    level_bytes[layer_offset + y * row..layer_offset + y * row + raw_row]
-                        .copy_from_slice(&data[y * raw_row..(y + 1) * raw_row]);
-                }
-            }
-            queue.write_texture(
-                // NOTE: `Texture::as_image_copy()` hardcodes mip_level 0, so
-                // it cannot be used here — every iteration would land on the
-                // base level, leaving the base level holding only the last
-                // (1x1) mip and every real mip zero-filled. The albedo array
-                // then samples as pure black at every distance. The copy
-                // target is built by hand so each level lands in its own mip.
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: level as u32,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &level_bytes,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row as u32),
-                    rows_per_image: Some(size),
-                },
-                wgpu::Extent3d {
-                    width: size,
-                    height: size,
+    let make_array =
+        |label: &str, layers: &[MipChain8; TERRAIN_ATLAS_SLOTS], format: wgpu::TextureFormat| {
+            let level_counts = layers.iter().map(|layer| layer.levels.len());
+            let max_levels = level_counts.max().unwrap_or(1) as u32;
+            let array_descriptor = wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: TERRAIN_TILE_SIZE as u32,
+                    height: TERRAIN_TILE_SIZE as u32,
                     depth_or_array_layers: TERRAIN_ATLAS_SLOTS as u32,
                 },
-            );
-        }
-        texture.create_view(&Default::default())
-    };
+                mip_level_count: max_levels,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            };
+            let texture = device.wgpu_device().create_texture(&array_descriptor);
+            for level in 0..max_levels as usize {
+                let size = (TERRAIN_TILE_SIZE >> level).max(1) as u32;
+                // Layers contiguous, each row padded to 256.
+                let raw_row = size as usize * 4;
+                let row = raw_row.next_multiple_of(256);
+                let mut level_bytes = vec![0u8; row * size as usize * TERRAIN_ATLAS_SLOTS];
+                for (slot, layer) in layers.iter().enumerate() {
+                    let Some(data) = layer.levels.get(level) else {
+                        continue; // shorter chains leave zero-filled tail levels
+                    };
+                    let layer_offset = slot * row * size as usize;
+                    for y in 0..size as usize {
+                        level_bytes[layer_offset + y * row..layer_offset + y * row + raw_row]
+                            .copy_from_slice(&data[y * raw_row..(y + 1) * raw_row]);
+                    }
+                }
+                queue.write_texture(
+                    // NOTE: `Texture::as_image_copy()` hardcodes mip_level 0, so
+                    // it cannot be used here — every iteration would land on the
+                    // base level, leaving the base level holding only the last
+                    // (1x1) mip and every real mip zero-filled. The albedo array
+                    // then samples as pure black at every distance. The copy
+                    // target is built by hand so each level lands in its own mip.
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: level as u32,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &level_bytes,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(row as u32),
+                        rows_per_image: Some(size),
+                    },
+                    wgpu::Extent3d {
+                        width: size,
+                        height: size,
+                        depth_or_array_layers: TERRAIN_ATLAS_SLOTS as u32,
+                    },
+                );
+            }
+            texture.create_view(&Default::default())
+        };
     // sRGB views decode RGB before bilinear/trilinear interpolation. Doing
     // that in the shader after sampling averages encoded color incorrectly;
     // alpha is deliberately exempt from the GPU's sRGB conversion.

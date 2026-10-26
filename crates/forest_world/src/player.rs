@@ -102,7 +102,10 @@ fn drawn_as(
 
 /// Per-frame player update, mirroring `UpdatePlayer`. The open developer menu
 /// suppresses gameplay input while the passive debug text leaves it active.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the domain inputs explicit at this call boundary"
+)]
 pub fn update_player_system(
     mut player: Query<&mut Player>,
     mut cursor_options: Query<(&mut CursorOptions,), With<PrimaryWindow>>,
@@ -476,7 +479,10 @@ fn footing(terrain: f32, near: &[NearBuilding<'_>], point: Vec2, feet: f32) -> f
 /// of the water and still rising, or landed crouched on a bank, to stand up.
 /// A building's floors are stood on as the ground is, and its ceilings stop
 /// a jump.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the domain inputs explicit at this call boundary"
+)]
 fn update_walking_ground(
     player: &mut Player,
     candidate: &mut Vec3,
@@ -860,7 +866,7 @@ pub fn sync_player_camera_transform(
     let Ok(player) = player.single_mut() else {
         return;
     };
-    let camera = PlayerCamera::from_player(&player);
+    let camera = PlayerCamera::from_player(player);
     if let Ok((mut transform, mut projection)) = transforms.single_mut() {
         transform.translation = camera.position;
         transform.look_at(camera.target, Vec3::Y);

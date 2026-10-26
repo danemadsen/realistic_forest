@@ -3,7 +3,10 @@ use super::*;
 /// One frame of erosion streaming around the player, mirroring the C++
 /// ordering: apply finished readbacks, honour a UI rerun request, then feed
 /// the cache with the PRE-update player position.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the domain inputs explicit at this call boundary"
+)]
 pub(super) fn erosion_stream_system(
     mut cache: ResMut<ErosionCache>,
     bridge: Res<ErosionBridge>,
@@ -104,38 +107,10 @@ pub(super) fn publish_erosion_shader_sources(
         ))
         .to_vec(),
     };
-    bridge.publish_shader_sources(sources);
+    // SAFETY: these embedded erosion shaders clamp texture coordinates and
+    // bound every array access for the worker's full-screen triangle draws.
+    unsafe { bridge.publish_shader_sources(sources) };
     *published = true;
-}
-
-#[cfg(test)]
-mod embedded_shader_tests {
-    use super::*;
-
-    #[test]
-    fn erosion_shaders_publish_once_without_asset_plugins() {
-        let mut app = App::new();
-        app.init_resource::<ErosionBridge>();
-        app.add_systems(Update, publish_erosion_shader_sources);
-
-        app.update();
-        let bridge = app.world().resource::<ErosionBridge>();
-        let sources = bridge
-            .take_shader_sources()
-            .expect("embedded shaders are ready");
-        let shader_sources = [
-            sources.init,
-            sources.flux,
-            sources.water,
-            sources.terrain,
-            sources.thermal,
-        ];
-        assert!(shader_sources.iter().all(|source| !source.is_empty()));
-
-        app.update();
-        let bridge = app.world().resource::<ErosionBridge>();
-        assert!(!bridge.shader_sources_ready());
-    }
 }
 
 /// `--measure-overlap` replaces the normal stream/measure pair, exactly as the
@@ -198,6 +173,7 @@ pub(super) fn measure_overlap_system(
     // second tile is never evicted mid-measurement.
     erosion::ensure_erosion_cache(&mut cache, first);
     let mut commands = crate::erosion::ErosionFrameCommands {
+        simulation_id: Default::default(),
         sim_min: crate::erosion::tile_simulation_minimum(target),
         init: None,
         iterate: None,
@@ -220,6 +196,7 @@ pub(super) fn measure_overlap_system(
     // the driver would keep feeding six more iterations per frame while the
     // readback was in flight and the tile would run well past the C++'s 144.
     if let Some(active) = cache.tiles.get_mut(&target) {
+        commands.simulation_id = active.simulation_id;
         if active.completed_iterations < applied.0.iterations {
             active.completed_iterations += EROSION_ITERATIONS_PER_FRAME;
             commands.iterate = Some(IterateCommand {
@@ -232,4 +209,34 @@ pub(super) fn measure_overlap_system(
         }
     }
     bridge.set_frame(commands, Some(erosion::erosion_lookup_records(&cache)));
+}
+
+#[cfg(test)]
+mod embedded_shader_tests {
+    use super::*;
+
+    #[test]
+    fn erosion_shaders_publish_once_without_asset_plugins() {
+        let mut app = App::new();
+        app.init_resource::<ErosionBridge>();
+        app.add_systems(Update, publish_erosion_shader_sources);
+
+        app.update();
+        let bridge = app.world().resource::<ErosionBridge>();
+        let sources = bridge
+            .take_shader_sources()
+            .expect("embedded shaders are ready");
+        let shader_sources = [
+            sources.init,
+            sources.flux,
+            sources.water,
+            sources.terrain,
+            sources.thermal,
+        ];
+        assert!(shader_sources.iter().all(|source| !source.is_empty()));
+
+        app.update();
+        let bridge = app.world().resource::<ErosionBridge>();
+        assert!(!bridge.shader_sources_ready());
+    }
 }

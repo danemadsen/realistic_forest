@@ -2,6 +2,7 @@
 name = "forest_render"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 forest_assets = { path = "../forest_assets" }
@@ -21,3 +22,6 @@ image.workspace = true
 [dev-dependencies]
 forest_buildings = { path = "../forest_buildings", features = ["test_support"] }
 naga.workspace = true
+
+[lints]
+workspace = true

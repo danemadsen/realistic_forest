@@ -1,7 +1,7 @@
 //! Seekable ZIP paks with independently compressed Zstandard entries.
 //! No archive is extracted, and parallel readers use separate file cursors.
 
-#![allow(non_snake_case)]
+#![expect(non_snake_case, reason = "Preserve the existing camelCase asset API")]
 
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -26,6 +26,11 @@ pub struct PakArchive {
 }
 
 impl PakArchive {
+    /// Open a pak and validate its file names, compression, and size metadata.
+    ///
+    /// # Errors
+    /// Returns an error for inaccessible archives, invalid groups, unsupported
+    /// entries, duplicate names, or entries exceeding the size limit.
     pub fn open(path: &Path, group: &str) -> Result<Self, String> {
         validateGroup(group)?;
         let mut archive = openReader(path)?;
@@ -66,6 +71,11 @@ impl PakArchive {
         &self.files
     }
 
+    /// Read and checksum one named asset with a bounded decompression buffer.
+    ///
+    /// # Errors
+    /// Returns an error if the asset is missing, exceeds its declared size,
+    /// has a bad checksum, or cannot be read or decompressed.
     pub fn read(&self, name: &str) -> Result<Vec<u8>, String> {
         if !self.files.contains(name) {
             return Err(format!("{}: missing asset {name}", self.path.display()));
@@ -132,6 +142,10 @@ fn validateEntryName(name: &str, group: &str) -> Result<(), String> {
 }
 
 /// List source files without following symlinks or including OS metadata.
+///
+/// # Errors
+/// Returns an error for invalid groups, unsupported filesystem entries,
+/// failed I/O, empty groups, or groups exceeding the file-count limit.
 pub fn sourceFiles(source_root: &Path, group: &str) -> Result<Vec<PathBuf>, String> {
     validateGroup(group)?;
     let directory = source_root.join(group);
@@ -194,6 +208,11 @@ pub struct PackStats {
     pub packed_bytes: u64,
 }
 
+/// Build and verify a reproducible pak before replacing the destination atomically.
+///
+/// # Errors
+/// Returns an error if source validation, compression, verification, or filesystem
+/// operations fail. Source files that change while packing are rejected.
 pub fn writePak(source_root: &Path, output_path: &Path, group: &str) -> Result<PackStats, String> {
     let files = sourceFiles(source_root, group)?;
     let output_directory = output_path
@@ -262,6 +281,11 @@ pub fn writePak(source_root: &Path, output_path: &Path, group: &str) -> Result<P
     })
 }
 
+/// Verify that a pak contains exactly the source group's files and bytes.
+///
+/// # Errors
+/// Returns an error for invalid archives, inaccessible sources, missing or extra
+/// entries, or byte differences between the archive and source files.
 pub fn verifyPak(source_root: &Path, pak_path: &Path, group: &str) -> Result<PackStats, String> {
     let files = sourceFiles(source_root, group)?;
     let archive = PakArchive::open(pak_path, group)?;

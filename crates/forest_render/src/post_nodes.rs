@@ -146,9 +146,10 @@ fn resize_ssao_targets(
     view: Res<ExtractedForestView>,
     device: Res<RenderDevice>,
 ) {
-    let Ok(mut inner) = state.inner.lock() else {
-        return;
-    };
+    let mut inner = state
+        .inner
+        .lock()
+        .expect("postprocessing render state lock poisoned");
     let width = view.physical_width.max(1);
     let height = view.physical_height.max(1);
     let ao_width = (width / 2).max(1);
@@ -195,6 +196,10 @@ fn resize_ssao_targets(
 /// and queues the two format-independent pipelines. Everything is skipped (and
 /// retried next frame) until the G-buffer, the shared globals buffer and the
 /// world textures exist.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bevy injects the resources used to prepare postprocessing pipelines"
+)]
 fn prepare_post_pipelines(
     state: Res<SsaoNodeState>,
     view: Res<ExtractedForestView>,
@@ -207,9 +212,10 @@ fn prepare_post_pipelines(
     pipeline_cache: Res<PipelineCache>,
     vegetation_shadows: Res<VegetationShadowMaps>,
 ) {
-    let Ok(mut inner) = state.inner.lock() else {
-        return;
-    };
+    let mut inner = state
+        .inner
+        .lock()
+        .expect("postprocessing render state lock poisoned");
     // uScreenSize is the AO target size, NOT the window size.
     let Some((ao_width, ao_height)) = inner
         .targets
@@ -279,9 +285,10 @@ fn prepare_post_pipelines(
 
     // The G-buffer and the world textures are created by their own prepare
     // systems; until they exist there is nothing to bind.
-    let Ok(gbuffer_guard) = terrain.gbuffer.lock() else {
-        return;
-    };
+    let gbuffer_guard = terrain
+        .gbuffer
+        .lock()
+        .expect("terrain G-buffer lock poisoned");
     let Some(gbuffer) = gbuffer_guard.as_ref() else {
         return;
     };
@@ -618,9 +625,10 @@ pub fn forest_ssao_pass(world: &World, mut ctx: RenderContext) {
     let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
         return;
     };
-    let Ok(inner) = state.inner.lock() else {
-        return;
-    };
+    let inner = state
+        .inner
+        .lock()
+        .expect("postprocessing render state lock poisoned");
     let (Some(targets), Some(globals), Some(group), Some(stage), Some(pipeline)) = (
         inner.targets.as_ref(),
         inner.half_res_globals.as_ref(),
@@ -674,9 +682,10 @@ pub fn forest_blur_pass(world: &World, mut ctx: RenderContext) {
     let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
         return;
     };
-    let Ok(inner) = state.inner.lock() else {
-        return;
-    };
+    let inner = state
+        .inner
+        .lock()
+        .expect("postprocessing render state lock poisoned");
     let (Some(targets), Some(globals), Some(group), Some(stage), Some(pipeline)) = (
         inner.targets.as_ref(),
         inner.half_res_globals.as_ref(),
@@ -741,9 +750,10 @@ pub fn forest_composite_pass(view: ViewQuery<&ViewTarget>, world: &World, mut ct
     else {
         return;
     };
-    let Ok(mut inner) = state.inner.lock() else {
-        return;
-    };
+    let mut inner = state
+        .inner
+        .lock()
+        .expect("postprocessing render state lock poisoned");
 
     // One pipeline per main-texture format (see `SsaoNodeInner`), queued
     // from here because only the view knows the format; a queued pipeline
@@ -905,9 +915,10 @@ pub fn forest_fxaa_pass(view: ViewQuery<&ViewTarget>, world: &World, mut ctx: Re
     let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
         return;
     };
-    let Ok(mut inner) = state.inner.lock() else {
-        return;
-    };
+    let mut inner = state
+        .inner
+        .lock()
+        .expect("postprocessing render state lock poisoned");
 
     let format = view.main_texture_format();
     let pipeline_id = match inner.fxaa_pipelines.get(&format).copied() {
@@ -945,8 +956,8 @@ pub fn forest_fxaa_pass(view: ViewQuery<&ViewTarget>, world: &World, mut ctx: Re
     // being read, and the two alternate every frame, so this group is
     // rebuilt per frame from the source view handed back above.
     let group = super::bind_group(
-        &device,
-        &pipeline_cache,
+        device,
+        pipeline_cache,
         "forest_fxaa_group",
         &layouts.fxaa,
         &[
@@ -999,9 +1010,7 @@ fn draw_fullscreen<'a>(
     render_pass.set_render_pipeline(pipeline);
     render_pass.set_viewport(0.0, 0.0, width, height, 0.0, 1.0);
     for (index, bind_group) in bind_groups.iter().enumerate() {
-        // `*bind_group` copies the reference out of the slice element so the
-        // bind group carries its own lifetime, not the iterator's borrow.
-        render_pass.set_bind_group(index, *bind_group, &[]);
+        render_pass.set_bind_group(index, bind_group, &[]);
     }
     render_pass.draw(0..3, 0..1);
 }

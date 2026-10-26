@@ -27,8 +27,8 @@ use forest_vegetation::assets::PreparedTexture;
 use pads::PadIndex;
 use placement::{Placement, SettlementPlanner};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 /// Buildings are kept, and their ground levelled, this far around the
 /// player: past the farthest they are drawn.
@@ -78,6 +78,37 @@ pub struct BuildingSnapshot {
 /// the buildings and the towns' street pads.
 type SettlementTask = Task<(Vec<Placement>, Vec<pads::Pad>)>;
 
+#[derive(Clone)]
+struct SettlementRequest {
+    cell: [i64; 2],
+    network: Option<Weak<forest_water::rivers::network::RiverNetwork>>,
+}
+
+impl SettlementRequest {
+    fn new(
+        cell: [i64; 2],
+        rivers: Option<&Arc<forest_water::rivers::network::RiverNetwork>>,
+    ) -> Self {
+        Self {
+            cell,
+            network: rivers.map(Arc::downgrade),
+        }
+    }
+}
+
+impl PartialEq for SettlementRequest {
+    fn eq(&self, other: &Self) -> bool {
+        let same_network = match (&self.network, &other.network) {
+            (Some(left), Some(right)) => Weak::ptr_eq(left, right),
+            (None, None) => true,
+            _ => false,
+        };
+        self.cell == other.cell && same_network
+    }
+}
+
+impl Eq for SettlementRequest {}
+
 #[derive(Resource)]
 pub struct BuildingField {
     enabled: bool,
@@ -97,8 +128,8 @@ pub struct BuildingField {
     doors: Vec<Vec<DoorState>>,
     /// Buildings by 64 m cell of their pad centre, indices into the snapshot.
     cells: HashMap<[i32; 2], Vec<usize>>,
-    streaming: Option<([i64; 2], SettlementTask)>,
-    streamed: Option<[i64; 2]>,
+    streaming: Option<(SettlementRequest, SettlementTask)>,
+    streamed: Option<SettlementRequest>,
     /// `--open-doors`: every door stands open and stays so.
     doors_held_open: bool,
     /// The snapshot generation the render world has on the GPU.
@@ -191,7 +222,7 @@ impl BuildingField {
         field.library = Some(library);
         field.planner = Some(planner);
         field.install(placements, streets);
-        field.streamed = Some(cell);
+        field.streamed = Some(SettlementRequest::new(cell, rivers));
         field
     }
 
@@ -418,13 +449,27 @@ pub fn stream_buildings(
             }
         }
     }
-    if let Some((cell, task)) = field.streaming.as_mut()
+    let Ok(player) = players.single() else {
+        return;
+    };
+    let cell = stream_cell(Vec2::new(player.position.x, player.position.z));
+    let request = SettlementRequest::new(cell, rivers.network());
+    // River generation can finish after a teleport's settlement task. Reject
+    // old work before polling so it cannot publish pads for another snapshot.
+    if field
+        .streaming
+        .as_ref()
+        .is_some_and(|(pending, _)| *pending != request)
+    {
+        field.streaming = None;
+    }
+    if let Some((pending, task)) = field.streaming.as_mut()
         && let Some((placements, streets)) = block_on(poll_once(task))
     {
-        let cell = *cell;
+        let completed = pending.clone();
         field.streaming = None;
         field.install(placements, streets);
-        field.streamed = Some(cell);
+        field.streamed = Some(completed);
     }
     // The ground the erosion cache hands every CPU height query is levelled
     // by the pads in force.
@@ -444,15 +489,11 @@ pub fn stream_buildings(
         }
     }
 
-    let Ok(player) = players.single() else {
-        return;
-    };
-    let cell = stream_cell(Vec2::new(player.position.x, player.position.z));
-    if field.streamed == Some(cell)
+    if field.streamed.as_ref() == Some(&request)
         || field
             .streaming
             .as_ref()
-            .is_some_and(|(pending, _)| *pending == cell)
+            .is_some_and(|(pending, _)| *pending == request)
     {
         return;
     }
@@ -467,7 +508,7 @@ pub fn stream_buildings(
         (placements, streets)
     };
     let task = AsyncComputeTaskPool::get().spawn(plan);
-    field.streaming = Some((cell, task));
+    field.streaming = Some((request, task));
 }
 
 /// Let the eye adapt to the room the player stands in.
@@ -523,4 +564,84 @@ pub fn clearings_around(
     };
     clearings.extend(streets.iter().map(street_clearing));
     clearings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::tasks::TaskPool;
+
+    fn streaming_world() -> World {
+        let noise = Arc::new(NoiseField::new());
+        let mut field = BuildingField::new(
+            Arc::clone(&noise),
+            None,
+            std::path::Path::new("."),
+            Vec2::ZERO,
+            false,
+        );
+        field.enabled = true;
+        field.planner = Some(Arc::new(SettlementPlanner::new(
+            Arc::clone(&noise),
+            Vec::new(),
+        )));
+
+        let mut world = World::new();
+        world.insert_resource(field);
+        world.insert_resource(forest_water::rivers::RiverField::new(noise, false));
+        world.init_resource::<forest_erosion::ErosionCache>();
+        world.init_resource::<Time>();
+        let player = Player {
+            position: bevy::math::Vec3::ZERO,
+            ..Default::default()
+        };
+        world.spawn(player);
+        world
+    }
+
+    #[test]
+    fn obsolete_river_work_is_discarded_before_publication() {
+        let mut world = streaming_world();
+        let (_, old_network) = forest_water::rivers::spawn_network();
+        let pool = AsyncComputeTaskPool::get_or_init(TaskPool::new);
+        let obsolete_task = pool.spawn(async { (Vec::new(), Vec::new()) });
+        {
+            let mut field = world.resource_mut::<BuildingField>();
+            field.streamed = Some(SettlementRequest::new([0, 0], None));
+            let old_request = SettlementRequest::new([0, 0], Some(&old_network));
+            field.streaming = Some((old_request, obsolete_task));
+        }
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(stream_buildings);
+        schedule.run(&mut world);
+
+        let field = world.resource::<BuildingField>();
+        assert!(field.streaming.is_none(), "obsolete work must be discarded");
+        assert_eq!(field.snapshot.generation, 0, "obsolete pads were published");
+    }
+
+    #[test]
+    fn a_river_change_replans_buildings_without_player_movement() {
+        let mut world = streaming_world();
+        let (_, old_network) = forest_water::rivers::spawn_network();
+        AsyncComputeTaskPool::get_or_init(TaskPool::new);
+        world.resource_mut::<BuildingField>().streamed =
+            Some(SettlementRequest::new([0, 0], Some(&old_network)));
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(stream_buildings);
+        schedule.run(&mut world);
+
+        let field = world.resource::<BuildingField>();
+        let (pending, _) = field
+            .streaming
+            .as_ref()
+            .expect("replacement settlement task");
+        assert!(pending == &SettlementRequest::new([0, 0], None));
+        assert!(
+            !field.ready(),
+            "capture must wait for replacement settlements"
+        );
+    }
 }

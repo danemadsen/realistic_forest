@@ -140,7 +140,7 @@ impl GrassReadiness {
         {
             return false;
         }
-        match *self.0.lock().unwrap_or_else(|e| e.into_inner()) {
+        match *self.0.lock().expect("grass readiness lock poisoned") {
             GrassReadyState::Ready(anchor) => anchor == scatter_anchor(center),
             GrassReadyState::Disabled => true,
             GrassReadyState::Waiting => false,
@@ -148,12 +148,12 @@ impl GrassReadiness {
     }
 
     pub fn set_ready(&self, anchor: Option<[i64; 2]>) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) =
+        *self.0.lock().expect("grass readiness lock poisoned") =
             anchor.map_or(GrassReadyState::Waiting, GrassReadyState::Ready);
     }
 
     pub fn disable(&self) {
-        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = GrassReadyState::Disabled;
+        *self.0.lock().expect("grass readiness lock poisoned") = GrassReadyState::Disabled;
     }
 }
 
@@ -225,7 +225,7 @@ impl GrassAssets {
             || normals.len() != positions.len()
             || uvs.len() != positions.len()
             || indices.is_empty()
-            || indices.len() % 3 != 0
+            || !indices.len().is_multiple_of(3)
             || indices
                 .iter()
                 .any(|&index| index as usize >= positions.len())
@@ -391,7 +391,7 @@ pub fn generate_tangents(
     use bevy::math::{Vec2, Vec3};
     let mut tangent_sum = vec![Vec3::ZERO; positions.len()];
     let mut bitangent_sum = vec![Vec3::ZERO; positions.len()];
-    for triangle in indices.chunks_exact(3) {
+    for triangle in indices.as_chunks::<3>().0 {
         let [a, b, c] = [
             triangle[0] as usize,
             triangle[1] as usize,
@@ -433,7 +433,7 @@ impl GrassTexture {
     pub fn visible_mean_luminance(&self, factor: [f32; 4], alpha_cutoff: f32) -> f32 {
         let mut weighted_luminance = 0.0;
         let mut weight_sum = 0.0;
-        for pixel in self.rgba.chunks_exact(4) {
+        for pixel in self.rgba.as_chunks::<4>().0.iter() {
             let alpha = pixel[3] as f32 / 255.0 * factor[3];
             if alpha < alpha_cutoff {
                 continue;
@@ -481,9 +481,9 @@ impl GrassTexture {
                         for sx in x * previous.width / width..(x + 1) * previous.width / width {
                             let offset = ((sy * previous.width + sx) * 4) as usize;
                             let alpha = previous.rgba[offset + 3] as f32 / 255.0;
-                            for channel in 0..3 {
+                            for (channel, total) in sum.iter_mut().enumerate().take(3) {
                                 let encoded = previous.rgba[offset + channel] as f32 / 255.0;
-                                sum[channel] += if srgb {
+                                *total += if srgb {
                                     srgb_to_linear(encoded) * alpha
                                 } else {
                                     encoded
@@ -535,7 +535,9 @@ fn linear_to_srgb(value: f32) -> f32 {
 }
 
 fn alpha_coverage(rgba: &[u8], cutoff: f32, scale: f32) -> f32 {
-    rgba.chunks_exact(4)
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
         .filter(|pixel| ((pixel[3] as f32 * scale).round().min(255.0) / 255.0) >= cutoff)
         .count() as f32
         / (rgba.len() / 4) as f32
@@ -560,7 +562,7 @@ fn preserve_alpha_coverage(rgba: &mut [u8], cutoff: f32, target: f32) {
             high = scale;
         }
     }
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0.iter_mut() {
         pixel[3] = (pixel[3] as f32 * best_scale).round().clamp(0.0, 255.0) as u8;
     }
 }
@@ -896,7 +898,7 @@ fn cell_hash(x: i64, z: i64) -> u64 {
     mix64(
         (x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
             ^ (z as u64).wrapping_mul(0xd1b5_4a32_d192_ed03)
-            ^ 0x4752_4153_53,
+            ^ 0x0047_5241_5353,
     )
 }
 
@@ -1098,7 +1100,9 @@ mod tests {
     fn mip_coverage_keeps_thin_blades_and_all_odd_edge_texels() {
         let mut rgba = vec![0u8; 8 * 4];
         for (pixel, alpha) in rgba
-            .chunks_exact_mut(4)
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
             .zip([255, 255, 255, 0, 200, 0, 0, 0])
         {
             pixel.copy_from_slice(&[20, 180, 30, alpha]);
@@ -1120,7 +1124,6 @@ mod tests {
 
     /// The generator before candidates were chunked, kept as the oracle: the
     /// chunked field must hold exactly the same instances.
-    #[allow(clippy::needless_range_loop)]
     fn reference_scatter_grass(center: [f32; 2], model_count: usize) -> Vec<Vec<GrassInstance>> {
         let mut groups = vec![Vec::new(); model_count];
         if model_count == 0

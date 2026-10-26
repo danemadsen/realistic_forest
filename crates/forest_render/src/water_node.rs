@@ -541,9 +541,10 @@ fn surface_vertex_layouts() -> Vec<VertexBufferLayout> {
 /// the instance buffers are created empty-ready and filled by
 /// [`prepare_water_rings`] on the same frame.
 fn prepare_water_meshes(state: Res<WaterNodeState>, device: Res<RenderDevice>) {
-    let Ok(mut inner) = state.inner.lock() else {
-        return;
-    };
+    let mut inner = state
+        .inner
+        .lock()
+        .expect("water render state lock poisoned");
     if inner.meshes.is_some() {
         return;
     }
@@ -582,9 +583,10 @@ fn prepare_water_rings(
     view: Res<ExtractedForestView>,
     queue: Res<RenderQueue>,
 ) {
-    let Ok(mut inner) = state.inner.lock() else {
-        return;
-    };
+    let mut inner = state
+        .inner
+        .lock()
+        .expect("water render state lock poisoned");
     let centre = snapped_centre([view.player_position[0], view.player_position[2]]);
     if inner.snapped_centre == Some(centre) {
         return;
@@ -602,7 +604,10 @@ fn prepare_water_rings(
 /// pass draws with, and writes the block. Everything is skipped (and retried
 /// next frame) until the G-buffer, the globals buffer and the plants' shadow
 /// targets exist.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bevy injects the resources used to prepare water"
+)]
 fn prepare_water(
     state: Res<WaterNodeState>,
     globals: Res<ForestGlobals>,
@@ -613,15 +618,17 @@ fn prepare_water(
     queue: Res<RenderQueue>,
     pipeline_cache: Res<PipelineCache>,
 ) {
-    let Ok(mut inner) = state.inner.lock() else {
-        return;
-    };
+    let mut inner = state
+        .inner
+        .lock()
+        .expect("water render state lock poisoned");
     let Some(globals_buffer) = globals.buffer.as_ref() else {
         return;
     };
-    let Ok(gbuffer_guard) = terrain.gbuffer.lock() else {
-        return;
-    };
+    let gbuffer_guard = terrain
+        .gbuffer
+        .lock()
+        .expect("terrain G-buffer lock poisoned");
     if gbuffer_guard.is_none() {
         return;
     }
@@ -915,12 +922,14 @@ pub fn forest_water_surface_pass(
     let Some(globals) = world.get_resource::<ForestGlobals>() else {
         return;
     };
-    let Ok(mut inner) = state.inner.lock() else {
-        return;
-    };
-    let Ok(gbuffer_guard) = terrain.gbuffer.lock() else {
-        return;
-    };
+    let mut inner = state
+        .inner
+        .lock()
+        .expect("water render state lock poisoned");
+    let gbuffer_guard = terrain
+        .gbuffer
+        .lock()
+        .expect("terrain G-buffer lock poisoned");
     let Some(gbuffer) = gbuffer_guard.as_ref() else {
         return;
     };
@@ -1212,17 +1221,19 @@ pub fn forest_underwater_pass(view: ViewQuery<&ViewTarget>, world: &World, mut c
     let Some(pipeline_cache) = world.get_resource::<PipelineCache>() else {
         return;
     };
-    let Ok(inner) = state.inner.lock() else {
-        return;
-    };
+    let inner = state
+        .inner
+        .lock()
+        .expect("water render state lock poisoned");
     // Above the surface the medium contributes nothing, so the node is pure
     // overhead and is skipped rather than drawn with a zero fade.
     if inner.underwater_fade <= 0.0 {
         return;
     }
-    let Ok(gbuffer_guard) = terrain.gbuffer.lock() else {
-        return;
-    };
+    let gbuffer_guard = terrain
+        .gbuffer
+        .lock()
+        .expect("terrain G-buffer lock poisoned");
     let Some(gbuffer) = gbuffer_guard.as_ref() else {
         return;
     };
@@ -1312,6 +1323,10 @@ fn screen_bind_group(
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the bind group combines distinct screen, terrain, shore and canopy resources"
+)]
 fn screen_group(
     device: &RenderDevice,
     cache: &PipelineCache,
@@ -1874,8 +1889,10 @@ mod shading_tests {
         let bytes = readback.get_mapped_range(..).to_vec();
         Some(
             bytes
-                .chunks_exact(16)
-                .map(bytemuck::pod_read_unaligned)
+                .as_chunks::<16>()
+                .0
+                .iter()
+                .map(|chunk| bytemuck::pod_read_unaligned(chunk))
                 .collect(),
         )
     }

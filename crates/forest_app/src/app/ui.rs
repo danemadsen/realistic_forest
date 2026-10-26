@@ -50,7 +50,14 @@ pub struct TrainerState {
 }
 
 /// Draw the developer menu, passive diagnostics, and world overlays.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the domain inputs explicit at this call boundary"
+)]
+#[expect(
+    clippy::type_complexity,
+    reason = "groups the optional domain resources in one system parameter"
+)]
 pub fn draw_diagnostics_ui(
     mut contexts: EguiContexts,
     mut settings: ResMut<AppSettings>,
@@ -116,10 +123,11 @@ pub fn draw_diagnostics_ui(
             rivers.as_deref(),
             buildings.as_deref(),
         );
-        if !settings.show_trainer && automation.shot_path.is_none() {
-            if let Ok(mut cursor) = cursors.single_mut() {
-                player.set_mouse_capture(true, &mut cursor);
-            }
+        if !settings.show_trainer
+            && automation.shot_path.is_none()
+            && let Ok(mut cursor) = cursors.single_mut()
+        {
+            player.set_mouse_capture(true, &mut cursor);
         }
     }
 
@@ -161,7 +169,10 @@ pub fn draw_diagnostics_ui(
 
 /// Paint passive text directly over the world. Its bottom edge leaves room
 /// for the trainer so both can be visible in the top-left corner.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the domain inputs explicit at this call boundary"
+)]
 fn draw_debug_overlay(
     ctx: &egui::Context,
     settings: &AppSettings,
@@ -474,7 +485,10 @@ fn draw_player_tools(
 }
 
 /// One dev window owns all interactive controls; closing it hides everything.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the domain inputs explicit at this call boundary"
+)]
 fn draw_trainer_window(
     ctx: &egui::Context,
     debug_bottom: f32,
@@ -622,7 +636,10 @@ fn draw_trainer_window(
 }
 
 /// Detailed controls live inside the trainer rather than a second window.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "keeps the domain inputs explicit at this call boundary"
+)]
 fn draw_advanced_controls(
     ui: &mut egui::Ui,
     settings: &mut AppSettings,

@@ -2,6 +2,7 @@
 name = "forest_vegetation"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [features]
 test_support = []
@@ -19,3 +20,6 @@ forest_water = { path = "../forest_water" }
 
 [dev-dependencies]
 forest_water = { path = "../forest_water", features = ["test_support"] }
+
+[lints]
+workspace = true

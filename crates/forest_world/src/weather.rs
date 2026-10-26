@@ -270,6 +270,10 @@ pub fn local_cloud_base(
 /// Matches weatherPrecipitation in precipitation_functions.wgslinc. Broad
 /// overcast gates a narrower moving storm field; snow follows the low mountain
 /// snowline unless a named showcase trend explicitly selects the phase.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors the shader's precipitation inputs"
+)]
 pub fn sample_precipitation(
     world_xz: [f32; 2],
     altitude: f32,
@@ -1016,6 +1020,10 @@ impl WeatherMotion {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bevy injects each system resource separately"
+)]
 pub fn advance_weather(
     time: Res<Time<Real>>,
     settings: Res<AppSettings>,

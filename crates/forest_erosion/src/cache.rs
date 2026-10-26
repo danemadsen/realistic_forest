@@ -13,12 +13,38 @@ use forest_core::constants::*;
 use forest_core::noise::NoiseField;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Hash)]
 pub struct TileKey {
     pub x: i64,
     pub z: i64,
+}
+
+/// Identifies one simulation attempt, including retries of the same tile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SimulationId(u64);
+
+impl SimulationId {
+    fn next() -> Self {
+        static NEXT_SIMULATION_ID: AtomicU64 = AtomicU64::new(1);
+        let mut current = NEXT_SIMULATION_ID.load(Ordering::Relaxed);
+        loop {
+            let next = current
+                .checked_add(1)
+                .expect("erosion simulation identifiers are exhausted");
+            match NEXT_SIMULATION_ID.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Self(current),
+                Err(observed) => current = observed,
+            }
+        }
+    }
 }
 
 pub const fn tile(x: i64, z: i64) -> TileKey {
@@ -67,6 +93,10 @@ pub enum ErosionTileState {
 #[derive(Clone, Debug)]
 pub struct ErosionTile {
     pub key: TileKey,
+
+    /// The attempt producing this tile; zero until simulation begins.
+    pub simulation_id: SimulationId,
+
     pub atlas_slot: usize,
     pub completed_iterations: usize,
     pub failed_readbacks: usize,
@@ -87,6 +117,7 @@ impl ErosionTile {
     fn new(key: TileKey, atlas_slot: usize) -> Self {
         Self {
             key,
+            simulation_id: SimulationId::default(),
             atlas_slot,
             completed_iterations: 0,
             failed_readbacks: 0,
@@ -310,6 +341,9 @@ pub fn sample_eroded_concavity(
 /// by the main-world coordinator, extracted, then executed in the render
 /// world in a fully prescribed order.
 pub struct ErosionFrameCommands {
+    /// Identifies the active attempt independently of its world coordinates.
+    pub simulation_id: SimulationId,
+
     /// The active tile's simulation-domain minimum (uWorldMin).
     pub sim_min: [f32; 2],
 
@@ -350,6 +384,10 @@ pub struct IterateCommand {
 /// render side runs them through `write_padded_at`'s `cast_slice` at upload.
 pub struct PendingAtlasPatch {
     pub key: TileKey,
+
+    /// The attempt that produced these atlas texels.
+    pub simulation_id: SimulationId,
+
     pub atlas_height: Vec<f32>,
     pub atlas_flow: Vec<f32>,
 
@@ -393,13 +431,20 @@ pub struct FinalizedTile {
 }
 
 pub enum ErosionEvent {
-    TileFinalized(FinalizedTile),
-    ReadbackFailed(TileKey),
+    TileFinalized {
+        simulation_id: SimulationId,
+        tile: FinalizedTile,
+    },
+    ReadbackFailed {
+        key: TileKey,
+        simulation_id: SimulationId,
+    },
 }
 
 /// Inner state behind the bridge's mutex, shared by the main world (tile
 /// scheduling), the render world (lookup writes, atlas uploads), and the
 /// erosion worker thread.
+#[derive(Default)]
 pub struct BridgeState {
     commands: Option<ErosionFrameCommands>,
     lookup_records: Option<Vec<f32>>,
@@ -419,20 +464,6 @@ pub struct BridgeState {
     /// The five WGSL sources, published once by the main world and taken once
     /// by the worker spawn; see [`ErosionShaderSources`].
     shader_sources: Option<ErosionShaderSources>,
-}
-
-impl Default for BridgeState {
-    fn default() -> Self {
-        Self {
-            commands: None,
-            lookup_records: None,
-            events: VecDeque::new(),
-            phase_costs: ErosionPhaseCosts::default(),
-            patches: VecDeque::new(),
-            worker_dead: None,
-            shader_sources: None,
-        }
-    }
 }
 
 /// Cumulative render-node phase costs in microseconds for `--shot` frame-time
@@ -524,18 +555,12 @@ impl ErosionBridge {
     /// survive the same way.
     pub fn set_frame(&self, mut commands: ErosionFrameCommands, lookup_records: Option<Vec<f32>>) {
         let mut state = self.state();
-        // `sim_min` is a bijection of the tile key, so it identifies which tile
-        // a command set describes. Work may only be carried across frames that
-        // describe the *same* tile: once the main world moves on, its previous
-        // tile has already finalized (that is what lets it move on), so
-        // anything still pending for it is a duplicate re-send of `finalize`
-        // and merging it into the new tile's frame would finalize the new tile
-        // after a single batch.
-        let same_tile = state
-            .commands
-            .as_ref()
-            .is_some_and(|pending| pending.sim_min == commands.sim_min);
-        if let Some(pending) = state.commands.take().filter(|_| same_tile) {
+        // Only frames for the same attempt can share work. A reset or retry
+        // may reuse both the tile key and its world-space minimum.
+        let same_attempt = state.commands.as_ref().is_some_and(|pending| {
+            pending.simulation_id == commands.simulation_id && pending.sim_min == commands.sim_min
+        });
+        if let Some(pending) = state.commands.take().filter(|_| same_attempt) {
             if commands.init.is_none() {
                 // `sim_min` belongs to the newest frame's active tile, which
                 // is the same tile a carried-over init refers to: the main
@@ -567,10 +592,17 @@ impl ErosionBridge {
     /// so the oldest patch is dropped with a warning past
     /// `EROSION_PENDING_PATCH_CAP` — the tile it belonged to re-streams
     /// through the normal queue rather than stalling everything behind it.
-    pub fn push_patches(&self, key: TileKey, atlas_height: Vec<f32>, atlas_flow: Vec<f32>) {
+    pub fn push_patches(
+        &self,
+        key: TileKey,
+        simulation_id: SimulationId,
+        atlas_height: Vec<f32>,
+        atlas_flow: Vec<f32>,
+    ) {
         let mut state = self.state();
         state.patches.push_back(PendingAtlasPatch {
             key,
+            simulation_id,
             atlas_height,
             atlas_flow,
             age: 0,
@@ -589,7 +621,13 @@ impl ErosionBridge {
         std::mem::take(&mut self.state().patches)
     }
     /// Publishes the five WGSL sources; consumed once by the worker spawn.
-    pub fn publish_shader_sources(&self, sources: ErosionShaderSources) {
+    ///
+    /// # Safety
+    ///
+    /// Every supplied shader must keep all memory accesses in bounds for
+    /// every invocation made by the erosion worker. The worker disables
+    /// shader runtime checks to preserve the simulation's numerical results.
+    pub unsafe fn publish_shader_sources(&self, sources: ErosionShaderSources) {
         self.state().shader_sources = Some(sources);
     }
     pub fn take_shader_sources(&self) -> Option<ErosionShaderSources> {
@@ -614,8 +652,7 @@ impl ErosionBridge {
     pub fn set_worker_dead(&self, why: String) {
         self.state().worker_dead = Some(why);
     }
-    /// Returns the worker's death reason, once. The consumer panics; see
-    /// [`BridgeState::worker_dead`].
+    /// Returns the worker's death reason once; applying erosion events then panics.
     pub fn take_worker_dead(&self) -> Option<String> {
         self.state().worker_dead.take()
     }
@@ -817,6 +854,39 @@ pub fn erosion_lookup_records(cache: &ErosionCache) -> Vec<f32> {
     records
 }
 
+/// A coherent render snapshot of atlas allocations and their simulation attempts.
+#[derive(Clone, Debug, Default)]
+pub struct ErosionLookup {
+    pub minimum: TileKey,
+    pub records: Vec<f32>,
+    pub simulation_ids: Vec<SimulationId>,
+}
+
+/// Captures lookup records, their origin and matching attempts from one cache state.
+pub fn erosion_lookup_snapshot(cache: &ErosionCache) -> ErosionLookup {
+    let records = erosion_lookup_records(cache);
+    let mut simulation_ids = vec![SimulationId::default(); EROSION_LOOKUP_DIAMETER.pow(2)];
+    for (key, existing) in &cache.tiles {
+        if existing.state != ErosionTileState::Ready {
+            continue;
+        }
+        let relative_x = key.x - cache.lookup_minimum.x;
+        let relative_z = key.z - cache.lookup_minimum.z;
+        if !(0..EROSION_LOOKUP_DIAMETER as i64).contains(&relative_x)
+            || !(0..EROSION_LOOKUP_DIAMETER as i64).contains(&relative_z)
+        {
+            continue;
+        }
+        let destination = relative_z as usize * EROSION_LOOKUP_DIAMETER + relative_x as usize;
+        simulation_ids[destination] = existing.simulation_id;
+    }
+    ErosionLookup {
+        minimum: cache.lookup_minimum,
+        records,
+        simulation_ids,
+    }
+}
+
 pub fn reset_erosion_cache(cache: &mut ErosionCache) {
     cache.tiles.clear();
     cache.free_atlas_slots = (0..EROSION_ATLAS_SLOTS).rev().collect();
@@ -825,6 +895,7 @@ pub fn reset_erosion_cache(cache: &mut ErosionCache) {
     cache.lookup_minimum = tile(0, 0);
     // A pending immediate-reveal belongs to a tile the reset just discarded.
     cache.force_reveal = None;
+    cache.watchdog_frames = 0;
 }
 
 /// Contributing area, in cells and counting the cell itself, of every cell of
@@ -1136,6 +1207,8 @@ pub fn begin_prepared_tile(
     if !cache.tiles.contains_key(&key) {
         return;
     }
+    let simulation_id = SimulationId::next();
+    commands.simulation_id = simulation_id;
     commands.sim_min = tile_simulation_minimum(key);
     commands.init = Some(InitTileCommand {
         key,
@@ -1144,6 +1217,7 @@ pub fn begin_prepared_tile(
         river: prepared.river,
     });
     if let Some(existing) = cache.tiles.get_mut(&key) {
+        existing.simulation_id = simulation_id;
         existing.state = ErosionTileState::Simulating;
         existing.completed_iterations = 0;
         existing.reveal = 0.0;
@@ -1170,6 +1244,10 @@ pub fn advance_active_tile(
     if !cache.has_active_tile {
         return false;
     }
+    commands.simulation_id = match cache.tiles.get(&cache.active_tile) {
+        Some(existing) => existing.simulation_id,
+        None => return false,
+    };
     let (completed, remaining) = match cache.tiles.get(&cache.active_tile) {
         Some(existing) => (
             existing.completed_iterations,
@@ -1216,7 +1294,10 @@ pub fn advance_active_tile(
 /// With `preparation`, the next tile's inputs are built off the main thread
 /// while the active tile simulates, and it begins once they are ready;
 /// without, it begins in this frame.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "coordinates the cache, worker bridge and per-frame streaming inputs"
+)]
 pub fn update_erosion_cache(
     cache: &mut ErosionCache,
     bridge: &ErosionBridge,
@@ -1243,6 +1324,11 @@ pub fn update_erosion_cache(
     }
 
     let mut commands = ErosionFrameCommands {
+        simulation_id: cache
+            .tiles
+            .get(&cache.active_tile)
+            .filter(|_| cache.has_active_tile)
+            .map_or(SimulationId::default(), |existing| existing.simulation_id),
         sim_min: tile_simulation_minimum(if cache.has_active_tile {
             cache.active_tile
         } else {
@@ -1321,6 +1407,15 @@ fn mark_tile_failed(cache: &mut ErosionCache, key: TileKey, why: &str) {
     cache.has_active_tile = false;
 }
 
+fn is_active_simulation(cache: &ErosionCache, key: TileKey, simulation_id: SimulationId) -> bool {
+    cache.has_active_tile
+        && cache.active_tile == key
+        && cache.tiles.get(&key).is_some_and(|existing| {
+            existing.state == ErosionTileState::Simulating
+                && existing.simulation_id == simulation_id
+        })
+}
+
 /// Apply events published by the erosion worker, and keep the watchdog
 /// running against its death or stall.
 pub fn apply_erosion_events(cache: &mut ErosionCache, bridge: &ErosionBridge) {
@@ -1335,16 +1430,14 @@ pub fn apply_erosion_events(cache: &mut ErosionCache, bridge: &ErosionBridge) {
     let mut delivery = false;
     for event in bridge.drain_events() {
         match event {
-            ErosionEvent::TileFinalized(finalized) => {
+            ErosionEvent::TileFinalized {
+                simulation_id,
+                tile: finalized,
+            } => {
                 let key = finalized.key;
-                // The worker sees finalize commands again each frame while
-                // the main world still shows the tile active; only the first
-                // event of a simulation may transition the tile.
-                let already_ready = cache
-                    .tiles
-                    .get(&key)
-                    .is_some_and(|existing| existing.state == ErosionTileState::Ready);
-                if already_ready {
+                // Resets and retries can reuse a key while an earlier
+                // attempt's readback remains in flight.
+                if !is_active_simulation(cache, key, simulation_id) {
                     continue;
                 }
                 if let Some(existing) = cache.tiles.get_mut(&key) {
@@ -1384,7 +1477,10 @@ pub fn apply_erosion_events(cache: &mut ErosionCache, bridge: &ErosionBridge) {
                 cache.has_active_tile = false;
                 delivery = true;
             }
-            ErosionEvent::ReadbackFailed(key) => {
+            ErosionEvent::ReadbackFailed { key, simulation_id } => {
+                if !is_active_simulation(cache, key, simulation_id) {
+                    continue;
+                }
                 mark_tile_failed(cache, key, "readback failed");
                 delivery = true;
             }

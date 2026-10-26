@@ -5,8 +5,9 @@ pub(super) fn on_manual_screenshot(trigger: On<ScreenshotCaptured>) {
     let name = chrono::Local::now()
         .format("forest_%Y%m%d_%H%M%S.png")
         .to_string();
-    write_png(&trigger.image, Path::new(&name));
-    log::info!("SCREENSHOT: saved {name}");
+    if write_png(&trigger.image, Path::new(&name)) {
+        log::info!("SCREENSHOT: saved {name}");
+    }
 }
 
 /// Serializes a captured bevy Image as a PNG byte file. Returns whether the
@@ -32,7 +33,7 @@ pub(super) fn image_converter_png(image: &Image) -> Result<Vec<u8>, String> {
         TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb => {
             // The wgpu swapchain is BGRA; PNG wants RGBA.
             let mut rgba = image.data.clone().ok_or("capture had no data")?;
-            for pixel in rgba.chunks_exact_mut(4) {
+            for pixel in rgba.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
             let decoded = image::RgbaImage::from_raw(image.width(), image.height(), rgba)
@@ -106,6 +107,10 @@ impl FrameTimes {
 
 /// Unattended capture: let the erosion cache stream in around the pinned
 /// camera for `--wait` frames, then save one screenshot and exit.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Bevy injects each capture dependency separately"
+)]
 pub(super) fn shot_scheduling_system(
     automation: Res<AutomationSettings>,
     cache: Res<ErosionCache>,

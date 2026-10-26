@@ -396,8 +396,8 @@ mod tests {
         assert_eq!(uniform.splits[3] - uniform.params[2], 1793.6);
         assert_eq!(uniform.texel[3], 0.0);
         assert_eq!(SHADOW_RESOLUTIONS, [2048, 2048, 1536]);
-        for index in 0..SHADOW_CASCADES {
-            assert_eq!(uniform.texel[index], cascades[index].texel);
+        for (index, cascade) in cascades.iter().enumerate() {
+            assert_eq!(uniform.texel[index], cascade.texel);
         }
     }
 

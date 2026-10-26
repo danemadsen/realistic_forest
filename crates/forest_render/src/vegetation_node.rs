@@ -1145,7 +1145,10 @@ fn prepare_vegetation(
     extracted: Res<ExtractedVegetation>,
     state: Res<VegetationNodeState>,
 ) {
-    let mut state = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = state
+        .0
+        .lock()
+        .expect("vegetation render state lock poisoned");
     if state.is_none() {
         let (Some(assets), Some(global_buffer)) =
             (extracted.assets.as_ref(), globals.buffer.as_ref())
@@ -1269,10 +1272,16 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
     };
     if !view.settings.vegetation_enabled {
         if let Some(terrain) = world.get_resource::<terrain_node::TerrainNodeState>() {
-            let gbuffer = terrain.gbuffer.lock().unwrap_or_else(|e| e.into_inner());
+            let gbuffer = terrain
+                .gbuffer
+                .lock()
+                .expect("vegetation render state lock poisoned");
             if let Some(gbuffer) = gbuffer.as_ref() {
                 clear_canopy(
-                    &mut state.0.lock().unwrap_or_else(|e| e.into_inner()),
+                    &mut state
+                        .0
+                        .lock()
+                        .expect("vegetation render state lock poisoned"),
                     gbuffer,
                     &mut ctx,
                 );
@@ -1293,11 +1302,17 @@ pub fn forest_vegetation_pass(world: &World, mut ctx: RenderContext) {
     let Some(textures) = textures.0.as_deref() else {
         return;
     };
-    let gbuffer = terrain.gbuffer.lock().unwrap_or_else(|e| e.into_inner());
+    let gbuffer = terrain
+        .gbuffer
+        .lock()
+        .expect("vegetation render state lock poisoned");
     let Some(gbuffer) = gbuffer.as_ref() else {
         return;
     };
-    let mut guard = state.0.lock().unwrap_or_else(|e| e.into_inner());
+    let mut guard = state
+        .0
+        .lock()
+        .expect("vegetation render state lock poisoned");
     if guard
         .as_ref()
         .is_none_or(|r| r.snapshot.as_ref().is_none_or(|s| s.plant_count == 0))

@@ -217,7 +217,7 @@ fn add_quad(indices: &mut Vec<u32>, column: u32, row: u32, columns: u32) {
     let lower_right = lower_left + 1;
     let upper_left = lower_left + columns;
     let upper_right = upper_left + 1;
-    let quad = if (column + row) % 2 == 0 {
+    let quad = if (column + row).is_multiple_of(2) {
         [
             upper_right,
             lower_right,
@@ -390,8 +390,7 @@ mod tests {
             let inner = (lod > 0).then(|| 2.0 * lod_scale(lod - 1));
             for tile in tile_layout(lod) {
                 let bounds = tile_world_bounds(&tile, lod);
-                for axis in 0..2 {
-                    let [low, high] = bounds[axis];
+                for (axis, &[low, high]) in bounds.iter().enumerate() {
                     if let Some(inner) = inner {
                         let reach_inward = low.abs().min(high.abs());
                         assert!(
@@ -424,11 +423,10 @@ mod tests {
         let lod = WATER_LOD_COUNT - 1;
         for tile in tile_layout(lod) {
             let bounds = tile_world_bounds(&tile, lod);
-            for axis in 0..2 {
+            for (axis, &[low, high]) in bounds.iter().enumerate() {
                 if tile.offset[axis].abs() != OUTER_TILE_OFFSET {
                     continue;
                 }
-                let [low, high] = bounds[axis];
                 let side = tile.offset[axis].signum();
                 assert!(
                     side * low >= 0.0 && side * high >= 0.0,
@@ -466,7 +464,7 @@ mod tests {
                     ]
                 })
                 .collect();
-            for triangle in mesh.indices.chunks_exact(3) {
+            for triangle in mesh.indices.as_chunks::<3>().0 {
                 let vertices: [[f32; 2]; 3] =
                     std::array::from_fn(|i| positions[triangle[i] as usize]);
                 // Only the horizon skirt has edges longer than a whole tile.

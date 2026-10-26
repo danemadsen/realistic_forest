@@ -2,6 +2,7 @@
 name = "forest_world"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 forest_core = { path = "../forest_core" }
@@ -15,3 +16,6 @@ bevy.workspace = true
 forest_vegetation = { path = "../forest_vegetation", features = ["test_support"] }
 bytemuck.workspace = true
 wgpu.workspace = true
+
+[lints]
+workspace = true

@@ -2,6 +2,7 @@
 name = "forest_core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 bevy.workspace = true
@@ -10,3 +11,6 @@ quick-noise.workspace = true
 [dev-dependencies]
 wgpu.workspace = true
 bytemuck.workspace = true
+
+[lints]
+workspace = true
