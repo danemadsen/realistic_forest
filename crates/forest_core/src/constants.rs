@@ -221,6 +221,12 @@ impl Default for ErosionSettings {
     }
 }
 
+/// Default bass boost for thunder's low-frequency body, in decibels.
+pub const DEFAULT_THUNDER_BASS_DB: f32 = 8.0;
+
+/// Maximum bass boost exposed by the thunder controls, in decibels.
+pub const MAX_THUNDER_BASS_DB: f32 = 12.0;
+
 #[derive(Clone, Copy, Debug, Resource)]
 pub struct AppSettings {
     pub ssao_enabled: bool,
@@ -262,6 +268,10 @@ pub struct AppSettings {
     pub exposure: f32,
     /// Loudness of thunder, 0 silent to 1 full.
     pub thunder_volume: f32,
+
+    /// Low-frequency thunder boost in decibels, applied to the next strike.
+    pub thunder_bass_db: f32,
+
     /// Draw the scattered trees, shrubs and flowers.
     pub vegetation_enabled: bool,
     /// Multiplies every plant LOD switch distance (1 = default detail).
@@ -317,6 +327,7 @@ impl Default for AppSettings {
             // protects highlights.
             exposure: 1.0,
             thunder_volume: 0.8,
+            thunder_bass_db: DEFAULT_THUNDER_BASS_DB,
             vegetation_enabled: true,
             vegetation_detail: 1.0,
             vegetation_shadows: true,

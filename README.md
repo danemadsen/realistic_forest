@@ -132,7 +132,8 @@ Choose a weather preset to apply it immediately around the player, or choose
 **Natural weather** to return to varied conditions. The **Move weather fronts**
 checkbox controls whether those conditions drift. Under a thunderstorm,
 **Strike lightning** fires the next discharge at once, and **Thunder volume**
-sets the loudness of thunder. Set the hour with
+sets the loudness of thunder. **Thunder bass** adds low-end weight, from
+`0` to `12 dB` (default `8 dB`), starting with the next strike. Set the hour with
 the slider or Dawn, Noon, Dusk and Night buttons; changing it holds the selected
 time until **Hold selected time** is unchecked. **Advanced controls** expands
 the full controls.
@@ -195,16 +196,19 @@ and texture profiles; no recorded audio plays. The channel's nearest distance
 sets the travel delay and the balance of sharp claps and distant rolls, while
 its range spread sets the rolling duration. Hidden cloud flashes are muffled.
 Later visible return strokes add quieter, short cracks beneath the main clap.
-The reference's relative levels are preserved, and overlapping peals pass through
-a soft limiter. Rendering runs off the main thread at the generator's native
+The same procedural claps and rolls receive an adjustable, broad bass shelf at
+`170 Hz`, boosting their low-frequency weight by `8 dB` by default. **Thunder bass**
+ranges from `0` to `12 dB`; zero restores the base EQ. Overlapping peals still pass
+through a soft limiter. Rendering runs off the main thread at the generator's native
 22,050 Hz; the audio backend resamples for playback.
 
 To render nearby, medium, distant, and cloud thunder for listening without opening
 the app, run `cargo run -p forest_world --example thunder-preview -- tmp/thunder-preview`.
 These WAV previews include unchanged reference claps and rolls alongside the
 integrated nearby, medium, distant, and cloud sounds, with alternate nearby seeds.
-Integrated previews start at the first sound arrival and preserve the generator's
-levels; the app also applies travel delay and distance attenuation.
+Integrated previews start at the first sound arrival and normally include the
+default bass boost; additional nearby previews compare `0` and `12 dB`. The app
+also applies travel delay and distance attenuation.
 
 **Volumetric clouds** controls cloud coverage, density, base altitude, layer
 thickness, wind speed and direction, and shadow strength. **Cloud shape** expands

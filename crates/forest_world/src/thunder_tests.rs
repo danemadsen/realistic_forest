@@ -30,11 +30,11 @@ fn energy(samples: &[f32]) -> f64 {
         .sum()
 }
 
-/// Two-pole low- and high-pass filters measure the body between bass and hiss.
-fn middle_band_energy(samples: &[f32]) -> f64 {
+/// Two-pole analysis filters measure energy in a broad frequency range.
+fn band_energy(samples: &[f32], low_frequency: f32, high_frequency: f32) -> f64 {
     let rate = THUNDER_SAMPLE_RATE as f32;
-    let low_keep = (-std::f32::consts::TAU * 1200.0 / rate).exp();
-    let high_keep = (-std::f32::consts::TAU * 100.0 / rate).exp();
+    let low_keep = (-std::f32::consts::TAU * high_frequency / rate).exp();
+    let high_keep = (-std::f32::consts::TAU * low_frequency / rate).exp();
     let mut low_first = 0.0;
     let mut low_second = 0.0;
     let mut high_first = 0.0;
@@ -52,6 +52,109 @@ fn middle_band_energy(samples: &[f32]) -> f64 {
     }
 
     total
+}
+
+fn sine_wave(frequency: f32) -> Vec<f32> {
+    let rate = THUNDER_SAMPLE_RATE as f32;
+    (0..THUNDER_SAMPLE_RATE)
+        .map(|index| {
+            let phase = std::f32::consts::TAU * frequency * index as f32 / rate;
+            phase.sin() * 0.05
+        })
+        .collect()
+}
+
+#[test]
+fn bass_shelf_adds_weight_without_dulling_the_crack() {
+    for (frequency, minimum_db, maximum_db) in [
+        (55.0, 7.5, 8.25),
+        (170.0, 3.7, 4.3),
+        (1000.0, -0.1, 0.1),
+        (4000.0, -0.1, 0.1),
+    ] {
+        let original = sine_wave(frequency);
+        let mut boosted = original.clone();
+        boost_thunder_bass(&mut boosted, 8.0);
+
+        // Exclude filter startup and the endpoint fade from steady-state gain.
+        let from = THUNDER_SAMPLE_RATE as usize / 5;
+        let to = THUNDER_SAMPLE_RATE as usize * 4 / 5;
+        let gain_db = 10.0 * (energy(&boosted[from..to]) / energy(&original[from..to])).log10();
+        assert!(
+            (minimum_db..=maximum_db).contains(&gain_db),
+            "{frequency} Hz must retain the intended bass/crack balance: {gain_db} dB"
+        );
+    }
+}
+
+#[test]
+fn zero_and_invalid_bass_gains_preserve_the_original_samples() {
+    let original = [0.0, 0.25, -0.4, 0.1, -0.05];
+    for gain in [0.0, -8.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let mut samples = original;
+        boost_thunder_bass(&mut samples, gain);
+        assert_eq!(samples, original, "gain {gain} must bypass the bass filter");
+    }
+
+    let mut silence = Vec::new();
+    boost_thunder_bass(&mut silence, 12.0);
+    assert!(silence.is_empty(), "an empty source must remain silent");
+}
+
+#[test]
+fn default_bass_adds_low_end_energy_to_different_procedural_claps() {
+    let sources = column(250.0, 900.0, 30);
+    let opening = THUNDER_SAMPLE_RATE as usize;
+    for seed in [7, 19, 37] {
+        let original = synthesize_thunder_with_bass(&sources, seed, false, 0.0);
+        let boosted = synthesize_thunder(&sources, seed, false);
+        let original_bass = band_energy(&original[..opening], 40.0, 160.0);
+        let boosted_bass = band_energy(&boosted[..opening], 40.0, 160.0);
+        let original_crack = band_energy(&original[..opening], 1000.0, 6000.0);
+        let boosted_crack = band_energy(&boosted[..opening], 1000.0, 6000.0);
+
+        assert!(
+            boosted_bass > original_bass * 2.5,
+            "seed {seed}: bass must gain substantial energy without peak normalization: original {original_bass}, boosted {boosted_bass}"
+        );
+        let crack_ratio = boosted_crack / original_crack;
+        assert!(
+            (0.75..=1.3).contains(&crack_ratio),
+            "seed {seed}: the crack must keep its energy as bass grows: ratio {crack_ratio}"
+        );
+    }
+}
+
+#[test]
+fn strong_bass_and_overlapping_restrikes_stay_finite_and_bounded() {
+    let sources = column(100.0, 900.0, 30);
+    let strokes = [
+        (0.0, 1.0),
+        (0.06, 0.7),
+        (0.12, 0.6),
+        (0.2, 0.5),
+        (0.28, 0.4),
+    ];
+    for bass_db in [8.0, 12.0] {
+        for seed in [3, 11] {
+            let samples = synthesize_discharge(&sources, &strokes, seed, false, bass_db);
+            assert!(
+                samples
+                    .iter()
+                    .all(|sample| sample.is_finite() && sample.abs() < 1.0),
+                "seed {seed}, boost {bass_db} dB: overlapping booms must not clip or become non-finite"
+            );
+            assert_eq!(
+                samples[0], 0.0,
+                "a boosted strike must start without a click"
+            );
+            assert_eq!(
+                samples.last().copied(),
+                Some(0.0),
+                "a boosted strike must finish in silence"
+            );
+        }
+    }
 }
 
 #[test]
@@ -129,7 +232,7 @@ fn nearby_thunder_preserves_the_reference_clap() {
         distance: 250.0,
         energy: 12.0,
     }];
-    let rendered = synthesize_thunder(&sources, 7, false);
+    let rendered = synthesize_thunder_with_bass(&sources, 7, false, 0.0);
     let reference_wav = thunder_synth::wav(thunder_synth::Thunder::Clap, 7);
     let (frames, _) = reference_wav[44..].as_chunks::<2>();
     let reference_samples: Vec<_> = frames
@@ -161,10 +264,12 @@ fn nearby_thunder_preserves_the_reference_clap() {
 }
 
 #[test]
-fn distant_rolls_keep_their_lower_peaks() {
+fn distant_rolls_keep_their_lower_playback_levels() {
+    let near_sources = column(250.0, 100.0, 12);
+    let far_sources = column(4500.0, 100.0, 12);
     for seed in [11, 23, 37] {
-        let near = synthesize_thunder(&column(250.0, 100.0, 12), seed, false);
-        let far = synthesize_thunder(&column(4500.0, 100.0, 12), seed, false);
+        let near = synthesize_thunder(&near_sources, seed, false);
+        let far = synthesize_thunder(&far_sources, seed, false);
         let near_peak = near
             .iter()
             .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
@@ -172,9 +277,11 @@ fn distant_rolls_keep_their_lower_peaks() {
             .iter()
             .fold(0.0_f32, |peak, sample| peak.max(sample.abs()));
 
+        let near_playback_peak = near_peak * loudness(&near_sources);
+        let far_playback_peak = far_peak * loudness(&far_sources);
         assert!(
-            near_peak > far_peak * 1.25,
-            "seed {seed}: do not normalize a distant roll to a close clap's peak: near {near_peak}, far {far_peak}"
+            near_playback_peak > far_playback_peak * 3.0,
+            "seed {seed}: distant thunder must stay quieter after bass processing and distance attenuation: near {near_playback_peak}, far {far_playback_peak}"
         );
     }
 }
@@ -263,7 +370,7 @@ fn nearby_thunder_has_audible_body_between_bass_and_crack() {
     let samples = synthesize_thunder(&sources, 23, false);
     let opening_length = THUNDER_SAMPLE_RATE as usize;
     let opening = &samples[..opening_length];
-    let body_share = middle_band_energy(opening) / energy(opening);
+    let body_share = band_energy(opening, 100.0, 1200.0) / energy(opening);
 
     assert!(
         body_share > 0.08,
@@ -276,8 +383,8 @@ fn restrikes_extend_the_roll_and_add_a_subordinate_crack() {
     let sources = column(900.0, 100.0, 12);
     let single_stroke = [(0.0, 1.0)];
     let repeated_strokes = [(0.0, 1.0), (1.5, 0.8)];
-    let single = synthesize_discharge(&sources, &single_stroke, 31, false);
-    let repeated = synthesize_discharge(&sources, &repeated_strokes, 31, false);
+    let single = synthesize_discharge(&sources, &single_stroke, 31, false, 0.0);
+    let repeated = synthesize_discharge(&sources, &repeated_strokes, 31, false, 0.0);
     let extra_seconds = (repeated.len() - single.len()) as f32 / THUNDER_SAMPLE_RATE as f32;
 
     assert!(
@@ -302,7 +409,7 @@ fn restrikes_extend_the_roll_and_add_a_subordinate_crack() {
         "a later stroke must add an audible crack while preserving the dominant first clap: added {added_energy}, first {first_clap_energy}"
     );
     assert!(
-        synthesize_discharge(&sources, &[], 31, false).is_empty(),
+        synthesize_discharge(&sources, &[], 31, false, 0.0).is_empty(),
         "a discharge without return strokes must be silent"
     );
 }

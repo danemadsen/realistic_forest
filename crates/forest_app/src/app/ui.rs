@@ -556,6 +556,14 @@ fn draw_trainer_window(
         thunder_volume_slider = thunder_volume_slider.fixed_decimals(2);
         ui.add(thunder_volume_slider);
 
+        let mut thunder_bass_slider =
+            egui::Slider::new(&mut settings.thunder_bass_db, 0.0..=MAX_THUNDER_BASS_DB);
+        thunder_bass_slider = thunder_bass_slider.text("Thunder bass");
+        thunder_bass_slider = thunder_bass_slider.suffix(" dB");
+        thunder_bass_slider = thunder_bass_slider.fixed_decimals(0);
+        let bass_response = ui.add(thunder_bass_slider);
+        bass_response.on_hover_text("Adds low-end weight to thunder. Applies to the next strike.");
+
         separator_text(ui, "Time of day");
         if ui
             .add(
@@ -702,6 +710,14 @@ fn draw_advanced_controls(
     thunder_volume_slider = thunder_volume_slider.text("Thunder volume");
     thunder_volume_slider = thunder_volume_slider.fixed_decimals(2);
     ui.add(thunder_volume_slider);
+
+    let mut thunder_bass_slider =
+        egui::Slider::new(&mut settings.thunder_bass_db, 0.0..=MAX_THUNDER_BASS_DB);
+    thunder_bass_slider = thunder_bass_slider.text("Thunder bass");
+    thunder_bass_slider = thunder_bass_slider.suffix(" dB");
+    thunder_bass_slider = thunder_bass_slider.fixed_decimals(0);
+    let bass_response = ui.add(thunder_bass_slider);
+    bass_response.on_hover_text("Adds low-end weight to thunder. Applies to the next strike.");
 
     separator_text(ui, "Sun and time");
     let mut time_of_day_slider = egui::Slider::new(&mut day_night.time_hours, 0.0..=23.99);

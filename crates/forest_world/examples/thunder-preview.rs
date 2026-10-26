@@ -1,5 +1,6 @@
 //! Render deterministic procedural thunder previews without opening the application.
 
+use forest_core::constants::{DEFAULT_THUNDER_BASS_DB, MAX_THUNDER_BASS_DB};
 use forest_world::lightning;
 use forest_world::thunder::{self, THUNDER_SAMPLE_RATE};
 use std::env;
@@ -69,21 +70,23 @@ fn main() -> io::Result<()> {
 
     let segments = lightning::ground_bolt(0.41, [0.0, 0.0, 0.0], [100.0, 1600.0, 50.0]);
     let previews = [
-        ("very-near-100m.wav", 100.0, 7),
-        ("near-250m.wav", 250.0, 7),
-        ("near-250m-seed-2.wav", 250.0, 2),
-        ("near-250m-seed-19.wav", 250.0, 19),
-        ("medium-1200m.wav", 1200.0, 7),
-        ("distant-4500m.wav", 4500.0, 7),
+        ("very-near-100m.wav", 100.0, 7, DEFAULT_THUNDER_BASS_DB),
+        ("near-250m.wav", 250.0, 7, DEFAULT_THUNDER_BASS_DB),
+        ("near-250m-no-bass.wav", 250.0, 7, 0.0),
+        ("near-250m-extra-bass.wav", 250.0, 7, MAX_THUNDER_BASS_DB),
+        ("near-250m-seed-2.wav", 250.0, 2, DEFAULT_THUNDER_BASS_DB),
+        ("near-250m-seed-19.wav", 250.0, 19, DEFAULT_THUNDER_BASS_DB),
+        ("medium-1200m.wav", 1200.0, 7, DEFAULT_THUNDER_BASS_DB),
+        ("distant-4500m.wav", 4500.0, 7, DEFAULT_THUNDER_BASS_DB),
     ];
-    for (name, distance, seed) in previews {
+    for (name, distance, seed, bass_db) in previews {
         let listener = [distance, 20.0, 0.0];
         let sources = thunder::channel_sources(&segments, listener);
-        let samples = thunder::synthesize_thunder(&sources, seed, false);
+        let samples = thunder::synthesize_thunder_with_bass(&sources, seed, false, bass_db);
         let path = output_directory.join(name);
         write_wav(&path, &samples)?;
         println!(
-            "{} ({:.2} seconds)",
+            "{} ({:.2} seconds, bass +{bass_db:.0} dB)",
             path.display(),
             samples.len() as f32 / THUNDER_SAMPLE_RATE as f32
         );

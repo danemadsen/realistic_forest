@@ -2,7 +2,8 @@
 //! Channel distance controls sound propagation and the balance of close cracks
 //! and distant rolls; its range spread controls the rolling duration. Rendering
 //! runs off the main thread. Every discharge is generated from fresh noise,
-//! without recorded audio, and retains the reference synthesizer's dynamics.
+//! without recorded audio. Adjustable bass weight strengthens the boom while
+//! preserving the reference synthesizer's crack and irregular rolling texture.
 
 use crate::automation::AutomationSettings;
 use crate::lightning::{ActiveBolt, BoltKind, BoltSegment};
@@ -14,7 +15,7 @@ use bevy::audio::{
 use bevy::math::Vec3;
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
-use forest_core::constants::AppSettings;
+use forest_core::constants::{AppSettings, DEFAULT_THUNDER_BASS_DB, MAX_THUNDER_BASS_DB};
 use std::num::NonZero;
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,6 +36,8 @@ const RESTRIKE_SECONDS: f32 = 0.18;
 const RESTRIKE_GAIN: f32 = 0.22;
 /// Match the reference roll's fade when the final roll ends between clip boundaries.
 const ROLL_FADE_SECONDS: f32 = 0.8;
+/// Shelf midpoint: lifts deep bass and the low body without raising the crack.
+const THUNDER_BASS_FREQUENCY: f64 = 170.0;
 
 /// A piece of the channel as the listener hears it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -152,6 +155,52 @@ fn lowpass(samples: &mut [f32], cutoff: f32) {
     }
 }
 
+fn boost_thunder_bass(samples: &mut [f32], bass_db: f32) {
+    if !bass_db.is_finite() || bass_db <= 0.0 || samples.is_empty() {
+        return;
+    }
+    let bass_db = bass_db.min(MAX_THUNDER_BASS_DB);
+
+    // RBJ low shelf, slope S = 1: https://www.w3.org/TR/audio-eq-cookbook/.
+    // Double precision keeps the low-frequency poles accurate at audio rates.
+    let amplitude = 10.0_f64.powf(f64::from(bass_db) / 40.0);
+    let angle = std::f64::consts::TAU * THUNDER_BASS_FREQUENCY / f64::from(THUNDER_SAMPLE_RATE);
+    let cosine = angle.cos();
+    let alpha = angle.sin() / std::f64::consts::SQRT_2;
+    let shelf_cross = 2.0 * amplitude.sqrt() * alpha;
+    let amplitude_plus_one = amplitude + 1.0;
+    let amplitude_minus_one = amplitude - 1.0;
+    let normalizer = amplitude_plus_one + amplitude_minus_one * cosine + shelf_cross;
+
+    let numerator = [
+        amplitude * (amplitude_plus_one - amplitude_minus_one * cosine + shelf_cross),
+        2.0 * amplitude * (amplitude_minus_one - amplitude_plus_one * cosine),
+        amplitude * (amplitude_plus_one - amplitude_minus_one * cosine - shelf_cross),
+    ];
+    let denominator = [
+        -2.0 * (amplitude_minus_one + amplitude_plus_one * cosine),
+        amplitude_plus_one + amplitude_minus_one * cosine - shelf_cross,
+    ];
+    let feed = numerator.map(|coefficient| coefficient / normalizer);
+    let feedback = denominator.map(|coefficient| coefficient / normalizer);
+
+    let (mut delay_one, mut delay_two) = (0.0, 0.0);
+    for sample in samples.iter_mut() {
+        let input = f64::from(*sample);
+        let output = feed[0] * input + delay_one;
+        delay_one = feed[1] * input - feedback[0] * output + delay_two;
+        delay_two = feed[2] * input - feedback[1] * output;
+        *sample = output as f32;
+    }
+
+    // The shelf's filter state can outlast the source's final silent sample.
+    let fade = (0.005 * THUNDER_SAMPLE_RATE as f32) as usize;
+    let fade = fade.min(samples.len());
+    for (index, sample) in samples.iter_mut().rev().take(fade).enumerate() {
+        *sample *= index as f32 / fade as f32;
+    }
+}
+
 fn add_rolls(samples: &mut [f32], seed: u64, proximity: f32, muffled: bool) {
     let rate = THUNDER_SAMPLE_RATE as f32;
     let overlap = (thunder_synth::ROLL_OVERLAP * rate) as usize;
@@ -223,10 +272,22 @@ fn add_claps(
 }
 
 /// The thunder of one return stroke as mono samples at [`THUNDER_SAMPLE_RATE`].
-/// Empty or inactive sources are silent. Near claps and far rolls retain the
-/// reference generator's relative levels, with a soft limiter for overlapping peals.
+/// Empty or inactive sources are silent. The default bass boost adds low-end
+/// weight, with a soft limiter for overlapping peals.
 pub fn synthesize_thunder(sources: &[ThunderSource], seed: u64, muffled: bool) -> Vec<f32> {
-    synthesize_discharge(sources, &[(0.0, 1.0)], seed, muffled)
+    synthesize_thunder_with_bass(sources, seed, muffled, DEFAULT_THUNDER_BASS_DB)
+}
+
+/// Render procedural thunder with a low-frequency boost in decibels.
+/// Zero preserves the original bass balance; boosts are capped at 12 dB.
+/// Negative and non-finite boosts bypass the equalizer.
+pub fn synthesize_thunder_with_bass(
+    sources: &[ThunderSource],
+    seed: u64,
+    muffled: bool,
+    bass_db: f32,
+) -> Vec<f32> {
+    synthesize_discharge(sources, &[(0.0, 1.0)], seed, muffled, bass_db)
 }
 
 fn synthesize_discharge(
@@ -234,6 +295,7 @@ fn synthesize_discharge(
     strokes: &[(f32, f32)],
     seed: u64,
     muffled: bool,
+    bass_db: f32,
 ) -> Vec<f32> {
     let sources: Vec<_> = sources
         .iter()
@@ -277,6 +339,7 @@ fn synthesize_discharge(
     let mut samples = vec![0.0; length];
     add_rolls(&mut samples, seed, proximity, muffled);
     add_claps(&mut samples, &strokes, seed, nearest, proximity);
+    boost_thunder_bass(&mut samples, bass_db);
 
     // Preserve the reference's dynamic range: normalising every roll to a
     // clap's peak would turn quiet distant thunder into an equally loud roar.
@@ -369,6 +432,7 @@ pub fn queue_thunder(
     automation: Res<AutomationSettings>,
     bolt: Res<ActiveBolt>,
     weather: Res<WeatherState>,
+    settings: Res<AppSettings>,
     players: Query<&Player>,
     mut queue: ResMut<ThunderQueue>,
 ) {
@@ -407,8 +471,9 @@ pub fn queue_thunder(
     let loudness = loudness(&sources);
     let seed = bolt.generation ^ (lightning.seed.to_bits() as u64) << 20;
     let strokes: Vec<_> = lightning.thunder_strokes().collect();
+    let bass_db = settings.thunder_bass_db;
     let task = AsyncComputeTaskPool::get()
-        .spawn(async move { synthesize_discharge(&sources, &strokes, seed, muffled) });
+        .spawn(async move { synthesize_discharge(&sources, &strokes, seed, muffled, bass_db) });
     queue.pending.push(PendingThunder {
         task,
         samples: None,
